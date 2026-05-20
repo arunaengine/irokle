@@ -1,0 +1,71 @@
+use crate::{
+    crypto::{Signer, canonical_bytes, verify},
+    error::{Error, Result},
+    ids::{ActorId, OpId, PeerId, TopicId},
+    topic::TopicPayload,
+};
+use ed25519_dalek::Signature;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpBody {
+    pub topic_id: TopicId,
+    pub author: PeerId,
+    pub actor_id: ActorId,
+    pub actor_seq: u64,
+    pub actor_prev: Option<OpId>,
+    pub deps: BTreeSet<OpId>,
+    pub generation: u64,
+    pub payload: TopicPayload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedOp {
+    pub body: OpBody,
+    pub signature: Signature,
+}
+
+impl SignedOp {
+    pub fn sign(body: OpBody, signer: &impl Signer) -> Result<Self> {
+        if body.author != signer.peer_id() {
+            return Err(Error::WrongSigner);
+        }
+        let bytes = canonical_bytes(&body)?;
+        let signature = signer.sign(&bytes)?;
+        Ok(Self { body, signature })
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        let bytes = canonical_bytes(&self.body)?;
+        verify(self.body.author, &bytes, &self.signature)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Op {
+    pub id: OpId,
+    pub signed: SignedOp,
+}
+
+impl Op {
+    pub fn new(signed: SignedOp) -> Result<Self> {
+        let id = Self::derive_id(&signed)?;
+        Ok(Self { id, signed })
+    }
+
+    pub fn sign(body: OpBody, signer: &impl Signer) -> Result<Self> {
+        Self::new(SignedOp::sign(body, signer)?)
+    }
+
+    pub fn derive_id(signed: &SignedOp) -> Result<OpId> {
+        Ok(OpId::hash(canonical_bytes(signed)?))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.id != Self::derive_id(&self.signed)? {
+            return Err(Error::InvalidOpId);
+        }
+        self.signed.verify()
+    }
+}
