@@ -895,13 +895,11 @@ impl Storage for FjallStorage {
                     .concat(),
                     &(meta.actor_seq, op.id),
                 )?;
-                if let Some((source_peer, _, pending_meta)) =
-                    Self::tx_get::<(PeerId, Op, OpMeta)>(
-                        tx,
-                        &self.records,
-                        Self::key_id(b"po", &op.id),
-                    )?
-                {
+                if let Some((source_peer, _, pending_meta)) = Self::tx_get::<(PeerId, Op, OpMeta)>(
+                    tx,
+                    &self.records,
+                    Self::key_id(b"po", &op.id),
+                )? {
                     tx.remove(&self.records, Self::key_id(b"po", &op.id));
                     for dep in &pending_meta.missing_deps {
                         tx.remove(
@@ -1156,8 +1154,7 @@ impl Storage for FjallStorage {
             };
             tx.remove(&self.records, Self::key_id(b"po", op_id));
             for dep in &meta.missing_deps {
-                let waiter_key =
-                    [b"pw".as_slice(), dep.as_ref(), op_id.as_ref()].concat();
+                let waiter_key = [b"pw".as_slice(), dep.as_ref(), op_id.as_ref()].concat();
                 tx.remove(&self.records, waiter_key);
                 let count_key = [b"wn".as_slice(), dep.as_ref()].concat();
                 let count: u64 =
@@ -1169,8 +1166,7 @@ impl Storage for FjallStorage {
                     Self::tx_put(tx, &self.records, count_key.as_slice(), &next)?;
                 }
             }
-            let total: u64 =
-                Self::tx_get(tx, &self.records, b"pn".as_slice())?.unwrap_or_default();
+            let total: u64 = Self::tx_get(tx, &self.records, b"pn".as_slice())?.unwrap_or_default();
             let next_total = total.saturating_sub(1);
             if next_total == 0 {
                 tx.remove(&self.records, b"pn".as_slice());
