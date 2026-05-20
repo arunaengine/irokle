@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Iroh chat example using NodeId-only discovery-backed sync.
 
-use futures::StreamExt;
-use iroh::Watcher;
 use irokle::history::HistoryOrder;
 use irokle::{Irokle, TopicConfig};
 use serde::{Deserialize, Serialize};
@@ -16,20 +14,19 @@ struct ChatEvent {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .alpns(vec![irokle::net::IROKLE_SYNC_ALPN.to_vec()])
         .bind()
         .await?;
-    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
         .alpns(vec![irokle::net::IROKLE_SYNC_ALPN.to_vec()])
         .bind()
         .await?;
+    timeout(Duration::from_secs(10), alice_endpoint.online()).await?;
+    timeout(Duration::from_secs(10), bob_endpoint.online()).await?;
+
     let alice = Irokle::builder().with_net(alice_endpoint).build()?;
     let bob = Irokle::builder().with_net(bob_endpoint).build()?;
-    let alice_addr = ready_addr(alice.endpoint().expect("iroh endpoint")).await?;
-    let bob_addr = ready_addr(bob.endpoint().expect("iroh endpoint")).await?;
-    alice.add_peer_addr(bob_addr)?;
-    bob.add_peer_addr(alice_addr)?;
 
     let alice_topic = alice.create_topic::<ChatEvent>(TopicConfig {
         initial_peers: [bob.peer_id()].into(),
@@ -64,27 +61,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-async fn ready_addr(
-    endpoint: &iroh::Endpoint,
-) -> Result<iroh::EndpointAddr, Box<dyn std::error::Error>> {
-    let addr = endpoint.addr();
-    if !addr.addrs.is_empty() {
-        return Ok(addr);
-    }
-    let mut stream = endpoint.watch_addr().stream();
-    let addr = timeout(Duration::from_secs(5), async move {
-        loop {
-            let addr = stream
-                .next()
-                .await
-                .ok_or_else(|| std::io::Error::other("endpoint address stream closed"))?;
-            if !addr.addrs.is_empty() {
-                return Ok::<_, Box<dyn std::error::Error>>(addr);
-            }
-        }
-    })
-    .await??;
-    Ok(addr)
 }
