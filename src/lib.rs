@@ -31,7 +31,9 @@ pub use op::{Op, OpBody, SignedOp};
 #[cfg(feature = "fjall")]
 pub use storage::FjallStorage;
 pub use storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
-pub use topic::{ReplicationPolicy, TopicConfig, TopicControl, TopicGenesis, TopicInfo, TopicPayload};
+pub use topic::{
+    ReplicationPolicy, TopicConfig, TopicControl, TopicGenesis, TopicInfo, TopicPayload,
+};
 
 #[cfg(test)]
 mod tests {
@@ -948,7 +950,7 @@ mod tests {
             .build()
             .unwrap();
         let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
-        let net = net::IrohNet::new(alice_endpoint, alice.clone());
+        let net = net::IrohNet::new(alice_endpoint, alice.clone()).unwrap();
         let outsider_peer = PeerId::from_bytes(*outsider_endpoint.id().as_bytes());
 
         let responses = net
