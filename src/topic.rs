@@ -46,19 +46,10 @@ fn default_max_sync_peers() -> usize {
     DEFAULT_MAX_SYNC_PEERS
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicConfig {
     pub initial_peers: BTreeSet<PeerId>,
     pub replication_policy: ReplicationPolicy,
-}
-
-impl Default for TopicConfig {
-    fn default() -> Self {
-        Self {
-            initial_peers: BTreeSet::new(),
-            replication_policy: ReplicationPolicy::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,11 +57,6 @@ pub struct TopicInfo {
     pub topic_id: crate::TopicId,
     pub event_type_id: String,
     pub genesis: crate::OpId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerInfo {
-    pub peer_id: PeerId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,10 +73,6 @@ impl TopicGenesis {
             initial_peers: peers.into_iter().collect(),
             replication_policy: ReplicationPolicy::default(),
         }
-    }
-
-    pub fn allows(&self, peer: &PeerId) -> bool {
-        self.initial_peers.contains(peer)
     }
 }
 
