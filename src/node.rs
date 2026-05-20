@@ -6,9 +6,9 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::history::{DagQuery, HistoryOrder, VecStream, limited, ordered};
+use crate::history::{DagQuery, HistoryOrder, limited, ordered};
 use crate::oplog::{Oplog, topological, topological_subset};
-use crate::reducer::{EventRecord, Reducer};
+use crate::reducer::EventRecord;
 use crate::storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
 use crate::sync::{
     SyncAck, SyncData, SyncEngine, SyncFingerprint, SyncOpen, SyncPlan, SyncReport, SyncRequest,
@@ -233,7 +233,9 @@ impl<S: Storage> IrokleBuilder<S> {
                     Error::Storage(format!("failed to start iroh accept loop: {err}"))
                 })?;
                 net.start_resync_loop(std::time::Duration::from_secs(30))
-                    .map_err(|err| Error::Storage(format!("failed to start iroh resync loop: {err}")))?;
+                    .map_err(|err| {
+                        Error::Storage(format!("failed to start iroh resync loop: {err}"))
+                    })?;
             }
             return Ok(node.with_net(net));
         }
@@ -369,18 +371,6 @@ impl<S: Storage> Irokle<S> {
         Ok(Topic::new(self.clone(), topic_id, actor_id))
     }
 
-    pub fn create_topic_with_reducer<E, R>(
-        &self,
-        config: TopicConfig,
-    ) -> Result<ReducerTopic<E, R, S>>
-    where
-        E: Event,
-        R: Reducer<E> + Default,
-        R::State: Default,
-    {
-        Ok(ReducerTopic::new(self.create_topic::<E>(config)?))
-    }
-
     fn next_topic_id<E: Event>(&self) -> Result<TopicId> {
         for _ in 0..16 {
             let counter = TOPIC_NONCE.fetch_add(1, Ordering::Relaxed);
@@ -419,15 +409,6 @@ impl<S: Storage> Irokle<S> {
         }
         let actor_id = actor_id_for(topic_id, self.peer_id());
         Ok(Topic::new(self.clone(), topic_id, actor_id))
-    }
-
-    pub fn open_topic_with_reducer<E, R>(&self, topic_id: TopicId) -> Result<ReducerTopic<E, R, S>>
-    where
-        E: Event,
-        R: Reducer<E> + Default,
-        R::State: Default,
-    {
-        Ok(ReducerTopic::new(self.open_topic::<E>(topic_id)?))
     }
 
     pub fn list_topics(&self) -> Result<Vec<crate::TopicInfo>> {
@@ -498,8 +479,14 @@ impl<S: Storage> Irokle<S> {
         Ok(ack)
     }
 
-    pub fn receive_sync_data_from(&self, source_peer_id: PeerId, data: SyncData) -> Result<SyncAck> {
-        let mut ack = self.sync.receive_data(source_peer_id, self.peer_id(), data)?;
+    pub fn receive_sync_data_from(
+        &self,
+        source_peer_id: PeerId,
+        data: SyncData,
+    ) -> Result<SyncAck> {
+        let mut ack = self
+            .sync
+            .receive_data(source_peer_id, self.peer_id(), data)?;
         ack.sign(&self.config.signer)?;
         Ok(ack)
     }
@@ -725,12 +712,6 @@ pub struct Topic<E: Event, S: Storage = MemoryStorage> {
     _event: PhantomData<E>,
 }
 
-pub struct ReducerTopic<E: Event, R: Reducer<E>, S: Storage = MemoryStorage> {
-    topic: Topic<E, S>,
-    reducer: R,
-    state: R::State,
-}
-
 impl<E: Event, S: Storage> Topic<E, S> {
     fn new(node: Irokle<S>, topic_id: TopicId, actor_id: ActorId) -> Self {
         Self {
@@ -776,9 +757,6 @@ impl<E: Event, S: Storage> Topic<E, S> {
             TopicControl::SetReplicationPolicy { policy },
         )
     }
-    pub fn events(&self) -> Result<VecStream<EventRecord<E>>> {
-        Ok(VecStream::new(self.history(HistoryOrder::OldestFirst)?))
-    }
     pub fn history(&self, order: HistoryOrder) -> Result<Vec<EventRecord<E>>> {
         self.node.topic_history(self.topic_id, order)
     }
@@ -792,59 +770,6 @@ impl<E: Event, S: Storage> Topic<E, S> {
     #[cfg(feature = "iroh")]
     pub async fn sync_now(&self) -> std::io::Result<()> {
         self.node.sync_topic_now(self.topic_id).await
-    }
-}
-
-impl<E, R, S> ReducerTopic<E, R, S>
-where
-    E: Event,
-    R: Reducer<E> + Default,
-    R::State: Default,
-    S: Storage,
-{
-    fn new(topic: Topic<E, S>) -> Self {
-        Self {
-            topic,
-            reducer: R::default(),
-            state: R::State::default(),
-        }
-    }
-
-    pub fn id(&self) -> TopicId {
-        self.topic.id()
-    }
-
-    pub fn topic(&self) -> &Topic<E, S> {
-        &self.topic
-    }
-
-    pub fn state(&self) -> &R::State {
-        &self.state
-    }
-
-    pub fn publish(&mut self, event: E) -> std::result::Result<EventRecord<E>, R::Error>
-    where
-        E: Clone,
-        R::Error: From<Error>,
-    {
-        let record = self.topic.publish(event).map_err(R::Error::from)?;
-        self.reducer.apply(&mut self.state, &record)?;
-        Ok(record)
-    }
-
-    pub fn reduce_now(&mut self, order: HistoryOrder) -> std::result::Result<&R::State, R::Error>
-    where
-        R::Error: From<Error>,
-    {
-        self.state = R::State::default();
-        for record in self.topic.history(order).map_err(R::Error::from)? {
-            self.reducer.apply(&mut self.state, &record)?;
-        }
-        Ok(&self.state)
-    }
-
-    pub fn heads(&self) -> Result<BTreeSet<OpId>> {
-        self.topic.heads()
     }
 }
 
