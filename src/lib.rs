@@ -31,7 +31,7 @@ pub use node::{Irokle, IrokleBuilder, NodeConfig, PublishOptions, RawTopic, Topi
 pub use op::{Op, OpBody, SignedOp};
 #[cfg(feature = "fjall")]
 pub use storage::FjallStorage;
-pub use storage::{MemoryStorage, Storage};
+pub use storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
 pub use topic::{
     PeerInfo, ReplicationPolicy, TopicConfig, TopicControl, TopicGenesis, TopicInfo, TopicPayload,
 };

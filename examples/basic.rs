@@ -2,8 +2,7 @@
 //! Minimal in-memory example showing typed events and manual sync planning.
 
 use irokle::history::HistoryOrder;
-use irokle::net;
-use irokle::{Ed25519Signer, Irokle, PublishOptions, TopicConfig, WriteConcern};
+use irokle::{Ed25519Signer, Irokle, TopicConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
@@ -36,15 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     alice.apply_sync_ack(&ack)?;
 
     let bob_topic = bob.open_topic::<ChatEvent>(alice_topic.id())?;
-    let second = bob_topic.publish_with(
-        ChatEvent {
-            author: "bob".into(),
-            text: "write concern is chosen per publish".into(),
-        },
-        PublishOptions {
-            write_concern: WriteConcern::Local,
-        },
-    )?;
+    let second = bob_topic.publish(ChatEvent {
+        author: "bob".into(),
+        text: "reply from another member".into(),
+    })?;
 
     let bob_summary = bob.sync_summary(alice_topic.id())?;
     let data_for_bob = alice.plan_sync_data(bob.peer_id(), &bob_summary)?;
@@ -55,21 +49,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     alice.apply_sync_ack(&bob_ack)?;
     bob.apply_sync_ack(&alice_ack)?;
 
-    let encoded_ack = net::encode_sync_message(&irokle::sync::SyncMessage::Ack(alice_ack))?;
-    let framed = net::frame_sync_bytes(&encoded_ack);
-    let decoded_frames = net::decode_frames(&framed)?;
-    let decoded_messages = decoded_frames
-        .iter()
-        .map(|frame| net::decode_sync_message(frame))
-        .collect::<std::io::Result<Vec<_>>>()?;
     let history = alice_topic.history(HistoryOrder::OldestFirst)?;
 
     println!(
-        "published '{}' and '{}'; bob history={}; sync messages={}",
+        "published '{}' and '{}'; alice history={}",
         first.event.text,
         second.event.text,
-        history.len(),
-        decoded_messages.len()
+        history.len()
     );
 
     Ok(())

@@ -113,5 +113,8 @@ id_type!(ActorId);
 id_type!(PeerId);
 
 pub fn actor_id_for(topic_id: TopicId, peer_id: PeerId) -> ActorId {
-    ActorId::hash([topic_id.as_ref(), peer_id.as_ref()].concat())
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(topic_id.as_ref());
+    hasher.update(peer_id.as_ref());
+    ActorId::from_bytes(*hasher.finalize().as_bytes())
 }

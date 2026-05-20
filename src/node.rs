@@ -390,16 +390,14 @@ impl<S: Storage> Irokle<S> {
                 .duration_since(UNIX_EPOCH)
                 .map_err(|err| Error::Storage(format!("system time before unix epoch: {err}")))?
                 .as_nanos();
-            let seed = [
-                b"irokle-topic-v1".as_slice(),
-                self.peer_id().as_ref(),
-                E::TYPE_ID.as_bytes(),
-                &std::process::id().to_le_bytes(),
-                &counter.to_le_bytes(),
-                &now.to_le_bytes(),
-            ]
-            .concat();
-            let topic_id = TopicId::hash(seed);
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"irokle-topic-v1");
+            hasher.update(self.peer_id().as_ref());
+            hasher.update(E::TYPE_ID.as_bytes());
+            hasher.update(&std::process::id().to_le_bytes());
+            hasher.update(&counter.to_le_bytes());
+            hasher.update(&now.to_le_bytes());
+            let topic_id = TopicId::from_bytes(*hasher.finalize().as_bytes());
             if self.storage().topic_state(&topic_id)?.is_none() {
                 return Ok(topic_id);
             }

@@ -83,10 +83,6 @@ pub fn decode_frames(mut input: &[u8]) -> io::Result<Vec<Vec<u8>>> {
     Ok(frames)
 }
 
-pub fn frame_sync_bytes(message_bytes: &[u8]) -> Vec<u8> {
-    encode_frame(message_bytes)
-}
-
 #[cfg(feature = "iroh")]
 #[derive(Clone)]
 pub struct ConnectionPool {

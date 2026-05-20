@@ -1802,7 +1802,6 @@ dependencies = [
 name = "irokle"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "blake3",
  "bytes",
  "ed25519-dalek 2.2.0",

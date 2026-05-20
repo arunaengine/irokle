@@ -395,20 +395,14 @@ impl<S: Storage> Oplog<S> {
         if body.actor_prev != expected_prev {
             return Err(Error::ActorPrevMismatch);
         }
-        let generation = body
-            .deps
-            .iter()
-            .map(|id| {
-                let meta = self
-                    .storage
-                    .get_meta(id)?
-                    .ok_or(Error::MissingDependency(*id))?;
-                checked_next(meta.generation)
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .unwrap_or(0);
+        let mut generation = 0;
+        for id in &body.deps {
+            let meta = self
+                .storage
+                .get_meta(id)?
+                .ok_or(Error::MissingDependency(*id))?;
+            generation = generation.max(checked_next(meta.generation)?);
+        }
         if body.generation != generation {
             return Err(Error::InvalidOpId);
         }
@@ -689,17 +683,11 @@ impl<S: Storage> Oplog<S> {
         if body.actor_prev != expected_prev {
             return Err(Error::ActorPrevMismatch);
         }
-        let generation = body
-            .deps
-            .iter()
-            .map(|id| {
-                self.meta_projected(id, overlay_meta)
-                    .and_then(|m| checked_next(m.generation))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .unwrap_or(0);
+        let mut generation = 0;
+        for id in &body.deps {
+            let meta = self.meta_projected(id, overlay_meta)?;
+            generation = generation.max(checked_next(meta.generation)?);
+        }
         if body.generation != generation {
             return Err(Error::InvalidOpId);
         }
