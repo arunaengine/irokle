@@ -277,24 +277,6 @@ impl<S: Storage> Irokle<S> {
     }
 
     #[cfg(feature = "iroh")]
-    pub fn add_peer_addr(&self, addr: iroh::EndpointAddr) -> Result<PeerId> {
-        Ok(self
-            .net
-            .as_ref()
-            .ok_or_else(|| Error::Storage("iroh is not configured".into()))?
-            .add_peer_addr(addr))
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn add_peer_addr_for(&self, peer_id: PeerId, addr: iroh::EndpointAddr) -> Result<PeerId> {
-        self.net
-            .as_ref()
-            .ok_or_else(|| Error::Storage("iroh is not configured".into()))?
-            .add_peer_addr_for(peer_id, addr)
-            .map_err(|err| Error::Storage(err.to_string()))
-    }
-
-    #[cfg(feature = "iroh")]
     pub fn start_accept_loop(&self) -> std::io::Result<()> {
         self.net
             .as_ref()
@@ -506,10 +488,16 @@ impl<S: Storage> Irokle<S> {
     }
 
     pub fn receive_sync_data(&self, peer_id: PeerId, data: SyncData) -> Result<SyncAck> {
-        let mut ack = self.sync.receive_data(peer_id, data)?;
+        let mut ack = self.sync.receive_data(peer_id, peer_id, data)?;
         if ack.peer_id == self.peer_id() {
             ack.sign(&self.config.signer)?;
         }
+        Ok(ack)
+    }
+
+    pub fn receive_sync_data_from(&self, source_peer_id: PeerId, data: SyncData) -> Result<SyncAck> {
+        let mut ack = self.sync.receive_data(source_peer_id, self.peer_id(), data)?;
+        ack.sign(&self.config.signer)?;
         Ok(ack)
     }
 

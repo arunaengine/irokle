@@ -348,16 +348,23 @@ impl<S: Storage> SyncEngine<S> {
         })
     }
 
-    pub fn receive_data(&self, peer_id: PeerId, data: SyncData) -> Result<SyncAck> {
+    pub fn receive_data(
+        &self,
+        source_peer_id: PeerId,
+        ack_peer_id: PeerId,
+        data: SyncData,
+    ) -> Result<SyncAck> {
         for op in &data.ops {
             if op.signed.body.topic_id != data.topic_id {
                 return Err(Error::TopicMismatch);
             }
         }
-        let accepted = self.oplog.receive_ops_from_peer(Some(peer_id), data.ops)?;
+        let accepted = self
+            .oplog
+            .receive_ops_from_peer(Some(source_peer_id), data.ops)?;
         Ok(SyncAck {
             topic_id: data.topic_id,
-            peer_id,
+            peer_id: ack_peer_id,
             accepted,
             heads: self.oplog.storage().heads(&data.topic_id)?,
             clock: self.oplog.storage().actor_clock(&data.topic_id)?,

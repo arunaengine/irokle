@@ -140,7 +140,6 @@ impl ConnectionPool {
 pub struct IrohNet<S: Storage = MemoryStorage> {
     pool: ConnectionPool,
     node: Irokle<S>,
-    peers: Arc<Mutex<HashMap<PeerId, iroh::EndpointAddr>>>,
 }
 
 #[cfg(feature = "iroh")]
@@ -166,7 +165,6 @@ impl<S: Storage> IrohNet<S> {
         Ok(Self {
             pool: ConnectionPool::new(endpoint),
             node,
-            peers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -182,47 +180,8 @@ impl<S: Storage> IrohNet<S> {
         &self.pool
     }
 
-    pub fn add_peer_addr(&self, addr: iroh::EndpointAddr) -> PeerId {
-        let peer_id = peer_id_from_endpoint_id(addr.id);
-        self.add_peer_addr_for(peer_id, addr)
-            .expect("peer id derived from endpoint id must match")
-    }
-
-    pub fn add_peer_addr_for(
-        &self,
-        peer_id: PeerId,
-        addr: iroh::EndpointAddr,
-    ) -> io::Result<PeerId> {
-        if peer_id_from_endpoint_id(addr.id) != peer_id {
-            return Err(invalid_data("peer id does not match iroh endpoint id"));
-        }
-        self.peers
-            .lock()
-            .expect("peer registry lock poisoned")
-            .entry(peer_id)
-            .and_modify(|existing| existing.addrs.extend(addr.addrs.clone()))
-            .or_insert(addr);
-        Ok(peer_id)
-    }
-
-    pub fn peer_ids(&self) -> Vec<PeerId> {
-        self.peers
-            .lock()
-            .expect("peer registry lock poisoned")
-            .keys()
-            .copied()
-            .collect()
-    }
-
     pub async fn sync_peer_now(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<()> {
-        let addr = self
-            .peers
-            .lock()
-            .expect("peer registry lock poisoned")
-            .get(&peer_id)
-            .cloned()
-            .map(Ok)
-            .unwrap_or_else(|| peer_id_to_endpoint_addr(peer_id))?;
+        let addr = peer_id_to_endpoint_addr(peer_id)?;
         self.sync_now(addr, topic_id).await
     }
 
@@ -332,14 +291,20 @@ impl<S: Storage> IrohNet<S> {
             }
         }
         let summary = summary.ok_or_else(|| invalid_data("peer did not return a sync summary"))?;
-        let data = self
+        let plan = self
             .node
-            .plan_sync_data(remote_peer_id, &summary)
+            .negotiate_sync(remote_peer_id, &summary)
             .map_err(invalid_data)?;
-        let request = self
-            .node
-            .plan_sync_request(remote_peer_id, &summary)
-            .map_err(invalid_data)?;
+        let data = crate::sync::SyncData {
+            topic_id: plan.topic_id,
+            ops: plan.send,
+        };
+        let request = crate::sync::SyncRequest {
+            topic_id: plan.topic_id,
+            known: plan.common,
+            wants: plan.need,
+            actor_range_hints: plan.actor_range_hints,
+        };
 
         let mut messages = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
         if !data.ops.is_empty() {
@@ -371,7 +336,7 @@ impl<S: Storage> IrohNet<S> {
                 SyncMessage::Data(data) => {
                     let ack = self
                         .node
-                        .receive_sync_data_as_local(data)
+                        .receive_sync_data_from(remote_peer_id, data)
                         .map_err(invalid_data)?;
                     followup.push(SyncMessage::Ack(ack));
                 }
@@ -486,12 +451,28 @@ impl<S: Storage> IrohNet<S> {
         remote_peer_id: Option<PeerId>,
     ) -> io::Result<Vec<SyncMessage>> {
         match message {
-            SyncMessage::Open(open) => self
-                .node
-                .sync_summary(open.topic_id)
-                .map(SyncMessage::Summary)
-                .map(|message| vec![message])
-                .map_err(invalid_data),
+            SyncMessage::Open(open) => {
+                let peer_id = remote_peer_id.ok_or_else(|| {
+                    invalid_data("sync open requires authenticated peer context")
+                })?;
+                if let Some(state) = self
+                    .node
+                    .storage()
+                    .topic_state(&open.topic_id)
+                    .map_err(invalid_data)?
+                {
+                    if !state.members.contains(&peer_id) {
+                        return Ok(Vec::new());
+                    }
+                }
+                // Unknown topics return an empty local summary so an inviter can
+                // bootstrap a new member by pushing the signed genesis/history.
+                self.node
+                    .sync_summary(open.topic_id)
+                    .map(SyncMessage::Summary)
+                    .map(|message| vec![message])
+                    .map_err(invalid_data)
+            }
             SyncMessage::Fingerprint(fingerprint) => {
                 let peer_id = remote_peer_id.ok_or_else(|| {
                     invalid_data("sync fingerprint requires a preceding SyncOpen with peer_id")
@@ -557,11 +538,11 @@ impl<S: Storage> IrohNet<S> {
                     .map_err(invalid_data)
             }
             SyncMessage::Data(data) => {
-                remote_peer_id.ok_or_else(|| {
+                let source_peer = remote_peer_id.ok_or_else(|| {
                     invalid_data("sync data requires a preceding SyncOpen with peer_id")
                 })?;
                 self.node
-                    .receive_sync_data_as_local(data)
+                    .receive_sync_data_from(source_peer, data)
                     .map(SyncMessage::Ack)
                     .map(|message| vec![message])
                     .map_err(invalid_data)
@@ -599,9 +580,6 @@ fn peer_id_to_endpoint_addr(peer_id: PeerId) -> io::Result<iroh::EndpointAddr> {
 
 #[cfg(feature = "iroh")]
 fn extend_alpns(mut alpns: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-    if alpns.is_empty() {
-        return alpns;
-    }
     let irokle = IROKLE_SYNC_ALPN.to_vec();
     if !alpns.contains(&irokle) {
         alpns.push(irokle);
