@@ -2,8 +2,6 @@
 
 Irokle is a signed Merkle-DAG operation log for invite-only topics. Application events and membership changes are stored as signed operations; heads, actor clocks, topic state, history, sync summaries, and reducer projections are derived from those operations.
 
-License: `MIT OR Apache-2.0`. Rust source files carry the matching SPDX header.
-
 ## What It Provides
 
 - Signed operations: every event or control change is signed by the peer that authored it.

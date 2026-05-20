@@ -815,6 +815,7 @@ mod tests {
         let distant_set = distant.iter().copied().collect::<BTreeSet<_>>();
 
         assert_eq!(local, node::select_sync_peers(topic_id, peers[1], &state));
+        assert_ne!(local_set, distant_set);
         assert!(local_set.intersection(&distant_set).count() >= 2);
     }
 

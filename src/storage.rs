@@ -124,9 +124,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
     fn put_peer_ack(&self, ack: PeerAck) -> Result<()>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
-    fn peer_acks(&self, _topic_id: &TopicId) -> Result<Vec<PeerAck>> {
-        Ok(Vec::new())
-    }
+    fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>>;
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()>;
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>>;
     fn clear_satisfied_sync_obligations(&self, ack: &PeerAck) -> Result<usize>;
@@ -154,14 +152,16 @@ pub trait Storage: Clone + Send + Sync + 'static {
         let Some(meta) = self.get_meta(op_id)? else {
             return Ok(Vec::new());
         };
-        Ok(self
+        let mut peers = self
             .peer_acks(&meta.topic_id)?
             .into_iter()
             .filter(|ack| {
                 ack.heads.contains(op_id) || ack.clock.get(&meta.actor_id) >= meta.actor_seq
             })
             .map(|ack| ack.peer_id)
-            .collect())
+            .collect::<Vec<_>>();
+        peers.sort();
+        Ok(peers)
     }
 }
 

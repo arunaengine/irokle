@@ -922,10 +922,11 @@ pub(crate) fn select_sync_peers(
             .cmp(left_score)
             .then_with(|| left_peer.cmp(right_peer))
     });
-    for (_, peer) in shared.into_iter().take(
-        max.saturating_add(SYNC_PEER_SHARED_OVERLAP)
-            .min(candidates.len()),
-    ) {
+    let shared_budget = SYNC_PEER_SHARED_OVERLAP
+        .saturating_add(1)
+        .min(max)
+        .min(candidates.len());
+    for (_, peer) in shared.into_iter().take(shared_budget) {
         selected.insert(peer);
         if selected.len() >= max {
             break;
