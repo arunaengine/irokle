@@ -6,9 +6,9 @@
 use std::io;
 
 #[cfg(feature = "iroh")]
-use std::collections::HashMap;
-#[cfg(feature = "iroh")]
 use std::collections::BTreeSet;
+#[cfg(feature = "iroh")]
+use std::collections::HashMap;
 #[cfg(feature = "iroh")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "iroh")]
@@ -91,25 +91,25 @@ pub fn decode_frames(mut input: &[u8]) -> io::Result<Vec<Vec<u8>>> {
 
 #[cfg(feature = "iroh")]
 #[derive(Clone)]
-pub struct ConnectionPool {
+struct ConnectionPool {
     endpoint: iroh::Endpoint,
     connections: Arc<Mutex<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>>,
 }
 
 #[cfg(feature = "iroh")]
 impl ConnectionPool {
-    pub fn new(endpoint: iroh::Endpoint) -> Self {
+    fn new(endpoint: iroh::Endpoint) -> Self {
         Self {
             endpoint,
             connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn endpoint(&self) -> &iroh::Endpoint {
+    fn endpoint(&self) -> &iroh::Endpoint {
         &self.endpoint
     }
 
-    pub fn insert(&self, connection: iroh::endpoint::Connection) -> iroh::EndpointId {
+    fn insert(&self, connection: iroh::endpoint::Connection) -> iroh::EndpointId {
         let peer = connection.remote_id();
         self.connections
             .lock()
@@ -118,7 +118,7 @@ impl ConnectionPool {
         peer
     }
 
-    pub fn get(&self, peer: &iroh::EndpointId) -> Option<iroh::endpoint::Connection> {
+    fn get(&self, peer: &iroh::EndpointId) -> Option<iroh::endpoint::Connection> {
         self.connections
             .lock()
             .expect("connection pool lock poisoned")
@@ -127,7 +127,7 @@ impl ConnectionPool {
             .cloned()
     }
 
-    pub async fn get_or_connect(
+    async fn get_or_connect(
         &self,
         peer: iroh::EndpointAddr,
     ) -> io::Result<iroh::endpoint::Connection> {
@@ -153,9 +153,8 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
 
 #[cfg(feature = "iroh")]
 impl<S: Storage> IrohNet<S> {
-    pub fn new(endpoint: iroh::Endpoint, node: Irokle<S>) -> Self {
+    pub fn new(endpoint: iroh::Endpoint, node: Irokle<S>) -> io::Result<Self> {
         Self::new_with_alpns(endpoint, node, Vec::new())
-            .expect("iroh endpoint identity must match node signer")
     }
 
     pub fn new_with_alpns(
@@ -184,10 +183,6 @@ impl<S: Storage> IrohNet<S> {
 
     pub fn endpoint(&self) -> &iroh::Endpoint {
         self.pool.endpoint()
-    }
-
-    pub fn connection_pool(&self) -> &ConnectionPool {
-        &self.pool
     }
 
     pub async fn sync_peer_now(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<()> {
@@ -334,11 +329,6 @@ impl<S: Storage> IrohNet<S> {
                 SyncMessage::Summary(remote_summary) if remote_summary.topic_id == topic_id => {
                     summary = Some(remote_summary)
                 }
-                SyncMessage::Report(report) => {
-                    if report.topic_id != topic_id || report.peer_id != remote_peer_id {
-                        return Err(invalid_data("sync report does not match remote peer/topic"));
-                    }
-                }
                 other => {
                     return Err(invalid_data(format!(
                         "unexpected sync response {}",
@@ -385,11 +375,6 @@ impl<S: Storage> IrohNet<S> {
                     self.node.apply_sync_ack(&ack).map_err(invalid_data)?;
                 }
                 SyncMessage::Summary(summary) if summary.topic_id == topic_id => {}
-                SyncMessage::Report(report) => {
-                    if report.topic_id != topic_id || report.peer_id != remote_peer_id {
-                        return Err(invalid_data("sync report does not match remote peer/topic"));
-                    }
-                }
                 SyncMessage::Data(data) => {
                     let ack = self
                         .node
@@ -489,7 +474,11 @@ impl<S: Storage> IrohNet<S> {
     }
 
     /// Convenience server-side entry point for an already accepted stream body.
-    pub fn handle_incoming(&self, peer: iroh::EndpointId, incoming: &[u8]) -> io::Result<Vec<u8>> {
+    pub(crate) fn handle_incoming(
+        &self,
+        peer: iroh::EndpointId,
+        incoming: &[u8],
+    ) -> io::Result<Vec<u8>> {
         let messages = decode_frames(incoming)?
             .iter()
             .map(|bytes| decode_sync_message(bytes))
@@ -509,9 +498,8 @@ impl<S: Storage> IrohNet<S> {
     ) -> io::Result<Vec<SyncMessage>> {
         match message {
             SyncMessage::Open(open) => {
-                let peer_id = remote_peer_id.ok_or_else(|| {
-                    invalid_data("sync open requires authenticated peer context")
-                })?;
+                let peer_id = remote_peer_id
+                    .ok_or_else(|| invalid_data("sync open requires authenticated peer context"))?;
                 if let Some(state) = self
                     .node
                     .storage()
@@ -618,7 +606,6 @@ impl<S: Storage> IrohNet<S> {
                     .map(|()| Vec::new())
                     .map_err(invalid_data)
             }
-            SyncMessage::Report(_) => Err(invalid_data("sync report is not a request message")),
         }
     }
 }
@@ -652,7 +639,6 @@ fn message_topic_id(message: &SyncMessage) -> Option<crate::TopicId> {
         SyncMessage::Request(request) => Some(request.topic_id),
         SyncMessage::Data(data) => Some(data.topic_id),
         SyncMessage::Ack(ack) => Some(ack.topic_id),
-        SyncMessage::Report(report) => Some(report.topic_id),
     }
 }
 
@@ -664,7 +650,6 @@ pub fn _message_type_name(message: &SyncMessage) -> &'static str {
         SyncMessage::Request(_) => "request",
         SyncMessage::Data(_) => "data",
         SyncMessage::Ack(_) => "ack",
-        SyncMessage::Report(_) => "report",
     }
 }
 
