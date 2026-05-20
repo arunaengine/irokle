@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::oplog::{Oplog, topological_subset};
 use crate::storage::{PeerAck, Storage, SyncObligation};
@@ -25,11 +26,15 @@ pub struct SyncOpen {
     pub protocol: String,
     pub topic_id: TopicId,
     pub peer_id: PeerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_type_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncSummary {
     pub topic_id: TopicId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_type_id: Option<String>,
     pub fingerprint: [u8; 32],
     pub heads: BTreeSet<OpId>,
     pub actor_clock: ActorClock,
@@ -148,17 +153,24 @@ impl<S: Storage> SyncEngine<S> {
     pub fn new(oplog: Oplog<S>) -> Self {
         Self { oplog }
     }
-    pub fn open(topic_id: TopicId, peer_id: PeerId) -> SyncOpen {
+    pub fn open(topic_id: TopicId, peer_id: PeerId, event_type_id: Option<String>) -> SyncOpen {
         SyncOpen {
             protocol: "irokle/sync/1".into(),
             topic_id,
             peer_id,
+            event_type_id,
         }
     }
 
     pub fn summary(&self, topic_id: TopicId) -> Result<SyncSummary> {
+        let event_type_id = self
+            .oplog
+            .storage()
+            .topic_state(&topic_id)?
+            .map(|state| state.event_type_id);
         Ok(SyncSummary {
             topic_id,
+            event_type_id,
             fingerprint: self.oplog.storage().topic_fingerprint(&topic_id)?,
             heads: self.oplog.storage().heads(&topic_id)?,
             actor_clock: self.oplog.storage().actor_clock(&topic_id)?,
@@ -200,6 +212,14 @@ impl<S: Storage> SyncEngine<S> {
                 send: Vec::new(),
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
+            });
+        }
+        if let Some(remote_event_type_id) = &remote.event_type_id
+            && *remote_event_type_id != state.event_type_id
+        {
+            return Err(Error::EventTypeMismatch {
+                expected: state.event_type_id,
+                actual: remote_event_type_id.clone(),
             });
         }
 
@@ -267,12 +287,12 @@ impl<S: Storage> SyncEngine<S> {
 
     pub fn missing_closure(&self, remote: &SyncSummary) -> Result<Vec<Op>> {
         let mut missing = BTreeSet::new();
-        let mut stack = self
+        let mut stack: SmallVec<[OpId; 8]> = self
             .oplog
             .storage()
             .heads(&remote.topic_id)?
             .into_iter()
-            .collect::<Vec<_>>();
+            .collect();
         while let Some(id) = stack.pop() {
             if missing.contains(&id) {
                 continue;

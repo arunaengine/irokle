@@ -19,6 +19,8 @@ use std::time::Duration;
 use crate::sync::SyncMessage;
 #[cfg(feature = "iroh")]
 use crate::{Irokle, MemoryStorage, PeerId, Storage};
+#[cfg(feature = "iroh")]
+use smallvec::{SmallVec, smallvec};
 
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 pub const IROKLE_SYNC_ALPN: &[u8] = b"irokle/sync/1";
@@ -353,7 +355,8 @@ impl<S: Storage> IrohNet<S> {
             actor_range_hints: plan.actor_range_hints,
         };
 
-        let mut messages = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
+        let mut messages: SmallVec<[SyncMessage; 3]> =
+            smallvec![SyncMessage::Open(self.node.sync_open(topic_id))];
         if !data.ops.is_empty() {
             messages.push(SyncMessage::Data(data));
         }
@@ -365,7 +368,8 @@ impl<S: Storage> IrohNet<S> {
         }
 
         let responses = self.sync_with(peer.clone(), &messages).await?;
-        let mut followup = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
+        let mut followup: SmallVec<[SyncMessage; 2]> =
+            smallvec![SyncMessage::Open(self.node.sync_open(topic_id))];
         for response in responses {
             match response {
                 SyncMessage::Ack(ack) => {

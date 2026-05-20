@@ -6,6 +6,9 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(any(feature = "iroh", test))]
+use smallvec::SmallVec;
+
 use crate::history::{DagQuery, HistoryOrder, limited, ordered};
 use crate::oplog::{Oplog, topological, topological_subset};
 use crate::reducer::EventRecord;
@@ -20,6 +23,8 @@ use crate::{
 };
 
 static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "iroh", test))]
+const SYNC_PEER_SHARED_OVERLAP: usize = 2;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum WriteConcern {
@@ -435,7 +440,13 @@ impl<S: Storage> Irokle<S> {
     }
 
     pub fn sync_open(&self, topic_id: TopicId) -> SyncOpen {
-        SyncEngine::<S>::open(topic_id, self.peer_id())
+        let event_type_id = self
+            .storage()
+            .topic_state(&topic_id)
+            .ok()
+            .flatten()
+            .map(|state| state.event_type_id);
+        SyncEngine::<S>::open(topic_id, self.peer_id(), event_type_id)
     }
 
     pub fn sync_summary(&self, topic_id: TopicId) -> Result<SyncSummary> {
@@ -492,6 +503,14 @@ impl<S: Storage> Irokle<S> {
 
     pub fn apply_sync_ack(&self, ack: &SyncAck) -> Result<()> {
         self.sync.apply_ack(ack)
+    }
+
+    pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {
+        self.storage().peer_reached_op(&peer_id, &op_id)
+    }
+
+    pub fn peers_reached_op(&self, op_id: OpId) -> Result<Vec<PeerId>> {
+        self.storage().peers_reached_op(&op_id)
     }
 
     pub fn put_sync_obligation(
@@ -762,6 +781,14 @@ impl<E: Event, S: Storage> Topic<E, S> {
         self.node.topic_heads(self.topic_id)
     }
 
+    pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {
+        self.node.peer_reached_op(peer_id, op_id)
+    }
+
+    pub fn peers_reached_op(&self, op_id: OpId) -> Result<Vec<PeerId>> {
+        self.node.peers_reached_op(op_id)
+    }
+
     #[cfg(feature = "iroh")]
     pub async fn sync_now(&self) -> std::io::Result<()> {
         self.node.sync_topic_now(self.topic_id).await
@@ -786,6 +813,14 @@ impl<S: Storage> RawTopic<S> {
     }
     pub fn heads(&self) -> Result<BTreeSet<OpId>> {
         self.oplog.storage().heads(&self.topic_id)
+    }
+
+    pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {
+        self.oplog.storage().peer_reached_op(&peer_id, &op_id)
+    }
+
+    pub fn peers_reached_op(&self, op_id: OpId) -> Result<Vec<PeerId>> {
+        self.oplog.storage().peers_reached_op(&op_id)
     }
 }
 
@@ -862,17 +897,42 @@ pub(crate) fn select_sync_peers(
     };
     scope.insert(local_peer);
 
-    let candidates = scope
+    let candidates: SmallVec<[PeerId; 16]> = scope
         .iter()
         .copied()
         .filter(|peer| *peer != local_peer)
-        .collect::<Vec<_>>();
+        .collect();
     if candidates.len() <= max {
-        return candidates;
+        return candidates.into_vec();
     }
 
     let mut selected = BTreeSet::new();
-    let ring = scope.into_iter().collect::<Vec<_>>();
+    let mut shared = candidates
+        .iter()
+        .copied()
+        .map(|peer| {
+            (
+                sync_peer_score(topic_id, PeerId::hash(b"shared"), peer),
+                peer,
+            )
+        })
+        .collect::<SmallVec<[_; 16]>>();
+    shared.sort_by(|(left_score, left_peer), (right_score, right_peer)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_peer.cmp(right_peer))
+    });
+    for (_, peer) in shared.into_iter().take(
+        max.saturating_add(SYNC_PEER_SHARED_OVERLAP)
+            .min(candidates.len()),
+    ) {
+        selected.insert(peer);
+        if selected.len() >= max {
+            break;
+        }
+    }
+
+    let ring = scope.into_iter().collect::<SmallVec<[PeerId; 16]>>();
     if let Some(local_index) = ring.iter().position(|peer| *peer == local_peer) {
         for offset in 1..ring.len() {
             if selected.len() >= max {
