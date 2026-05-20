@@ -583,6 +583,7 @@ impl<S: Storage> Irokle<S> {
         Ok(counts)
     }
 
+    #[cfg(any(feature = "iroh", test))]
     pub(crate) fn record_sync_result(
         &self,
         peer_id: PeerId,
@@ -977,6 +978,7 @@ fn sync_peer_score(topic_id: TopicId, local_peer: PeerId, peer: PeerId) -> [u8; 
     *hasher.finalize().as_bytes()
 }
 
+#[cfg(any(feature = "iroh", test))]
 fn now_millis() -> Result<u64> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
