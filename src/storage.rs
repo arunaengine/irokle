@@ -73,6 +73,28 @@ pub struct SyncObligation {
     pub target_clock: ActorClock,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SyncPeerState {
+    #[default]
+    Idle,
+    Healthy,
+    Behind,
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncPeerStatus {
+    pub peer_id: PeerId,
+    pub topic_id: TopicId,
+    pub state: SyncPeerState,
+    pub pending_obligations: usize,
+    pub failed_attempts: u64,
+    pub successful_attempts: u64,
+    pub last_attempt_ms: Option<u64>,
+    pub last_success_ms: Option<u64>,
+    pub last_error: Option<String>,
+}
+
 pub trait Storage: Clone + Send + Sync + 'static {
     fn put_admitted_batch(
         &self,
@@ -122,6 +144,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn put_peer_ack(&self, ack: PeerAck) -> Result<()>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()>;
+    fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>>;
     fn clear_satisfied_sync_obligations(&self, ack: &PeerAck) -> Result<usize>;
     /// Atomically persist `ack` and clear any obligations satisfied by it.
     /// Backends must perform both writes in one durable operation so a crash
@@ -130,6 +153,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize>;
     fn sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId)
     -> Result<Vec<SyncObligation>>;
+    fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()>;
+    fn sync_statuses(&self, topic_id: &TopicId) -> Result<Vec<SyncPeerStatus>>;
 }
 
 #[derive(Clone, Default)]
@@ -155,6 +180,7 @@ struct MemoryInner {
     pending_waiters: BTreeMap<OpId, BTreeSet<OpId>>,
     peer_acks: HashMap<(PeerId, TopicId), PeerAck>,
     obligations: Vec<SyncObligation>,
+    sync_statuses: BTreeMap<(TopicId, PeerId), SyncPeerStatus>,
 }
 
 impl MemoryStorage {
@@ -514,6 +540,10 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
+    fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>> {
+        Ok(self.inner.lock().unwrap().obligations.clone())
+    }
+
     fn clear_satisfied_sync_obligations(&self, ack: &PeerAck) -> Result<usize> {
         let mut inner = self.inner.lock().unwrap();
         Ok(clear_satisfied_obligations_locked(&mut inner, ack))
@@ -539,6 +569,27 @@ impl Storage for MemoryStorage {
             .obligations
             .iter()
             .filter(|o| o.peer_id == *peer_id && o.topic_id == *topic_id)
+            .cloned()
+            .collect())
+    }
+
+    fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .sync_statuses
+            .insert((status.topic_id, status.peer_id), status);
+        Ok(())
+    }
+
+    fn sync_statuses(&self, topic_id: &TopicId) -> Result<Vec<SyncPeerStatus>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .sync_statuses
+            .values()
+            .filter(|status| status.topic_id == *topic_id)
             .cloned()
             .collect())
     }
@@ -1157,6 +1208,16 @@ impl Storage for FjallStorage {
         self.put(Self::sync_obligation_key(&obligation), &obligation)
     }
 
+    fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>> {
+        let mut out = Vec::new();
+        let read_tx = self.db.read_tx();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, b"ob".as_slice()) {
+            let value = item.value()?;
+            out.push(postcard::from_bytes(value.as_ref())?);
+        }
+        Ok(out)
+    }
+
     fn clear_satisfied_sync_obligations(&self, ack: &PeerAck) -> Result<usize> {
         self.transaction(|tx| clear_satisfied_obligations_tx(tx, &self.records, ack))
     }
@@ -1180,6 +1241,29 @@ impl Storage for FjallStorage {
         topic_id: &TopicId,
     ) -> Result<Vec<SyncObligation>> {
         let prefix = [b"ob".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat();
+        let mut out = Vec::new();
+        let read_tx = self.db.read_tx();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
+            let value = item.value()?;
+            out.push(postcard::from_bytes(value.as_ref())?);
+        }
+        Ok(out)
+    }
+
+    fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()> {
+        self.put(
+            [
+                b"ss".as_slice(),
+                status.topic_id.as_ref(),
+                status.peer_id.as_ref(),
+            ]
+            .concat(),
+            &status,
+        )
+    }
+
+    fn sync_statuses(&self, topic_id: &TopicId) -> Result<Vec<SyncPeerStatus>> {
+        let prefix = [b"ss".as_slice(), topic_id.as_ref()].concat();
         let mut out = Vec::new();
         let read_tx = self.db.read_tx();
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! High-level node, topic, publishing, and sync facade APIs.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::history::{DagQuery, HistoryOrder, VecStream, limited, ordered};
 use crate::oplog::{Oplog, topological, topological_subset};
 use crate::reducer::{EventRecord, Reducer};
-use crate::storage::{MemoryStorage, Storage};
+use crate::storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
 use crate::sync::{
     SyncAck, SyncData, SyncEngine, SyncFingerprint, SyncOpen, SyncPlan, SyncReport, SyncRequest,
     SyncSummary,
@@ -234,6 +234,8 @@ impl<S: Storage> IrokleBuilder<S> {
                 net.start_accept_loop().map_err(|err| {
                     Error::Storage(format!("failed to start iroh accept loop: {err}"))
                 })?;
+                net.start_resync_loop(std::time::Duration::from_secs(30))
+                    .map_err(|err| Error::Storage(format!("failed to start iroh resync loop: {err}")))?;
             }
             return Ok(node.with_net(net));
         }
@@ -442,6 +444,24 @@ impl<S: Storage> Irokle<S> {
         })
     }
 
+    pub fn reject_topic(&self, topic_id: TopicId) -> Result<()> {
+        let state = self
+            .storage()
+            .topic_state(&topic_id)?
+            .ok_or(Error::TopicNotFound)?;
+        if !state.members.contains(&self.peer_id()) {
+            return Err(Error::NotTopicMember);
+        }
+        let actor_id = actor_id_for(topic_id, self.peer_id());
+        self.publish_control(
+            topic_id,
+            actor_id,
+            TopicControl::RemovePeer {
+                peer: self.peer_id(),
+            },
+        )
+    }
+
     pub fn sync_open(&self, topic_id: TopicId) -> SyncOpen {
         SyncEngine::<S>::open(topic_id, self.peer_id())
     }
@@ -507,6 +527,89 @@ impl<S: Storage> Irokle<S> {
 
     pub fn sync_report(&self, peer_id: PeerId, topic_id: TopicId) -> Result<SyncReport> {
         self.sync.report(peer_id, topic_id)
+    }
+
+    pub fn sync_status(&self, topic_id: TopicId) -> Result<Vec<SyncPeerStatus>> {
+        let mut by_peer = self
+            .storage()
+            .sync_statuses(&topic_id)?
+            .into_iter()
+            .map(|status| (status.peer_id, status))
+            .collect::<BTreeMap<_, _>>();
+        for status in by_peer.values_mut() {
+            status.pending_obligations = 0;
+        }
+
+        for obligation in self
+            .storage()
+            .all_sync_obligations()?
+            .into_iter()
+            .filter(|obligation| obligation.topic_id == topic_id)
+        {
+            by_peer
+                .entry(obligation.peer_id)
+                .or_insert_with(|| SyncPeerStatus {
+                    peer_id: obligation.peer_id,
+                    topic_id,
+                    state: SyncPeerState::Behind,
+                    ..SyncPeerStatus::default()
+                })
+                .pending_obligations += 1;
+        }
+
+        let mut statuses = by_peer.into_values().collect::<Vec<_>>();
+        for status in &mut statuses {
+            if status.pending_obligations > 0 && status.state == SyncPeerState::Healthy {
+                status.state = SyncPeerState::Behind;
+            }
+        }
+        Ok(statuses)
+    }
+
+    pub fn sync_state_counts(&self, topic_id: TopicId) -> Result<BTreeMap<SyncPeerState, usize>> {
+        let mut counts = BTreeMap::new();
+        for status in self.sync_status(topic_id)? {
+            *counts.entry(status.state).or_default() += 1;
+        }
+        Ok(counts)
+    }
+
+    pub(crate) fn record_sync_result(
+        &self,
+        peer_id: PeerId,
+        topic_id: TopicId,
+        result: std::result::Result<(), &std::io::Error>,
+    ) -> Result<()> {
+        let mut status = self
+            .storage()
+            .sync_statuses(&topic_id)?
+            .into_iter()
+            .find(|status| status.peer_id == peer_id)
+            .unwrap_or(SyncPeerStatus {
+                peer_id,
+                topic_id,
+                ..SyncPeerStatus::default()
+            });
+        status.last_attempt_ms = Some(now_millis()?);
+        status.pending_obligations = self.storage().sync_obligations(&peer_id, &topic_id)?.len();
+        match result {
+            Ok(()) => {
+                status.successful_attempts = status.successful_attempts.saturating_add(1);
+                status.last_success_ms = status.last_attempt_ms;
+                status.last_error = None;
+                status.state = if status.pending_obligations == 0 {
+                    SyncPeerState::Healthy
+                } else {
+                    SyncPeerState::Behind
+                };
+            }
+            Err(error) => {
+                status.failed_attempts = status.failed_attempts.saturating_add(1);
+                status.last_error = Some(error.to_string());
+                status.state = SyncPeerState::Failed;
+            }
+        }
+        self.storage().put_sync_status(status)
     }
 
     pub(crate) fn publish_event<E: Event>(
@@ -653,6 +756,9 @@ impl<E: Event, S: Storage> Topic<E, S> {
             self.actor_id,
             TopicControl::RemovePeer { peer },
         )
+    }
+    pub fn leave(&self) -> Result<()> {
+        self.node.reject_topic(self.topic_id)
     }
     pub fn set_replication_policy(&self, policy: crate::ReplicationPolicy) -> Result<()> {
         self.node.publish_control(
@@ -877,4 +983,14 @@ fn sync_peer_score(topic_id: TopicId, local_peer: PeerId, peer: PeerId) -> [u8; 
     hasher.update(local_peer.as_ref());
     hasher.update(peer.as_ref());
     *hasher.finalize().as_bytes()
+}
+
+fn now_millis() -> Result<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| Error::Storage(format!("system time before unix epoch: {err}")))?
+        .as_millis();
+    millis
+        .try_into()
+        .map_err(|_| Error::Storage("system time does not fit in u64 milliseconds".into()))
 }

@@ -8,7 +8,13 @@ use std::io;
 #[cfg(feature = "iroh")]
 use std::collections::HashMap;
 #[cfg(feature = "iroh")]
+use std::collections::BTreeSet;
+#[cfg(feature = "iroh")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "iroh")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "iroh")]
+use std::time::Duration;
 
 use crate::sync::SyncMessage;
 #[cfg(feature = "iroh")]
@@ -140,6 +146,7 @@ impl ConnectionPool {
 pub struct IrohNet<S: Storage = MemoryStorage> {
     pool: ConnectionPool,
     node: Irokle<S>,
+    resync_started: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "iroh")]
@@ -165,6 +172,7 @@ impl<S: Storage> IrohNet<S> {
         Ok(Self {
             pool: ConnectionPool::new(endpoint),
             node,
+            resync_started: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -218,6 +226,36 @@ impl<S: Storage> IrohNet<S> {
         Ok(())
     }
 
+    pub fn start_resync_loop(self: &Arc<Self>, interval: Duration) -> io::Result<()> {
+        if self.resync_started.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| io::Error::other("iroh resync requires a Tokio runtime"))?;
+        let net = Arc::clone(self);
+        handle.spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tick.tick().await;
+                if net.endpoint().is_closed() {
+                    break;
+                }
+                let obligations = match net.node.storage().all_sync_obligations() {
+                    Ok(obligations) => obligations,
+                    Err(_) => continue,
+                };
+                let targets = obligations
+                    .into_iter()
+                    .map(|obligation| (obligation.peer_id, obligation.topic_id))
+                    .collect::<BTreeSet<_>>();
+                for (peer_id, topic_id) in targets {
+                    let _ = net.sync_peer_now(peer_id, topic_id).await;
+                }
+            }
+        });
+        Ok(())
+    }
+
     async fn handle_connection(
         self: Arc<Self>,
         peer: iroh::EndpointId,
@@ -250,6 +288,23 @@ impl<S: Storage> IrohNet<S> {
     }
 
     pub async fn sync_now(
+        &self,
+        peer: iroh::EndpointAddr,
+        topic_id: crate::TopicId,
+    ) -> io::Result<()> {
+        let remote_peer_id = peer_id_from_endpoint_id(peer.id);
+        let result = self.sync_now_inner(peer, topic_id).await;
+        let record_result = match &result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error),
+        };
+        let _ = self
+            .node
+            .record_sync_result(remote_peer_id, topic_id, record_result);
+        result
+    }
+
+    async fn sync_now_inner(
         &self,
         peer: iroh::EndpointAddr,
         topic_id: crate::TopicId,
