@@ -31,3 +31,11 @@ tempfile = "3"
 [[example]]
 name = "iroh_chat"
 required-features = ["iroh"]
+
+[[example]]
+name = "iroh_topic_intro"
+required-features = ["iroh"]
+
+[[example]]
+name = "iroh_fjall_recovery"
+required-features = ["iroh", "fjall"]
