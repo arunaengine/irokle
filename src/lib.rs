@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Public facade and re-exports for Irokle's signed topic operation log.
+
 pub mod clock;
 pub mod crypto;
 pub mod error;

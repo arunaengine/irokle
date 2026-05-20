@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Operation-log admission, DAG validation, and topic-state materialization.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::storage::{

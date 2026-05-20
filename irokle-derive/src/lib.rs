@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Proc-macro implementation for deriving `irokle::Event`.
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::ext::IdentExt;

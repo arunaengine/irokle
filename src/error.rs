@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Error and result types shared across storage, admission, and sync APIs.
+
 use thiserror::Error;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Signed operation envelopes and operation-id validation.
+
 use crate::{
     crypto::{Signer, canonical_bytes, verify},
     error::{Error, Result},

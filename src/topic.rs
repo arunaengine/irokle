@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Topic configuration, replication policy, membership, and payload types.
+
 use crate::{event::EventEnvelope, ids::PeerId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

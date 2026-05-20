@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Typed event encoding plus envelopes stored inside signed operations.
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 

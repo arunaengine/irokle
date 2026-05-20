@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Reducer traits and typed event records for application projections.
+
 use crate::{ActorClock, ActorId, OpId};
 
 pub trait Reducer<E> {

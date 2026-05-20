@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Actor/vector-clock utilities used for admission, reducers, and sync.
+
 use crate::ids::ActorId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

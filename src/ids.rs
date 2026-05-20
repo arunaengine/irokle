@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Strongly typed 32-byte identifiers for topics, peers, actors, and ops.
+
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 

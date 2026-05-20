@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Iroh-backed sync framing, connection handling, and bounded resync loops.
+
 #![allow(dead_code, unexpected_cfgs)]
 
 use std::io;

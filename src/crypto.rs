@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Signing, verification, and canonical serialization helpers for signed ops.
+
 use crate::{
     error::{Error, Result},
     ids::PeerId,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! High-level node, topic, publishing, and sync facade APIs.
+
 use std::collections::{BTreeSet, VecDeque};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};

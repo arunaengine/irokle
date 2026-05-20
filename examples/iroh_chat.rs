@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Iroh chat example using NodeId-only discovery-backed sync.
+
 use futures::StreamExt;
 use iroh::Watcher;
 use irokle::history::HistoryOrder;

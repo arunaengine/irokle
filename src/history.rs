@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //! User-facing history and DAG traversal helpers.
 
 use std::collections::{HashSet, VecDeque};

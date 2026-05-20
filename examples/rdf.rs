@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Example application projection using an observed-remove RDF reducer.
+
 use std::collections::HashMap;
 
 use irokle::history::HistoryOrder;

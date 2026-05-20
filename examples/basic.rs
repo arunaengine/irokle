@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Minimal in-memory example showing typed events and manual sync planning.
+
 use irokle::history::HistoryOrder;
 use irokle::net;
 use irokle::{Ed25519Signer, Irokle, PublishOptions, TopicConfig, WriteConcern};

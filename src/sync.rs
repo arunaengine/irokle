@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Transport-neutral sync messages, planning, acknowledgements, and reports.
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ed25519_dalek::Signature;
