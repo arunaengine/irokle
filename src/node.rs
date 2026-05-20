@@ -42,7 +42,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            signer: Ed25519Signer::from_bytes(&[42; 32]),
+            signer: Ed25519Signer::generate(),
             default_write_concern: WriteConcern::Local,
         }
     }

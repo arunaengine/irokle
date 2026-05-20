@@ -23,6 +23,12 @@ impl Ed25519Signer {
         Self { key }
     }
 
+    pub fn generate() -> Self {
+        Self {
+            key: SigningKey::generate(&mut rand_core::OsRng),
+        }
+    }
+
     pub fn from_bytes(bytes: &[u8; 32]) -> Self {
         Self {
             key: SigningKey::from_bytes(bytes),
