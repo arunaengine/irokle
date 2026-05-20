@@ -348,20 +348,7 @@ impl<S: Storage> Irokle<S> {
             .topic_state(&topic_id)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "topic not found"))?;
-        let peers = if state.replication_policy.selected_peers.is_empty() {
-            net.peer_ids()
-                .into_iter()
-                .filter(|peer| *peer != self.peer_id() && state.members.contains(peer))
-                .collect::<Vec<_>>()
-        } else {
-            state
-                .replication_policy
-                .selected_peers
-                .iter()
-                .copied()
-                .filter(|peer| *peer != self.peer_id() && state.members.contains(peer))
-                .collect::<Vec<_>>()
-        };
+        let peers = select_sync_peers(topic_id, self.peer_id(), &state);
         for peer in peers {
             net.sync_peer_now(peer, topic_id).await?;
         }
@@ -815,4 +802,79 @@ fn dag_ops<S: Storage>(storage: &S, topic_id: TopicId, query: DagQuery<OpId>) ->
     } else {
         Ok(limited(topological(storage, &topic_id)?, query.limit))
     }
+}
+
+pub(crate) fn select_sync_peers(
+    topic_id: TopicId,
+    local_peer: PeerId,
+    state: &crate::storage::TopicState,
+) -> Vec<PeerId> {
+    let max = state.replication_policy.max_sync_peers;
+    if max == 0 {
+        return Vec::new();
+    }
+
+    let mut scope = if state.replication_policy.selected_peers.is_empty() {
+        state.members.clone()
+    } else {
+        state
+            .replication_policy
+            .selected_peers
+            .intersection(&state.members)
+            .copied()
+            .collect()
+    };
+    scope.insert(local_peer);
+
+    let candidates = scope
+        .iter()
+        .copied()
+        .filter(|peer| *peer != local_peer)
+        .collect::<Vec<_>>();
+    if candidates.len() <= max {
+        return candidates;
+    }
+
+    let mut selected = BTreeSet::new();
+    let ring = scope.into_iter().collect::<Vec<_>>();
+    if let Some(local_index) = ring.iter().position(|peer| *peer == local_peer) {
+        for offset in 1..ring.len() {
+            if selected.len() >= max {
+                break;
+            }
+            selected.insert(ring[(local_index + offset) % ring.len()]);
+            if selected.len() >= max {
+                break;
+            }
+            selected.insert(ring[(local_index + ring.len() - offset) % ring.len()]);
+        }
+    }
+
+    let mut remaining = candidates
+        .into_iter()
+        .filter(|peer| !selected.contains(peer))
+        .map(|peer| (sync_peer_score(topic_id, local_peer, peer), peer))
+        .collect::<Vec<_>>();
+    remaining.sort_by(|(left_score, left_peer), (right_score, right_peer)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_peer.cmp(right_peer))
+    });
+    for (_, peer) in remaining {
+        if selected.len() >= max {
+            break;
+        }
+        selected.insert(peer);
+    }
+
+    selected.into_iter().collect()
+}
+
+fn sync_peer_score(topic_id: TopicId, local_peer: PeerId, peer: PeerId) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"irokle-sync-peer-v1");
+    hasher.update(topic_id.as_ref());
+    hasher.update(local_peer.as_ref());
+    hasher.update(peer.as_ref());
+    *hasher.finalize().as_bytes()
 }
