@@ -175,7 +175,7 @@ struct MemoryInner {
     topic_fingerprint: BTreeMap<TopicId, [u8; 32]>,
     max_generation: BTreeMap<TopicId, u64>,
     topics: BTreeMap<TopicId, TopicState>,
-    pending_ops: BTreeMap<OpId, (Op, OpMeta)>,
+    pending_ops: BTreeMap<OpId, (PeerId, Op, OpMeta)>,
     pending_by_source: BTreeMap<PeerId, BTreeSet<OpId>>,
     pending_waiters: BTreeMap<OpId, BTreeSet<OpId>>,
     peer_acks: HashMap<(PeerId, TopicId), PeerAck>,
@@ -488,7 +488,7 @@ impl Storage for MemoryStorage {
             .entry(source_peer)
             .or_default()
             .insert(op.id);
-        inner.pending_ops.insert(op.id, (op, meta));
+        inner.pending_ops.insert(op.id, (source_peer, op, meta));
         Ok(())
     }
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>> {
@@ -499,14 +499,10 @@ impl Storage for MemoryStorage {
             .into_iter()
             .flatten()
             .filter_map(|op_id| {
-                let source = inner
-                    .pending_by_source
-                    .iter()
-                    .find_map(|(source, op_ids)| op_ids.contains(op_id).then_some(*source))?;
                 inner
                     .pending_ops
                     .get(op_id)
-                    .map(|(op, _)| (source, op.clone()))
+                    .map(|(source, op, _)| (*source, op.clone()))
             })
             .collect())
     }
@@ -610,7 +606,7 @@ fn clear_satisfied_obligations_locked(inner: &mut MemoryInner, ack: &PeerAck) ->
 }
 
 fn remove_pending_locked(inner: &mut MemoryInner, op_id: &OpId) {
-    let Some((_, meta)) = inner.pending_ops.remove(op_id) else {
+    let Some((_, _, meta)) = inner.pending_ops.remove(op_id) else {
         return;
     };
     for dep in meta.missing_deps {
@@ -782,14 +778,14 @@ impl Storage for FjallStorage {
 
             let mut actor_tips = BTreeMap::new();
             let mut new_entries = Vec::new();
-            for (op, meta) in entries.clone() {
+            for (op, meta) in &entries {
                 if meta.topic_id != topic_id {
                     return Err(Error::TopicMismatch);
                 }
                 if let Some(existing) =
                     Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))?
                 {
-                    if existing != op {
+                    if existing != *op {
                         return Err(Error::Storage("op id collision with different op".into()));
                     }
                     continue;
@@ -849,7 +845,7 @@ impl Storage for FjallStorage {
                     }
                 }
                 actor_tips.insert((meta.topic_id, meta.actor_id), (meta.actor_seq, op.id));
-                new_entries.push((op, meta));
+                new_entries.push((op.clone(), meta.clone()));
             }
 
             let mut clock: ActorClock =
