@@ -31,12 +31,18 @@ pub fn decode_sync_message(bytes: &[u8]) -> io::Result<SyncMessage> {
     postcard::from_bytes(bytes).map_err(invalid_data)
 }
 
-pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
+pub fn encode_frame(payload: &[u8]) -> io::Result<Vec<u8>> {
+    if payload.len() > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sync frame exceeds maximum length",
+        ));
+    }
     let len = payload.len() as u32;
     let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(payload);
-    frame
+    Ok(frame)
 }
 
 pub fn decode_frame(input: &[u8]) -> io::Result<Option<(Vec<u8>, usize)>> {
@@ -60,12 +66,12 @@ pub fn decode_frame(input: &[u8]) -> io::Result<Option<(Vec<u8>, usize)>> {
     Ok(Some((input[4..end].to_vec(), end)))
 }
 
-pub fn encode_frames<'a>(payloads: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+pub fn encode_frames<'a>(payloads: impl IntoIterator<Item = &'a [u8]>) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     for payload in payloads {
-        out.extend_from_slice(&encode_frame(payload));
+        out.extend_from_slice(&encode_frame(payload)?);
     }
-    out
+    Ok(out)
 }
 
 pub fn decode_frames(mut input: &[u8]) -> io::Result<Vec<Vec<u8>>> {
@@ -271,7 +277,7 @@ impl<S: Storage> IrohNet<S> {
             .iter()
             .map(encode_sync_message)
             .collect::<io::Result<Vec<_>>>()?;
-        let body = encode_frames(payloads.iter().map(Vec::as_slice));
+        let body = encode_frames(payloads.iter().map(Vec::as_slice))?;
         let connection = self.pool.get_or_connect(peer).await?;
         let (mut send, mut recv) = connection.open_bi().await.map_err(other)?;
         send.write_all(&body).await.map_err(other)?;
@@ -443,7 +449,7 @@ impl<S: Storage> IrohNet<S> {
             .iter()
             .map(encode_sync_message)
             .collect::<io::Result<Vec<_>>>()?;
-        let out = encode_frames(responses.iter().map(Vec::as_slice));
+        let out = encode_frames(responses.iter().map(Vec::as_slice))?;
         send.write_all(&out).await.map_err(other)?;
         send.finish().map_err(other)?;
         Ok(())
@@ -493,7 +499,7 @@ impl<S: Storage> IrohNet<S> {
             .iter()
             .map(encode_sync_message)
             .collect::<io::Result<Vec<_>>>()?;
-        Ok(encode_frames(responses.iter().map(Vec::as_slice)))
+        encode_frames(responses.iter().map(Vec::as_slice))
     }
 
     fn handle_message(

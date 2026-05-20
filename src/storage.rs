@@ -669,7 +669,7 @@ impl FjallStorage {
         &self,
         mut f: impl FnMut(&mut fjall::OptimisticWriteTx) -> Result<R>,
     ) -> Result<R> {
-        loop {
+        for _ in 0..64 {
             let mut tx = self
                 .db
                 .write_tx()?
@@ -680,6 +680,7 @@ impl FjallStorage {
                 Err(_) => continue,
             }
         }
+        Err(Error::AdmissionConflict)
     }
 
     fn key_id(prefix: &[u8], id: &impl AsRef<[u8]>) -> Vec<u8> {
@@ -970,11 +971,13 @@ impl Storage for FjallStorage {
         self.get(Self::key_id(b"m", id))
     }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>> {
-        Ok(self
-            .list_op_ids(topic_id)?
+        self.list_op_ids(topic_id)?
             .iter()
-            .filter_map(|id| self.get_op(id).ok().flatten())
-            .collect())
+            .map(|id| {
+                self.get_op(id)?
+                    .ok_or_else(|| Error::Storage(format!("missing op indexed for topic: {id}")))
+            })
+            .collect()
     }
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         let prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
@@ -1031,12 +1034,12 @@ impl Storage for FjallStorage {
         Ok(self.get(Self::key_id(b"mg", topic_id))?.unwrap_or_default())
     }
     fn topic_state(&self, topic_id: &TopicId) -> Result<Option<TopicState>> {
-        Ok(self
-            .get::<TopicState>(Self::key_id(b"ts", topic_id))?
+        self.get::<TopicState>(Self::key_id(b"ts", topic_id))?
             .map(|mut state| {
-                state.heads = self.heads(topic_id).unwrap_or_default();
-                state
-            }))
+                state.heads = self.heads(topic_id)?;
+                Ok(state)
+            })
+            .transpose()
     }
     fn list_topics(&self) -> Result<Vec<TopicInfo>> {
         // v0 keeps this simple: scan durable topic records instead of maintaining a second index.

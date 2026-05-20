@@ -25,8 +25,6 @@ static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
 pub enum WriteConcern {
     Local,
     AsyncReplication,
-    Replicas(usize),
-    AllSelectedReplicas,
 }
 
 impl Default for WriteConcern {
@@ -523,6 +521,18 @@ impl<S: Storage> Irokle<S> {
         self.sync.put_obligation(peer_id, topic_id, op_ids)
     }
 
+    #[cfg(feature = "iroh")]
+    fn put_replication_obligations(&self, topic_id: TopicId, op_id: OpId) -> Result<()> {
+        let state = self
+            .storage()
+            .topic_state(&topic_id)?
+            .ok_or(Error::TopicNotFound)?;
+        for peer_id in select_sync_peers(topic_id, self.peer_id(), &state) {
+            self.put_sync_obligation(peer_id, topic_id, [op_id].into())?;
+        }
+        Ok(())
+    }
+
     pub fn sync_report(&self, peer_id: PeerId, topic_id: TopicId) -> Result<SyncReport> {
         self.sync.report(peer_id, topic_id)
     }
@@ -637,6 +647,7 @@ impl<S: Storage> Irokle<S> {
         let _ = &options;
         #[cfg(feature = "iroh")]
         if matches!(options.write_concern, WriteConcern::AsyncReplication) && self.net.is_some() {
+            self.put_replication_obligations(topic_id, op.id)?;
             let node = self.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
@@ -908,6 +919,7 @@ fn dag_ops<S: Storage>(storage: &S, topic_id: TopicId, query: DagQuery<OpId>) ->
     }
 }
 
+#[cfg(any(feature = "iroh", test))]
 pub(crate) fn select_sync_peers(
     topic_id: TopicId,
     local_peer: PeerId,
@@ -974,6 +986,7 @@ pub(crate) fn select_sync_peers(
     selected.into_iter().collect()
 }
 
+#[cfg(any(feature = "iroh", test))]
 fn sync_peer_score(topic_id: TopicId, local_peer: PeerId, peer: PeerId) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"irokle-sync-peer-v1");
