@@ -66,33 +66,6 @@ impl<I> DagQuery<I> {
     }
 }
 
-/// A simple Vec-backed stream. It is deliberately just an iterator so callers can
-/// use it ergonomically without depending on an async runtime.
-#[derive(Clone, Debug)]
-pub struct VecStream<T> {
-    inner: std::vec::IntoIter<T>,
-}
-
-impl<T> VecStream<T> {
-    pub fn new(items: Vec<T>) -> Self {
-        Self {
-            inner: items.into_iter(),
-        }
-    }
-
-    pub fn collect_vec(self) -> Vec<T> {
-        self.inner.collect()
-    }
-}
-
-impl<T> Iterator for VecStream<T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
-}
-
 pub fn ordered<T>(mut records: Vec<T>, order: HistoryOrder) -> Vec<T> {
     if order == HistoryOrder::NewestFirst {
         records.reverse();
