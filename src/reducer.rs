@@ -46,19 +46,3 @@ impl<E> EventRecord<E> {
         }
     }
 }
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ReadyBatch<E> {
-    pub records: Vec<EventRecord<E>>,
-}
-
-pub fn apply_batch<E, R: Reducer<E>>(
-    reducer: &mut R,
-    state: &mut R::State,
-    batch: &ReadyBatch<E>,
-) -> Result<(), R::Error> {
-    for record in &batch.records {
-        reducer.apply(state, record)?;
-    }
-    Ok(())
-}
