@@ -1,0 +1,1110 @@
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use crate::storage::{
+    ControlKey, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage, TopicState,
+};
+use crate::{
+    ActorId, Error, EventEnvelope, Op, OpBody, Result, SignedOp, Signer, TopicControl,
+    TopicGenesis, TopicId, TopicPayload, actor_id_for,
+};
+
+const MAX_ADMISSION_RETRIES: usize = 64;
+
+#[derive(Clone)]
+pub struct Oplog<S = MemoryStorage> {
+    storage: S,
+}
+
+impl Default for Oplog<MemoryStorage> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Oplog<MemoryStorage> {
+    pub fn new() -> Self {
+        Self {
+            storage: MemoryStorage::new(),
+        }
+    }
+}
+
+impl<S: Storage> Oplog<S> {
+    pub fn with_storage(storage: S) -> Self {
+        Self { storage }
+    }
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    pub fn create_topic_genesis(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        genesis: TopicGenesis,
+        signer: &impl Signer,
+    ) -> Result<Op> {
+        let mut peers = genesis.initial_peers.clone();
+        peers.insert(signer.peer_id());
+        let genesis = TopicGenesis {
+            initial_peers: peers,
+            ..genesis
+        };
+        self.create_and_admit_local_op(topic_id, actor_id, TopicPayload::Genesis(genesis), signer)
+    }
+
+    pub fn create_event_op(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        event: EventEnvelope,
+        signer: &impl Signer,
+    ) -> Result<Op> {
+        self.create_and_admit_local_op(topic_id, actor_id, TopicPayload::Event(event), signer)
+    }
+
+    pub fn create_control_op(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        control: TopicControl,
+        signer: &impl Signer,
+    ) -> Result<Op> {
+        self.create_and_admit_local_op(topic_id, actor_id, TopicPayload::Control(control), signer)
+    }
+
+    pub fn receive_op(&self, op: Op) -> Result<()> {
+        self.receive_ops(vec![op]).map(|_| ())
+    }
+
+    pub fn receive_ops(&self, ops: Vec<Op>) -> Result<BTreeSet<crate::OpId>> {
+        self.receive_ops_from_peer(None, ops)
+    }
+
+    pub fn receive_ops_from_peer(
+        &self,
+        source_peer: Option<crate::PeerId>,
+        ops: Vec<Op>,
+    ) -> Result<BTreeSet<crate::OpId>> {
+        self.receive_ops_admission(source_peer, ops)
+    }
+
+    pub fn receive_signed_op(&self, signed: SignedOp) -> Result<Op> {
+        let op = Op::new(signed)?;
+        self.receive_op(op.clone())?;
+        Ok(op)
+    }
+
+    fn receive_ops_admission(
+        &self,
+        source_peer: Option<crate::PeerId>,
+        ops: Vec<Op>,
+    ) -> Result<BTreeSet<crate::OpId>> {
+        let mut accepted = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        if !ops.is_empty() {
+            queue.push_back((source_peer, ops, false));
+        }
+
+        while let Some((batch_source_peer, ops, from_pending)) = queue.pop_front() {
+            let batch_accepted = match self.admit_ops_batch_retry(batch_source_peer, ops) {
+                Ok(accepted) => accepted,
+                Err(err) if from_pending && is_semantic_rejection(&err) => continue,
+                Err(err) => return Err(err),
+            };
+            for op_id in &batch_accepted {
+                for (waiter_source_peer, waiter) in self.storage.pending_waiters(op_id)? {
+                    self.storage.remove_pending_op(&waiter.id)?;
+                    queue.push_back((Some(waiter_source_peer), vec![waiter], true));
+                }
+            }
+            accepted.extend(batch_accepted);
+        }
+
+        Ok(accepted)
+    }
+
+    fn admit_ops_batch_retry(
+        &self,
+        source_peer: Option<crate::PeerId>,
+        ops: Vec<Op>,
+    ) -> Result<BTreeSet<crate::OpId>> {
+        for _ in 0..MAX_ADMISSION_RETRIES {
+            match self.admit_ops_batch(source_peer, ops.clone()) {
+                Err(Error::AdmissionConflict) => continue,
+                result => return result,
+            }
+        }
+        Err(Error::AdmissionConflict)
+    }
+
+    fn admit_ops_batch(
+        &self,
+        source_peer: Option<crate::PeerId>,
+        ops: Vec<Op>,
+    ) -> Result<BTreeSet<crate::OpId>> {
+        let ops = topological_ops(ops)?;
+        let mut accepted = BTreeSet::new();
+        let Some(topic_id) = ops.first().map(|op| op.signed.body.topic_id) else {
+            return Ok(accepted);
+        };
+        if ops.iter().any(|op| op.signed.body.topic_id != topic_id) {
+            return Err(Error::TopicMismatch);
+        }
+
+        let expected_heads = self.storage.heads(&topic_id)?;
+        let expected_state = self.storage.topic_state(&topic_id)?;
+        let mut heads = expected_heads.clone();
+        let mut state = expected_state.clone();
+        let mut topic_state_changed = false;
+        let mut overlay_ops = BTreeMap::new();
+        let mut overlay_meta = BTreeMap::new();
+        let mut overlay_tips = BTreeMap::new();
+        let mut overlay_index = BTreeMap::new();
+        let mut entries = Vec::new();
+        let mut pending = Vec::new();
+
+        for op in ops {
+            op.validate()?;
+            if self.storage.get_op(&op.id)?.is_some() {
+                continue;
+            }
+
+            let missing_deps = self.missing_deps_projected(&op, &overlay_ops)?;
+            if !missing_deps.is_empty() {
+                self.validate_pending_op_projected(
+                    &op,
+                    &missing_deps,
+                    &overlay_meta,
+                    &overlay_tips,
+                    &overlay_index,
+                    state.as_ref(),
+                )?;
+                pending.push((op, missing_deps));
+                continue;
+            }
+
+            self.validate_op_projected(
+                &op,
+                &overlay_ops,
+                &overlay_meta,
+                &overlay_tips,
+                &overlay_index,
+                &heads,
+                state.as_ref(),
+            )?;
+            let meta = self.meta_for_projected(&op, &overlay_meta)?;
+            heads = heads_after(&heads, &op);
+            match &op.signed.body.payload {
+                TopicPayload::Genesis(genesis) => {
+                    state = Some(TopicState {
+                        topic_id,
+                        event_type_id: genesis.event_type_id.clone(),
+                        genesis: op.id,
+                        heads: heads.clone(),
+                        members: genesis.initial_peers.clone(),
+                        replication_policy: genesis.replication_policy.clone(),
+                        membership_controls: BTreeMap::new(),
+                        replication_policy_control: None,
+                    });
+                    topic_state_changed = true;
+                }
+                TopicPayload::Event(_) => {
+                    if let Some(state) = state.as_mut() {
+                        state.heads = heads.clone();
+                    }
+                }
+                TopicPayload::Control(control) => {
+                    let state = state.as_mut().ok_or(Error::TopicNotFound)?;
+                    state.heads = heads.clone();
+                    apply_control_to_state(state, &op, control);
+                    topic_state_changed = true;
+                }
+            }
+
+            overlay_index.insert((topic_id, meta.actor_id, meta.actor_seq), op.id);
+            overlay_tips.insert((topic_id, meta.actor_id), (meta.actor_seq, op.id));
+            overlay_meta.insert(op.id, meta.clone());
+            overlay_ops.insert(op.id, op.clone());
+            accepted.insert(op.id);
+            entries.push((op, meta));
+        }
+
+        for (op, missing_deps) in pending {
+            let source_peer = source_peer.unwrap_or(op.signed.body.author);
+            self.storage.put_pending_op(
+                source_peer,
+                op.clone(),
+                pending_meta_for(&op, missing_deps),
+            )?;
+        }
+
+        if !entries.is_empty() {
+            self.storage.put_admitted_batch(
+                topic_id,
+                expected_heads,
+                expected_state,
+                entries,
+                heads,
+                topic_state_changed.then(|| state.clone()).flatten(),
+            )?;
+        }
+
+        Ok(accepted)
+    }
+
+    pub fn observed_clock(&self, topic_id: &TopicId) -> Result<crate::ActorClock> {
+        self.storage.actor_clock(topic_id)
+    }
+
+    fn create_and_admit_local_op(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        payload: TopicPayload,
+        signer: &impl Signer,
+    ) -> Result<Op> {
+        for _ in 0..MAX_ADMISSION_RETRIES {
+            match self.try_create_and_admit_local_op(topic_id, actor_id, payload.clone(), signer) {
+                Err(err) if is_local_admission_race(&err) => continue,
+                result => return result,
+            }
+        }
+        Err(Error::AdmissionConflict)
+    }
+
+    fn try_create_and_admit_local_op(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        payload: TopicPayload,
+        signer: &impl Signer,
+    ) -> Result<Op> {
+        if !matches!(payload, TopicPayload::Genesis(_)) {
+            self.ensure_member(&topic_id, signer.peer_id())?;
+        }
+        let expected_heads = self.storage.heads(&topic_id)?;
+        let expected_state = self.storage.topic_state(&topic_id)?;
+        let op = self.next_local_op(topic_id, actor_id, expected_heads.clone(), payload, signer)?;
+        op.validate()?;
+        self.validate_op(&op)?;
+        let meta = self.meta_for(&op)?;
+        self.commit_admission(op.clone(), meta, expected_heads, expected_state)?;
+        Ok(op)
+    }
+
+    fn next_local_op(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        mut deps: BTreeSet<crate::OpId>,
+        payload: TopicPayload,
+        signer: &impl Signer,
+    ) -> Result<Op> {
+        let tip = self.storage.actor_tip(&topic_id, &actor_id)?;
+        let (actor_seq, actor_prev) = match tip {
+            Some((seq, id)) => (
+                seq.checked_add(1)
+                    .ok_or_else(|| Error::Storage("actor sequence overflow".into()))?,
+                Some(id),
+            ),
+            None => (1, None),
+        };
+        if let Some(prev) = actor_prev {
+            deps.insert(prev);
+        }
+        let generation = if deps.is_empty() {
+            0
+        } else {
+            self.storage
+                .max_generation(&topic_id)?
+                .checked_add(1)
+                .ok_or(Error::InvalidOpId)?
+        };
+        Op::sign(
+            OpBody {
+                topic_id,
+                author: signer.peer_id(),
+                actor_id,
+                actor_seq,
+                actor_prev,
+                deps,
+                generation,
+                payload,
+            },
+            signer,
+        )
+    }
+
+    fn validate_op(&self, op: &Op) -> Result<()> {
+        let body = &op.signed.body;
+        if body.actor_id != actor_id_for(body.topic_id, body.author) {
+            return Err(Error::ActorAuthorMismatch);
+        }
+        for dep in &body.deps {
+            if self.storage.get_op(dep)?.is_none() {
+                return Err(Error::MissingDependency(*dep));
+            }
+        }
+        match &body.payload {
+            TopicPayload::Genesis(_) => {
+                if body.actor_seq != 1
+                    || body.actor_prev.is_some()
+                    || !body.deps.is_empty()
+                    || self.storage.topic_state(&body.topic_id)?.is_some()
+                {
+                    return Err(Error::InvalidGenesis);
+                }
+            }
+            _ => {
+                let current = self
+                    .storage
+                    .topic_state(&body.topic_id)?
+                    .ok_or(Error::TopicNotFound)?;
+                let author_is_member = if body.deps == current.heads {
+                    current.members.contains(&body.author)
+                } else {
+                    self.topic_state_for_deps(&body.topic_id, &body.deps)?
+                        .members
+                        .contains(&body.author)
+                };
+                if !author_is_member {
+                    return Err(Error::NotTopicMember);
+                }
+            }
+        }
+        if let Some(existing) =
+            self.storage
+                .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+        {
+            if existing != op.id {
+                return Err(Error::ActorFork);
+            }
+        }
+        let expected = self.storage.actor_tip(&body.topic_id, &body.actor_id)?;
+        let (expected_seq, expected_prev) = next_actor_position(expected)?;
+        if body.actor_seq != expected_seq {
+            return Err(Error::ActorSeqGap {
+                expected: expected_seq,
+                actual: body.actor_seq,
+            });
+        }
+        if body.actor_prev != expected_prev {
+            return Err(Error::ActorPrevMismatch);
+        }
+        let generation = body
+            .deps
+            .iter()
+            .map(|id| {
+                let meta = self
+                    .storage
+                    .get_meta(id)?
+                    .ok_or(Error::MissingDependency(*id))?;
+                checked_next(meta.generation)
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        if body.generation != generation {
+            return Err(Error::InvalidOpId);
+        }
+        Ok(())
+    }
+
+    fn meta_for(&self, op: &Op) -> Result<OpMeta> {
+        let body = &op.signed.body;
+        let observed_clock = self.observed_clock_for_deps(&body.topic_id, &body.deps)?;
+        Ok(OpMeta {
+            id: op.id,
+            topic_id: body.topic_id,
+            author: body.author,
+            actor_id: body.actor_id,
+            actor_seq: body.actor_seq,
+            actor_prev: body.actor_prev,
+            deps: body.deps.clone(),
+            generation: body.generation,
+            observed_clock,
+            ready: true,
+            missing_deps: BTreeSet::new(),
+        })
+    }
+
+    fn meta_for_projected(
+        &self,
+        op: &Op,
+        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
+    ) -> Result<OpMeta> {
+        let body = &op.signed.body;
+        let mut observed_clock = crate::ActorClock::new();
+        for dep in &body.deps {
+            let meta = self.meta_projected(dep, overlay_meta)?;
+            if meta.topic_id != body.topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            observed_clock.merge(&meta.observed_clock);
+            observed_clock.observe(meta.actor_id, meta.actor_seq);
+        }
+        Ok(OpMeta {
+            id: op.id,
+            topic_id: body.topic_id,
+            author: body.author,
+            actor_id: body.actor_id,
+            actor_seq: body.actor_seq,
+            actor_prev: body.actor_prev,
+            deps: body.deps.clone(),
+            generation: body.generation,
+            observed_clock,
+            ready: true,
+            missing_deps: BTreeSet::new(),
+        })
+    }
+
+    fn meta_projected(
+        &self,
+        id: &crate::OpId,
+        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
+    ) -> Result<OpMeta> {
+        overlay_meta.get(id).cloned().map(Ok).unwrap_or_else(|| {
+            self.storage
+                .get_meta(id)?
+                .ok_or(Error::MissingDependency(*id))
+        })
+    }
+
+    fn op_projected(
+        &self,
+        id: &crate::OpId,
+        overlay_ops: &BTreeMap<crate::OpId, Op>,
+    ) -> Result<Op> {
+        overlay_ops.get(id).cloned().map(Ok).unwrap_or_else(|| {
+            self.storage
+                .get_op(id)?
+                .ok_or(Error::MissingDependency(*id))
+        })
+    }
+
+    fn missing_deps_projected(
+        &self,
+        op: &Op,
+        overlay_ops: &BTreeMap<crate::OpId, Op>,
+    ) -> Result<BTreeSet<crate::OpId>> {
+        let mut missing = BTreeSet::new();
+        for dep in &op.signed.body.deps {
+            if !overlay_ops.contains_key(dep) && self.storage.get_op(dep)?.is_none() {
+                missing.insert(*dep);
+            }
+        }
+        Ok(missing)
+    }
+
+    fn validate_pending_op_projected(
+        &self,
+        op: &Op,
+        missing_deps: &BTreeSet<crate::OpId>,
+        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
+        overlay_tips: &BTreeMap<(TopicId, ActorId), (u64, crate::OpId)>,
+        overlay_index: &BTreeMap<(TopicId, ActorId, u64), crate::OpId>,
+        state: Option<&TopicState>,
+    ) -> Result<()> {
+        let body = &op.signed.body;
+        if missing_deps.len() > MAX_PENDING_MISSING_DEPS {
+            return Err(Error::Storage(
+                "pending op has too many missing deps".into(),
+            ));
+        }
+        if body.actor_id != actor_id_for(body.topic_id, body.author) {
+            return Err(Error::ActorAuthorMismatch);
+        }
+        if body.actor_seq == 0 {
+            return Err(Error::ActorSeqGap {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        match &body.payload {
+            TopicPayload::Genesis(_) => {
+                if body.actor_seq != 1
+                    || body.actor_prev.is_some()
+                    || !body.deps.is_empty()
+                    || state.is_some()
+                {
+                    return Err(Error::InvalidGenesis);
+                }
+            }
+            _ => {
+                if body.deps.is_empty() || body.generation == 0 {
+                    return Err(Error::InvalidOpId);
+                }
+                // When we already know the topic, only buffer pending ops from
+                // known members. This stops non-members from consuming
+                // per-source pending quota by submitting structurally-valid
+                // ops that would be rejected at admission time anyway.
+                if let Some(state) = state {
+                    if !state.members.contains(&body.author) {
+                        return Err(Error::NotTopicMember);
+                    }
+                }
+            }
+        }
+        match (body.actor_seq, body.actor_prev) {
+            (1, Some(_)) => return Err(Error::ActorPrevMismatch),
+            (2.., None) => return Err(Error::ActorPrevMismatch),
+            _ => {}
+        }
+        if let Some(prev) = body.actor_prev {
+            if !body.deps.contains(&prev) {
+                return Err(Error::ActorPrevMismatch);
+            }
+            if !missing_deps.contains(&prev) {
+                let prev_meta = self.meta_projected(&prev, overlay_meta)?;
+                if prev_meta.topic_id != body.topic_id || prev_meta.actor_id != body.actor_id {
+                    return Err(Error::ActorPrevMismatch);
+                }
+                if checked_next(prev_meta.actor_seq)? != body.actor_seq {
+                    return Err(Error::ActorSeqGap {
+                        expected: checked_next(prev_meta.actor_seq)?,
+                        actual: body.actor_seq,
+                    });
+                }
+            }
+        }
+        if let Some(existing) = self
+            .storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+            .or_else(|| {
+                overlay_index
+                    .get(&(body.topic_id, body.actor_id, body.actor_seq))
+                    .copied()
+            })
+        {
+            if existing != op.id {
+                return Err(Error::ActorFork);
+            }
+        }
+        let expected = match overlay_tips.get(&(body.topic_id, body.actor_id)).copied() {
+            Some(tip) => Some(tip),
+            None => self.storage.actor_tip(&body.topic_id, &body.actor_id)?,
+        };
+        if let Some((tip_seq, tip_id)) = expected {
+            let next_seq = checked_next(tip_seq)?;
+            if body.actor_seq <= tip_seq {
+                return Err(Error::ActorSeqGap {
+                    expected: next_seq,
+                    actual: body.actor_seq,
+                });
+            }
+            if body.actor_prev == Some(tip_id) && body.actor_seq != next_seq {
+                return Err(Error::ActorSeqGap {
+                    expected: next_seq,
+                    actual: body.actor_seq,
+                });
+            }
+        }
+        for dep in &body.deps {
+            if missing_deps.contains(dep) {
+                continue;
+            }
+            let meta = self.meta_projected(dep, overlay_meta)?;
+            if meta.topic_id != body.topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            if meta.generation >= body.generation {
+                return Err(Error::InvalidOpId);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_op_projected(
+        &self,
+        op: &Op,
+        overlay_ops: &BTreeMap<crate::OpId, Op>,
+        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
+        overlay_tips: &BTreeMap<(TopicId, ActorId), (u64, crate::OpId)>,
+        overlay_index: &BTreeMap<(TopicId, ActorId, u64), crate::OpId>,
+        heads: &BTreeSet<crate::OpId>,
+        state: Option<&TopicState>,
+    ) -> Result<()> {
+        let body = &op.signed.body;
+        if body.actor_id != actor_id_for(body.topic_id, body.author) {
+            return Err(Error::ActorAuthorMismatch);
+        }
+        match &body.payload {
+            TopicPayload::Genesis(_) => {
+                if body.actor_seq != 1
+                    || body.actor_prev.is_some()
+                    || !body.deps.is_empty()
+                    || state.is_some()
+                {
+                    return Err(Error::InvalidGenesis);
+                }
+            }
+            _ => {
+                let state = state.ok_or(Error::TopicNotFound)?;
+                let author_is_member = if body.deps == *heads {
+                    state.members.contains(&body.author)
+                } else {
+                    self.topic_state_for_deps_projected(
+                        &body.topic_id,
+                        &body.deps,
+                        overlay_ops,
+                        overlay_meta,
+                    )?
+                    .members
+                    .contains(&body.author)
+                };
+                if !author_is_member {
+                    return Err(Error::NotTopicMember);
+                }
+            }
+        }
+        if let Some(existing) = self
+            .storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+            .or_else(|| {
+                overlay_index
+                    .get(&(body.topic_id, body.actor_id, body.actor_seq))
+                    .copied()
+            })
+        {
+            if existing != op.id {
+                return Err(Error::ActorFork);
+            }
+        }
+        let expected = match overlay_tips.get(&(body.topic_id, body.actor_id)).copied() {
+            Some(tip) => Some(tip),
+            None => self.storage.actor_tip(&body.topic_id, &body.actor_id)?,
+        };
+        let (expected_seq, expected_prev) = next_actor_position(expected)?;
+        if body.actor_seq != expected_seq {
+            return Err(Error::ActorSeqGap {
+                expected: expected_seq,
+                actual: body.actor_seq,
+            });
+        }
+        if body.actor_prev != expected_prev {
+            return Err(Error::ActorPrevMismatch);
+        }
+        let generation = body
+            .deps
+            .iter()
+            .map(|id| {
+                self.meta_projected(id, overlay_meta)
+                    .and_then(|m| checked_next(m.generation))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        if body.generation != generation {
+            return Err(Error::InvalidOpId);
+        }
+        Ok(())
+    }
+
+    fn topic_state_for_deps_projected(
+        &self,
+        topic_id: &TopicId,
+        deps: &BTreeSet<crate::OpId>,
+        overlay_ops: &BTreeMap<crate::OpId, Op>,
+        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
+    ) -> Result<TopicState> {
+        let mut reachable = BTreeMap::new();
+        let mut stack = deps.iter().copied().collect::<Vec<_>>();
+        while let Some(id) = stack.pop() {
+            if reachable.contains_key(&id) {
+                continue;
+            }
+            let meta = self.meta_projected(&id, overlay_meta)?;
+            if meta.topic_id != *topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            let op = self.op_projected(&id, overlay_ops)?;
+            stack.extend(meta.deps.iter().copied());
+            reachable.insert(id, op);
+        }
+
+        materialize_topic_state(reachable.into_values().collect(), BTreeSet::new())
+    }
+
+    fn observed_clock_for_deps(
+        &self,
+        topic_id: &TopicId,
+        deps: &BTreeSet<crate::OpId>,
+    ) -> Result<crate::ActorClock> {
+        let mut observed_clock = crate::ActorClock::new();
+        for id in deps {
+            let meta = self
+                .storage
+                .get_meta(id)?
+                .ok_or(Error::MissingDependency(*id))?;
+            if meta.topic_id != *topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            observed_clock.merge(&meta.observed_clock);
+            observed_clock.observe(meta.actor_id, meta.actor_seq);
+        }
+
+        Ok(observed_clock)
+    }
+
+    fn topic_state_after(
+        &self,
+        op: &Op,
+        heads: BTreeSet<crate::OpId>,
+        base_state: Option<TopicState>,
+    ) -> Result<Option<TopicState>> {
+        let body = &op.signed.body;
+        match &body.payload {
+            TopicPayload::Genesis(genesis) => Ok(Some(TopicState {
+                topic_id: body.topic_id,
+                event_type_id: genesis.event_type_id.clone(),
+                genesis: op.id,
+                heads,
+                members: genesis.initial_peers.clone(),
+                replication_policy: genesis.replication_policy.clone(),
+                membership_controls: BTreeMap::new(),
+                replication_policy_control: None,
+            })),
+            TopicPayload::Event(_) => Ok(None),
+            TopicPayload::Control(control) => {
+                let mut state = base_state.ok_or(Error::TopicNotFound)?;
+                state.heads = heads;
+                apply_control_to_state(&mut state, op, control);
+                Ok(Some(state))
+            }
+        }
+    }
+
+    fn commit_admission(
+        &self,
+        op: Op,
+        meta: OpMeta,
+        expected_heads: BTreeSet<crate::OpId>,
+        expected_state: Option<TopicState>,
+    ) -> Result<()> {
+        let heads = heads_after(&expected_heads, &op);
+        let topic_state = self.topic_state_after(&op, heads.clone(), expected_state.clone())?;
+        self.storage.put_admitted_op(
+            op.signed.body.topic_id,
+            expected_heads,
+            expected_state,
+            op,
+            meta,
+            heads,
+            topic_state,
+        )
+    }
+
+    fn topic_state_for_deps(
+        &self,
+        topic_id: &TopicId,
+        deps: &BTreeSet<crate::OpId>,
+    ) -> Result<TopicState> {
+        let mut reachable = BTreeMap::new();
+        let mut stack = deps.iter().copied().collect::<Vec<_>>();
+        while let Some(id) = stack.pop() {
+            if reachable.contains_key(&id) {
+                continue;
+            }
+            let op = self
+                .storage
+                .get_op(&id)?
+                .ok_or(Error::MissingDependency(id))?;
+            let body = &op.signed.body;
+            if body.topic_id != *topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            stack.extend(body.deps.iter().copied());
+            reachable.insert(id, op);
+        }
+
+        materialize_topic_state(reachable.into_values().collect(), BTreeSet::new())
+    }
+
+    fn ensure_member(&self, topic_id: &TopicId, peer: crate::PeerId) -> Result<()> {
+        let state = self
+            .storage
+            .topic_state(topic_id)?
+            .ok_or(Error::TopicNotFound)?;
+        if state.members.contains(&peer) {
+            Ok(())
+        } else {
+            Err(Error::NotTopicMember)
+        }
+    }
+}
+
+fn materialize_topic_state(ops: Vec<Op>, heads: BTreeSet<crate::OpId>) -> Result<TopicState> {
+    let mut genesis = None;
+    let mut member_controls = BTreeMap::new();
+    let mut replication_policy_control = None;
+
+    for op in ops {
+        let body = &op.signed.body;
+        match &body.payload {
+            TopicPayload::Genesis(topic_genesis) => {
+                genesis = Some((op.id, body.topic_id, topic_genesis.clone()));
+            }
+            TopicPayload::Control(TopicControl::AddPeer { peer }) => {
+                set_membership_control(&mut member_controls, *peer, control_key(&op), true);
+            }
+            TopicPayload::Control(TopicControl::RemovePeer { peer }) => {
+                set_membership_control(&mut member_controls, *peer, control_key(&op), false);
+            }
+            TopicPayload::Control(TopicControl::SetReplicationPolicy { policy }) => {
+                let key = control_key(&op);
+                if replication_policy_control
+                    .as_ref()
+                    .is_none_or(|(current_key, _)| key > *current_key)
+                {
+                    replication_policy_control = Some((key, policy.clone()));
+                }
+            }
+            TopicPayload::Event(_) => {}
+        }
+    }
+
+    let (genesis_id, topic_id, topic_genesis) = genesis.ok_or(Error::TopicNotFound)?;
+    let mut members = topic_genesis.initial_peers.clone();
+    for (peer, (_, is_member)) in &member_controls {
+        if *is_member {
+            members.insert(*peer);
+        } else {
+            members.remove(peer);
+        }
+    }
+
+    let replication_policy = replication_policy_control
+        .as_ref()
+        .map(|(_, policy)| policy.clone())
+        .unwrap_or(topic_genesis.replication_policy);
+
+    Ok(TopicState {
+        topic_id,
+        event_type_id: topic_genesis.event_type_id,
+        genesis: genesis_id,
+        heads,
+        members,
+        replication_policy,
+        membership_controls: member_controls,
+        replication_policy_control,
+    })
+}
+
+fn next_actor_position(tip: Option<(u64, crate::OpId)>) -> Result<(u64, Option<crate::OpId>)> {
+    match tip {
+        Some((seq, id)) => Ok((checked_next(seq)?, Some(id))),
+        None => Ok((1, None)),
+    }
+}
+
+fn checked_next(value: u64) -> Result<u64> {
+    value.checked_add(1).ok_or(Error::InvalidOpId)
+}
+
+fn is_semantic_rejection(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::InvalidSignature
+            | Error::InvalidPublicKey
+            | Error::InvalidOpId
+            | Error::WrongSigner
+            | Error::EventTypeMismatch { .. }
+            | Error::TopicNotFound
+            | Error::NotTopicMember
+            | Error::ActorSeqGap { .. }
+            | Error::ActorPrevMismatch
+            | Error::ActorFork
+            | Error::ActorAuthorMismatch
+            | Error::TopicMismatch
+            | Error::MissingDependency(_)
+            | Error::InvalidGenesis
+            | Error::Decode(_)
+    )
+}
+
+fn is_local_admission_race(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::AdmissionConflict
+            | Error::ActorSeqGap { .. }
+            | Error::ActorPrevMismatch
+            | Error::ActorFork
+    )
+}
+
+fn heads_after(current: &BTreeSet<crate::OpId>, op: &Op) -> BTreeSet<crate::OpId> {
+    let mut heads = current.clone();
+    for dep in &op.signed.body.deps {
+        heads.remove(dep);
+    }
+    heads.insert(op.id);
+    heads
+}
+
+fn pending_meta_for(op: &Op, missing_deps: BTreeSet<crate::OpId>) -> OpMeta {
+    let body = &op.signed.body;
+    OpMeta {
+        id: op.id,
+        topic_id: body.topic_id,
+        author: body.author,
+        actor_id: body.actor_id,
+        actor_seq: body.actor_seq,
+        actor_prev: body.actor_prev,
+        deps: body.deps.clone(),
+        generation: body.generation,
+        observed_clock: crate::ActorClock::new(),
+        ready: false,
+        missing_deps,
+    }
+}
+
+fn set_membership_control(
+    controls: &mut BTreeMap<crate::PeerId, (ControlKey, bool)>,
+    peer: crate::PeerId,
+    key: ControlKey,
+    is_member: bool,
+) -> bool {
+    if controls
+        .get(&peer)
+        .is_none_or(|(current_key, _)| key > *current_key)
+    {
+        controls.insert(peer, (key, is_member));
+        true
+    } else {
+        false
+    }
+}
+
+fn apply_control_to_state(state: &mut TopicState, op: &Op, control: &TopicControl) {
+    match control {
+        TopicControl::AddPeer { peer } => {
+            if set_membership_control(&mut state.membership_controls, *peer, control_key(op), true)
+            {
+                state.members.insert(*peer);
+            }
+        }
+        TopicControl::RemovePeer { peer } => {
+            if set_membership_control(
+                &mut state.membership_controls,
+                *peer,
+                control_key(op),
+                false,
+            ) {
+                state.members.remove(peer);
+            }
+        }
+        TopicControl::SetReplicationPolicy { policy } => {
+            let key = control_key(op);
+            if state
+                .replication_policy_control
+                .as_ref()
+                .is_none_or(|(current_key, _)| key > *current_key)
+            {
+                state.replication_policy_control = Some((key, policy.clone()));
+                state.replication_policy = policy.clone();
+            }
+        }
+    }
+}
+
+fn control_key(op: &Op) -> ControlKey {
+    let body = &op.signed.body;
+    ControlKey {
+        generation: body.generation,
+        actor_id: body.actor_id,
+        actor_seq: body.actor_seq,
+        op_id: op.id,
+    }
+}
+
+pub fn topological<S: Storage>(storage: &S, topic_id: &TopicId) -> Result<Vec<Op>> {
+    let ids = storage.list_op_ids(topic_id)?;
+    topological_subset(storage, &ids)
+}
+
+pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) -> Result<Vec<Op>> {
+    let mut indeg = BTreeMap::new();
+    for id in ids {
+        let meta = storage
+            .get_meta(id)?
+            .ok_or_else(|| Error::Storage(format!("missing op meta for {id}")))?;
+        indeg.insert(
+            *id,
+            meta.deps.iter().filter(|dep| ids.contains(dep)).count(),
+        );
+    }
+
+    let mut ready = indeg
+        .iter()
+        .filter_map(|(id, count)| (*count == 0).then_some(*id))
+        .collect::<VecDeque<_>>();
+    let mut out = Vec::with_capacity(ids.len());
+    while let Some(id) = ready.pop_front() {
+        let op = storage
+            .get_op(&id)?
+            .ok_or_else(|| Error::Storage(format!("missing op {id}")))?;
+        out.push(op);
+        for child in storage.children(&id)? {
+            if let Some(count) = indeg.get_mut(&child) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    ready.push_back(child);
+                }
+            }
+        }
+    }
+
+    if out.len() != ids.len() {
+        return Err(Error::Storage(
+            "cycle or missing dependency in op graph".into(),
+        ));
+    }
+    Ok(out)
+}
+
+pub(crate) fn topological_ops(ops: Vec<Op>) -> Result<Vec<Op>> {
+    let by_id = ops
+        .into_iter()
+        .map(|op| (op.id, op))
+        .collect::<BTreeMap<_, _>>();
+    let mut indeg = BTreeMap::new();
+    let mut children: BTreeMap<crate::OpId, BTreeSet<crate::OpId>> = BTreeMap::new();
+    for (id, op) in &by_id {
+        let mut count = 0_usize;
+        for dep in &op.signed.body.deps {
+            if by_id.contains_key(dep) {
+                count += 1;
+                children.entry(*dep).or_default().insert(*id);
+            }
+        }
+        indeg.insert(*id, count);
+    }
+    let mut ready = indeg
+        .iter()
+        .filter_map(|(id, count)| (*count == 0).then_some(*id))
+        .collect::<VecDeque<_>>();
+    let mut out = Vec::with_capacity(by_id.len());
+    while let Some(id) = ready.pop_front() {
+        out.push(
+            by_id
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| Error::Storage(format!("missing input op {id}")))?,
+        );
+        for child in children.get(&id).into_iter().flatten() {
+            if let Some(count) = indeg.get_mut(child) {
+                *count = (*count).saturating_sub(1);
+                if *count == 0 {
+                    ready.push_back(*child);
+                }
+            }
+        }
+    }
+    if out.len() != by_id.len() {
+        return Err(Error::Storage("cycle in input op batch".into()));
+    }
+    Ok(out)
+}
