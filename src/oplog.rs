@@ -359,7 +359,24 @@ impl<S: Storage> Oplog<S> {
                     return Err(Error::InvalidGenesis);
                 }
             }
-            _ => {
+            TopicPayload::Event(envelope) => {
+                let current = self
+                    .storage
+                    .topic_state(&body.topic_id)?
+                    .ok_or(Error::TopicNotFound)?;
+                ensure_event_type(&current.event_type_id, &envelope.type_id)?;
+                let author_is_member = if body.deps == current.heads {
+                    current.members.contains(&body.author)
+                } else {
+                    self.topic_state_for_deps(&body.topic_id, &body.deps)?
+                        .members
+                        .contains(&body.author)
+                };
+                if !author_is_member {
+                    return Err(Error::NotTopicMember);
+                }
+            }
+            TopicPayload::Control(_) => {
                 let current = self
                     .storage
                     .topic_state(&body.topic_id)?
@@ -528,7 +545,7 @@ impl<S: Storage> Oplog<S> {
                     return Err(Error::InvalidGenesis);
                 }
             }
-            _ => {
+            TopicPayload::Event(envelope) => {
                 if body.deps.is_empty() || body.generation == 0 {
                     return Err(Error::InvalidOpId);
                 }
@@ -536,6 +553,17 @@ impl<S: Storage> Oplog<S> {
                 // known members. This stops non-members from consuming
                 // per-source pending quota by submitting structurally-valid
                 // ops that would be rejected at admission time anyway.
+                if let Some(state) = state {
+                    ensure_event_type(&state.event_type_id, &envelope.type_id)?;
+                    if !state.members.contains(&body.author) {
+                        return Err(Error::NotTopicMember);
+                    }
+                }
+            }
+            TopicPayload::Control(_) => {
+                if body.deps.is_empty() || body.generation == 0 {
+                    return Err(Error::InvalidOpId);
+                }
                 if let Some(state) = state
                     && !state.members.contains(&body.author)
                 {
@@ -636,7 +664,26 @@ impl<S: Storage> Oplog<S> {
                     return Err(Error::InvalidGenesis);
                 }
             }
-            _ => {
+            TopicPayload::Event(envelope) => {
+                let state = state.ok_or(Error::TopicNotFound)?;
+                ensure_event_type(&state.event_type_id, &envelope.type_id)?;
+                let author_is_member = if body.deps == *heads {
+                    state.members.contains(&body.author)
+                } else {
+                    self.topic_state_for_deps_projected(
+                        &body.topic_id,
+                        &body.deps,
+                        overlay_ops,
+                        overlay_meta,
+                    )?
+                    .members
+                    .contains(&body.author)
+                };
+                if !author_is_member {
+                    return Err(Error::NotTopicMember);
+                }
+            }
+            TopicPayload::Control(_) => {
                 let state = state.ok_or(Error::TopicNotFound)?;
                 let author_is_member = if body.deps == *heads {
                     state.members.contains(&body.author)
@@ -890,6 +937,17 @@ fn next_actor_position(tip: Option<(u64, crate::OpId)>) -> Result<(u64, Option<c
 
 fn checked_next(value: u64) -> Result<u64> {
     value.checked_add(1).ok_or(Error::InvalidOpId)
+}
+
+fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(Error::EventTypeMismatch {
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
+        })
+    }
 }
 
 fn is_semantic_rejection(err: &Error) -> bool {

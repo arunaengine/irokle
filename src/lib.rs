@@ -789,6 +789,36 @@ mod tests {
     }
 
     #[test]
+    fn sync_peer_selection_has_deterministic_overlap() {
+        let topic_id = TopicId::hash(b"overlap-topic");
+        let mut peers = Vec::new();
+        let mut members = BTreeSet::new();
+        for idx in 0..64_u8 {
+            let peer = PeerId::hash([idx]);
+            peers.push(peer);
+            members.insert(peer);
+        }
+        let state = storage::TopicState {
+            topic_id,
+            event_type_id: Note::TYPE_ID.into(),
+            genesis: OpId::hash(b"genesis"),
+            heads: BTreeSet::new(),
+            members,
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(6),
+            membership_controls: std::collections::BTreeMap::new(),
+            replication_policy_control: None,
+        };
+
+        let local = node::select_sync_peers(topic_id, peers[1], &state);
+        let distant = node::select_sync_peers(topic_id, peers[61], &state);
+        let local_set = local.iter().copied().collect::<BTreeSet<_>>();
+        let distant_set = distant.iter().copied().collect::<BTreeSet<_>>();
+
+        assert_eq!(local, node::select_sync_peers(topic_id, peers[1], &state));
+        assert!(local_set.intersection(&distant_set).count() >= 2);
+    }
+
+    #[test]
     fn sync_status_reports_failures_and_pending_obligations() {
         let alice = node(87);
         let bob = node(88);
@@ -957,7 +987,7 @@ mod tests {
             .handle_messages(
                 outsider_endpoint.id(),
                 vec![sync::SyncMessage::Open(
-                    sync::SyncEngine::<MemoryStorage>::open(topic.id(), outsider_peer),
+                    sync::SyncEngine::<MemoryStorage>::open(topic.id(), outsider_peer, None),
                 )],
             )
             .unwrap();
@@ -1386,6 +1416,91 @@ mod tests {
     }
 
     #[test]
+    fn received_event_op_rejects_mismatched_event_type() {
+        let alice = node(90);
+        let bob_signer = Ed25519Signer::from_bytes(&[91; 32]);
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob_signer.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
+        let op = Op::sign(
+            OpBody {
+                topic_id: topic.id(),
+                author: bob_signer.peer_id(),
+                actor_id: actor_id_for(topic.id(), bob_signer.peer_id()),
+                actor_seq: 1,
+                actor_prev: None,
+                deps: [genesis.id].into(),
+                generation: 1,
+                payload: TopicPayload::Event(EventEnvelope::encode_event(&Other).unwrap()),
+            },
+            &bob_signer,
+        )
+        .unwrap();
+        let oplog = oplog::Oplog::with_storage(alice.storage().clone());
+
+        assert!(matches!(
+            oplog.receive_op(op),
+            Err(Error::EventTypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn sync_metadata_and_ack_reachability_are_exposed() {
+        let alice = node(92);
+        let bob = node(93);
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let record = topic
+            .publish(Note {
+                text: "seen".into(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            alice.sync_open(topic.id()).event_type_id.as_deref(),
+            Some(Note::TYPE_ID)
+        );
+        assert_eq!(
+            alice
+                .sync_summary(topic.id())
+                .unwrap()
+                .event_type_id
+                .as_deref(),
+            Some(Note::TYPE_ID)
+        );
+        assert!(
+            !alice
+                .peer_reached_op(bob.peer_id(), record.meta.op_id)
+                .unwrap()
+        );
+
+        let data = sync::SyncData {
+            topic_id: topic.id(),
+            ops: oplog::topological(alice.storage(), &topic.id()).unwrap(),
+        };
+        let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+        alice.apply_sync_ack(&ack).unwrap();
+
+        assert!(
+            alice
+                .peer_reached_op(bob.peer_id(), record.meta.op_id)
+                .unwrap()
+        );
+        assert_eq!(
+            alice.peers_reached_op(record.meta.op_id).unwrap(),
+            vec![bob.peer_id()]
+        );
+    }
+
+    #[test]
     fn plan_response_data_clamps_oversized_actor_range_hint() {
         let alice = node(80);
         let bob = node(81);
@@ -1466,6 +1581,7 @@ mod tests {
         // she cannot authenticate. The plan must now be empty.
         let summary = sync::SyncSummary {
             topic_id: unknown_topic,
+            event_type_id: None,
             fingerprint: [0; 32],
             heads: [OpId::hash(b"forged-head-1"), OpId::hash(b"forged-head-2")].into(),
             actor_clock: ActorClock::new(),

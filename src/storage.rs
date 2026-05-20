@@ -124,6 +124,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
     fn put_peer_ack(&self, ack: PeerAck) -> Result<()>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
+    fn peer_acks(&self, _topic_id: &TopicId) -> Result<Vec<PeerAck>> {
+        Ok(Vec::new())
+    }
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()>;
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>>;
     fn clear_satisfied_sync_obligations(&self, ack: &PeerAck) -> Result<usize>;
@@ -136,6 +139,30 @@ pub trait Storage: Clone + Send + Sync + 'static {
     -> Result<Vec<SyncObligation>>;
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()>;
     fn sync_statuses(&self, topic_id: &TopicId) -> Result<Vec<SyncPeerStatus>>;
+
+    fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
+        let Some(meta) = self.get_meta(op_id)? else {
+            return Ok(false);
+        };
+        let Some(ack) = self.peer_ack(peer_id, &meta.topic_id)? else {
+            return Ok(false);
+        };
+        Ok(ack.heads.contains(op_id) || ack.clock.get(&meta.actor_id) >= meta.actor_seq)
+    }
+
+    fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>> {
+        let Some(meta) = self.get_meta(op_id)? else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .peer_acks(&meta.topic_id)?
+            .into_iter()
+            .filter(|ack| {
+                ack.heads.contains(op_id) || ack.clock.get(&meta.actor_id) >= meta.actor_seq
+            })
+            .map(|ack| ack.peer_id)
+            .collect())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -506,6 +533,17 @@ impl Storage for MemoryStorage {
             .peer_acks
             .get(&(*peer_id, *topic_id))
             .cloned())
+    }
+    fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .peer_acks
+            .values()
+            .filter(|ack| ack.topic_id == *topic_id)
+            .cloned()
+            .collect())
     }
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
@@ -1176,6 +1214,18 @@ impl Storage for FjallStorage {
     }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
         self.get([b"ak".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat())
+    }
+    fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>> {
+        let mut out = Vec::new();
+        let read_tx = self.db.read_tx();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, b"ak".as_slice()) {
+            let value = item.value()?;
+            let ack: PeerAck = postcard::from_bytes(value.as_ref())?;
+            if ack.topic_id == *topic_id {
+                out.push(ack);
+            }
+        }
+        Ok(out)
     }
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()> {
         self.put(Self::sync_obligation_key(&obligation), &obligation)
