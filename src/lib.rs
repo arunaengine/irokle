@@ -764,6 +764,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bounded_sync_peer_selection_caps_member_fanout() {
+        let local = PeerId::hash(b"local");
+        let topic_id = TopicId::hash(b"fanout-topic");
+        let mut members = [local].into_iter().collect::<BTreeSet<_>>();
+        for idx in 0..24_u8 {
+            members.insert(PeerId::hash([idx]));
+        }
+        let state = storage::TopicState {
+            topic_id,
+            event_type_id: Note::TYPE_ID.into(),
+            genesis: OpId::hash(b"genesis"),
+            heads: BTreeSet::new(),
+            members,
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(3),
+            membership_controls: std::collections::BTreeMap::new(),
+            replication_policy_control: None,
+        };
+
+        let peers = node::select_sync_peers(topic_id, local, &state);
+
+        assert_eq!(peers.len(), 3);
+        assert!(!peers.contains(&local));
+    }
+
+    #[test]
+    fn sync_status_reports_failures_and_pending_obligations() {
+        let alice = node(87);
+        let bob = node(88);
+        let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
+        let record = topic.publish(Note { text: "status".into() }).unwrap();
+        alice
+            .put_sync_obligation(bob.peer_id(), topic.id(), [record.meta.op_id].into())
+            .unwrap();
+        let failure = std::io::Error::other("dial failed");
+
+        alice
+            .record_sync_result(bob.peer_id(), topic.id(), Err(&failure))
+            .unwrap();
+
+        let status = alice.sync_status(topic.id()).unwrap();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].state, storage::SyncPeerState::Failed);
+        assert_eq!(status[0].pending_obligations, 1);
+        assert_eq!(status[0].failed_attempts, 1);
+        assert!(status[0].last_error.as_deref().unwrap().contains("dial failed"));
+        assert_eq!(
+            alice
+                .sync_state_counts(topic.id())
+                .unwrap()
+                .get(&storage::SyncPeerState::Failed),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn introduced_peer_can_reject_topic_with_membership_control() {
+        let alice = node(89);
+        let bob = node(90);
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        topic.publish(Note { text: "invite".into() }).unwrap();
+
+        let bob_summary = bob.sync_summary(topic.id()).unwrap();
+        let data = alice.plan_sync_data(bob.peer_id(), &bob_summary).unwrap();
+        bob.receive_sync_data(bob.peer_id(), data).unwrap();
+        assert_eq!(bob.list_topics().unwrap().len(), 1);
+
+        bob.reject_topic(topic.id()).unwrap();
+        assert!(matches!(
+            bob.open_topic::<Note>(topic.id()),
+            Err(Error::NotTopicMember)
+        ));
+
+        let alice_summary = alice.sync_summary(topic.id()).unwrap();
+        let rejection = bob.plan_sync_data(alice.peer_id(), &alice_summary).unwrap();
+        alice.receive_sync_data(alice.peer_id(), rejection).unwrap();
+        assert!(
+            !alice
+                .storage()
+                .topic_state(&topic.id())
+                .unwrap()
+                .unwrap()
+                .members
+                .contains(&bob.peer_id())
+        );
+    }
+
     #[cfg(feature = "iroh")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn iroh_sync_now_records_ack_for_remote_peer() {
@@ -779,10 +871,7 @@ mod tests {
             .unwrap();
         let alice = Irokle::builder().with_net(alice_endpoint).build().unwrap();
         let bob = Irokle::builder().with_net(bob_endpoint).build().unwrap();
-        let alice_addr = ready_iroh_addr(alice.endpoint().unwrap()).await;
         let bob_addr = ready_iroh_addr(bob.endpoint().unwrap()).await;
-        alice.add_peer_addr(bob_addr).unwrap();
-        bob.add_peer_addr(alice_addr).unwrap();
 
         let topic = alice
             .create_topic::<Note>(TopicConfig {
@@ -799,7 +888,7 @@ mod tests {
             .put_sync_obligation(bob.peer_id(), topic.id(), [record.meta.op_id].into())
             .unwrap();
 
-        alice.sync_now(bob.peer_id(), topic.id()).await.unwrap();
+        alice.sync_addr_now(bob_addr, topic.id()).await.unwrap();
 
         assert_eq!(
             bob.open_topic::<Note>(topic.id())
@@ -830,6 +919,38 @@ mod tests {
                 .obligations
                 .is_empty()
         );
+    }
+
+    #[cfg(feature = "iroh")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iroh_open_does_not_return_summary_to_non_member() {
+        let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let outsider_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let alice = Irokle::builder()
+            .with_iroh_secret_key(alice_endpoint.secret_key())
+            .build()
+            .unwrap();
+        let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
+        let net = net::IrohNet::new(alice_endpoint, alice.clone());
+        let outsider_peer = PeerId::from_bytes(*outsider_endpoint.id().as_bytes());
+
+        let responses = net
+            .handle_messages(
+                outsider_endpoint.id(),
+                vec![sync::SyncMessage::Open(sync::SyncEngine::<MemoryStorage>::open(
+                    topic.id(),
+                    outsider_peer,
+                ))],
+            )
+            .unwrap();
+
+        assert!(responses.is_empty());
     }
 
     #[cfg(feature = "iroh")]
