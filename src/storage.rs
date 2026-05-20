@@ -105,25 +105,6 @@ pub trait Storage: Clone + Send + Sync + 'static {
         heads: BTreeSet<OpId>,
         topic_state: Option<TopicState>,
     ) -> Result<()>;
-    fn put_admitted_op(
-        &self,
-        topic_id: TopicId,
-        expected_heads: BTreeSet<OpId>,
-        expected_topic_state: Option<TopicState>,
-        op: Op,
-        meta: OpMeta,
-        heads: BTreeSet<OpId>,
-        topic_state: Option<TopicState>,
-    ) -> Result<()> {
-        self.put_admitted_batch(
-            topic_id,
-            expected_heads,
-            expected_topic_state,
-            vec![(op, meta)],
-            heads,
-            topic_state,
-        )
-    }
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>>;
@@ -215,14 +196,12 @@ impl Storage for MemoryStorage {
                 }
                 continue;
             }
-            if let Some(existing) =
-                inner
-                    .actor_by_seq
-                    .get(&(meta.topic_id, meta.actor_id, meta.actor_seq))
+            if let Some(existing) = inner
+                .actor_by_seq
+                .get(&(meta.topic_id, meta.actor_id, meta.actor_seq))
+                && *existing != op.id
             {
-                if *existing != op.id {
-                    return Err(Error::ActorFork);
-                }
+                return Err(Error::ActorFork);
             }
             let tip = actor_tips
                 .get(&(meta.topic_id, meta.actor_id))
@@ -266,13 +245,12 @@ impl Storage for MemoryStorage {
             .as_ref()
             .map(|state| state.topic_id)
             .or_else(|| new_entries.first().map(|(_, meta)| meta.topic_id));
-        if let Some(topic_id) = topic_id {
-            if new_entries
+        if let Some(topic_id) = topic_id
+            && new_entries
                 .iter()
                 .any(|(_, meta)| meta.topic_id != topic_id)
-            {
-                return Err(Error::TopicMismatch);
-            }
+        {
+            return Err(Error::TopicMismatch);
         }
 
         for (op, meta) in new_entries {
@@ -801,10 +779,9 @@ impl Storage for FjallStorage {
                         &meta.actor_seq.to_be_bytes(),
                     ]
                     .concat(),
-                )? {
-                    if existing != op.id {
-                        return Err(Error::ActorFork);
-                    }
+                )? && existing != op.id
+                {
+                    return Err(Error::ActorFork);
                 }
                 let tip =
                     actor_tips

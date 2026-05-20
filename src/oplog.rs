@@ -379,10 +379,9 @@ impl<S: Storage> Oplog<S> {
         if let Some(existing) =
             self.storage
                 .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+            && existing != op.id
         {
-            if existing != op.id {
-                return Err(Error::ActorFork);
-            }
+            return Err(Error::ActorFork);
         }
         let expected = self.storage.actor_tip(&body.topic_id, &body.actor_id)?;
         let (expected_seq, expected_prev) = next_actor_position(expected)?;
@@ -537,10 +536,10 @@ impl<S: Storage> Oplog<S> {
                 // known members. This stops non-members from consuming
                 // per-source pending quota by submitting structurally-valid
                 // ops that would be rejected at admission time anyway.
-                if let Some(state) = state {
-                    if !state.members.contains(&body.author) {
-                        return Err(Error::NotTopicMember);
-                    }
+                if let Some(state) = state
+                    && !state.members.contains(&body.author)
+                {
+                    return Err(Error::NotTopicMember);
                 }
             }
         }
@@ -574,10 +573,9 @@ impl<S: Storage> Oplog<S> {
                     .get(&(body.topic_id, body.actor_id, body.actor_seq))
                     .copied()
             })
+            && existing != op.id
         {
-            if existing != op.id {
-                return Err(Error::ActorFork);
-            }
+            return Err(Error::ActorFork);
         }
         let expected = match overlay_tips.get(&(body.topic_id, body.actor_id)).copied() {
             Some(tip) => Some(tip),
@@ -613,6 +611,7 @@ impl<S: Storage> Oplog<S> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validate_op_projected(
         &self,
         op: &Op,
@@ -664,10 +663,9 @@ impl<S: Storage> Oplog<S> {
                     .get(&(body.topic_id, body.actor_id, body.actor_seq))
                     .copied()
             })
+            && existing != op.id
         {
-            if existing != op.id {
-                return Err(Error::ActorFork);
-            }
+            return Err(Error::ActorFork);
         }
         let expected = match overlay_tips.get(&(body.topic_id, body.actor_id)).copied() {
             Some(tip) => Some(tip),
@@ -777,12 +775,11 @@ impl<S: Storage> Oplog<S> {
     ) -> Result<()> {
         let heads = heads_after(&expected_heads, &op);
         let topic_state = self.topic_state_after(&op, heads.clone(), expected_state.clone())?;
-        self.storage.put_admitted_op(
+        self.storage.put_admitted_batch(
             op.signed.body.topic_id,
             expected_heads,
             expected_state,
-            op,
-            meta,
+            vec![(op, meta)],
             heads,
             topic_state,
         )
