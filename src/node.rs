@@ -21,16 +21,11 @@ use crate::{
 
 static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum WriteConcern {
+    #[default]
     Local,
     AsyncReplication,
-}
-
-impl Default for WriteConcern {
-    fn default() -> Self {
-        Self::Local
-    }
 }
 
 #[derive(Clone)]

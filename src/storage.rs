@@ -196,9 +196,10 @@ impl Storage for MemoryStorage {
                 }
                 continue;
             }
-            if let Some(existing) = inner
-                .actor_by_seq
-                .get(&(meta.topic_id, meta.actor_id, meta.actor_seq))
+            if let Some(existing) =
+                inner
+                    .actor_by_seq
+                    .get(&(meta.topic_id, meta.actor_id, meta.actor_seq))
                 && *existing != op.id
             {
                 return Err(Error::ActorFork);

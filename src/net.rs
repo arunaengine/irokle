@@ -461,12 +461,12 @@ impl<S: Storage> IrohNet<S> {
                 }
                 remote_peer_id = Some(open.peer_id);
                 open_topic_id = Some(open.topic_id);
-            } else if let Some(topic_id) = message_topic_id(&message) {
-                if open_topic_id != Some(topic_id) {
-                    return Err(invalid_data(
-                        "sync message topic does not match SyncOpen topic",
-                    ));
-                }
+            } else if let Some(topic_id) = message_topic_id(&message)
+                && open_topic_id != Some(topic_id)
+            {
+                return Err(invalid_data(
+                    "sync message topic does not match SyncOpen topic",
+                ));
             }
             responses.extend(self.handle_message(message, remote_peer_id)?);
         }
@@ -505,10 +505,9 @@ impl<S: Storage> IrohNet<S> {
                     .storage()
                     .topic_state(&open.topic_id)
                     .map_err(invalid_data)?
+                    && !state.members.contains(&peer_id)
                 {
-                    if !state.members.contains(&peer_id) {
-                        return Ok(Vec::new());
-                    }
+                    return Ok(Vec::new());
                 }
                 // Unknown topics return an empty local summary so an inviter can
                 // bootstrap a new member by pushing the signed genesis/history.

@@ -5,16 +5,11 @@ use std::collections::{HashSet, VecDeque};
 use std::hash::Hash;
 
 /// Ordering used when traversing linearized history.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HistoryOrder {
+    #[default]
     OldestFirst,
     NewestFirst,
-}
-
-impl Default for HistoryOrder {
-    fn default() -> Self {
-        Self::OldestFirst
-    }
 }
 
 /// Query options for DAG traversal.

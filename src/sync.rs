@@ -391,10 +391,10 @@ impl<S: Storage> SyncEngine<S> {
     ) -> Result<()> {
         let mut target_clock = ActorClock::new();
         for op_id in &op_ids {
-            if let Some(meta) = self.oplog.storage().get_meta(op_id)? {
-                if meta.topic_id == topic_id {
-                    target_clock.observe(meta.actor_id, meta.actor_seq);
-                }
+            if let Some(meta) = self.oplog.storage().get_meta(op_id)?
+                && meta.topic_id == topic_id
+            {
+                target_clock.observe(meta.actor_id, meta.actor_seq);
             }
         }
         self.oplog.storage().put_sync_obligation(SyncObligation {
@@ -416,10 +416,10 @@ impl<S: Storage> SyncEngine<S> {
     fn actor_tips(&self, topic_id: TopicId) -> Result<BTreeMap<ActorId, (u64, OpId)>> {
         let mut tips = BTreeMap::new();
         for (actor_id, seq) in self.oplog.storage().actor_clock(&topic_id)?.iter() {
-            if let Some((tip_seq, tip_id)) = self.oplog.storage().actor_tip(&topic_id, actor_id)? {
-                if tip_seq == *seq {
-                    tips.insert(*actor_id, (tip_seq, tip_id));
-                }
+            if let Some((tip_seq, tip_id)) = self.oplog.storage().actor_tip(&topic_id, actor_id)?
+                && tip_seq == *seq
+            {
+                tips.insert(*actor_id, (tip_seq, tip_id));
             }
         }
         Ok(tips)
