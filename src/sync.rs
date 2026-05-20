@@ -137,7 +137,6 @@ pub enum SyncMessage {
     Request(SyncRequest),
     Data(SyncData),
     Ack(SyncAck),
-    Report(SyncReport),
 }
 
 #[derive(Clone)]
