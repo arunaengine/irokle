@@ -1,86 +1,160 @@
 # Irokle
 
-Irokle is a Git-like Merkle-DAG of signed operations for topics. Operations form the authoritative history; indexes, reducers, clocks, materialized views, and sync summaries are derived from accepted ops.
+Irokle is a signed Merkle-DAG operation log for invite-only topics. Application events and membership changes are stored as signed operations; heads, actor clocks, topic state, history, sync summaries, and reducer projections are derived from those operations.
 
-## Core Model
+License: `MIT OR Apache-2.0`. Rust source files carry the matching SPDX header.
 
-- Signed ops: every application event or control change is wrapped in a signed operation. The operation body names the topic, actor, dependencies, generation, and payload.
-- Operation identity: `OpId` is derived from the canonical signed op bytes, including dependencies. The `id` field on an operation envelope is a validated field: readers must recompute the id and reject mismatches.
-- Dependencies: the Merkle-DAG defines causal structure. Changing event bytes, topic, actor, signature, generation, or dependencies changes the derived `OpId`.
-- Actor/vector clocks: actor sequence clocks and vector clocks are derived indexes for admission, querying, reducers, and synchronization. They are not operation identity.
+## What It Provides
 
-## Topics And Membership
+- Signed operations: every event or control change is signed by the peer that authored it.
+- Topic membership: topics are not public broadcast channels; typed access is gated by the current signed member set.
+- Deterministic sync: peers exchange summaries, missing operation closures, requests, and signed acknowledgements.
+- Bounded fanout: topic replication is capped by `ReplicationPolicy::max_sync_peers` so a node does not sync with every member by default.
+- Observability: sync status records expose pending obligations, failure counts, last errors, last success, and per-state counts.
+- Storage choices: `MemoryStorage` is available by default; `FjallStorage` is available behind the `fjall` feature.
+- Iroh integration: the `iroh` feature syncs over `iroh::Endpoint` using `PeerId`/NodeId dialing.
 
-Topics are invite-only peer sets. A topic is not a global broadcast channel; peers replicate a topic after they receive the topic material or are otherwise granted membership.
-
-Typed topic access is also membership-gated: `open_topic::<E>` returns `NotTopicMember` when the local signer is not in the topic's current member set. Raw topic access remains available for local restore, inspection, and validation of stored signed operations.
-
-Membership changes are topic control ops. Control history lives in the same Merkle-DAG model as application events, so peers can validate membership evolution from signed operations instead of relying on out-of-band mutable state.
-
-## Events
-
-Typed events implement an `Event` trait with `TYPE_ID` only. There is no schema version field in the core event trait. Most applications can derive the trait:
+## Minimal Example
 
 ```rust
-#[derive(irokle::Event, serde::Serialize, serde::Deserialize)]
+use irokle::history::HistoryOrder;
+use irokle::{Irokle, TopicConfig};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
 #[irokle(type_id = "example.chat.message")]
 struct ChatEvent {
     author: String,
     text: String,
 }
+
+fn main() -> irokle::Result<()> {
+    let alice = Irokle::builder().build()?;
+    let bob = Irokle::builder().build()?;
+
+    let alice_topic = alice.create_topic::<ChatEvent>(TopicConfig {
+        initial_peers: [bob.peer_id()].into(),
+        ..TopicConfig::default()
+    })?;
+
+    alice_topic.publish(ChatEvent {
+        author: "alice".into(),
+        text: "hello".into(),
+    })?;
+
+    let bob_summary = bob.sync_summary(alice_topic.id())?;
+    let data_for_bob = alice.plan_sync_data(bob.peer_id(), &bob_summary)?;
+    let bob_ack = bob.receive_sync_data(bob.peer_id(), data_for_bob)?;
+    alice.apply_sync_ack(&bob_ack)?;
+
+    let bob_topic = bob.open_topic::<ChatEvent>(alice_topic.id())?;
+    bob_topic.publish(ChatEvent {
+        author: "bob".into(),
+        text: "reply".into(),
+    })?;
+
+    for record in bob_topic.history(HistoryOrder::OldestFirst)? {
+        println!("{}: {}", record.event.author, record.event.text);
+    }
+
+    Ok(())
+}
 ```
 
-If the `irokle` crate is renamed, use `#[irokle(crate = "path::to::irokle")]` alongside `type_id`.
+This example uses the transport-neutral sync API directly. Iroh examples use `sync_now(peer_id, topic_id)` instead.
 
-The derive uses the `Event` trait's postcard-backed default encoding and decoding. The crate still exposes the lower-level `Event` trait so applications can choose their own canonical event encoding.
+## Topics And Membership
 
-Backward compatibility is the application's responsibility. Applications should keep old decoders/reducers as long as old events need to be interpreted. If a peer sees an unknown future event type, typed reducers may have to stop or skip according to application policy, but raw DAG synchronization can still continue because sync moves signed operation bytes and metadata rather than typed reducer output.
+`TopicConfig::initial_peers` defines the initial signed member set. `Topic::add_peer` and `Topic::remove_peer` write membership control operations into the same DAG as application events.
 
-## Publishing
+When a node receives a topic for the first time, it can discover it through `list_topics()` and then open it with `open_topic::<E>(topic_id)` if its local peer is a current member. A node can reject membership with `Irokle::reject_topic(topic_id)` or `Topic::leave()`. Rejection is represented as a signed `RemovePeer` control operation, so other nodes can observe and sync the decision.
 
-Write concern is chosen per publish. `publish` uses the topic or node default, while `publish_with` accepts publish options such as a per-event write concern. The core crate currently records the local operation only; it does not perform transport waits or synthesize acknowledgement latency. Network integrations should turn non-local write concerns into sync obligations and complete those obligations from real `SyncAck` messages.
+## Bounded Replication
 
-## Storage
+`ReplicationPolicy::all()` means all current topic members are eligible sync targets, but the selected set is capped by `max_sync_peers`.
 
-The storage layer is a trait, not a hard-coded database. `Storage` stores signed ops, metadata, heads, actor indexes, topic state, peer acknowledgements, and sync obligations. Most applications construct a node with `Irokle::new(config)` for memory-backed storage or `Irokle::with_storage(storage, config)` for a custom backend. With the `fjall` feature enabled, `Irokle::open_fjall(path, config)` opens persistent storage directly.
+```rust
+use irokle::{ReplicationPolicy, TopicConfig};
 
-Admission is serialized by the node operation log, so cloned handles for the same node share one critical section for actor-tip/head reads, local op creation, validation, head/index/clock updates, topic-state materialization, and durable admission. Storage backends expose a semantic admitted-op commit that writes the op, metadata/indexes, heads, and topic state as one backend operation. Fjall v0 relies on that single `records` keyspace batch with `SyncAll` persistence for admission atomicity; it does not yet include a startup rebuild path for repairing manually corrupted or partially written indexes outside Fjall's batch guarantees.
+let config = TopicConfig {
+    replication_policy: ReplicationPolicy::all().with_max_sync_peers(4),
+    ..TopicConfig::default()
+};
+```
 
-Available backends:
+Peer selection is deterministic and combines ring neighbors with hash-ranked fill peers. The goal is bounded epidemic propagation: each node syncs with only a small overlapping subset, and state reaches the rest of the topic through repeated sync rounds.
 
-- `MemoryStorage`: in-memory backend for tests, examples, and ephemeral nodes.
-- `FjallStorage`: feature-gated persistent storage using reduced keyspaces and independent partition handles instead of a global storage mutex.
+## Iroh Sync
 
-## Synchronization
+With the `iroh` feature, `Irokle::builder().with_net(endpoint)` configures the Irokle sync ALPN automatically. Normal use is NodeId-only:
 
-Sync is transport-neutral messages and handlers, not a `Transport` trait. The protocol surface is message-shaped: `SyncOpen`, `SyncSummary`, `SyncData`, `SyncAck`, `SyncReport`. Normal applications use the `Irokle` facade methods such as `sync_summary`, `plan_sync_data`, `receive_sync_data`, and `apply_sync_ack`; `SyncEngine` is an advanced internal building block for tests and custom integrations.
+```rust
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+use irokle::{Irokle, TopicConfig};
+use tokio::time::{Duration, timeout};
 
-A typical exchange is:
+let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    .bind()
+    .await?;
+let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+    .bind()
+    .await?;
 
-1. A peer sends `SyncOpen` for a topic.
-2. The remote peer replies with `SyncSummary`, including heads, actor clocks, and known operation ids.
-3. The sender calls `irokle.plan_sync_data(peer_id, &summary)` to plan topological `SyncData` for operations the remote does not know. Planning uses the remote have-set/known-op intersection to send only wanted operations and returns no topic operations for peers that are not current topic members.
-4. The receiver calls `irokle.receive_sync_data(local_peer_id, data)` to validate dependency availability, admit accepted operations, and return `SyncAck`.
-5. Peers call `irokle.apply_sync_ack(&ack)` and inspect `irokle.sync_report(peer_id, topic_id)` for acknowledgement indexes and outstanding sync obligations.
+timeout(Duration::from_secs(10), alice_endpoint.online()).await?;
+timeout(Duration::from_secs(10), bob_endpoint.online()).await?;
 
-Iroh integration targets `iroh` `1.0.0-rc.0` and moves these sync messages over streams using an existing `iroh::Endpoint`. `IrohNet::new(endpoint, irokle)` holds an `Irokle` handle and uses the facade methods for inbound sync handling. Irokle should not own a second abstract transport stack; network integrations only need to encode/decode `SyncMessage` values and carry them over their stream/session machinery. Connections should be reused per peer/topic where possible rather than opened for every sync message.
+let alice = Irokle::builder().with_net(alice_endpoint).build()?;
+let bob = Irokle::builder().with_net(bob_endpoint).build()?;
 
-## RDF As An Advanced Example
+let topic = alice.create_topic::<MyEvent>(TopicConfig {
+    initial_peers: [bob.peer_id()].into(),
+    ..TopicConfig::default()
+})?;
 
-RDF is not part of the core crate API and has no exported `irokle::rdf` module. `examples/rdf.rs` defines its own `RdfEvent`, `Quad`, state, and reducer as an advanced example of building application semantics on top of Irokle metadata.
+alice.sync_now(bob.peer_id(), topic.id()).await?;
+# Ok(())
+# }
+# #[derive(Clone, Debug, irokle::Event, serde::Serialize, serde::Deserialize)]
+# struct MyEvent;
+```
 
-The RDF example reducer is an observed-remove projection over RDF quads. Remove events should remove only quad observations that were visible to the removing op.
+`sync_addr_now(endpoint_addr, topic_id)` remains available for explicit one-off manual dialing in local/offline setups. The peer registry API was removed; when discovery is configured, peers are identified by `PeerId`/Iroh `EndpointId`.
 
-The intended reducer model uses operation metadata `observed_clock` plus per-quad clocks. It does not need to keep per-quad operation provenance forever: each quad tracks enough actor/vector-clock information to know which observations a remove saw. A concurrent add that was not included in the remove operation's observed clock survives that remove.
+## Sync Failures And Status
 
-## Status
+Iroh nodes start a periodic resync loop when auto-accept is enabled. The loop scans outstanding sync obligations and retries those peer/topic pairs. Publish with `WriteConcern::AsyncReplication` creates obligations for the bounded replication target set and wakes the same sync machinery.
 
-This is the first production-oriented iteration of Irokle's public API and architecture. The core direction is signed Merkle-DAG operations, invite-only topic replication, typed events, storage-backed admission, and transport-neutral sync.
+Applications can inspect sync state:
 
-Future work, where not already implemented in a given checkout, includes compaction, snapshots, persistent backend hardening, and full Iroh router integration. The examples intentionally prefer small end-to-end API sketches over complete production wiring.
+```rust
+let statuses = node.sync_status(topic_id)?;
+let counts = node.sync_state_counts(topic_id)?;
+```
+
+Each `SyncPeerStatus` includes `state`, `pending_obligations`, `failed_attempts`, `successful_attempts`, `last_attempt_ms`, `last_success_ms`, and `last_error`.
+
+## Disk Recovery
+
+With `fjall` and `iroh`, durable recovery means reopening the same Fjall path and reusing the same Iroh `SecretKey`, because the Iroh key defines the node’s `PeerId`.
+
+See `examples/iroh_fjall_recovery.rs` for a complete example that creates a topic, closes the endpoint, reopens the database with the same key, lists recovered topics, and reads typed history.
 
 ## Examples
 
-- `examples/basic.rs` derives `irokle::Event` for a postcard-encoded `ChatEvent`, creates two in-memory nodes, invites Bob at topic creation, syncs Alice's topic data to Bob with `Irokle::plan_sync_data`, publishes from both peers, and demonstrates sync message byte framing.
-- `examples/rdf.rs` is an advanced, example-only RDF projection with local event/reducer types. It demonstrates the observed-remove rule where a concurrent add survives a remove that did not observe it.
-- `examples/iroh_chat.rs` is gated by the `iroh` feature. It creates two Iroh endpoints, wraps them with Irokle's `IrohNet`, creates a chat topic, exchanges sync messages, publishes from both peers, and reads typed history.
+- `examples/basic.rs`: in-memory typed events plus transport-neutral sync planning.
+- `examples/rdf.rs`: observed-remove RDF projection implemented as application code on top of event history.
+- `examples/iroh_chat.rs`: NodeId-only Iroh chat sync using discovery.
+- `examples/iroh_topic_intro.rs`: introduces a peer to a topic, opens it on the receiver, then rejects membership.
+- `examples/iroh_fjall_recovery.rs`: reopens an Iroh/Fjall node from disk with the same Iroh secret key.
+
+Run examples with features as needed:
+
+```bash
+cargo run --features iroh --example iroh_chat
+cargo run --features iroh --example iroh_topic_intro
+cargo run --features 'iroh fjall' --example iroh_fjall_recovery
+```
+
+## Status
+
+This is still a young implementation, but the core now includes signed membership, bounded sync target selection, periodic failed-sync retry, and basic sync observability. Remaining hardening areas include compaction, snapshots, richer persistence repair tooling, and production metrics/tracing adapters.
