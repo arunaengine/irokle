@@ -26,15 +26,12 @@ pub use error::{Error, Result};
 pub use event::{Event, EventEnvelope};
 pub use ids::{ActorId, IdParseError, OpId, PeerId, TopicId, actor_id_for};
 pub use irokle_derive::Event;
-pub use node::ReducerTopic;
 pub use node::{Irokle, IrokleBuilder, NodeConfig, PublishOptions, RawTopic, Topic, WriteConcern};
 pub use op::{Op, OpBody, SignedOp};
 #[cfg(feature = "fjall")]
 pub use storage::FjallStorage;
 pub use storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
-pub use topic::{
-    PeerInfo, ReplicationPolicy, TopicConfig, TopicControl, TopicGenesis, TopicInfo, TopicPayload,
-};
+pub use topic::{ReplicationPolicy, TopicConfig, TopicControl, TopicGenesis, TopicInfo, TopicPayload};
 
 #[cfg(test)]
 mod tests {
@@ -794,7 +791,11 @@ mod tests {
         let alice = node(87);
         let bob = node(88);
         let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
-        let record = topic.publish(Note { text: "status".into() }).unwrap();
+        let record = topic
+            .publish(Note {
+                text: "status".into(),
+            })
+            .unwrap();
         alice
             .put_sync_obligation(bob.peer_id(), topic.id(), [record.meta.op_id].into())
             .unwrap();
@@ -809,7 +810,13 @@ mod tests {
         assert_eq!(status[0].state, storage::SyncPeerState::Failed);
         assert_eq!(status[0].pending_obligations, 1);
         assert_eq!(status[0].failed_attempts, 1);
-        assert!(status[0].last_error.as_deref().unwrap().contains("dial failed"));
+        assert!(
+            status[0]
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("dial failed")
+        );
         assert_eq!(
             alice
                 .sync_state_counts(topic.id())
@@ -829,7 +836,11 @@ mod tests {
                 ..TopicConfig::default()
             })
             .unwrap();
-        topic.publish(Note { text: "invite".into() }).unwrap();
+        topic
+            .publish(Note {
+                text: "invite".into(),
+            })
+            .unwrap();
 
         let bob_summary = bob.sync_summary(topic.id()).unwrap();
         let data = alice.plan_sync_data(bob.peer_id(), &bob_summary).unwrap();
@@ -943,10 +954,9 @@ mod tests {
         let responses = net
             .handle_messages(
                 outsider_endpoint.id(),
-                vec![sync::SyncMessage::Open(sync::SyncEngine::<MemoryStorage>::open(
-                    topic.id(),
-                    outsider_peer,
-                ))],
+                vec![sync::SyncMessage::Open(
+                    sync::SyncEngine::<MemoryStorage>::open(topic.id(), outsider_peer),
+                )],
             )
             .unwrap();
 
