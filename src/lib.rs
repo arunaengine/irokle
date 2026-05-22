@@ -579,6 +579,42 @@ mod tests {
     }
 
     #[test]
+    fn sync_data_messages_batch_ops_preserving_order() {
+        let alice = node(104);
+        let bob = node(105);
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        for index in 0..=net::MAX_SYNC_DATA_OPS_PER_MESSAGE {
+            topic
+                .publish(Note {
+                    text: format!("event-{index}"),
+                })
+                .unwrap();
+        }
+        let data = alice
+            .plan_sync_data(bob.peer_id(), &bob.sync_summary(topic.id()).unwrap())
+            .unwrap();
+        assert!(data.ops.len() > net::MAX_SYNC_DATA_OPS_PER_MESSAGE);
+
+        let expected_ids = data.ops.iter().map(|op| op.id).collect::<Vec<_>>();
+        let batches = net::sync_data_messages(data.topic_id, data.ops);
+        assert!(batches.len() > 1);
+        let mut actual_ids = Vec::new();
+        for batch in batches {
+            let sync::SyncMessage::Data(data) = batch else {
+                panic!("expected data batch");
+            };
+            assert!(data.ops.len() <= net::MAX_SYNC_DATA_OPS_PER_MESSAGE);
+            actual_ids.extend(data.ops.into_iter().map(|op| op.id));
+        }
+        assert_eq!(actual_ids, expected_ids);
+    }
+
+    #[test]
     fn sync_response_includes_actor_range_dependency_closure() {
         let alice = node(38);
         let bob = node(39);
@@ -675,6 +711,15 @@ mod tests {
         let first = ops[1].clone();
         let second = ops[2].clone();
 
+        bob.receive_sync_data_from(
+            alice.peer_id(),
+            sync::SyncData {
+                topic_id: topic.id(),
+                ops: vec![genesis.clone()],
+            },
+        )
+        .unwrap();
+
         let first_ack = bob
             .receive_sync_data_from(
                 alice.peer_id(),
@@ -696,11 +741,74 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            second_ack.accepted,
-            [genesis.id, first.id, second.id].into()
-        );
+        assert_eq!(second_ack.accepted, [first.id, second.id].into());
         assert!(bob.storage().get_op(&second.id).unwrap().is_some());
+    }
+
+    fn pending_reconciles_after_dependency_admitted_for_storage<S: Storage>(storage: S) {
+        let alice = node(44);
+        let bob_signer = Ed25519Signer::from_bytes(&[45; 32]);
+        let bob_config = NodeConfig {
+            signer: bob_signer.clone(),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        };
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob_signer.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        topic.publish(Note { text: "one".into() }).unwrap();
+        topic.publish(Note { text: "two".into() }).unwrap();
+        let ops = oplog::topological(alice.storage(), &topic.id()).unwrap();
+        let genesis = ops[0].clone();
+        let first = ops[1].clone();
+        let second = ops[2].clone();
+
+        let bob = Irokle::with_storage(storage.clone(), bob_config.clone()).unwrap();
+        bob.receive_sync_data_from(
+            alice.peer_id(),
+            sync::SyncData {
+                topic_id: topic.id(),
+                ops: vec![genesis.clone()],
+            },
+        )
+        .unwrap();
+        let pending_ack = bob
+            .receive_sync_data_from(
+                alice.peer_id(),
+                sync::SyncData {
+                    topic_id: topic.id(),
+                    ops: vec![second.clone()],
+                },
+            )
+            .unwrap();
+        assert!(pending_ack.accepted.is_empty());
+        assert!(storage.get_op(&second.id).unwrap().is_none());
+
+        let first_meta = alice.storage().get_meta(&first.id).unwrap().unwrap();
+        storage
+            .put_admitted_batch(
+                topic.id(),
+                storage.heads(&topic.id()).unwrap(),
+                storage.topic_state(&topic.id()).unwrap(),
+                vec![(first.clone(), first_meta)],
+                [first.id].into(),
+                None,
+            )
+            .unwrap();
+        assert!(storage.get_op(&first.id).unwrap().is_some());
+        assert!(storage.get_op(&second.id).unwrap().is_none());
+
+        Irokle::with_storage(storage.clone(), bob_config).unwrap();
+        assert!(storage.get_op(&second.id).unwrap().is_some());
+        assert_eq!(storage.heads(&topic.id()).unwrap(), [second.id].into());
+    }
+
+    #[test]
+    fn memory_pending_reconciles_after_dependency_admitted_on_open() {
+        pending_reconciles_after_dependency_admitted_for_storage(MemoryStorage::new());
     }
 
     #[test]
@@ -1056,6 +1164,39 @@ mod tests {
         assert!(bob.storage().topic_state(&topic.id()).unwrap().is_none());
 
         bob.add_peer_to_whitelist(alice.peer_id()).unwrap();
+        let charlie = node(106);
+        let excluded_topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [charlie.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let excluded_data = sync::SyncData {
+            topic_id: excluded_topic.id(),
+            ops: oplog::topological(alice.storage(), &excluded_topic.id()).unwrap(),
+        };
+        let err = net
+            .handle_messages(
+                alice_endpoint.id(),
+                vec![
+                    sync::SyncMessage::Open(sync::SyncEngine::<MemoryStorage>::open(
+                        excluded_topic.id(),
+                        alice.peer_id(),
+                        None,
+                    )),
+                    sync::SyncMessage::Data(excluded_data),
+                ],
+            )
+            .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            bob.storage()
+                .topic_state(&excluded_topic.id())
+                .unwrap()
+                .is_none()
+        );
+
         let responses = net
             .handle_messages(
                 alice_endpoint.id(),
@@ -1192,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn open_topic_rejects_non_member_typed_access() {
+    fn receive_sync_data_from_rejects_unknown_topic_when_local_peer_not_in_genesis() {
         let a = node(10);
         let topic = a.create_topic::<Note>(TopicConfig::default()).unwrap();
         let outsider = node(11);
@@ -1201,14 +1342,17 @@ mod tests {
             ops: oplog::topological(a.storage(), &topic.id()).unwrap(),
         };
 
-        outsider
+        let err = outsider
             .receive_sync_data_from(a.peer_id(), raw_data)
-            .unwrap();
-        assert!(outsider.raw_topic(topic.id()).unwrap().history().is_ok());
-        assert!(matches!(
-            outsider.open_topic::<Note>(topic.id()),
-            Err(Error::NotTopicMember)
-        ));
+            .unwrap_err();
+        assert!(matches!(err, Error::NotTopicMember));
+        assert!(
+            outsider
+                .storage()
+                .topic_state(&topic.id())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1311,6 +1455,63 @@ mod tests {
     #[test]
     fn memory_ack_clears_only_satisfied_obligations() {
         ack_clears_only_satisfied_obligations_for_storage(MemoryStorage::new());
+    }
+
+    fn stale_ack_does_not_regress_stored_peer_ack_for_storage<S: Storage>(storage: S) {
+        let ack_signer = Ed25519Signer::from_bytes(&[96; 32]);
+        let peer = ack_signer.peer_id();
+        let alice = Irokle::with_storage(storage.clone(), NodeConfig::default()).unwrap();
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let first = topic
+            .publish(Note {
+                text: "first".into(),
+            })
+            .unwrap();
+        let second = topic
+            .publish(Note {
+                text: "second".into(),
+            })
+            .unwrap();
+
+        let mut fresh_clock = ActorClock::new();
+        fresh_clock.observe(second.meta.actor_id, second.meta.actor_seq);
+        let mut fresh = sync::SyncAck {
+            topic_id: topic.id(),
+            peer_id: peer,
+            accepted: BTreeSet::new(),
+            heads: [second.meta.op_id].into(),
+            clock: fresh_clock,
+            signature: None,
+        };
+        fresh.sign(&ack_signer).unwrap();
+        alice.apply_sync_ack(&fresh).unwrap();
+
+        let mut stale_clock = ActorClock::new();
+        stale_clock.observe(first.meta.actor_id, first.meta.actor_seq);
+        let mut stale = sync::SyncAck {
+            topic_id: topic.id(),
+            peer_id: peer,
+            accepted: BTreeSet::new(),
+            heads: [first.meta.op_id].into(),
+            clock: stale_clock,
+            signature: None,
+        };
+        stale.sign(&ack_signer).unwrap();
+        alice.apply_sync_ack(&stale).unwrap();
+
+        let stored = storage.peer_ack(&peer, &topic.id()).unwrap().unwrap();
+        assert_eq!(stored.heads, [second.meta.op_id].into());
+        assert!(stored.clock.get(&second.meta.actor_id) >= second.meta.actor_seq);
+    }
+
+    #[test]
+    fn memory_stale_ack_does_not_regress_stored_peer_ack() {
+        stale_ack_does_not_regress_stored_peer_ack_for_storage(MemoryStorage::new());
     }
 
     #[test]
@@ -1584,9 +1785,23 @@ mod tests {
     fn sync_data_rejects_ops_from_another_topic() {
         let alice = node(19);
         let bob = node(20);
-        let topic_a = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
+        let topic_a = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
         let topic_b = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
+        let op_a = oplog::topological(alice.storage(), &topic_a.id()).unwrap()[0].clone();
         let op_b = oplog::topological(alice.storage(), &topic_b.id()).unwrap()[0].clone();
+        bob.receive_sync_data_from(
+            alice.peer_id(),
+            sync::SyncData {
+                topic_id: topic_a.id(),
+                ops: vec![op_a],
+            },
+        )
+        .unwrap();
         assert!(matches!(
             bob.receive_sync_data_from(
                 alice.peer_id(),
@@ -1900,6 +2115,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = storage::FjallStorage::open(dir.path()).unwrap();
         ack_clears_only_satisfied_obligations_for_storage(storage);
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn fjall_stale_ack_does_not_regress_stored_peer_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage::FjallStorage::open(dir.path()).unwrap();
+        stale_ack_does_not_regress_stored_peer_ack_for_storage(storage);
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn fjall_pending_reconciles_after_dependency_admitted_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = storage::FjallStorage::open(dir.path()).unwrap();
+        pending_reconciles_after_dependency_admitted_for_storage(storage);
     }
 
     #[cfg(feature = "fjall")]

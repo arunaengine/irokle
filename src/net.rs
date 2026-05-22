@@ -16,13 +16,18 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "iroh")]
 use std::time::Duration;
 
+#[cfg(any(feature = "iroh", test))]
+use crate::sync::SyncData;
 use crate::sync::SyncMessage;
 #[cfg(feature = "iroh")]
 use crate::{Irokle, MemoryStorage, PeerId, Storage};
+#[cfg(any(feature = "iroh", test))]
+use crate::{Op, TopicId};
 #[cfg(feature = "iroh")]
 use smallvec::{SmallVec, smallvec};
 
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+pub const MAX_SYNC_DATA_OPS_PER_MESSAGE: usize = 256;
 #[cfg(feature = "iroh")]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "iroh")]
@@ -93,6 +98,18 @@ pub fn decode_frames(mut input: &[u8]) -> io::Result<Vec<Vec<u8>>> {
         input = &input[consumed..];
     }
     Ok(frames)
+}
+
+#[cfg(any(feature = "iroh", test))]
+pub(crate) fn sync_data_messages(topic_id: TopicId, ops: Vec<Op>) -> Vec<SyncMessage> {
+    ops.chunks(MAX_SYNC_DATA_OPS_PER_MESSAGE)
+        .map(|ops| {
+            SyncMessage::Data(SyncData {
+                topic_id,
+                ops: ops.to_vec(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(feature = "iroh")]
@@ -294,21 +311,12 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         messages: &[SyncMessage],
     ) -> io::Result<Vec<SyncMessage>> {
-        let payloads = messages
-            .iter()
-            .map(encode_sync_message)
-            .collect::<io::Result<Vec<_>>>()?;
-        let body = encode_frames(payloads.iter().map(Vec::as_slice))?;
         let connection = self.pool.get_or_connect(peer).await?;
         let (mut send, mut recv) = tokio::time::timeout(SYNC_IO_TIMEOUT, connection.open_bi())
             .await
             .map_err(|_| timed_out("sync stream open timed out"))?
             .map_err(other)?;
-        tokio::time::timeout(SYNC_IO_TIMEOUT, send.write_all(&body))
-            .await
-            .map_err(|_| timed_out("sync write timed out"))?
-            .map_err(other)?;
-        send.finish().map_err(other)?;
+        write_sync_messages(&mut send, messages).await?;
         read_sync_messages(&mut recv).await
     }
 
@@ -373,10 +381,6 @@ impl<S: Storage> IrohNet<S> {
             .node
             .negotiate_sync(remote_peer_id, &summary)
             .map_err(invalid_data)?;
-        let data = crate::sync::SyncData {
-            topic_id: plan.topic_id,
-            ops: plan.send,
-        };
         let request = crate::sync::SyncRequest {
             topic_id: plan.topic_id,
             known: plan.common,
@@ -386,9 +390,7 @@ impl<S: Storage> IrohNet<S> {
 
         let mut messages: SmallVec<[SyncMessage; 3]> =
             smallvec![SyncMessage::Open(self.node.sync_open(topic_id))];
-        if !data.ops.is_empty() {
-            messages.push(SyncMessage::Data(data));
-        }
+        messages.extend(sync_data_messages(plan.topic_id, plan.send));
         if !request.wants.is_empty() || !request.actor_range_hints.is_empty() {
             messages.push(SyncMessage::Request(request));
         }
@@ -460,12 +462,9 @@ impl<S: Storage> IrohNet<S> {
         let messages = read_sync_messages(&mut recv).await?;
         let responses = self
             .handle_messages(peer, messages)?
-            .iter()
-            .map(encode_sync_message)
-            .collect::<io::Result<Vec<_>>>()?;
-        let out = encode_frames(responses.iter().map(Vec::as_slice))?;
-        send.write_all(&out).await.map_err(other)?;
-        send.finish().map_err(other)?;
+            .into_iter()
+            .collect::<Vec<_>>();
+        write_sync_messages(&mut send, &responses).await?;
         Ok(())
     }
 
@@ -570,10 +569,7 @@ impl<S: Storage> IrohNet<S> {
                     .map_err(invalid_data)?;
                 let mut responses = Vec::new();
                 if !plan.send.is_empty() {
-                    responses.push(SyncMessage::Data(crate::sync::SyncData {
-                        topic_id: plan.topic_id,
-                        ops: plan.send,
-                    }));
+                    responses.extend(sync_data_messages(plan.topic_id, plan.send));
                 }
                 if !plan.need.is_empty() || !plan.actor_range_hints.is_empty() {
                     responses.push(SyncMessage::Request(crate::sync::SyncRequest {
@@ -589,11 +585,11 @@ impl<S: Storage> IrohNet<S> {
                 let peer_id = remote_peer_id.ok_or_else(|| {
                     invalid_data("sync request requires a preceding SyncOpen with peer_id")
                 })?;
-                self.node
+                let data = self
+                    .node
                     .plan_sync_response_data(peer_id, &request)
-                    .map(SyncMessage::Data)
-                    .map(|message| vec![message])
-                    .map_err(invalid_data)
+                    .map_err(invalid_data)?;
+                Ok(sync_data_messages(data.topic_id, data.ops))
             }
             SyncMessage::Data(data) => {
                 let source_peer = remote_peer_id.ok_or_else(|| {
@@ -639,6 +635,22 @@ async fn read_sync_messages(recv: &mut iroh::endpoint::RecvStream) -> io::Result
         })?);
     }
     Ok(messages)
+}
+
+#[cfg(feature = "iroh")]
+async fn write_sync_messages(
+    send: &mut iroh::endpoint::SendStream,
+    messages: &[SyncMessage],
+) -> io::Result<()> {
+    for message in messages {
+        let payload = encode_sync_message(message)?;
+        let frame = encode_frame(&payload)?;
+        tokio::time::timeout(SYNC_IO_TIMEOUT, send.write_all(&frame))
+            .await
+            .map_err(|_| timed_out("sync write timed out"))?
+            .map_err(other)?;
+    }
+    send.finish().map_err(other)
 }
 
 #[cfg(feature = "iroh")]
