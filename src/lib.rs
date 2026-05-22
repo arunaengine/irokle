@@ -1015,6 +1015,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn late_added_peer_can_accept_initial_sync_batch() {
+        let alice = node(107);
+        let bob = node(108);
+        let charlie = node(109);
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        topic
+            .publish(Note {
+                text: "before join".into(),
+            })
+            .unwrap();
+        topic.add_peer(charlie.peer_id()).unwrap();
+        topic
+            .publish(Note {
+                text: "after join".into(),
+            })
+            .unwrap();
+
+        let charlie_summary = charlie.sync_summary(topic.id()).unwrap();
+        let data = alice
+            .plan_sync_data(charlie.peer_id(), &charlie_summary)
+            .unwrap();
+        let ack = charlie
+            .receive_sync_data_from(alice.peer_id(), data)
+            .unwrap();
+        alice.apply_sync_ack(&ack).unwrap();
+
+        let charlie_topic = charlie.open_topic::<Note>(topic.id()).unwrap();
+        assert_eq!(
+            charlie_topic
+                .history(history::HistoryOrder::OldestFirst)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            charlie
+                .storage()
+                .topic_state(&topic.id())
+                .unwrap()
+                .unwrap()
+                .members
+                .contains(&charlie.peer_id())
+        );
+    }
+
     #[cfg(feature = "iroh")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn iroh_sync_now_records_ack_for_remote_peer() {
