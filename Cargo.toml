@@ -30,7 +30,9 @@ tracing = "0.1"
 irokle-derive = { path = "irokle-derive" }
 
 [dev-dependencies]
+ctor = "0.6"
 futures = "0.3"
+patchbay = "0.5.2"
 tempfile = "3"
 
 [[example]]
