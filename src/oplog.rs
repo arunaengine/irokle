@@ -7,7 +7,7 @@ use crate::storage::{
     ControlKey, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage, TopicState,
 };
 use crate::{
-    ActorId, Error, EventEnvelope, Op, OpBody, Result, SignedOp, Signer, TopicControl,
+    ActorId, Error, EventEnvelope, Op, OpBody, PeerId, Result, SignedOp, Signer, TopicControl,
     TopicGenesis, TopicId, TopicPayload, actor_id_for,
 };
 
@@ -92,6 +92,10 @@ impl<S: Storage> Oplog<S> {
         self.receive_ops_admission(source_peer, ops)
     }
 
+    pub fn reconcile_pending_ops(&self) -> Result<BTreeSet<crate::OpId>> {
+        self.receive_ops_admission(None, Vec::new())
+    }
+
     pub fn receive_signed_op(&self, signed: SignedOp) -> Result<Op> {
         let op = Op::new(signed)?;
         self.receive_op(op.clone())?;
@@ -105,26 +109,66 @@ impl<S: Storage> Oplog<S> {
     ) -> Result<BTreeSet<crate::OpId>> {
         let mut accepted = BTreeSet::new();
         let mut queue = VecDeque::new();
+        let mut queued_pending = BTreeSet::new();
         if !ops.is_empty() {
             queue.push_back((source_peer, ops, false));
         }
+        self.enqueue_ready_pending_ops(&mut queue, &mut queued_pending)?;
 
         while let Some((batch_source_peer, ops, from_pending)) = queue.pop_front() {
+            let pending_op_ids = if from_pending {
+                ops.iter().map(|op| op.id).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for op_id in &pending_op_ids {
+                queued_pending.remove(op_id);
+            }
             let batch_accepted = match self.admit_ops_batch_retry(batch_source_peer, ops) {
                 Ok(accepted) => accepted,
-                Err(err) if from_pending && is_semantic_rejection(&err) => continue,
+                Err(err) if from_pending && is_semantic_rejection(&err) => {
+                    for op_id in pending_op_ids {
+                        self.storage.remove_pending_op(&op_id)?;
+                    }
+                    continue;
+                }
                 Err(err) => return Err(err),
             };
             for op_id in &batch_accepted {
-                for (waiter_source_peer, waiter) in self.storage.pending_waiters(op_id)? {
-                    self.storage.remove_pending_op(&waiter.id)?;
-                    queue.push_back((Some(waiter_source_peer), vec![waiter], true));
-                }
+                self.enqueue_pending_ops(
+                    &mut queue,
+                    &mut queued_pending,
+                    self.storage.pending_waiters(op_id)?,
+                );
             }
+            self.enqueue_ready_pending_ops(&mut queue, &mut queued_pending)?;
             accepted.extend(batch_accepted);
         }
 
         Ok(accepted)
+    }
+
+    fn enqueue_ready_pending_ops(
+        &self,
+        queue: &mut VecDeque<(Option<PeerId>, Vec<Op>, bool)>,
+        queued_pending: &mut BTreeSet<crate::OpId>,
+    ) -> Result<()> {
+        let pending = self.storage.ready_pending_ops()?;
+        self.enqueue_pending_ops(queue, queued_pending, pending);
+        Ok(())
+    }
+
+    fn enqueue_pending_ops(
+        &self,
+        queue: &mut VecDeque<(Option<PeerId>, Vec<Op>, bool)>,
+        queued_pending: &mut BTreeSet<crate::OpId>,
+        pending: Vec<(PeerId, Op)>,
+    ) {
+        for (source_peer, op) in pending {
+            if queued_pending.insert(op.id) {
+                queue.push_back((Some(source_peer), vec![op], true));
+            }
+        }
     }
 
     fn admit_ops_batch_retry(

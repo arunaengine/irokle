@@ -265,6 +265,7 @@ impl<S: Storage> IrokleBuilder<S> {
 impl<S: Storage> Irokle<S> {
     pub fn with_storage(storage: S, config: NodeConfig) -> Result<Self> {
         let oplog = Oplog::with_storage(storage);
+        oplog.reconcile_pending_ops()?;
         let sync = SyncEngine::new(oplog.clone());
         Ok(Self {
             oplog,
@@ -500,6 +501,7 @@ impl<S: Storage> Irokle<S> {
         source_peer_id: PeerId,
         data: SyncData,
     ) -> Result<SyncAck> {
+        self.ensure_unknown_topic_admission(source_peer_id, &data)?;
         let mut ack = self
             .sync
             .receive_data(source_peer_id, self.peer_id(), data)?;
@@ -587,13 +589,31 @@ impl<S: Storage> Irokle<S> {
         if !peer_allowed {
             return Err(Error::PeerNotWhitelisted(source_peer_id));
         }
-        let source_authored_genesis = data.ops.iter().any(|op| {
-            op.signed.body.topic_id == data.topic_id
-                && op.signed.body.author == source_peer_id
-                && matches!(op.signed.body.payload, crate::TopicPayload::Genesis(_))
-        });
-        if !source_authored_genesis {
+        self.ensure_unknown_topic_admission(source_peer_id, data)
+    }
+
+    fn ensure_unknown_topic_admission(
+        &self,
+        source_peer_id: PeerId,
+        data: &SyncData,
+    ) -> Result<()> {
+        if self.storage().topic_state(&data.topic_id)?.is_some() {
+            return Ok(());
+        }
+        let Some(genesis) = data.ops.iter().find_map(|op| {
+            let body = &op.signed.body;
+            if body.topic_id != data.topic_id || body.author != source_peer_id {
+                return None;
+            }
+            match &body.payload {
+                crate::TopicPayload::Genesis(genesis) => Some(genesis),
+                _ => None,
+            }
+        }) else {
             return Err(Error::InvalidGenesis);
+        };
+        if !genesis.initial_peers.contains(&self.peer_id()) {
+            return Err(Error::NotTopicMember);
         }
         Ok(())
     }

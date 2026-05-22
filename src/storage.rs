@@ -121,6 +121,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn list_topics(&self) -> Result<Vec<TopicInfo>>;
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()>;
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>>;
+    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>>;
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>>;
@@ -448,9 +449,19 @@ impl Storage for MemoryStorage {
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         let mut inner = self.lock()?;
-        if inner.ops.contains_key(&op.id) || inner.pending_ops.contains_key(&op.id) {
+        if inner.ops.contains_key(&op.id) {
             return Ok(());
         }
+        let replace_pending = if let Some((_, existing, _)) = inner.pending_ops.get(&op.id) {
+            if existing != &op {
+                return Err(Error::Storage(
+                    "pending op id collision with different op".into(),
+                ));
+            }
+            true
+        } else {
+            false
+        };
         if meta
             .missing_deps
             .iter()
@@ -462,6 +473,9 @@ impl Storage for MemoryStorage {
             return Err(Error::Storage(
                 "pending op has too many missing deps".into(),
             ));
+        }
+        if replace_pending {
+            remove_pending_locked(&mut inner, &op.id);
         }
         if inner.pending_ops.len() >= MAX_PENDING_OPS_TOTAL {
             return Err(Error::Storage("pending op buffer is full".into()));
@@ -506,6 +520,19 @@ impl Storage for MemoryStorage {
             })
             .collect())
     }
+    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>> {
+        let inner = self.lock()?;
+        Ok(inner
+            .pending_ops
+            .values()
+            .filter(|(_, _, meta)| {
+                meta.missing_deps
+                    .iter()
+                    .all(|dep| inner.ops.contains_key(dep))
+            })
+            .map(|(source, op, _)| (*source, op.clone()))
+            .collect())
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         let mut inner = self.lock()?;
         remove_pending_locked(&mut inner, op_id);
@@ -537,10 +564,18 @@ impl Storage for MemoryStorage {
 
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {
         let mut inner = self.lock()?;
-        inner
-            .peer_acks
-            .insert((ack.peer_id, ack.topic_id), ack.clone());
-        Ok(clear_satisfied_obligations_locked(&mut inner, &ack))
+        let key = (ack.peer_id, ack.topic_id);
+        let effective_ack = match inner.peer_acks.get(&key) {
+            Some(existing) if stored_ack_dominates(existing, &ack) => existing.clone(),
+            _ => {
+                inner.peer_acks.insert(key, ack.clone());
+                ack
+            }
+        };
+        Ok(clear_satisfied_obligations_locked(
+            &mut inner,
+            &effective_ack,
+        ))
     }
 
     fn sync_obligations(
@@ -626,6 +661,12 @@ fn sync_obligation_satisfied(obligation: &SyncObligation, ack: &PeerAck) -> bool
         return true;
     }
     !obligation.target_clock.is_empty() && ack.clock.dominates(&obligation.target_clock)
+}
+
+fn stored_ack_dominates(existing: &PeerAck, incoming: &PeerAck) -> bool {
+    existing.peer_id == incoming.peer_id
+        && existing.topic_id == incoming.topic_id
+        && existing.clock.dominates(&incoming.clock)
 }
 
 #[cfg(feature = "fjall")]
@@ -719,6 +760,48 @@ impl FjallStorage {
         Ok(fjall::Readable::get(tx, records, key.as_ref())?
             .map(|v| postcard::from_bytes(v.as_ref()))
             .transpose()?)
+    }
+
+    fn tx_remove_pending_op(
+        tx: &mut fjall::OptimisticWriteTx,
+        records: &fjall::OptimisticTxKeyspace,
+        op_id: &OpId,
+    ) -> Result<()> {
+        let Some((source_peer, _, meta)) =
+            Self::tx_get::<(PeerId, Op, OpMeta)>(tx, records, Self::key_id(b"po", op_id))?
+        else {
+            return Ok(());
+        };
+        tx.remove(records, Self::key_id(b"po", op_id));
+        for dep in &meta.missing_deps {
+            let waiter_key = [b"pw".as_slice(), dep.as_ref(), op_id.as_ref()].concat();
+            tx.remove(records, waiter_key);
+            let count_key = [b"wn".as_slice(), dep.as_ref()].concat();
+            let count: u64 = Self::tx_get(tx, records, count_key.as_slice())?.unwrap_or_default();
+            let next = count.saturating_sub(1);
+            if next == 0 {
+                tx.remove(records, count_key);
+            } else {
+                Self::tx_put(tx, records, count_key.as_slice(), &next)?;
+            }
+        }
+        let total: u64 = Self::tx_get(tx, records, b"pn".as_slice())?.unwrap_or_default();
+        let next_total = total.saturating_sub(1);
+        if next_total == 0 {
+            tx.remove(records, b"pn".as_slice());
+        } else {
+            Self::tx_put(tx, records, b"pn".as_slice(), &next_total)?;
+        }
+        let source_key = [b"ps".as_slice(), source_peer.as_ref()].concat();
+        let source_count: u64 =
+            Self::tx_get(tx, records, source_key.as_slice())?.unwrap_or_default();
+        let next_source = source_count.saturating_sub(1);
+        if next_source == 0 {
+            tx.remove(records, source_key);
+        } else {
+            Self::tx_put(tx, records, source_key.as_slice(), &next_source)?;
+        }
+        Ok(())
     }
 
     fn sync_obligation_key(obligation: &SyncObligation) -> Vec<u8> {
@@ -1055,15 +1138,20 @@ impl Storage for FjallStorage {
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         self.transaction(|tx| {
-            if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))?.is_some()
-                || Self::tx_get::<(PeerId, Op, OpMeta)>(
-                    tx,
-                    &self.records,
-                    Self::key_id(b"po", &op.id),
-                )?
-                .is_some()
-            {
+            if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))?.is_some() {
                 return Ok(());
+            }
+            if let Some((_, existing, _)) = Self::tx_get::<(PeerId, Op, OpMeta)>(
+                tx,
+                &self.records,
+                Self::key_id(b"po", &op.id),
+            )? {
+                if existing != op {
+                    return Err(Error::Storage(
+                        "pending op id collision with different op".into(),
+                    ));
+                }
+                Self::tx_remove_pending_op(tx, &self.records, &op.id)?;
             }
             for dep in &meta.missing_deps {
                 if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", dep))?.is_some() {
@@ -1142,48 +1230,28 @@ impl Storage for FjallStorage {
         }
         Ok(out)
     }
-    fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
-        self.transaction(|tx| {
-            let Some((source_peer, _, meta)) = Self::tx_get::<(PeerId, Op, OpMeta)>(
-                tx,
-                &self.records,
-                Self::key_id(b"po", op_id),
-            )?
-            else {
-                return Ok(());
-            };
-            tx.remove(&self.records, Self::key_id(b"po", op_id));
+    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>> {
+        let mut out = Vec::new();
+        let read_tx = self.db.read_tx();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, b"po".as_slice()) {
+            let value = item.value()?;
+            let (source, op, meta): (PeerId, Op, OpMeta) = postcard::from_bytes(value.as_ref())?;
+            let mut ready = true;
             for dep in &meta.missing_deps {
-                let waiter_key = [b"pw".as_slice(), dep.as_ref(), op_id.as_ref()].concat();
-                tx.remove(&self.records, waiter_key);
-                let count_key = [b"wn".as_slice(), dep.as_ref()].concat();
-                let count: u64 =
-                    Self::tx_get(tx, &self.records, count_key.as_slice())?.unwrap_or_default();
-                let next = count.saturating_sub(1);
-                if next == 0 {
-                    tx.remove(&self.records, count_key);
-                } else {
-                    Self::tx_put(tx, &self.records, count_key.as_slice(), &next)?;
+                if fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", dep))?.is_none()
+                {
+                    ready = false;
+                    break;
                 }
             }
-            let total: u64 = Self::tx_get(tx, &self.records, b"pn".as_slice())?.unwrap_or_default();
-            let next_total = total.saturating_sub(1);
-            if next_total == 0 {
-                tx.remove(&self.records, b"pn".as_slice());
-            } else {
-                Self::tx_put(tx, &self.records, b"pn".as_slice(), &next_total)?;
+            if ready {
+                out.push((source, op));
             }
-            let source_key = [b"ps".as_slice(), source_peer.as_ref()].concat();
-            let source_count: u64 =
-                Self::tx_get(tx, &self.records, source_key.as_slice())?.unwrap_or_default();
-            let next_source = source_count.saturating_sub(1);
-            if next_source == 0 {
-                tx.remove(&self.records, source_key);
-            } else {
-                Self::tx_put(tx, &self.records, source_key.as_slice(), &next_source)?;
-            }
-            Ok(())
-        })
+        }
+        Ok(out)
+    }
+    fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
+        self.transaction(|tx| Self::tx_remove_pending_op(tx, &self.records, op_id))
     }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
         self.get([b"ak".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat())
@@ -1222,8 +1290,15 @@ impl Storage for FjallStorage {
                 ack.topic_id.as_ref(),
             ]
             .concat();
-            Self::tx_put(tx, &self.records, ack_key, &ack)?;
-            clear_satisfied_obligations_tx(tx, &self.records, &ack)
+            let effective_ack =
+                match Self::tx_get::<PeerAck>(tx, &self.records, ack_key.as_slice())? {
+                    Some(existing) if stored_ack_dominates(&existing, &ack) => existing,
+                    _ => {
+                        Self::tx_put(tx, &self.records, ack_key, &ack)?;
+                        ack.clone()
+                    }
+                };
+            clear_satisfied_obligations_tx(tx, &self.records, &effective_ack)
         })
     }
 
