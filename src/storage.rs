@@ -2,7 +2,7 @@
 //! Storage trait plus in-memory and Fjall-backed persistence implementations.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(feature = "fjall")]
 use std::path::Path;
@@ -122,12 +122,10 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()>;
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>>;
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
-    fn put_peer_ack(&self, ack: PeerAck) -> Result<()>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>>;
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()>;
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>>;
-    fn clear_satisfied_sync_obligations(&self, ack: &PeerAck) -> Result<usize>;
     /// Atomically persist `ack` and clear any obligations satisfied by it.
     /// Backends must perform both writes in one durable operation so a crash
     /// between them cannot leave the ack visible while obligations remain,
@@ -195,6 +193,10 @@ impl MemoryStorage {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn lock(&self) -> Result<MutexGuard<'_, MemoryInner>> {
+        self.inner.lock().map_err(Error::from)
+    }
 }
 
 impl Storage for MemoryStorage {
@@ -207,7 +209,7 @@ impl Storage for MemoryStorage {
         heads: BTreeSet<OpId>,
         topic_state: Option<TopicState>,
     ) -> Result<()> {
-        let mut inner = self.inner.lock().expect("memory storage lock poisoned");
+        let mut inner = self.lock()?;
         if inner.heads.get(&topic_id).cloned().unwrap_or_default() != expected_heads {
             return Err(Error::AdmissionConflict);
         }
@@ -329,13 +331,13 @@ impl Storage for MemoryStorage {
     }
 
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
-        Ok(self.inner.lock().unwrap().ops.get(id).cloned())
+        Ok(self.lock()?.ops.get(id).cloned())
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
-        Ok(self.inner.lock().unwrap().meta.get(id).cloned())
+        Ok(self.lock()?.meta.get(id).cloned())
     }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock()?;
         Ok(inner
             .topic_ops
             .get(topic_id)
@@ -347,8 +349,7 @@ impl Storage for MemoryStorage {
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         Ok(self
             .inner
-            .lock()
-            .unwrap()
+            .lock()?
             .topic_ops
             .get(topic_id)
             .cloned()
@@ -357,8 +358,7 @@ impl Storage for MemoryStorage {
     fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         Ok(self
             .inner
-            .lock()
-            .unwrap()
+            .lock()?
             .heads
             .get(topic_id)
             .cloned()
@@ -367,8 +367,7 @@ impl Storage for MemoryStorage {
     fn children(&self, op_id: &OpId) -> Result<BTreeSet<OpId>> {
         Ok(self
             .inner
-            .lock()
-            .unwrap()
+            .lock()?
             .children
             .get(op_id)
             .cloned()
@@ -377,8 +376,7 @@ impl Storage for MemoryStorage {
     fn actor_tip(&self, topic_id: &TopicId, actor_id: &ActorId) -> Result<Option<(u64, OpId)>> {
         Ok(self
             .inner
-            .lock()
-            .unwrap()
+            .lock()?
             .actor_tip
             .get(&(*topic_id, *actor_id))
             .cloned())
@@ -391,8 +389,7 @@ impl Storage for MemoryStorage {
     ) -> Result<Option<OpId>> {
         Ok(self
             .inner
-            .lock()
-            .unwrap()
+            .lock()?
             .actor_by_seq
             .get(&(*topic_id, *actor_id, seq))
             .copied())
@@ -400,15 +397,14 @@ impl Storage for MemoryStorage {
     fn actor_clock(&self, topic_id: &TopicId) -> Result<ActorClock> {
         Ok(self
             .inner
-            .lock()
-            .unwrap()
+            .lock()?
             .actor_clock
             .get(topic_id)
             .cloned()
             .unwrap_or_default())
     }
     fn topic_fingerprint(&self, topic_id: &TopicId) -> Result<[u8; 32]> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock()?;
         Ok(inner
             .topic_fingerprint
             .get(topic_id)
@@ -424,15 +420,14 @@ impl Storage for MemoryStorage {
     fn max_generation(&self, topic_id: &TopicId) -> Result<u64> {
         Ok(self
             .inner
-            .lock()
-            .unwrap()
+            .lock()?
             .max_generation
             .get(topic_id)
             .copied()
             .unwrap_or_default())
     }
     fn topic_state(&self, topic_id: &TopicId) -> Result<Option<TopicState>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock()?;
         Ok(inner.topics.get(topic_id).cloned().map(|mut state| {
             state.heads = inner.heads.get(topic_id).cloned().unwrap_or_default();
             state
@@ -441,8 +436,7 @@ impl Storage for MemoryStorage {
     fn list_topics(&self) -> Result<Vec<TopicInfo>> {
         Ok(self
             .inner
-            .lock()
-            .unwrap()
+            .lock()?
             .topics
             .values()
             .map(|s| TopicInfo {
@@ -453,7 +447,7 @@ impl Storage for MemoryStorage {
             .collect())
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock()?;
         if inner.ops.contains_key(&op.id) || inner.pending_ops.contains_key(&op.id) {
             return Ok(());
         }
@@ -498,7 +492,7 @@ impl Storage for MemoryStorage {
         Ok(())
     }
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock()?;
         Ok(inner
             .pending_waiters
             .get(dep_id)
@@ -513,32 +507,16 @@ impl Storage for MemoryStorage {
             .collect())
     }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock()?;
         remove_pending_locked(&mut inner, op_id);
         Ok(())
     }
-    fn put_peer_ack(&self, ack: PeerAck) -> Result<()> {
-        self.inner
-            .lock()
-            .unwrap()
-            .peer_acks
-            .insert((ack.peer_id, ack.topic_id), ack);
-        Ok(())
-    }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .peer_acks
-            .get(&(*peer_id, *topic_id))
-            .cloned())
+        Ok(self.lock()?.peer_acks.get(&(*peer_id, *topic_id)).cloned())
     }
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>> {
         Ok(self
-            .inner
-            .lock()
-            .unwrap()
+            .lock()?
             .peer_acks
             .values()
             .filter(|ack| ack.topic_id == *topic_id)
@@ -546,7 +524,7 @@ impl Storage for MemoryStorage {
             .collect())
     }
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock()?;
         if !inner.obligations.contains(&obligation) {
             inner.obligations.push(obligation);
         }
@@ -554,16 +532,11 @@ impl Storage for MemoryStorage {
     }
 
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>> {
-        Ok(self.inner.lock().unwrap().obligations.clone())
-    }
-
-    fn clear_satisfied_sync_obligations(&self, ack: &PeerAck) -> Result<usize> {
-        let mut inner = self.inner.lock().unwrap();
-        Ok(clear_satisfied_obligations_locked(&mut inner, ack))
+        Ok(self.lock()?.obligations.clone())
     }
 
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock()?;
         inner
             .peer_acks
             .insert((ack.peer_id, ack.topic_id), ack.clone());
@@ -576,9 +549,7 @@ impl Storage for MemoryStorage {
         topic_id: &TopicId,
     ) -> Result<Vec<SyncObligation>> {
         Ok(self
-            .inner
-            .lock()
-            .unwrap()
+            .lock()?
             .obligations
             .iter()
             .filter(|o| o.peer_id == *peer_id && o.topic_id == *topic_id)
@@ -587,9 +558,7 @@ impl Storage for MemoryStorage {
     }
 
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()> {
-        self.inner
-            .lock()
-            .unwrap()
+        self.lock()?
             .sync_statuses
             .insert((status.topic_id, status.peer_id), status);
         Ok(())
@@ -597,9 +566,7 @@ impl Storage for MemoryStorage {
 
     fn sync_statuses(&self, topic_id: &TopicId) -> Result<Vec<SyncPeerStatus>> {
         Ok(self
-            .inner
-            .lock()
-            .unwrap()
+            .lock()?
             .sync_statuses
             .values()
             .filter(|status| status.topic_id == *topic_id)
@@ -669,6 +636,11 @@ pub struct FjallStorage {
 }
 
 #[cfg(feature = "fjall")]
+const FJALL_SCHEMA_VERSION: u32 = 1;
+#[cfg(feature = "fjall")]
+const FJALL_SCHEMA_VERSION_KEY: &[u8] = b"sv";
+
+#[cfg(feature = "fjall")]
 impl FjallStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = fjall::OptimisticTxDatabase::builder(path).open()?;
@@ -676,10 +648,22 @@ impl FjallStorage {
     }
 
     pub fn from_database(db: fjall::OptimisticTxDatabase) -> Result<Self> {
-        Ok(Self {
+        let storage = Self {
             records: db.keyspace("records", fjall::KeyspaceCreateOptions::default)?,
             db,
-        })
+        };
+        storage.ensure_schema_version()?;
+        Ok(storage)
+    }
+
+    fn ensure_schema_version(&self) -> Result<()> {
+        match self.get::<u32>(FJALL_SCHEMA_VERSION_KEY)? {
+            Some(FJALL_SCHEMA_VERSION) => Ok(()),
+            Some(version) => Err(Error::Storage(format!(
+                "unsupported fjall schema version {version}"
+            ))),
+            None => self.put(FJALL_SCHEMA_VERSION_KEY, &FJALL_SCHEMA_VERSION),
+        }
     }
 
     fn transaction<R>(
@@ -1201,17 +1185,6 @@ impl Storage for FjallStorage {
             Ok(())
         })
     }
-    fn put_peer_ack(&self, ack: PeerAck) -> Result<()> {
-        self.put(
-            [
-                b"ak".as_slice(),
-                ack.peer_id.as_ref(),
-                ack.topic_id.as_ref(),
-            ]
-            .concat(),
-            &ack,
-        )
-    }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
         self.get([b"ak".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat())
     }
@@ -1239,10 +1212,6 @@ impl Storage for FjallStorage {
             out.push(postcard::from_bytes(value.as_ref())?);
         }
         Ok(out)
-    }
-
-    fn clear_satisfied_sync_obligations(&self, ack: &PeerAck) -> Result<usize> {
-        self.transaction(|tx| clear_satisfied_obligations_tx(tx, &self.records, ack))
     }
 
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {

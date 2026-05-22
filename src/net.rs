@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Iroh-backed sync framing, connection handling, and bounded resync loops.
 
-#![allow(dead_code, unexpected_cfgs)]
+#![allow(unexpected_cfgs)]
 
 use std::io;
 
@@ -23,6 +23,10 @@ use crate::{Irokle, MemoryStorage, PeerId, Storage};
 use smallvec::{SmallVec, smallvec};
 
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+#[cfg(feature = "iroh")]
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "iroh")]
+const SYNC_IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub const IROKLE_SYNC_ALPN: &[u8] = b"irokle/sync/1";
 
 pub fn encode_sync_message(message: &SyncMessage) -> io::Result<Vec<u8>> {
@@ -111,37 +115,40 @@ impl ConnectionPool {
         &self.endpoint
     }
 
-    fn insert(&self, connection: iroh::endpoint::Connection) -> iroh::EndpointId {
+    fn insert(&self, connection: iroh::endpoint::Connection) -> io::Result<iroh::EndpointId> {
         let peer = connection.remote_id();
         self.connections
             .lock()
-            .expect("connection pool lock poisoned")
+            .map_err(|_| io::Error::other("connection pool lock poisoned"))?
             .insert(peer, connection);
-        peer
+        Ok(peer)
     }
 
-    fn get(&self, peer: &iroh::EndpointId) -> Option<iroh::endpoint::Connection> {
-        self.connections
+    fn get(&self, peer: &iroh::EndpointId) -> io::Result<Option<iroh::endpoint::Connection>> {
+        Ok(self
+            .connections
             .lock()
-            .expect("connection pool lock poisoned")
+            .map_err(|_| io::Error::other("connection pool lock poisoned"))?
             .get(peer)
             .filter(|connection| connection.close_reason().is_none())
-            .cloned()
+            .cloned())
     }
 
     async fn get_or_connect(
         &self,
         peer: iroh::EndpointAddr,
     ) -> io::Result<iroh::endpoint::Connection> {
-        if let Some(connection) = self.get(&peer.id) {
+        if let Some(connection) = self.get(&peer.id)? {
             return Ok(connection);
         }
-        let connection = self
-            .endpoint
-            .connect(peer, IROKLE_SYNC_ALPN)
-            .await
-            .map_err(other)?;
-        self.insert(connection.clone());
+        let connection = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            self.endpoint.connect(peer, IROKLE_SYNC_ALPN),
+        )
+        .await
+        .map_err(|_| timed_out("iroh connect timed out"))?
+        .map_err(other)?;
+        self.insert(connection.clone())?;
         Ok(connection)
     }
 }
@@ -218,7 +225,10 @@ impl<S: Storage> IrohNet<S> {
                             connection_net.handle_connection(peer, connection).await;
                         });
                     }
-                    Err(_) => continue,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to accept iroh connection");
+                        continue;
+                    }
                 }
             }
         });
@@ -241,14 +251,19 @@ impl<S: Storage> IrohNet<S> {
                 }
                 let obligations = match net.node.storage().all_sync_obligations() {
                     Ok(obligations) => obligations,
-                    Err(_) => continue,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to read sync obligations");
+                        continue;
+                    }
                 };
                 let targets = obligations
                     .into_iter()
                     .map(|obligation| (obligation.peer_id, obligation.topic_id))
                     .collect::<BTreeSet<_>>();
                 for (peer_id, topic_id) in targets {
-                    let _ = net.sync_peer_now(peer_id, topic_id).await;
+                    if let Err(error) = net.sync_peer_now(peer_id, topic_id).await {
+                        tracing::warn!(%peer_id, %topic_id, %error, "failed to resync peer");
+                    }
                 }
             }
         });
@@ -260,8 +275,17 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointId,
         connection: iroh::endpoint::Connection,
     ) {
-        while let Ok((send, recv)) = connection.accept_bi().await {
-            let _ = self.handle_stream(peer, recv, send).await;
+        loop {
+            let (send, recv) = match connection.accept_bi().await {
+                Ok(streams) => streams,
+                Err(error) => {
+                    tracing::debug!(%peer, %error, "iroh connection stopped accepting streams");
+                    break;
+                }
+            };
+            if let Err(error) = self.handle_stream(peer, recv, send).await {
+                tracing::warn!(%peer, %error, "failed to handle iroh sync stream");
+            }
         }
     }
 
@@ -276,14 +300,16 @@ impl<S: Storage> IrohNet<S> {
             .collect::<io::Result<Vec<_>>>()?;
         let body = encode_frames(payloads.iter().map(Vec::as_slice))?;
         let connection = self.pool.get_or_connect(peer).await?;
-        let (mut send, mut recv) = connection.open_bi().await.map_err(other)?;
-        send.write_all(&body).await.map_err(other)?;
+        let (mut send, mut recv) = tokio::time::timeout(SYNC_IO_TIMEOUT, connection.open_bi())
+            .await
+            .map_err(|_| timed_out("sync stream open timed out"))?
+            .map_err(other)?;
+        tokio::time::timeout(SYNC_IO_TIMEOUT, send.write_all(&body))
+            .await
+            .map_err(|_| timed_out("sync write timed out"))?
+            .map_err(other)?;
         send.finish().map_err(other)?;
-        let response = recv.read_to_end(MAX_FRAME_LEN).await.map_err(other)?;
-        decode_frames(&response)?
-            .iter()
-            .map(|bytes| decode_sync_message(bytes))
-            .collect()
+        read_sync_messages(&mut recv).await
     }
 
     pub async fn sync_now(
@@ -326,6 +352,9 @@ impl<S: Storage> IrohNet<S> {
                     if remote.topic_id == topic_id
                         && remote.fingerprint == local_fingerprint.fingerprint =>
                 {
+                    self.node
+                        .record_peer_synced(remote_peer_id, topic_id)
+                        .map_err(invalid_data)?;
                     return Ok(());
                 }
                 SyncMessage::Summary(remote_summary) if remote_summary.topic_id == topic_id => {
@@ -428,11 +457,7 @@ impl<S: Storage> IrohNet<S> {
         mut recv: iroh::endpoint::RecvStream,
         mut send: iroh::endpoint::SendStream,
     ) -> io::Result<()> {
-        let incoming = recv.read_to_end(MAX_FRAME_LEN).await.map_err(other)?;
-        let messages = decode_frames(&incoming)?
-            .iter()
-            .map(|bytes| decode_sync_message(bytes))
-            .collect::<io::Result<Vec<_>>>()?;
+        let messages = read_sync_messages(&mut recv).await?;
         let responses = self
             .handle_messages(peer, messages)?
             .iter()
@@ -455,7 +480,7 @@ impl<S: Storage> IrohNet<S> {
         let mut responses = Vec::new();
         for message in messages {
             if let SyncMessage::Open(open) = &message {
-                if open.protocol != "irokle/sync/1" {
+                if open.protocol.as_bytes() != IROKLE_SYNC_ALPN {
                     return Err(invalid_data("unsupported sync protocol"));
                 }
                 if open.peer_id != authenticated_peer_id {
@@ -475,24 +500,6 @@ impl<S: Storage> IrohNet<S> {
             responses.extend(self.handle_message(message, remote_peer_id)?);
         }
         Ok(responses)
-    }
-
-    /// Convenience server-side entry point for an already accepted stream body.
-    pub(crate) fn handle_incoming(
-        &self,
-        peer: iroh::EndpointId,
-        incoming: &[u8],
-    ) -> io::Result<Vec<u8>> {
-        let messages = decode_frames(incoming)?
-            .iter()
-            .map(|bytes| decode_sync_message(bytes))
-            .collect::<io::Result<Vec<_>>>()?;
-        let responses = self
-            .handle_messages(peer, messages)?
-            .iter()
-            .map(encode_sync_message)
-            .collect::<io::Result<Vec<_>>>()?;
-        encode_frames(responses.iter().map(Vec::as_slice))
     }
 
     fn handle_message(
@@ -541,6 +548,9 @@ impl<S: Storage> IrohNet<S> {
                     .sync_fingerprint(fingerprint.topic_id)
                     .map_err(invalid_data)?;
                 if local.fingerprint == fingerprint.fingerprint {
+                    self.node
+                        .record_peer_synced(peer_id, fingerprint.topic_id)
+                        .map_err(invalid_data)?;
                     Ok(vec![SyncMessage::Fingerprint(local)])
                 } else {
                     self.node
@@ -590,6 +600,9 @@ impl<S: Storage> IrohNet<S> {
                     invalid_data("sync data requires a preceding SyncOpen with peer_id")
                 })?;
                 self.node
+                    .ensure_iroh_peer_whitelisted(source_peer, &data)
+                    .map_err(invalid_data)?;
+                self.node
                     .receive_sync_data_from(source_peer, data)
                     .map(SyncMessage::Ack)
                     .map(|message| vec![message])
@@ -614,6 +627,76 @@ impl<S: Storage> IrohNet<S> {
 }
 
 #[cfg(feature = "iroh")]
+async fn read_sync_messages(recv: &mut iroh::endpoint::RecvStream) -> io::Result<Vec<SyncMessage>> {
+    let mut messages = Vec::new();
+    while let Some(frame) = read_next_frame(recv).await? {
+        let frame_index = messages.len();
+        let frame_len = frame.len();
+        messages.push(decode_sync_message(&frame).map_err(|err| {
+            invalid_data(format!(
+                "invalid sync message frame {frame_index} ({frame_len} bytes): {err}"
+            ))
+        })?);
+    }
+    Ok(messages)
+}
+
+#[cfg(feature = "iroh")]
+async fn read_next_frame(recv: &mut iroh::endpoint::RecvStream) -> io::Result<Option<Vec<u8>>> {
+    let mut len_buf = [0_u8; 4];
+    let Some(first_read) = read_some_with_timeout(recv, &mut len_buf[..1]).await? else {
+        return Ok(None);
+    };
+    if first_read == 0 {
+        return Ok(None);
+    }
+
+    let mut read = first_read;
+    while read < len_buf.len() {
+        let Some(n) = read_some_with_timeout(recv, &mut len_buf[read..]).await? else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete sync frame length",
+            ));
+        };
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete sync frame length",
+            ));
+        }
+        read += n;
+    }
+
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sync frame exceeds maximum length",
+        ));
+    }
+    let mut payload = vec![0_u8; len];
+    if len > 0 {
+        tokio::time::timeout(SYNC_IO_TIMEOUT, recv.read_exact(&mut payload))
+            .await
+            .map_err(|_| timed_out("sync read timed out"))?
+            .map_err(other)?;
+    }
+    Ok(Some(payload))
+}
+
+#[cfg(feature = "iroh")]
+async fn read_some_with_timeout(
+    recv: &mut iroh::endpoint::RecvStream,
+    buf: &mut [u8],
+) -> io::Result<Option<usize>> {
+    tokio::time::timeout(SYNC_IO_TIMEOUT, recv.read(buf))
+        .await
+        .map_err(|_| timed_out("sync read timed out"))?
+        .map_err(other)
+}
+
+#[cfg(feature = "iroh")]
 fn peer_id_from_endpoint_id(peer: iroh::EndpointId) -> PeerId {
     PeerId::from_bytes(*peer.as_bytes())
 }
@@ -634,6 +717,7 @@ fn extend_alpns(mut alpns: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     alpns
 }
 
+#[cfg(feature = "iroh")]
 fn message_topic_id(message: &SyncMessage) -> Option<crate::TopicId> {
     match message {
         SyncMessage::Open(open) => Some(open.topic_id),
@@ -660,6 +744,12 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
+#[cfg(feature = "iroh")]
+fn timed_out(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, message)
+}
+
+#[cfg(feature = "iroh")]
 fn other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }

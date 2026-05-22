@@ -26,14 +26,14 @@ pub struct SyncOpen {
     pub protocol: String,
     pub topic_id: TopicId,
     pub peer_id: PeerId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub event_type_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncSummary {
     pub topic_id: TopicId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub event_type_id: Option<String>,
     pub fingerprint: [u8; 32],
     pub heads: BTreeSet<OpId>,
@@ -59,7 +59,6 @@ pub struct SyncPlan {
     pub topic_id: TopicId,
     pub common: BTreeSet<OpId>,
     pub have: BTreeSet<OpId>,
-    pub want: BTreeSet<OpId>,
     pub send: Vec<Op>,
     pub need: BTreeSet<OpId>,
     pub actor_range_hints: Vec<ActorRangeHint>,
@@ -187,7 +186,7 @@ impl<S: Storage> SyncEngine<S> {
 
     pub fn negotiate(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
         // If we don't know this topic locally, the remote's heads are
-        // unauthenticated claims. We must not surface them as `need`/`want`
+        // unauthenticated claims. We must not surface them as `need`
         // because that would let a peer inflate our request set for a topic
         // we can't even validate. Bootstrap for a new member happens when the
         // inviter pushes the genesis (and reachable history) via SyncData;
@@ -197,7 +196,6 @@ impl<S: Storage> SyncEngine<S> {
                 topic_id: remote.topic_id,
                 common: BTreeSet::new(),
                 have: BTreeSet::new(),
-                want: BTreeSet::new(),
                 send: Vec::new(),
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
@@ -208,7 +206,6 @@ impl<S: Storage> SyncEngine<S> {
                 topic_id: remote.topic_id,
                 common: BTreeSet::new(),
                 have: state.heads,
-                want: BTreeSet::new(),
                 send: Vec::new(),
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
@@ -229,7 +226,6 @@ impl<S: Storage> SyncEngine<S> {
                 topic_id: remote.topic_id,
                 common: local_heads.clone(),
                 have: local_heads,
-                want: BTreeSet::new(),
                 send: Vec::new(),
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
@@ -248,7 +244,6 @@ impl<S: Storage> SyncEngine<S> {
             topic_id: remote.topic_id,
             common,
             have: local_heads,
-            want: need.clone(),
             send,
             need,
             actor_range_hints: self.needed_actor_ranges(remote.topic_id, remote)?,
@@ -393,6 +388,7 @@ impl<S: Storage> SyncEngine<S> {
 
     pub fn apply_ack(&self, ack: &SyncAck) -> Result<()> {
         ack.verify_signature()?;
+        self.validate_ack(ack)?;
         let peer_ack = PeerAck {
             peer_id: ack.peer_id,
             topic_id: ack.topic_id,
@@ -400,6 +396,63 @@ impl<S: Storage> SyncEngine<S> {
             clock: ack.clock.clone(),
         };
         self.oplog.storage().apply_peer_ack(peer_ack)?;
+        Ok(())
+    }
+
+    pub fn record_peer_synced(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
+        let state = self
+            .oplog
+            .storage()
+            .topic_state(&topic_id)?
+            .ok_or(Error::TopicNotFound)?;
+        if !state.members.contains(&peer_id) {
+            return Err(Error::NotTopicMember);
+        }
+        let peer_ack = PeerAck {
+            peer_id,
+            topic_id,
+            heads: self.oplog.storage().heads(&topic_id)?,
+            clock: self.oplog.storage().actor_clock(&topic_id)?,
+        };
+        self.oplog.storage().apply_peer_ack(peer_ack)?;
+        Ok(())
+    }
+
+    fn validate_ack(&self, ack: &SyncAck) -> Result<()> {
+        let state = self
+            .oplog
+            .storage()
+            .topic_state(&ack.topic_id)?
+            .ok_or(Error::TopicNotFound)?;
+        if !state.members.contains(&ack.peer_id) {
+            return Err(Error::NotTopicMember);
+        }
+
+        let local_clock = self.oplog.storage().actor_clock(&ack.topic_id)?;
+        for (actor_id, seq) in ack.clock.iter() {
+            let local_seq = local_clock.get(actor_id);
+            if *seq > local_seq {
+                return Err(Error::InvalidSyncAck(format!(
+                    "clock for actor {actor_id} claims seq {seq}, local seq is {local_seq}"
+                )));
+            }
+        }
+
+        for op_id in ack.accepted.iter().chain(ack.heads.iter()) {
+            let Some(meta) = self.oplog.storage().get_meta(op_id)? else {
+                return Err(Error::InvalidSyncAck(format!(
+                    "ack references unknown op {op_id}"
+                )));
+            };
+            if meta.topic_id != ack.topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            if ack.heads.contains(op_id) && ack.clock.get(&meta.actor_id) < meta.actor_seq {
+                return Err(Error::InvalidSyncAck(format!(
+                    "head {op_id} is not represented by ack clock"
+                )));
+            }
+        }
         Ok(())
     }
 
