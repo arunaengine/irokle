@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! High-level node, topic, publishing, and sync facade APIs.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::marker::PhantomData;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(any(feature = "iroh", test))]
-use smallvec::SmallVec;
+mod builder;
+mod peers;
+mod topic;
 
-use crate::history::{DagQuery, HistoryOrder, limited, ordered};
-use crate::oplog::{Oplog, topological, topological_subset};
+#[cfg(any(feature = "iroh", test))]
+pub(crate) use peers::select_sync_peers;
+pub use topic::{RawTopic, Topic};
+
+use crate::history::{DagQuery, HistoryOrder, ordered};
+use crate::oplog::{Oplog, topological};
 use crate::reducer::EventRecord;
 use crate::storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
 use crate::sync::{
@@ -84,182 +88,6 @@ pub struct IrokleBuilder<S = MemoryStorage> {
     alpns: Vec<Vec<u8>>,
     #[cfg(feature = "iroh")]
     auto_accept: bool,
-}
-
-impl Irokle<MemoryStorage> {
-    pub fn builder() -> IrokleBuilder<MemoryStorage> {
-        IrokleBuilder {
-            storage: MemoryStorage::new(),
-            config: NodeConfig::default(),
-            signer_explicit: false,
-            #[cfg(feature = "iroh")]
-            endpoint: None,
-            #[cfg(feature = "iroh")]
-            alpns: Vec::new(),
-            #[cfg(feature = "iroh")]
-            auto_accept: true,
-        }
-    }
-
-    pub fn new(config: NodeConfig) -> Result<Self> {
-        Self::with_storage(MemoryStorage::new(), config)
-    }
-    pub fn in_memory() -> Result<Self> {
-        Self::new(NodeConfig::default())
-    }
-}
-
-impl<S: Storage> IrokleBuilder<S> {
-    pub fn with_storage<T: Storage>(self, storage: T) -> IrokleBuilder<T> {
-        IrokleBuilder {
-            storage,
-            config: self.config,
-            signer_explicit: self.signer_explicit,
-            #[cfg(feature = "iroh")]
-            endpoint: self.endpoint,
-            #[cfg(feature = "iroh")]
-            alpns: self.alpns,
-            #[cfg(feature = "iroh")]
-            auto_accept: self.auto_accept,
-        }
-    }
-
-    pub fn with_config(mut self, config: NodeConfig) -> Self {
-        self.config = config;
-        self.signer_explicit = true;
-        self
-    }
-
-    pub fn with_signer(mut self, signer: Ed25519Signer) -> Self {
-        self.config.signer = signer;
-        self.signer_explicit = true;
-        self
-    }
-
-    pub fn with_write_concern(mut self, write_concern: WriteConcern) -> Self {
-        self.config.default_write_concern = write_concern;
-        self
-    }
-
-    pub fn with_peer_whitelist<I>(mut self, peer_ids: I) -> Self
-    where
-        I: IntoIterator<Item = PeerId>,
-    {
-        self.config.peer_whitelist = Some(peer_ids.into_iter().collect());
-        self
-    }
-
-    pub fn without_peer_whitelist(mut self) -> Self {
-        self.config.peer_whitelist = None;
-        self
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn with_iroh_secret_key(mut self, secret_key: &iroh::SecretKey) -> Self {
-        self.config.signer = Ed25519Signer::from_iroh_secret_key(secret_key);
-        self.signer_explicit = true;
-        self
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn with_net(mut self, endpoint: iroh::Endpoint) -> Self {
-        if !self.signer_explicit {
-            self.config.signer = Ed25519Signer::from_iroh_secret_key(endpoint.secret_key());
-        }
-        self.endpoint = Some(endpoint);
-        self.auto_accept = true;
-        self
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn with_alpn(mut self, alpn: impl AsRef<[u8]>) -> Self {
-        let alpn = alpn.as_ref().to_vec();
-        if !self.alpns.contains(&alpn) {
-            self.alpns.push(alpn);
-        }
-        self
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn with_alpns<I, A>(mut self, alpns: I) -> Self
-    where
-        I: IntoIterator<Item = A>,
-        A: AsRef<[u8]>,
-    {
-        for alpn in alpns {
-            let alpn = alpn.as_ref().to_vec();
-            if !self.alpns.contains(&alpn) {
-                self.alpns.push(alpn);
-            }
-        }
-        self
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn without_auto_accept(mut self) -> Self {
-        self.auto_accept = false;
-        self
-    }
-
-    #[cfg(feature = "fjall")]
-    pub fn with_fjall_path(
-        self,
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<IrokleBuilder<crate::FjallStorage>> {
-        Ok(IrokleBuilder {
-            storage: crate::FjallStorage::open(path)?,
-            config: self.config,
-            signer_explicit: self.signer_explicit,
-            #[cfg(feature = "iroh")]
-            endpoint: self.endpoint,
-            #[cfg(feature = "iroh")]
-            alpns: self.alpns,
-            #[cfg(feature = "iroh")]
-            auto_accept: self.auto_accept,
-        })
-    }
-
-    #[cfg(feature = "fjall")]
-    pub fn with_fjall_database(
-        self,
-        db: fjall::OptimisticTxDatabase,
-    ) -> Result<IrokleBuilder<crate::FjallStorage>> {
-        Ok(IrokleBuilder {
-            storage: crate::FjallStorage::from_database(db)?,
-            config: self.config,
-            signer_explicit: self.signer_explicit,
-            #[cfg(feature = "iroh")]
-            endpoint: self.endpoint,
-            #[cfg(feature = "iroh")]
-            alpns: self.alpns,
-            #[cfg(feature = "iroh")]
-            auto_accept: self.auto_accept,
-        })
-    }
-
-    pub fn build(self) -> Result<Irokle<S>> {
-        #[cfg(feature = "iroh")]
-        if let Some(endpoint) = self.endpoint {
-            let node = Irokle::with_storage(self.storage, self.config)?;
-            let net = Arc::new(
-                crate::net::IrohNet::new_with_alpns(endpoint, node.clone(), self.alpns)
-                    .map_err(|err| Error::Storage(format!("failed to configure iroh: {err}")))?,
-            );
-            if self.auto_accept {
-                net.start_accept_loop().map_err(|err| {
-                    Error::Storage(format!("failed to start iroh accept loop: {err}"))
-                })?;
-                net.start_resync_loop(std::time::Duration::from_secs(30))
-                    .map_err(|err| {
-                        Error::Storage(format!("failed to start iroh resync loop: {err}"))
-                    })?;
-            }
-            return Ok(node.with_net(net));
-        }
-
-        let node = Irokle::with_storage(self.storage, self.config)?;
-        Ok(node)
-    }
 }
 
 impl<S: Storage> Irokle<S> {
@@ -501,7 +329,7 @@ impl<S: Storage> Irokle<S> {
         source_peer_id: PeerId,
         data: SyncData,
     ) -> Result<SyncAck> {
-        self.ensure_unknown_topic_admission(source_peer_id, &data)?;
+        self.check_unknown_topic(source_peer_id, &data)?;
         let mut ack = self
             .sync
             .receive_data(source_peer_id, self.peer_id(), data)?;
@@ -589,14 +417,10 @@ impl<S: Storage> Irokle<S> {
         if !peer_allowed {
             return Err(Error::PeerNotWhitelisted(source_peer_id));
         }
-        self.ensure_unknown_topic_admission(source_peer_id, data)
+        self.check_unknown_topic(source_peer_id, data)
     }
 
-    fn ensure_unknown_topic_admission(
-        &self,
-        source_peer_id: PeerId,
-        data: &SyncData,
-    ) -> Result<()> {
+    fn check_unknown_topic(&self, source_peer_id: PeerId, data: &SyncData) -> Result<()> {
         if self.storage().topic_state(&data.topic_id)?.is_some() {
             return Ok(());
         }
@@ -804,7 +628,7 @@ impl<S: Storage> Irokle<S> {
     }
 
     pub(crate) fn topic_dag(&self, topic_id: TopicId, query: DagQuery<OpId>) -> Result<Vec<Op>> {
-        dag_ops(self.oplog.storage(), topic_id, query)
+        topic::dag_ops(self.oplog.storage(), topic_id, query)
     }
 
     pub(crate) fn topic_heads(&self, topic_id: TopicId) -> Result<BTreeSet<OpId>> {
@@ -824,265 +648,6 @@ impl Irokle<crate::FjallStorage> {
     ) -> Result<Self> {
         Irokle::with_storage(crate::FjallStorage::from_database(db)?, config)
     }
-}
-
-#[derive(Clone)]
-pub struct Topic<E: Event, S: Storage = MemoryStorage> {
-    node: Irokle<S>,
-    topic_id: TopicId,
-    actor_id: ActorId,
-    _event: PhantomData<E>,
-}
-
-impl<E: Event, S: Storage> Topic<E, S> {
-    fn new(node: Irokle<S>, topic_id: TopicId, actor_id: ActorId) -> Self {
-        Self {
-            node,
-            topic_id,
-            actor_id,
-            _event: PhantomData,
-        }
-    }
-    pub fn id(&self) -> TopicId {
-        self.topic_id
-    }
-    pub fn publish(&self, event: E) -> Result<EventRecord<E>> {
-        self.publish_with(
-            event,
-            PublishOptions {
-                write_concern: self.node.config.default_write_concern.clone(),
-            },
-        )
-    }
-    pub fn publish_with(&self, event: E, options: PublishOptions) -> Result<EventRecord<E>> {
-        self.node
-            .publish_event(self.topic_id, self.actor_id, event, options)
-    }
-    pub fn add_peer(&self, peer: PeerId) -> Result<()> {
-        self.node
-            .publish_control(self.topic_id, self.actor_id, TopicControl::AddPeer { peer })
-    }
-    pub fn remove_peer(&self, peer: PeerId) -> Result<()> {
-        self.node.publish_control(
-            self.topic_id,
-            self.actor_id,
-            TopicControl::RemovePeer { peer },
-        )
-    }
-    pub fn leave(&self) -> Result<()> {
-        self.node.reject_topic(self.topic_id)
-    }
-    pub fn set_replication_policy(&self, policy: crate::ReplicationPolicy) -> Result<()> {
-        self.node.publish_control(
-            self.topic_id,
-            self.actor_id,
-            TopicControl::SetReplicationPolicy { policy },
-        )
-    }
-    pub fn history(&self, order: HistoryOrder) -> Result<Vec<EventRecord<E>>> {
-        self.node.topic_history(self.topic_id, order)
-    }
-    pub fn dag(&self, query: DagQuery<OpId>) -> Result<Vec<Op>> {
-        self.node.topic_dag(self.topic_id, query)
-    }
-    pub fn heads(&self) -> Result<BTreeSet<OpId>> {
-        self.node.topic_heads(self.topic_id)
-    }
-
-    pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {
-        self.node.peer_reached_op(peer_id, op_id)
-    }
-
-    pub fn peers_reached_op(&self, op_id: OpId) -> Result<Vec<PeerId>> {
-        self.node.peers_reached_op(op_id)
-    }
-
-    #[cfg(feature = "iroh")]
-    pub async fn sync_now(&self) -> std::io::Result<()> {
-        self.node.sync_topic_now(self.topic_id).await
-    }
-}
-
-#[derive(Clone)]
-pub struct RawTopic<S: Storage = MemoryStorage> {
-    oplog: Oplog<S>,
-    topic_id: TopicId,
-}
-
-impl<S: Storage> RawTopic<S> {
-    pub fn id(&self) -> TopicId {
-        self.topic_id
-    }
-    pub fn history(&self) -> Result<Vec<Op>> {
-        topological(self.oplog.storage(), &self.topic_id)
-    }
-    pub fn dag(&self, query: DagQuery<OpId>) -> Result<Vec<Op>> {
-        dag_ops(self.oplog.storage(), self.topic_id, query)
-    }
-    pub fn heads(&self) -> Result<BTreeSet<OpId>> {
-        self.oplog.storage().heads(&self.topic_id)
-    }
-
-    pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {
-        self.oplog.storage().peer_reached_op(&peer_id, &op_id)
-    }
-
-    pub fn peers_reached_op(&self, op_id: OpId) -> Result<Vec<PeerId>> {
-        self.oplog.storage().peers_reached_op(&op_id)
-    }
-}
-
-fn dag_ops<S: Storage>(storage: &S, topic_id: TopicId, query: DagQuery<OpId>) -> Result<Vec<Op>> {
-    if query.order == HistoryOrder::NewestFirst || !query.heads.is_empty() {
-        let starts = if query.heads.is_empty() {
-            storage.heads(&topic_id)?.into_iter().collect::<Vec<_>>()
-        } else {
-            query.heads
-        };
-        let mut seen = BTreeSet::new();
-        let mut queue = starts
-            .into_iter()
-            .map(|head| (head, true))
-            .collect::<VecDeque<_>>();
-        let mut ids = Vec::new();
-        while let Some((id, is_head)) = queue.pop_front() {
-            if !seen.insert(id) {
-                continue;
-            }
-            let meta = storage
-                .get_meta(&id)?
-                .ok_or_else(|| Error::Storage(format!("missing op meta for {id}")))?;
-            if meta.topic_id != topic_id {
-                return Err(Error::TopicMismatch);
-            }
-            if query.include_heads || !is_head {
-                ids.push(id);
-                if query.limit.is_some_and(|limit| ids.len() >= limit) {
-                    break;
-                }
-            }
-            for dep in meta.deps {
-                queue.push_back((dep, false));
-            }
-        }
-        if query.order == HistoryOrder::OldestFirst {
-            let subset = ids.into_iter().collect::<BTreeSet<_>>();
-            topological_subset(storage, &subset)
-        } else {
-            ids.into_iter()
-                .map(|id| {
-                    storage
-                        .get_op(&id)?
-                        .ok_or_else(|| Error::Storage(format!("missing op {id}")))
-                })
-                .collect()
-        }
-    } else {
-        Ok(limited(topological(storage, &topic_id)?, query.limit))
-    }
-}
-
-#[cfg(any(feature = "iroh", test))]
-pub(crate) fn select_sync_peers(
-    topic_id: TopicId,
-    local_peer: PeerId,
-    state: &crate::storage::TopicState,
-) -> Vec<PeerId> {
-    let max = state.replication_policy.max_sync_peers;
-    if max == 0 {
-        return Vec::new();
-    }
-
-    let mut scope = if state.replication_policy.selected_peers.is_empty() {
-        state.members.clone()
-    } else {
-        state
-            .replication_policy
-            .selected_peers
-            .intersection(&state.members)
-            .copied()
-            .collect()
-    };
-    scope.insert(local_peer);
-
-    let candidates: SmallVec<[PeerId; 16]> = scope
-        .iter()
-        .copied()
-        .filter(|peer| *peer != local_peer)
-        .collect();
-    if candidates.len() <= max {
-        return candidates.into_vec();
-    }
-
-    let mut selected = BTreeSet::new();
-    let mut shared = candidates
-        .iter()
-        .copied()
-        .map(|peer| {
-            (
-                sync_peer_score(topic_id, PeerId::hash(b"shared"), peer),
-                peer,
-            )
-        })
-        .collect::<SmallVec<[_; 16]>>();
-    shared.sort_by(|(left_score, left_peer), (right_score, right_peer)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left_peer.cmp(right_peer))
-    });
-    let shared_budget = SYNC_PEER_SHARED_OVERLAP
-        .saturating_add(1)
-        .min(max)
-        .min(candidates.len());
-    for (_, peer) in shared.into_iter().take(shared_budget) {
-        selected.insert(peer);
-        if selected.len() >= max {
-            break;
-        }
-    }
-
-    let ring = scope.into_iter().collect::<SmallVec<[PeerId; 16]>>();
-    if let Some(local_index) = ring.iter().position(|peer| *peer == local_peer) {
-        for offset in 1..ring.len() {
-            if selected.len() >= max {
-                break;
-            }
-            selected.insert(ring[(local_index + offset) % ring.len()]);
-            if selected.len() >= max {
-                break;
-            }
-            selected.insert(ring[(local_index + ring.len() - offset) % ring.len()]);
-        }
-    }
-
-    let mut remaining = candidates
-        .into_iter()
-        .filter(|peer| !selected.contains(peer))
-        .map(|peer| (sync_peer_score(topic_id, local_peer, peer), peer))
-        .collect::<Vec<_>>();
-    remaining.sort_by(|(left_score, left_peer), (right_score, right_peer)| {
-        right_score
-            .cmp(left_score)
-            .then_with(|| left_peer.cmp(right_peer))
-    });
-    for (_, peer) in remaining {
-        if selected.len() >= max {
-            break;
-        }
-        selected.insert(peer);
-    }
-
-    selected.into_iter().collect()
-}
-
-#[cfg(any(feature = "iroh", test))]
-fn sync_peer_score(topic_id: TopicId, local_peer: PeerId, peer: PeerId) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"irokle-sync-peer-v1");
-    hasher.update(topic_id.as_ref());
-    hasher.update(local_peer.as_ref());
-    hasher.update(peer.as_ref());
-    *hasher.finalize().as_bytes()
 }
 
 #[cfg(any(feature = "iroh", test))]
