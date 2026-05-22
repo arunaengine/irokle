@@ -123,13 +123,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-By default, Iroh auto-accept only admits brand-new topics from peers in `peer_whitelist`. The whitelist starts as `Some(empty)`, so add allowed peers with `with_peer_whitelist`, `add_peer_to_whitelist`, `add_peers_to_whitelist`, or `set_peer_whitelist`. Set the whitelist to `None` only when unknown-topic admission should be unrestricted.
+By default, Iroh auto-accept only admits brand-new topics from peers in `peer_whitelist`. The whitelist starts as `Some(empty)`, so add allowed peers with `with_peer_whitelist`, `add_peer_to_whitelist`, `add_peers_to_whitelist`, or `set_peer_whitelist`. Set the whitelist to `None` only when unknown-topic admission should be unrestricted. For production deployments, keep the Irokle sync ALPN dedicated to trusted peers and whitelist topic introducers explicitly.
 
 `sync_addr_now(endpoint_addr, topic_id)` remains available for explicit one-off manual dialing in local/offline setups. The peer registry API was removed; when discovery is configured, peers are identified by `PeerId`/Iroh `EndpointId`.
 
+Iroh runtime behavior is configurable when defaults are not appropriate for the deployment:
+
+```rust
+use irokle::net::IrohRuntimeConfig;
+use std::time::Duration;
+
+let runtime = IrohRuntimeConfig {
+    connect_timeout: Duration::from_secs(10),
+    sync_io_timeout: Duration::from_secs(10),
+    resync_interval: Duration::from_secs(15),
+};
+
+let node = irokle::Irokle::builder()
+    .with_iroh_runtime_config(runtime)
+    .with_net(endpoint)
+    .build()?;
+```
+
+Use `shutdown_iroh().await` during orderly shutdown to close the endpoint and abort tracked background accept/resync tasks.
+
 ## Sync Failures And Status
 
-Iroh nodes start a periodic resync loop when auto-accept is enabled. The loop scans outstanding sync obligations and retries those peer/topic pairs. Publish with `WriteConcern::AsyncReplication` creates obligations for the bounded replication target set and wakes the same sync machinery.
+Iroh nodes start a periodic resync loop when auto-accept is enabled. The loop scans outstanding sync obligations and retries those peer/topic pairs. Publish with `WriteConcern::AsyncReplication` creates obligations for the bounded replication target set and wakes the same sync machinery. If the wake cannot start because no Tokio runtime is active, the obligation remains visible and sync status records the failure.
 
 Applications can inspect sync state:
 
@@ -142,7 +162,7 @@ Each `SyncPeerStatus` includes `state`, `pending_obligations`, `failed_attempts`
 
 ## Disk Recovery
 
-With `fjall` and `iroh`, durable recovery means reopening the same Fjall path and reusing the same Iroh `SecretKey`, because the Iroh key defines the node’s `PeerId`.
+With `fjall` and `iroh`, durable recovery means reopening the same Fjall path and reusing the same Iroh `SecretKey`, because the Iroh key defines the node’s `PeerId`. Production applications should persist the Iroh secret in their normal secret-management system, restrict filesystem permissions for local key files, and back up the key with the Fjall database path.
 
 See `examples/iroh_fjall_recovery.rs` for a complete example that creates a topic, closes the endpoint, reopens the database with the same key, lists recovered topics, and reads typed history.
 
@@ -161,7 +181,3 @@ cargo run --features iroh --example iroh_chat
 cargo run --features iroh --example iroh_topic_intro
 cargo run --features 'iroh fjall' --example iroh_fjall_recovery
 ```
-
-## Status
-
-This is still a young implementation, but the core now includes signed membership, bounded sync target selection, periodic failed-sync retry, and basic sync observability. Remaining hardening areas include compaction, snapshots, richer persistence repair tooling, and production metrics/tracing adapters.
