@@ -59,6 +59,22 @@ pub struct PeerAck {
     pub clock: ActorClock,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionEffects {
+    pub sync_obligations: Vec<SyncObligation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmittedBatch {
+    pub topic_id: TopicId,
+    pub expected_heads: BTreeSet<OpId>,
+    pub expected_topic_state: Option<TopicState>,
+    pub entries: Vec<(Op, OpMeta)>,
+    pub heads: BTreeSet<OpId>,
+    pub topic_state: Option<TopicState>,
+    pub effects: AdmissionEffects,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncObligation {
     pub peer_id: PeerId,
@@ -91,15 +107,7 @@ pub struct SyncPeerStatus {
 }
 
 pub trait Storage: Clone + Send + Sync + 'static {
-    fn put_admitted_batch(
-        &self,
-        topic_id: TopicId,
-        expected_heads: BTreeSet<OpId>,
-        expected_topic_state: Option<TopicState>,
-        entries: Vec<(Op, OpMeta)>,
-        heads: BTreeSet<OpId>,
-        topic_state: Option<TopicState>,
-    ) -> Result<()>;
+    fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()>;
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>>;

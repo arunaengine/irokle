@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, TopicInfo};
 
 use super::{
-    MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL,
+    AdmittedBatch, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL,
     MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation, SyncPeerStatus,
     TopicState, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
 };
@@ -48,15 +48,16 @@ impl MemoryStorage {
 }
 
 impl Storage for MemoryStorage {
-    fn put_admitted_batch(
-        &self,
-        topic_id: TopicId,
-        expected_heads: BTreeSet<OpId>,
-        expected_topic_state: Option<TopicState>,
-        entries: Vec<(Op, OpMeta)>,
-        heads: BTreeSet<OpId>,
-        topic_state: Option<TopicState>,
-    ) -> Result<()> {
+    fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
+        let AdmittedBatch {
+            topic_id,
+            expected_heads,
+            expected_topic_state,
+            entries,
+            heads,
+            topic_state,
+            effects,
+        } = batch;
         let mut inner = self.lock()?;
         if inner.heads.get(&topic_id).cloned().unwrap_or_default() != expected_heads {
             return Err(Error::AdmissionConflict);
@@ -174,6 +175,11 @@ impl Storage for MemoryStorage {
         }
         if let Some(state) = topic_state {
             inner.topics.insert(state.topic_id, state);
+        }
+        for obligation in effects.sync_obligations {
+            if !inner.obligations.contains(&obligation) {
+                inner.obligations.push(obligation);
+            }
         }
         Ok(())
     }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, TopicInfo};
 
 use super::{
-    MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL,
+    AdmittedBatch, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL,
     MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation, SyncPeerStatus,
     TopicState, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
 };
@@ -179,15 +179,16 @@ impl FjallStorage {
 
 #[cfg(feature = "fjall")]
 impl Storage for FjallStorage {
-    fn put_admitted_batch(
-        &self,
-        topic_id: TopicId,
-        expected_heads: BTreeSet<OpId>,
-        expected_topic_state: Option<TopicState>,
-        entries: Vec<(Op, OpMeta)>,
-        heads: BTreeSet<OpId>,
-        topic_state: Option<TopicState>,
-    ) -> Result<()> {
+    fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
+        let AdmittedBatch {
+            topic_id,
+            expected_heads,
+            expected_topic_state,
+            entries,
+            heads,
+            topic_state,
+            effects,
+        } = batch;
         self.transaction(|tx| {
             let current_heads: BTreeSet<OpId> =
                 Self::tx_get(tx, &self.records, Self::key_id(b"h", &topic_id))?.unwrap_or_default();
@@ -384,6 +385,14 @@ impl Storage for FjallStorage {
                     &self.records,
                     Self::key_id(b"ts", &state.topic_id),
                     state,
+                )?;
+            }
+            for obligation in &effects.sync_obligations {
+                Self::tx_put(
+                    tx,
+                    &self.records,
+                    Self::sync_obligation_key(obligation),
+                    obligation,
                 )?;
             }
             Ok(())
