@@ -24,8 +24,11 @@ impl Ed25519Signer {
     }
 
     pub fn generate() -> Self {
+        let mut bytes = [0; 32];
+        getrandom::fill(&mut bytes).expect("operating system random number generator failed");
+
         Self {
-            key: SigningKey::generate(&mut rand_core::OsRng),
+            key: SigningKey::from_bytes(&bytes),
         }
     }
 

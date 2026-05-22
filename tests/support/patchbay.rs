@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn init_patchbay_userns() {
     // patchbay requires user namespace setup before Tokio starts worker threads.
     unsafe { ::patchbay::init_userns_for_ctor() }
