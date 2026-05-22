@@ -17,5 +17,21 @@ jobs:
       - run: cargo test --locked
       - run: cargo check --locked --all-features --all-targets
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
-      - run: cargo test --locked --all-features
+      - run: cargo test --locked --all-features --lib --test derive
+      - run: cargo test --locked --all-features --doc
       - run: cargo doc --locked --all-features --no-deps
+
+  patchbay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install patchbay Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y iproute2 nftables
+      - name: Enable unprivileged user namespaces best-effort
+        run: |
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w user.max_user_namespaces=28633 || true
+      - run: cargo test --locked --features iroh --test iroh_patchbay_sync -- --nocapture --test-threads=1
