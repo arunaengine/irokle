@@ -2,6 +2,8 @@
 name = "irokle"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Signed Merkle-DAG operation log for invite-only topics"
 
 [workspace]
 members = [".", "irokle-derive"]
@@ -24,6 +26,7 @@ serde = { version = "1.0", features = ["derive"] }
 smallvec = "1.15"
 thiserror = "2.0.18"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"], optional = true }
+tracing = "0.1"
 irokle-derive = { path = "irokle-derive" }
 
 [dev-dependencies]
