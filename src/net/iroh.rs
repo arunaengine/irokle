@@ -1,125 +1,31 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Iroh-backed sync framing, connection handling, and bounded resync loops.
 
-#![allow(unexpected_cfgs)]
-
+use std::collections::{BTreeSet, HashMap};
 use std::io;
-
-#[cfg(feature = "iroh")]
-use std::collections::BTreeSet;
-#[cfg(feature = "iroh")]
-use std::collections::HashMap;
-#[cfg(feature = "iroh")]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "iroh")]
 use std::sync::{Arc, Mutex};
-#[cfg(feature = "iroh")]
 use std::time::Duration;
 
-#[cfg(any(feature = "iroh", test))]
-use crate::sync::SyncData;
-use crate::sync::SyncMessage;
-#[cfg(feature = "iroh")]
-use crate::{Irokle, MemoryStorage, PeerId, Storage};
-#[cfg(any(feature = "iroh", test))]
-use crate::{Op, TopicId};
-#[cfg(feature = "iroh")]
 use smallvec::{SmallVec, smallvec};
 
-const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
-pub const MAX_SYNC_DATA_OPS_PER_MESSAGE: usize = 256;
-#[cfg(feature = "iroh")]
+use crate::sync::SyncMessage;
+use crate::{Irokle, MemoryStorage, PeerId, Storage};
+
+use super::frame::MAX_FRAME_LEN;
+use super::{
+    _message_type_name, IROKLE_SYNC_ALPN, decode_sync_message, encode_frame, encode_sync_message,
+    invalid_data, sync_data_messages,
+};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(feature = "iroh")]
 const SYNC_IO_TIMEOUT: Duration = Duration::from_secs(30);
-pub const IROKLE_SYNC_ALPN: &[u8] = b"irokle/sync/1";
 
-pub fn encode_sync_message(message: &SyncMessage) -> io::Result<Vec<u8>> {
-    postcard::to_allocvec(message).map_err(invalid_data)
-}
-
-pub fn decode_sync_message(bytes: &[u8]) -> io::Result<SyncMessage> {
-    postcard::from_bytes(bytes).map_err(invalid_data)
-}
-
-pub fn encode_frame(payload: &[u8]) -> io::Result<Vec<u8>> {
-    if payload.len() > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "sync frame exceeds maximum length",
-        ));
-    }
-    let len = payload.len() as u32;
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(payload);
-    Ok(frame)
-}
-
-pub fn decode_frame(input: &[u8]) -> io::Result<Option<(Vec<u8>, usize)>> {
-    if input.len() < 4 {
-        return Ok(None);
-    }
-
-    let len = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "sync frame exceeds maximum length",
-        ));
-    }
-
-    let end = 4 + len;
-    if input.len() < end {
-        return Ok(None);
-    }
-
-    Ok(Some((input[4..end].to_vec(), end)))
-}
-
-pub fn encode_frames<'a>(payloads: impl IntoIterator<Item = &'a [u8]>) -> io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    for payload in payloads {
-        out.extend_from_slice(&encode_frame(payload)?);
-    }
-    Ok(out)
-}
-
-pub fn decode_frames(mut input: &[u8]) -> io::Result<Vec<Vec<u8>>> {
-    let mut frames = Vec::new();
-    while !input.is_empty() {
-        let Some((frame, consumed)) = decode_frame(input)? else {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "incomplete sync frame",
-            ));
-        };
-        frames.push(frame);
-        input = &input[consumed..];
-    }
-    Ok(frames)
-}
-
-#[cfg(any(feature = "iroh", test))]
-pub(crate) fn sync_data_messages(topic_id: TopicId, ops: Vec<Op>) -> Vec<SyncMessage> {
-    ops.chunks(MAX_SYNC_DATA_OPS_PER_MESSAGE)
-        .map(|ops| {
-            SyncMessage::Data(SyncData {
-                topic_id,
-                ops: ops.to_vec(),
-            })
-        })
-        .collect()
-}
-
-#[cfg(feature = "iroh")]
 #[derive(Clone)]
 struct ConnectionPool {
     endpoint: iroh::Endpoint,
     connections: Arc<Mutex<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>>,
 }
 
-#[cfg(feature = "iroh")]
 impl ConnectionPool {
     fn new(endpoint: iroh::Endpoint) -> Self {
         Self {
@@ -170,14 +76,12 @@ impl ConnectionPool {
     }
 }
 
-#[cfg(feature = "iroh")]
 pub struct IrohNet<S: Storage = MemoryStorage> {
     pool: ConnectionPool,
     node: Irokle<S>,
     resync_started: Arc<AtomicBool>,
 }
 
-#[cfg(feature = "iroh")]
 impl<S: Storage> IrohNet<S> {
     pub fn new(endpoint: iroh::Endpoint, node: Irokle<S>) -> io::Result<Self> {
         Self::new_with_alpns(endpoint, node, Vec::new())
@@ -622,7 +526,6 @@ impl<S: Storage> IrohNet<S> {
     }
 }
 
-#[cfg(feature = "iroh")]
 async fn read_sync_messages(recv: &mut iroh::endpoint::RecvStream) -> io::Result<Vec<SyncMessage>> {
     let mut messages = Vec::new();
     while let Some(frame) = read_next_frame(recv).await? {
@@ -637,7 +540,6 @@ async fn read_sync_messages(recv: &mut iroh::endpoint::RecvStream) -> io::Result
     Ok(messages)
 }
 
-#[cfg(feature = "iroh")]
 async fn write_sync_messages(
     send: &mut iroh::endpoint::SendStream,
     messages: &[SyncMessage],
@@ -653,7 +555,6 @@ async fn write_sync_messages(
     send.finish().map_err(other)
 }
 
-#[cfg(feature = "iroh")]
 async fn read_next_frame(recv: &mut iroh::endpoint::RecvStream) -> io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0_u8; 4];
     let Some(first_read) = read_some_with_timeout(recv, &mut len_buf[..1]).await? else {
@@ -697,7 +598,6 @@ async fn read_next_frame(recv: &mut iroh::endpoint::RecvStream) -> io::Result<Op
     Ok(Some(payload))
 }
 
-#[cfg(feature = "iroh")]
 async fn read_some_with_timeout(
     recv: &mut iroh::endpoint::RecvStream,
     buf: &mut [u8],
@@ -708,19 +608,16 @@ async fn read_some_with_timeout(
         .map_err(other)
 }
 
-#[cfg(feature = "iroh")]
 fn peer_id_from_endpoint_id(peer: iroh::EndpointId) -> PeerId {
     PeerId::from_bytes(*peer.as_bytes())
 }
 
-#[cfg(feature = "iroh")]
 fn peer_id_to_endpoint_addr(peer_id: PeerId) -> io::Result<iroh::EndpointAddr> {
     Ok(iroh::EndpointAddr::from(
         iroh::EndpointId::from_bytes(peer_id.as_bytes()).map_err(invalid_data)?,
     ))
 }
 
-#[cfg(feature = "iroh")]
 fn extend_alpns(mut alpns: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     let irokle = IROKLE_SYNC_ALPN.to_vec();
     if !alpns.contains(&irokle) {
@@ -729,7 +626,6 @@ fn extend_alpns(mut alpns: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     alpns
 }
 
-#[cfg(feature = "iroh")]
 fn message_topic_id(message: &SyncMessage) -> Option<crate::TopicId> {
     match message {
         SyncMessage::Open(open) => Some(open.topic_id),
@@ -741,27 +637,10 @@ fn message_topic_id(message: &SyncMessage) -> Option<crate::TopicId> {
     }
 }
 
-pub fn _message_type_name(message: &SyncMessage) -> &'static str {
-    match message {
-        SyncMessage::Open(_) => "open",
-        SyncMessage::Fingerprint(_) => "fingerprint",
-        SyncMessage::Summary(_) => "summary",
-        SyncMessage::Request(_) => "request",
-        SyncMessage::Data(_) => "data",
-        SyncMessage::Ack(_) => "ack",
-    }
-}
-
-fn invalid_data(error: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-}
-
-#[cfg(feature = "iroh")]
 fn timed_out(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, message)
 }
 
-#[cfg(feature = "iroh")]
 fn other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
