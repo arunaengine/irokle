@@ -25,7 +25,13 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1.0", features = ["derive"] }
 smallvec = "1.15"
 thiserror = "2.0.18"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "time"], optional = true }
+tokio = { version = "1", features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+], optional = true }
 tracing = "0.1"
 irokle-derive = { path = "irokle-derive" }
 

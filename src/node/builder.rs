@@ -19,6 +19,8 @@ impl Irokle<MemoryStorage> {
             alpns: Vec::new(),
             #[cfg(feature = "iroh")]
             auto_accept: true,
+            #[cfg(feature = "iroh")]
+            iroh_runtime: crate::net::IrohRuntimeConfig::default(),
         }
     }
 
@@ -43,6 +45,8 @@ impl<S: Storage> IrokleBuilder<S> {
             alpns: self.alpns,
             #[cfg(feature = "iroh")]
             auto_accept: self.auto_accept,
+            #[cfg(feature = "iroh")]
+            iroh_runtime: self.iroh_runtime,
         }
     }
 
@@ -73,6 +77,12 @@ impl<S: Storage> IrokleBuilder<S> {
 
     pub fn without_peer_whitelist(mut self) -> Self {
         self.config.peer_whitelist = None;
+        self
+    }
+
+    #[cfg(feature = "iroh")]
+    pub fn with_iroh_runtime_config(mut self, runtime: crate::net::IrohRuntimeConfig) -> Self {
+        self.iroh_runtime = runtime;
         self
     }
 
@@ -138,6 +148,8 @@ impl<S: Storage> IrokleBuilder<S> {
             alpns: self.alpns,
             #[cfg(feature = "iroh")]
             auto_accept: self.auto_accept,
+            #[cfg(feature = "iroh")]
+            iroh_runtime: self.iroh_runtime,
         })
     }
 
@@ -156,6 +168,8 @@ impl<S: Storage> IrokleBuilder<S> {
             alpns: self.alpns,
             #[cfg(feature = "iroh")]
             auto_accept: self.auto_accept,
+            #[cfg(feature = "iroh")]
+            iroh_runtime: self.iroh_runtime,
         })
     }
 
@@ -164,17 +178,21 @@ impl<S: Storage> IrokleBuilder<S> {
         if let Some(endpoint) = self.endpoint {
             let node = Irokle::with_storage(self.storage, self.config)?;
             let net = std::sync::Arc::new(
-                crate::net::IrohNet::new_with_alpns(endpoint, node.clone(), self.alpns)
-                    .map_err(|err| Error::Storage(format!("failed to configure iroh: {err}")))?,
+                crate::net::IrohNet::new_with_alpns_and_config(
+                    endpoint,
+                    node.clone(),
+                    self.alpns,
+                    self.iroh_runtime,
+                )
+                .map_err(|err| Error::Storage(format!("failed to configure iroh: {err}")))?,
             );
             if self.auto_accept {
                 net.start_accept_loop().map_err(|err| {
                     Error::Storage(format!("failed to start iroh accept loop: {err}"))
                 })?;
-                net.start_resync_loop(std::time::Duration::from_secs(30))
-                    .map_err(|err| {
-                        Error::Storage(format!("failed to start iroh resync loop: {err}"))
-                    })?;
+                net.start_configured_resync_loop().map_err(|err| {
+                    Error::Storage(format!("failed to start iroh resync loop: {err}"))
+                })?;
             }
             return Ok(node.with_net(net));
         }

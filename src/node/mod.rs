@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod builder;
@@ -73,7 +73,7 @@ pub struct Irokle<S: Storage = MemoryStorage> {
     oplog: Oplog<S>,
     sync: SyncEngine<S>,
     config: NodeConfig,
-    peer_whitelist: Arc<Mutex<Option<BTreeSet<PeerId>>>>,
+    peer_whitelist: Arc<RwLock<Option<BTreeSet<PeerId>>>>,
     #[cfg(feature = "iroh")]
     net: Option<Arc<crate::net::IrohNet<S>>>,
 }
@@ -88,6 +88,8 @@ pub struct IrokleBuilder<S = MemoryStorage> {
     alpns: Vec<Vec<u8>>,
     #[cfg(feature = "iroh")]
     auto_accept: bool,
+    #[cfg(feature = "iroh")]
+    iroh_runtime: crate::net::IrohRuntimeConfig,
 }
 
 impl<S: Storage> Irokle<S> {
@@ -98,7 +100,7 @@ impl<S: Storage> Irokle<S> {
         Ok(Self {
             oplog,
             sync,
-            peer_whitelist: Arc::new(Mutex::new(config.peer_whitelist.clone())),
+            peer_whitelist: Arc::new(RwLock::new(config.peer_whitelist.clone())),
             config,
             #[cfg(feature = "iroh")]
             net: None,
@@ -123,6 +125,18 @@ impl<S: Storage> Irokle<S> {
     #[cfg(feature = "iroh")]
     pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
         self.net.as_ref().map(|net| net.endpoint())
+    }
+
+    #[cfg(feature = "iroh")]
+    pub fn iroh_runtime_config(&self) -> Option<crate::net::IrohRuntimeConfig> {
+        self.net.as_ref().map(|net| net.runtime_config())
+    }
+
+    #[cfg(feature = "iroh")]
+    pub async fn shutdown_iroh(&self) {
+        if let Some(net) = &self.net {
+            net.shutdown().await;
+        }
     }
 
     #[cfg(feature = "iroh")]
@@ -198,8 +212,16 @@ impl<S: Storage> Irokle<S> {
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "topic not found"))?;
         let peers = select_sync_peers(topic_id, self.peer_id(), &state);
+        let mut first_error = None;
         for peer in peers {
-            net.sync_peer_now(peer, topic_id).await?;
+            if let Err(error) = net.sync_peer_now(peer, topic_id).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -352,24 +374,25 @@ impl<S: Storage> Irokle<S> {
     pub fn peer_whitelist(&self) -> Result<Option<BTreeSet<PeerId>>> {
         Ok(self
             .peer_whitelist
-            .lock()
-            .map_err(|_| Error::Storage("peer whitelist lock poisoned".into()))?
+            .read()
+            .map_err(|_| Error::Storage("peer whitelist read lock poisoned".into()))?
             .clone())
     }
 
     pub fn set_peer_whitelist(&self, peer_whitelist: Option<BTreeSet<PeerId>>) -> Result<()> {
         *self
             .peer_whitelist
-            .lock()
-            .map_err(|_| Error::Storage("peer whitelist lock poisoned".into()))? = peer_whitelist;
+            .write()
+            .map_err(|_| Error::Storage("peer whitelist write lock poisoned".into()))? =
+            peer_whitelist;
         Ok(())
     }
 
     pub fn add_peer_to_whitelist(&self, peer_id: PeerId) -> Result<()> {
         let mut peer_whitelist = self
             .peer_whitelist
-            .lock()
-            .map_err(|_| Error::Storage("peer whitelist lock poisoned".into()))?;
+            .write()
+            .map_err(|_| Error::Storage("peer whitelist write lock poisoned".into()))?;
         peer_whitelist
             .get_or_insert_with(BTreeSet::new)
             .insert(peer_id);
@@ -382,8 +405,8 @@ impl<S: Storage> Irokle<S> {
     {
         let mut peer_whitelist = self
             .peer_whitelist
-            .lock()
-            .map_err(|_| Error::Storage("peer whitelist lock poisoned".into()))?;
+            .write()
+            .map_err(|_| Error::Storage("peer whitelist write lock poisoned".into()))?;
         peer_whitelist
             .get_or_insert_with(BTreeSet::new)
             .extend(peer_ids);
@@ -407,8 +430,8 @@ impl<S: Storage> Irokle<S> {
         let peer_allowed = {
             let peer_whitelist = self
                 .peer_whitelist
-                .lock()
-                .map_err(|_| Error::Storage("peer whitelist lock poisoned".into()))?;
+                .read()
+                .map_err(|_| Error::Storage("peer whitelist read lock poisoned".into()))?;
             match &*peer_whitelist {
                 Some(peer_whitelist) => peer_whitelist.contains(&source_peer_id),
                 None => true,
@@ -454,15 +477,36 @@ impl<S: Storage> Irokle<S> {
     }
 
     #[cfg(feature = "iroh")]
-    fn put_replication_obligations(&self, topic_id: TopicId, op_id: OpId) -> Result<()> {
+    fn put_replication_obligations(&self, topic_id: TopicId, op_id: OpId) -> Result<Vec<PeerId>> {
         let state = self
             .storage()
             .topic_state(&topic_id)?
             .ok_or(Error::TopicNotFound)?;
-        for peer_id in select_sync_peers(topic_id, self.peer_id(), &state) {
+        let peers = select_sync_peers(topic_id, self.peer_id(), &state);
+        for peer_id in peers.iter().copied() {
             self.put_sync_obligation(peer_id, topic_id, [op_id].into())?;
+            self.record_replication_scheduled(peer_id, topic_id)?;
         }
-        Ok(())
+        Ok(peers)
+    }
+
+    #[cfg(feature = "iroh")]
+    fn record_replication_scheduled(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
+        let mut status = self
+            .storage()
+            .sync_statuses(&topic_id)?
+            .into_iter()
+            .find(|status| status.peer_id == peer_id)
+            .unwrap_or(SyncPeerStatus {
+                peer_id,
+                topic_id,
+                ..SyncPeerStatus::default()
+            });
+        status.pending_obligations = self.storage().sync_obligations(&peer_id, &topic_id)?.len();
+        if status.pending_obligations > 0 && status.state != SyncPeerState::Failed {
+            status.state = SyncPeerState::Behind;
+        }
+        self.storage().put_sync_status(status)
     }
 
     pub fn sync_report(&self, peer_id: PeerId, topic_id: TopicId) -> Result<SyncReport> {
@@ -580,12 +624,26 @@ impl<S: Storage> Irokle<S> {
         let _ = &options;
         #[cfg(feature = "iroh")]
         if matches!(options.write_concern, WriteConcern::AsyncReplication) && self.net.is_some() {
-            self.put_replication_obligations(topic_id, op.id)?;
-            let node = self.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = node.sync_topic_now(topic_id).await;
-                });
+            let peers = self.put_replication_obligations(topic_id, op.id)?;
+            if !peers.is_empty() {
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        let node = self.clone();
+                        handle.spawn(async move {
+                            if let Err(error) = node.sync_topic_now(topic_id).await {
+                                tracing::warn!(%topic_id, %error, "async replication wake failed");
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        let error = std::io::Error::other(format!(
+                            "async replication not started: {error}"
+                        ));
+                        for peer_id in peers {
+                            self.record_sync_result(peer_id, topic_id, Err(&error))?;
+                        }
+                    }
+                }
             }
         }
         Ok(record)

@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 use smallvec::{SmallVec, smallvec};
@@ -41,14 +41,14 @@ impl Default for IrohRuntimeConfig {
 #[derive(Clone)]
 struct ConnectionPool {
     endpoint: iroh::Endpoint,
-    connections: Arc<Mutex<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>>,
+    connections: Arc<RwLock<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>>,
 }
 
 impl ConnectionPool {
     fn new(endpoint: iroh::Endpoint) -> Self {
         Self {
             endpoint,
-            connections: Arc::new(Mutex::new(HashMap::new())),
+            connections: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -59,8 +59,8 @@ impl ConnectionPool {
     fn insert(&self, connection: iroh::endpoint::Connection) -> io::Result<iroh::EndpointId> {
         let peer = connection.remote_id();
         self.connections
-            .lock()
-            .map_err(|_| io::Error::other("connection pool lock poisoned"))?
+            .write()
+            .map_err(|_| io::Error::other("connection pool write lock poisoned"))?
             .insert(peer, connection);
         Ok(peer)
     }
@@ -68,8 +68,8 @@ impl ConnectionPool {
     fn get(&self, peer: &iroh::EndpointId) -> io::Result<Option<iroh::endpoint::Connection>> {
         Ok(self
             .connections
-            .lock()
-            .map_err(|_| io::Error::other("connection pool lock poisoned"))?
+            .read()
+            .map_err(|_| io::Error::other("connection pool read lock poisoned"))?
             .get(peer)
             .filter(|connection| connection.close_reason().is_none())
             .cloned())
@@ -101,7 +101,7 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
     runtime: IrohRuntimeConfig,
     accept_started: AtomicBool,
     resync_started: AtomicBool,
-    shutdown: AtomicBool,
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl<S: Storage> IrohNet<S> {
@@ -139,13 +139,14 @@ impl<S: Storage> IrohNet<S> {
         if !alpns.is_empty() {
             endpoint.set_alpns(alpns);
         }
+        let (shutdown, _) = tokio::sync::watch::channel(false);
         Ok(Self {
             pool: ConnectionPool::new(endpoint),
             node,
             runtime,
             accept_started: AtomicBool::new(false),
             resync_started: AtomicBool::new(false),
-            shutdown: AtomicBool::new(false),
+            shutdown,
         })
     }
 
@@ -162,12 +163,12 @@ impl<S: Storage> IrohNet<S> {
     }
 
     pub async fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = self.shutdown.send(true);
         self.endpoint().close().await;
     }
 
     fn is_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::SeqCst)
+        *self.shutdown.borrow()
     }
 
     pub async fn sync_peer_now(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<()> {
@@ -190,14 +191,16 @@ impl<S: Storage> IrohNet<S> {
     }
 
     pub fn spawn_accept_loop(self: &Arc<Self>) -> io::Result<Option<tokio::task::JoinHandle<()>>> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| io::Error::other("iroh auto accept requires a Tokio runtime"))?;
         if self.accept_started.swap(true, Ordering::SeqCst) {
             return Ok(None);
         }
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| io::Error::other("iroh auto accept requires a Tokio runtime"))?;
         let net = Arc::downgrade(self);
         let endpoint = self.endpoint().clone();
+        let mut shutdown = self.shutdown.subscribe();
         Ok(Some(handle.spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 let Some(current) = net.upgrade() else {
                     break;
@@ -207,7 +210,22 @@ impl<S: Storage> IrohNet<S> {
                 }
                 drop(current);
 
-                let Some(incoming) = endpoint.accept().await else {
+                let incoming = tokio::select! {
+                    Some(result) = connections.join_next(), if !connections.is_empty() => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "iroh connection task failed");
+                        }
+                        continue;
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    incoming = endpoint.accept() => incoming,
+                };
+                let Some(incoming) = incoming else {
                     break;
                 };
                 let Some(current) = net.upgrade() else {
@@ -217,12 +235,28 @@ impl<S: Storage> IrohNet<S> {
                     break;
                 }
                 drop(current);
-                match incoming.await.map_err(other) {
+                let accepted = tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    accepted = incoming => accepted.map_err(other),
+                };
+                match accepted {
                     Ok(connection) => {
                         let peer = connection.remote_id();
                         let connection_net = Weak::clone(&net);
-                        tokio::spawn(async move {
-                            handle_connection(connection_net, peer, connection).await;
+                        let connection_shutdown = shutdown.clone();
+                        connections.spawn(async move {
+                            handle_connection(
+                                connection_net,
+                                connection_shutdown,
+                                peer,
+                                connection,
+                            )
+                            .await;
                         });
                     }
                     Err(error) => {
@@ -231,6 +265,8 @@ impl<S: Storage> IrohNet<S> {
                     }
                 }
             }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
         })))
     }
 
@@ -247,16 +283,25 @@ impl<S: Storage> IrohNet<S> {
         self: &Arc<Self>,
         interval: Duration,
     ) -> io::Result<Option<tokio::task::JoinHandle<()>>> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| io::Error::other("iroh resync requires a Tokio runtime"))?;
         if self.resync_started.swap(true, Ordering::SeqCst) {
             return Ok(None);
         }
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| io::Error::other("iroh resync requires a Tokio runtime"))?;
         let net = Arc::downgrade(self);
+        let mut shutdown = self.shutdown.subscribe();
         Ok(Some(handle.spawn(async move {
             let mut tick = tokio::time::interval(interval);
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ = tick.tick() => {}
+                }
                 let Some(current) = net.upgrade() else {
                     break;
                 };
@@ -282,7 +327,16 @@ impl<S: Storage> IrohNet<S> {
                     if current.is_shutdown() {
                         break;
                     }
-                    if let Err(error) = current.sync_peer_now(peer_id, topic_id).await {
+                    let result = tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
+                            continue;
+                        }
+                        result = current.sync_peer_now(peer_id, topic_id) => result,
+                    };
+                    if let Err(error) = result {
                         tracing::warn!(%peer_id, %topic_id, %error, "failed to resync peer");
                     }
                 }
@@ -612,11 +666,21 @@ impl<S: Storage> IrohNet<S> {
 
 async fn handle_connection<S: Storage>(
     net: Weak<IrohNet<S>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
     peer: iroh::EndpointId,
     connection: iroh::endpoint::Connection,
 ) {
     loop {
-        let (send, recv) = match connection.accept_bi().await {
+        let streams = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+            streams = connection.accept_bi() => streams,
+        };
+        let (send, recv) = match streams {
             Ok(streams) => streams,
             Err(error) => {
                 tracing::debug!(%peer, %error, "iroh connection stopped accepting streams");
@@ -632,6 +696,12 @@ async fn handle_connection<S: Storage>(
         if let Err(error) = current.handle_stream(peer, recv, send).await {
             tracing::warn!(%peer, %error, "failed to handle iroh sync stream");
         }
+    }
+}
+
+impl<S: Storage> Drop for IrohNet<S> {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
     }
 }
 
