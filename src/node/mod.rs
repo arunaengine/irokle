@@ -10,13 +10,16 @@ mod builder;
 mod peers;
 mod topic;
 
-#[cfg(any(feature = "iroh", test))]
 pub(crate) use peers::select_sync_peers;
 pub use topic::{RawTopic, Topic};
 
+#[cfg(feature = "iroh")]
+use crate::ActorClock;
 use crate::history::{DagQuery, HistoryOrder, ordered};
 use crate::oplog::{Oplog, topological};
 use crate::reducer::EventRecord;
+#[cfg(feature = "iroh")]
+use crate::storage::{AdmissionEffects, OpMeta, SyncObligation, TopicState};
 use crate::storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
 use crate::sync::{
     SyncAck, SyncData, SyncEngine, SyncFingerprint, SyncOpen, SyncPlan, SyncReport, SyncRequest,
@@ -28,7 +31,6 @@ use crate::{
 };
 
 static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
-#[cfg(any(feature = "iroh", test))]
 const SYNC_PEER_SHARED_OVERLAP: usize = 2;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -235,8 +237,32 @@ impl<S: Storage> Irokle<S> {
             initial_peers: config.initial_peers,
             replication_policy: config.replication_policy,
         };
+        #[cfg(feature = "iroh")]
+        let op = self.oplog.create_topic_genesis_with_effects(
+            topic_id,
+            actor_id,
+            genesis,
+            &self.config.signer,
+            |op, meta, state| {
+                self.replication_admission_effects(
+                    topic_id,
+                    op.id,
+                    meta,
+                    state,
+                    &self.config.default_write_concern,
+                )
+            },
+        )?;
+        #[cfg(not(feature = "iroh"))]
         self.oplog
             .create_topic_genesis(topic_id, actor_id, genesis, &self.config.signer)?;
+        #[cfg(feature = "iroh")]
+        self.wake_async_replication(
+            topic_id,
+            op.id,
+            &self.config.default_write_concern,
+            "topic genesis replication wake failed",
+        )?;
         Ok(Topic::new(self.clone(), topic_id, actor_id))
     }
 
@@ -355,6 +381,7 @@ impl<S: Storage> Irokle<S> {
         let mut ack = self
             .sync
             .receive_data(source_peer_id, self.peer_id(), data)?;
+        self.put_receive_forward_obligations(source_peer_id, ack.topic_id, &ack.accepted)?;
         ack.sign(&self.config.signer)?;
         Ok(ack)
     }
@@ -476,21 +503,110 @@ impl<S: Storage> Irokle<S> {
         self.sync.put_obligation(peer_id, topic_id, op_ids)
     }
 
+    fn put_receive_forward_obligations(
+        &self,
+        source_peer_id: PeerId,
+        topic_id: TopicId,
+        accepted: &BTreeSet<OpId>,
+    ) -> Result<()> {
+        if accepted.is_empty() {
+            return Ok(());
+        }
+        let state = self
+            .storage()
+            .topic_state(&topic_id)?
+            .ok_or(Error::TopicNotFound)?;
+        for peer_id in select_sync_peers(topic_id, self.peer_id(), &state) {
+            if peer_id == source_peer_id || peer_id == self.peer_id() {
+                continue;
+            }
+            let mut missing = BTreeSet::new();
+            for op_id in accepted {
+                if !self.peer_reached_op(peer_id, *op_id)? {
+                    missing.insert(*op_id);
+                }
+            }
+            if !missing.is_empty() {
+                self.put_sync_obligation(peer_id, topic_id, missing)?;
+                self.record_replication_scheduled(peer_id, topic_id)?;
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "iroh")]
-    fn put_replication_obligations(&self, topic_id: TopicId, op_id: OpId) -> Result<Vec<PeerId>> {
+    fn replication_admission_effects(
+        &self,
+        topic_id: TopicId,
+        op_id: OpId,
+        meta: &OpMeta,
+        state: &TopicState,
+        write_concern: &WriteConcern,
+    ) -> Result<AdmissionEffects> {
+        if !matches!(write_concern, WriteConcern::AsyncReplication) || self.net.is_none() {
+            return Ok(AdmissionEffects::default());
+        }
+
+        let mut target_clock = ActorClock::new();
+        target_clock.observe(meta.actor_id, meta.actor_seq);
+        Ok(AdmissionEffects {
+            sync_obligations: select_sync_peers(topic_id, self.peer_id(), state)
+                .into_iter()
+                .map(|peer_id| SyncObligation {
+                    peer_id,
+                    topic_id,
+                    op_ids: [op_id].into(),
+                    target_clock: target_clock.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    #[cfg(feature = "iroh")]
+    fn wake_async_replication(
+        &self,
+        topic_id: TopicId,
+        _op_id: OpId,
+        write_concern: &WriteConcern,
+        wake_failed_message: &'static str,
+    ) -> Result<()> {
+        if !matches!(write_concern, WriteConcern::AsyncReplication) || self.net.is_none() {
+            return Ok(());
+        }
+
         let state = self
             .storage()
             .topic_state(&topic_id)?
             .ok_or(Error::TopicNotFound)?;
         let peers = select_sync_peers(topic_id, self.peer_id(), &state);
         for peer_id in peers.iter().copied() {
-            self.put_sync_obligation(peer_id, topic_id, [op_id].into())?;
             self.record_replication_scheduled(peer_id, topic_id)?;
         }
-        Ok(peers)
+        if peers.is_empty() {
+            return Ok(());
+        }
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let node = self.clone();
+                handle.spawn(async move {
+                    if let Err(error) = node.sync_topic_now(topic_id).await {
+                        tracing::warn!(%topic_id, %error, "{}", wake_failed_message);
+                    }
+                });
+            }
+            Err(error) => {
+                let error =
+                    std::io::Error::other(format!("async replication not started: {error}"));
+                for peer_id in peers {
+                    self.record_sync_result(peer_id, topic_id, Err(&error))?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
-    #[cfg(feature = "iroh")]
     fn record_replication_scheduled(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
         let mut status = self
             .storage()
@@ -605,6 +721,23 @@ impl<S: Storage> Irokle<S> {
         options: PublishOptions,
     ) -> Result<EventRecord<E>> {
         let envelope = EventEnvelope::encode_event(&event)?;
+        #[cfg(feature = "iroh")]
+        let op = self.oplog.create_event_op_with_effects(
+            topic_id,
+            actor_id,
+            envelope,
+            &self.config.signer,
+            |op, meta, state| {
+                self.replication_admission_effects(
+                    topic_id,
+                    op.id,
+                    meta,
+                    state,
+                    &options.write_concern,
+                )
+            },
+        )?;
+        #[cfg(not(feature = "iroh"))]
         let op = self
             .oplog
             .create_event_op(topic_id, actor_id, envelope, &self.config.signer)?;
@@ -623,29 +756,12 @@ impl<S: Storage> Irokle<S> {
         #[cfg(not(feature = "iroh"))]
         let _ = &options;
         #[cfg(feature = "iroh")]
-        if matches!(options.write_concern, WriteConcern::AsyncReplication) && self.net.is_some() {
-            let peers = self.put_replication_obligations(topic_id, op.id)?;
-            if !peers.is_empty() {
-                match tokio::runtime::Handle::try_current() {
-                    Ok(handle) => {
-                        let node = self.clone();
-                        handle.spawn(async move {
-                            if let Err(error) = node.sync_topic_now(topic_id).await {
-                                tracing::warn!(%topic_id, %error, "async replication wake failed");
-                            }
-                        });
-                    }
-                    Err(error) => {
-                        let error = std::io::Error::other(format!(
-                            "async replication not started: {error}"
-                        ));
-                        for peer_id in peers {
-                            self.record_sync_result(peer_id, topic_id, Err(&error))?;
-                        }
-                    }
-                }
-            }
-        }
+        self.wake_async_replication(
+            topic_id,
+            op.id,
+            &options.write_concern,
+            "async replication wake failed",
+        )?;
         Ok(record)
     }
 
@@ -655,9 +771,33 @@ impl<S: Storage> Irokle<S> {
         actor_id: ActorId,
         control: TopicControl,
     ) -> Result<()> {
+        #[cfg(feature = "iroh")]
+        let op = self.oplog.create_control_op_with_effects(
+            topic_id,
+            actor_id,
+            control,
+            &self.config.signer,
+            |op, meta, state| {
+                self.replication_admission_effects(
+                    topic_id,
+                    op.id,
+                    meta,
+                    state,
+                    &self.config.default_write_concern,
+                )
+            },
+        )?;
+        #[cfg(not(feature = "iroh"))]
         self.oplog
-            .create_control_op(topic_id, actor_id, control, &self.config.signer)
-            .map(|_| ())
+            .create_control_op(topic_id, actor_id, control, &self.config.signer)?;
+        #[cfg(feature = "iroh")]
+        self.wake_async_replication(
+            topic_id,
+            op.id,
+            &self.config.default_write_concern,
+            "topic control replication wake failed",
+        )?;
+        Ok(())
     }
 
     pub(crate) fn topic_history<E: Event>(

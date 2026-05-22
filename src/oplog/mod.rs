@@ -3,7 +3,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::storage::{MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage, TopicState};
+use crate::storage::{
+    AdmissionEffects, AdmittedBatch, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage,
+    TopicState,
+};
 use crate::{
     ActorId, Error, EventEnvelope, Op, OpBody, PeerId, Result, SignedOp, Signer, TopicControl,
     TopicGenesis, TopicId, TopicPayload, actor_id_for,
@@ -55,13 +58,35 @@ impl<S: Storage> Oplog<S> {
         genesis: TopicGenesis,
         signer: &impl Signer,
     ) -> Result<Op> {
+        self.create_topic_genesis_with_effects(topic_id, actor_id, genesis, signer, |_, _, _| {
+            Ok(AdmissionEffects::default())
+        })
+    }
+
+    pub(crate) fn create_topic_genesis_with_effects<F>(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        genesis: TopicGenesis,
+        signer: &impl Signer,
+        effects: F,
+    ) -> Result<Op>
+    where
+        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
+    {
         let mut peers = genesis.initial_peers.clone();
         peers.insert(signer.peer_id());
         let genesis = TopicGenesis {
             initial_peers: peers,
             ..genesis
         };
-        self.create_and_admit_local_op(topic_id, actor_id, TopicPayload::Genesis(genesis), signer)
+        self.create_and_admit_local_op_with_effects(
+            topic_id,
+            actor_id,
+            TopicPayload::Genesis(genesis),
+            signer,
+            effects,
+        )
     }
 
     pub fn create_event_op(
@@ -71,7 +96,29 @@ impl<S: Storage> Oplog<S> {
         event: EventEnvelope,
         signer: &impl Signer,
     ) -> Result<Op> {
-        self.create_and_admit_local_op(topic_id, actor_id, TopicPayload::Event(event), signer)
+        self.create_event_op_with_effects(topic_id, actor_id, event, signer, |_, _, _| {
+            Ok(AdmissionEffects::default())
+        })
+    }
+
+    pub(crate) fn create_event_op_with_effects<F>(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        event: EventEnvelope,
+        signer: &impl Signer,
+        effects: F,
+    ) -> Result<Op>
+    where
+        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
+    {
+        self.create_and_admit_local_op_with_effects(
+            topic_id,
+            actor_id,
+            TopicPayload::Event(event),
+            signer,
+            effects,
+        )
     }
 
     pub fn create_control_op(
@@ -81,7 +128,29 @@ impl<S: Storage> Oplog<S> {
         control: TopicControl,
         signer: &impl Signer,
     ) -> Result<Op> {
-        self.create_and_admit_local_op(topic_id, actor_id, TopicPayload::Control(control), signer)
+        self.create_control_op_with_effects(topic_id, actor_id, control, signer, |_, _, _| {
+            Ok(AdmissionEffects::default())
+        })
+    }
+
+    pub(crate) fn create_control_op_with_effects<F>(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        control: TopicControl,
+        signer: &impl Signer,
+        effects: F,
+    ) -> Result<Op>
+    where
+        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
+    {
+        self.create_and_admit_local_op_with_effects(
+            topic_id,
+            actor_id,
+            TopicPayload::Control(control),
+            signer,
+            effects,
+        )
     }
 
     pub fn receive_op(&self, op: Op) -> Result<()> {
@@ -295,14 +364,15 @@ impl<S: Storage> Oplog<S> {
         }
 
         if !entries.is_empty() {
-            self.storage.put_admitted_batch(
+            self.storage.put_admitted_batch(AdmittedBatch {
                 topic_id,
                 expected_heads,
-                expected_state,
+                expected_topic_state: expected_state,
                 entries,
                 heads,
-                topic_state_changed.then(|| state.clone()).flatten(),
-            )?;
+                topic_state: topic_state_changed.then(|| state.clone()).flatten(),
+                effects: AdmissionEffects::default(),
+            })?;
         }
 
         Ok(accepted)
@@ -312,15 +382,25 @@ impl<S: Storage> Oplog<S> {
         self.storage.actor_clock(topic_id)
     }
 
-    fn create_and_admit_local_op(
+    fn create_and_admit_local_op_with_effects<F>(
         &self,
         topic_id: TopicId,
         actor_id: ActorId,
         payload: TopicPayload,
         signer: &impl Signer,
-    ) -> Result<Op> {
+        effects: F,
+    ) -> Result<Op>
+    where
+        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
+    {
         for _ in 0..MAX_ADMISSION_RETRIES {
-            match self.try_create_and_admit_local_op(topic_id, actor_id, payload.clone(), signer) {
+            match self.try_create_and_admit_local_op(
+                topic_id,
+                actor_id,
+                payload.clone(),
+                signer,
+                &effects,
+            ) {
                 Err(err) if is_local_admission_race(&err) => continue,
                 result => return result,
             }
@@ -328,13 +408,17 @@ impl<S: Storage> Oplog<S> {
         Err(Error::AdmissionConflict)
     }
 
-    fn try_create_and_admit_local_op(
+    fn try_create_and_admit_local_op<F>(
         &self,
         topic_id: TopicId,
         actor_id: ActorId,
         payload: TopicPayload,
         signer: &impl Signer,
-    ) -> Result<Op> {
+        effects: &F,
+    ) -> Result<Op>
+    where
+        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
+    {
         if !matches!(payload, TopicPayload::Genesis(_)) {
             self.ensure_member(&topic_id, signer.peer_id())?;
         }
@@ -344,7 +428,7 @@ impl<S: Storage> Oplog<S> {
         op.validate()?;
         self.validate_op(&op)?;
         let meta = self.meta_for(&op)?;
-        self.commit_admission(op.clone(), meta, expected_heads, expected_state)?;
+        self.commit_admission(op.clone(), meta, expected_heads, expected_state, effects)?;
         Ok(op)
     }
 
@@ -865,23 +949,33 @@ impl<S: Storage> Oplog<S> {
         }
     }
 
-    fn commit_admission(
+    fn commit_admission<F>(
         &self,
         op: Op,
         meta: OpMeta,
         expected_heads: BTreeSet<crate::OpId>,
         expected_state: Option<TopicState>,
-    ) -> Result<()> {
+        effects: &F,
+    ) -> Result<()>
+    where
+        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
+    {
         let heads = heads_after(&expected_heads, &op);
         let topic_state = self.topic_state_after(&op, heads.clone(), expected_state.clone())?;
-        self.storage.put_admitted_batch(
-            op.signed.body.topic_id,
+        let effective_state = topic_state
+            .as_ref()
+            .or(expected_state.as_ref())
+            .ok_or(Error::TopicNotFound)?;
+        let effects = effects(&op, &meta, effective_state)?;
+        self.storage.put_admitted_batch(AdmittedBatch {
+            topic_id: op.signed.body.topic_id,
             expected_heads,
-            expected_state,
-            vec![(op, meta)],
+            expected_topic_state: expected_state,
+            entries: vec![(op, meta)],
             heads,
             topic_state,
-        )
+            effects,
+        })
     }
 
     fn topic_state_for_deps(

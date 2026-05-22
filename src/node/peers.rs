@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-#[cfg(any(feature = "iroh", test))]
 use std::collections::BTreeSet;
 
-#[cfg(any(feature = "iroh", test))]
 use smallvec::SmallVec;
 
-#[cfg(any(feature = "iroh", test))]
 use crate::{PeerId, TopicId};
 
-#[cfg(any(feature = "iroh", test))]
 use super::SYNC_PEER_SHARED_OVERLAP;
 
-#[cfg(any(feature = "iroh", test))]
 pub(crate) fn select_sync_peers(
     topic_id: TopicId,
     local_peer: PeerId,
@@ -105,7 +100,6 @@ pub(crate) fn select_sync_peers(
     selected.into_iter().collect()
 }
 
-#[cfg(any(feature = "iroh", test))]
 fn sync_peer_score(topic_id: TopicId, local_peer: PeerId, peer: PeerId) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"irokle-sync-peer-v1");
