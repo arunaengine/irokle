@@ -147,14 +147,15 @@ fn assert_pending_reconciles<S: Storage>(storage: S) {
 
     let first_meta = alice.storage().get_meta(&first.id).unwrap().unwrap();
     storage
-        .put_admitted_batch(
-            topic.id(),
-            storage.heads(&topic.id()).unwrap(),
-            storage.topic_state(&topic.id()).unwrap(),
-            vec![(first.clone(), first_meta)],
-            [first.id].into(),
-            None,
-        )
+        .put_admitted_batch(crate_storage::AdmittedBatch {
+            topic_id: topic.id(),
+            expected_heads: storage.heads(&topic.id()).unwrap(),
+            expected_topic_state: storage.topic_state(&topic.id()).unwrap(),
+            entries: vec![(first.clone(), first_meta)],
+            heads: [first.id].into(),
+            topic_state: None,
+            effects: crate_storage::AdmissionEffects::default(),
+        })
         .unwrap();
     assert!(storage.get_op(&first.id).unwrap().is_some());
     assert!(storage.get_op(&second.id).unwrap().is_none());

@@ -181,6 +181,110 @@ async fn async_replication_records_scheduled_status() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_replication_schedules_genesis_and_control_obligations() {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let alice = Irokle::builder()
+        .with_net(alice_endpoint)
+        .with_write_concern(WriteConcern::AsyncReplication)
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(bob_endpoint.secret_key())
+        .without_auto_accept()
+        .build()
+        .unwrap();
+
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(1),
+        })
+        .unwrap();
+    let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
+
+    let report = alice.sync_report(bob.peer_id(), topic.id()).unwrap();
+    assert!(
+        report
+            .obligations
+            .iter()
+            .any(|obligation| obligation.op_ids.contains(&genesis.id)),
+        "genesis op should be scheduled for async replication"
+    );
+
+    topic
+        .set_replication_policy(ReplicationPolicy::all().with_max_sync_peers(1))
+        .unwrap();
+    let control = oplog::topological(alice.storage(), &topic.id())
+        .unwrap()
+        .into_iter()
+        .find(|op| matches!(op.signed.body.payload, TopicPayload::Control(_)))
+        .expect("control op");
+
+    let report = alice.sync_report(bob.peer_id(), topic.id()).unwrap();
+    assert!(
+        report
+            .obligations
+            .iter()
+            .any(|obligation| obligation.op_ids.contains(&control.id)),
+        "control op should be scheduled for async replication"
+    );
+}
+
+#[cfg(all(feature = "iroh", feature = "fjall"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_replication_persists_genesis_obligation_with_fjall() {
+    let dir = tempfile::tempdir().unwrap();
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_peer = PeerId::from_bytes(*bob_endpoint.id().as_bytes());
+
+    let (topic_id, genesis_id) = {
+        let alice = Irokle::builder()
+            .with_net(alice_endpoint)
+            .with_write_concern(WriteConcern::AsyncReplication)
+            .with_fjall_path(dir.path())
+            .unwrap()
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob_peer].into(),
+                replication_policy: ReplicationPolicy::all().with_max_sync_peers(1),
+            })
+            .unwrap();
+        let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
+        alice.shutdown_iroh().await;
+        bob_endpoint.close().await;
+        (topic.id(), genesis.id)
+    };
+
+    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+    let obligations = storage.sync_obligations(&bob_peer, &topic_id).unwrap();
+    assert!(
+        obligations
+            .iter()
+            .any(|obligation| obligation.op_ids.contains(&genesis_id)),
+        "genesis obligation should be durably committed with the op"
+    );
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_hides_non_member_summary() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()

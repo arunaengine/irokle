@@ -460,6 +460,68 @@ fn deterministic_overlap() {
 }
 
 #[test]
+fn receive_forwarding_obligates_other_selected_peers() {
+    let alice = node(90);
+    let bob = node(91);
+    let charlie = node(92);
+    let dana = node(93);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id(), charlie.peer_id(), dana.peer_id()].into(),
+            replication_policy: ReplicationPolicy::selected([charlie.peer_id(), dana.peer_id()])
+                .with_max_sync_peers(1),
+        })
+        .unwrap();
+    let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
+    bob.receive_sync_data_from(
+        alice.peer_id(),
+        crate_sync::SyncData {
+            topic_id: topic.id(),
+            ops: vec![genesis],
+        },
+    )
+    .unwrap();
+
+    let record = topic
+        .publish(Note {
+            text: "forward me".into(),
+        })
+        .unwrap();
+    let op = alice.storage().get_op(&record.meta.op_id).unwrap().unwrap();
+    let ack = bob
+        .receive_sync_data_from(
+            alice.peer_id(),
+            crate_sync::SyncData {
+                topic_id: topic.id(),
+                ops: vec![op],
+            },
+        )
+        .unwrap();
+    assert_eq!(ack.accepted, [record.meta.op_id].into());
+
+    let state = bob.storage().topic_state(&topic.id()).unwrap().unwrap();
+    let expected_targets = node::select_sync_peers(topic.id(), bob.peer_id(), &state)
+        .into_iter()
+        .filter(|peer| *peer != alice.peer_id())
+        .collect::<BTreeSet<_>>();
+    assert!(!expected_targets.is_empty());
+
+    let actual_targets = bob
+        .storage()
+        .all_sync_obligations()
+        .unwrap()
+        .into_iter()
+        .filter(|obligation| {
+            obligation.topic_id == topic.id() && obligation.op_ids.contains(&record.meta.op_id)
+        })
+        .map(|obligation| obligation.peer_id)
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(actual_targets, expected_targets);
+    assert!(!actual_targets.contains(&alice.peer_id()));
+}
+
+#[test]
 fn reports_status() {
     let alice = node(87);
     let bob = node(88);
@@ -625,6 +687,67 @@ fn exposes_sync_metadata() {
         alice.peers_reached_op(record.meta.op_id).unwrap(),
         vec![bob.peer_id()]
     );
+}
+
+#[test]
+fn receive_schedules_forwarding_only_for_missing_selected_peers() {
+    let alice = node(94);
+    let bob = node(95);
+    let charlie = node(96);
+    let dana = node(97);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id(), charlie.peer_id(), dana.peer_id()].into(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(8),
+        })
+        .unwrap();
+    let record = topic.publish(Note { text: "fan".into() }).unwrap();
+    let data = crate_sync::SyncData {
+        topic_id: topic.id(),
+        ops: oplog::topological(alice.storage(), &topic.id()).unwrap(),
+    };
+    let meta = alice
+        .storage()
+        .get_meta(&record.meta.op_id)
+        .unwrap()
+        .unwrap();
+    let mut clock = ActorClock::new();
+    clock.observe(meta.actor_id, meta.actor_seq);
+    bob.storage()
+        .apply_peer_ack(crate_storage::PeerAck {
+            peer_id: charlie.peer_id(),
+            topic_id: topic.id(),
+            heads: [record.meta.op_id].into(),
+            clock,
+        })
+        .unwrap();
+
+    let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+
+    assert!(
+        bob.storage()
+            .sync_obligations(&alice.peer_id(), &topic.id())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        bob.storage()
+            .sync_obligations(&bob.peer_id(), &topic.id())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        bob.storage()
+            .sync_obligations(&charlie.peer_id(), &topic.id())
+            .unwrap()
+            .is_empty()
+    );
+    let dana_obligations = bob
+        .storage()
+        .sync_obligations(&dana.peer_id(), &topic.id())
+        .unwrap();
+    assert_eq!(dana_obligations.len(), 1);
+    assert_eq!(dana_obligations[0].op_ids, ack.accepted);
 }
 
 #[test]
