@@ -600,19 +600,13 @@ impl<S: Storage> Irokle<S> {
         if self.storage().topic_state(&data.topic_id)?.is_some() {
             return Ok(());
         }
-        let Some(genesis) = data.ops.iter().find_map(|op| {
-            let body = &op.signed.body;
-            if body.topic_id != data.topic_id || body.author != source_peer_id {
-                return None;
-            }
-            match &body.payload {
-                crate::TopicPayload::Genesis(genesis) => Some(genesis),
-                _ => None,
-            }
-        }) else {
+        let dry_storage = MemoryStorage::new();
+        let dry_oplog = Oplog::with_storage(dry_storage.clone());
+        dry_oplog.receive_ops_from_peer(Some(source_peer_id), data.ops.clone())?;
+        let Some(state) = dry_storage.topic_state(&data.topic_id)? else {
             return Err(Error::InvalidGenesis);
         };
-        if !genesis.initial_peers.contains(&self.peer_id()) {
+        if !state.members.contains(&self.peer_id()) || !state.members.contains(&source_peer_id) {
             return Err(Error::NotTopicMember);
         }
         Ok(())
