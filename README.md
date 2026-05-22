@@ -42,7 +42,7 @@ fn main() -> irokle::Result<()> {
 
     let bob_summary = bob.sync_summary(alice_topic.id())?;
     let data_for_bob = alice.plan_sync_data(bob.peer_id(), &bob_summary)?;
-    let bob_ack = bob.receive_sync_data(bob.peer_id(), data_for_bob)?;
+    let bob_ack = bob.receive_sync_data_from(alice.peer_id(), data_for_bob)?;
     alice.apply_sync_ack(&bob_ack)?;
 
     let bob_topic = bob.open_topic::<ChatEvent>(alice_topic.id())?;
@@ -87,34 +87,43 @@ Peer selection is deterministic and combines ring neighbors with hash-ranked fil
 With the `iroh` feature, `Irokle::builder().with_net(endpoint)` configures the Irokle sync ALPN automatically. Normal use is NodeId-only:
 
 ```rust
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
 use irokle::{Irokle, TopicConfig};
+use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, timeout};
 
-let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-    .bind()
-    .await?;
-let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-    .bind()
-    .await?;
+#[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
+struct MyEvent;
 
-timeout(Duration::from_secs(10), alice_endpoint.online()).await?;
-timeout(Duration::from_secs(10), bob_endpoint.online()).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
 
-let alice = Irokle::builder().with_net(alice_endpoint).build()?;
-let bob = Irokle::builder().with_net(bob_endpoint).build()?;
+    timeout(Duration::from_secs(10), alice_endpoint.online()).await?;
+    timeout(Duration::from_secs(10), bob_endpoint.online()).await?;
 
-let topic = alice.create_topic::<MyEvent>(TopicConfig {
-    initial_peers: [bob.peer_id()].into(),
-    ..TopicConfig::default()
-})?;
+    let alice = Irokle::builder().with_net(alice_endpoint).build()?;
+    let bob = Irokle::builder()
+        .with_peer_whitelist([alice.peer_id()])
+        .with_net(bob_endpoint)
+        .build()?;
 
-alice.sync_now(bob.peer_id(), topic.id()).await?;
-# Ok(())
-# }
-# #[derive(Clone, Debug, irokle::Event, serde::Serialize, serde::Deserialize)]
-# struct MyEvent;
+    let topic = alice.create_topic::<MyEvent>(TopicConfig {
+        initial_peers: [bob.peer_id()].into(),
+        ..TopicConfig::default()
+    })?;
+
+    alice.sync_now(bob.peer_id(), topic.id()).await?;
+
+    Ok(())
+}
 ```
+
+By default, Iroh auto-accept only admits brand-new topics from peers in `peer_whitelist`. The whitelist starts as `Some(empty)`, so add allowed peers with `with_peer_whitelist`, `add_peer_to_whitelist`, `add_peers_to_whitelist`, or `set_peer_whitelist`. Set the whitelist to `None` only when unknown-topic admission should be unrestricted.
 
 `sync_addr_now(endpoint_addr, topic_id)` remains available for explicit one-off manual dialing in local/offline setups. The peer registry API was removed; when discovery is configured, peers are identified by `PeerId`/Iroh `EndpointId`.
 
