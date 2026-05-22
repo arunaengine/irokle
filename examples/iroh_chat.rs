@@ -26,7 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     timeout(Duration::from_secs(10), bob_endpoint.online()).await?;
 
     let alice = Irokle::builder().with_net(alice_endpoint).build()?;
-    let bob = Irokle::builder().with_net(bob_endpoint).build()?;
+    let bob = Irokle::builder()
+        .with_peer_whitelist([alice.peer_id()])
+        .with_net(bob_endpoint)
+        .build()?;
 
     let alice_topic = alice.create_topic::<ChatEvent>(TopicConfig {
         initial_peers: [bob.peer_id()].into(),

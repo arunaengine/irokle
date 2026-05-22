@@ -37,6 +37,12 @@ pub enum Error {
     #[error("peer is not a member of topic")]
     NotTopicMember,
 
+    #[error("peer {0} is not in the peer whitelist")]
+    PeerNotWhitelisted(crate::ids::PeerId),
+
+    #[error("invalid sync acknowledgement: {0}")]
+    InvalidSyncAck(String),
+
     #[error("actor sequence gap: expected {expected}, got {actual}")]
     ActorSeqGap { expected: u64, actual: u64 },
 

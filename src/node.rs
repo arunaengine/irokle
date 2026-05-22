@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(any(feature = "iroh", test))]
@@ -37,6 +38,7 @@ pub enum WriteConcern {
 pub struct NodeConfig {
     pub signer: Ed25519Signer,
     pub default_write_concern: WriteConcern,
+    pub peer_whitelist: Option<BTreeSet<PeerId>>,
 }
 
 impl Default for NodeConfig {
@@ -44,6 +46,7 @@ impl Default for NodeConfig {
         Self {
             signer: Ed25519Signer::generate(),
             default_write_concern: WriteConcern::Local,
+            peer_whitelist: Some(BTreeSet::new()),
         }
     }
 }
@@ -66,8 +69,9 @@ pub struct Irokle<S: Storage = MemoryStorage> {
     oplog: Oplog<S>,
     sync: SyncEngine<S>,
     config: NodeConfig,
+    peer_whitelist: Arc<Mutex<Option<BTreeSet<PeerId>>>>,
     #[cfg(feature = "iroh")]
-    net: Option<std::sync::Arc<crate::net::IrohNet<S>>>,
+    net: Option<Arc<crate::net::IrohNet<S>>>,
 }
 
 pub struct IrokleBuilder<S = MemoryStorage> {
@@ -134,6 +138,19 @@ impl<S: Storage> IrokleBuilder<S> {
 
     pub fn with_write_concern(mut self, write_concern: WriteConcern) -> Self {
         self.config.default_write_concern = write_concern;
+        self
+    }
+
+    pub fn with_peer_whitelist<I>(mut self, peer_ids: I) -> Self
+    where
+        I: IntoIterator<Item = PeerId>,
+    {
+        self.config.peer_whitelist = Some(peer_ids.into_iter().collect());
+        self
+    }
+
+    pub fn without_peer_whitelist(mut self) -> Self {
+        self.config.peer_whitelist = None;
         self
     }
 
@@ -224,7 +241,7 @@ impl<S: Storage> IrokleBuilder<S> {
         #[cfg(feature = "iroh")]
         if let Some(endpoint) = self.endpoint {
             let node = Irokle::with_storage(self.storage, self.config)?;
-            let net = std::sync::Arc::new(
+            let net = Arc::new(
                 crate::net::IrohNet::new_with_alpns(endpoint, node.clone(), self.alpns)
                     .map_err(|err| Error::Storage(format!("failed to configure iroh: {err}")))?,
             );
@@ -252,6 +269,7 @@ impl<S: Storage> Irokle<S> {
         Ok(Self {
             oplog,
             sync,
+            peer_whitelist: Arc::new(Mutex::new(config.peer_whitelist.clone())),
             config,
             #[cfg(feature = "iroh")]
             net: None,
@@ -259,7 +277,7 @@ impl<S: Storage> Irokle<S> {
     }
 
     #[cfg(feature = "iroh")]
-    pub(crate) fn with_net(mut self, net: std::sync::Arc<crate::net::IrohNet<S>>) -> Self {
+    pub(crate) fn with_net(mut self, net: Arc<crate::net::IrohNet<S>>) -> Self {
         self.net = Some(net);
         self
     }
@@ -477,14 +495,6 @@ impl<S: Storage> Irokle<S> {
         self.sync.plan_response_data(peer_id, request)
     }
 
-    pub fn receive_sync_data(&self, peer_id: PeerId, data: SyncData) -> Result<SyncAck> {
-        let mut ack = self.sync.receive_data(peer_id, peer_id, data)?;
-        if ack.peer_id == self.peer_id() {
-            ack.sign(&self.config.signer)?;
-        }
-        Ok(ack)
-    }
-
     pub fn receive_sync_data_from(
         &self,
         source_peer_id: PeerId,
@@ -498,11 +508,94 @@ impl<S: Storage> Irokle<S> {
     }
 
     pub fn receive_sync_data_as_local(&self, data: SyncData) -> Result<SyncAck> {
-        self.receive_sync_data(self.peer_id(), data)
+        let mut ack = self
+            .sync
+            .receive_data(self.peer_id(), self.peer_id(), data)?;
+        ack.sign(&self.config.signer)?;
+        Ok(ack)
     }
 
     pub fn apply_sync_ack(&self, ack: &SyncAck) -> Result<()> {
         self.sync.apply_ack(ack)
+    }
+
+    pub fn peer_whitelist(&self) -> Result<Option<BTreeSet<PeerId>>> {
+        Ok(self
+            .peer_whitelist
+            .lock()
+            .map_err(|_| Error::Storage("peer whitelist lock poisoned".into()))?
+            .clone())
+    }
+
+    pub fn set_peer_whitelist(&self, peer_whitelist: Option<BTreeSet<PeerId>>) -> Result<()> {
+        *self
+            .peer_whitelist
+            .lock()
+            .map_err(|_| Error::Storage("peer whitelist lock poisoned".into()))? = peer_whitelist;
+        Ok(())
+    }
+
+    pub fn add_peer_to_whitelist(&self, peer_id: PeerId) -> Result<()> {
+        let mut peer_whitelist = self
+            .peer_whitelist
+            .lock()
+            .map_err(|_| Error::Storage("peer whitelist lock poisoned".into()))?;
+        peer_whitelist
+            .get_or_insert_with(BTreeSet::new)
+            .insert(peer_id);
+        Ok(())
+    }
+
+    pub fn add_peers_to_whitelist<I>(&self, peer_ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = PeerId>,
+    {
+        let mut peer_whitelist = self
+            .peer_whitelist
+            .lock()
+            .map_err(|_| Error::Storage("peer whitelist lock poisoned".into()))?;
+        peer_whitelist
+            .get_or_insert_with(BTreeSet::new)
+            .extend(peer_ids);
+        Ok(())
+    }
+
+    #[cfg(feature = "iroh")]
+    pub(crate) fn record_peer_synced(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
+        self.sync.record_peer_synced(peer_id, topic_id)
+    }
+
+    #[cfg(feature = "iroh")]
+    pub(crate) fn ensure_iroh_peer_whitelisted(
+        &self,
+        source_peer_id: PeerId,
+        data: &SyncData,
+    ) -> Result<()> {
+        if self.storage().topic_state(&data.topic_id)?.is_some() {
+            return Ok(());
+        }
+        let peer_allowed = {
+            let peer_whitelist = self
+                .peer_whitelist
+                .lock()
+                .map_err(|_| Error::Storage("peer whitelist lock poisoned".into()))?;
+            match &*peer_whitelist {
+                Some(peer_whitelist) => peer_whitelist.contains(&source_peer_id),
+                None => true,
+            }
+        };
+        if !peer_allowed {
+            return Err(Error::PeerNotWhitelisted(source_peer_id));
+        }
+        let source_authored_genesis = data.ops.iter().any(|op| {
+            op.signed.body.topic_id == data.topic_id
+                && op.signed.body.author == source_peer_id
+                && matches!(op.signed.body.payload, crate::TopicPayload::Genesis(_))
+        });
+        if !source_authored_genesis {
+            return Err(Error::InvalidGenesis);
+        }
+        Ok(())
     }
 
     pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {

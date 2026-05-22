@@ -66,6 +66,7 @@ mod tests {
         Irokle::new(NodeConfig {
             signer: Ed25519Signer::from_bytes(&[seed; 32]),
             default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
         })
         .unwrap()
     }
@@ -232,6 +233,7 @@ mod tests {
         let config = NodeConfig {
             signer: Ed25519Signer::from_bytes(&[45; 32]),
             default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
         };
         let initial = Irokle::with_storage(storage.clone(), config.clone()).unwrap();
         let topic = initial
@@ -285,6 +287,7 @@ mod tests {
         let config = NodeConfig {
             signer: Ed25519Signer::from_bytes(&[46; 32]),
             default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
         };
         let creates = 32_usize;
         let barrier = Arc::new(Barrier::new(creates));
@@ -360,7 +363,7 @@ mod tests {
         let summary_b = b.sync_summary(topic.id()).unwrap();
         let data = a.plan_sync_data(b.peer_id(), &summary_b).unwrap();
         assert_eq!(data.ops.len(), 2);
-        let ack = b.receive_sync_data(b.peer_id(), data).unwrap();
+        let ack = b.receive_sync_data_from(a.peer_id(), data).unwrap();
         assert!(
             b.storage()
                 .peer_ack(&b.peer_id(), &topic.id())
@@ -417,7 +420,7 @@ mod tests {
 
         let bob_summary = bob.sync_summary(topic.id()).unwrap();
         let data = alice.plan_sync_data(bob.peer_id(), &bob_summary).unwrap();
-        bob.receive_sync_data(bob.peer_id(), data).unwrap();
+        bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
 
         let plan = alice
             .negotiate_sync(bob.peer_id(), &bob.sync_summary(topic.id()).unwrap())
@@ -439,8 +442,8 @@ mod tests {
             })
             .unwrap();
         let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
-        bob.receive_sync_data(
-            bob.peer_id(),
+        bob.receive_sync_data_from(
+            alice.peer_id(),
             sync::SyncData {
                 topic_id: topic.id(),
                 ops: vec![genesis.clone()],
@@ -482,8 +485,8 @@ mod tests {
             })
             .unwrap();
         let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
-        bob.receive_sync_data(
-            bob.peer_id(),
+        bob.receive_sync_data_from(
+            alice.peer_id(),
             sync::SyncData {
                 topic_id: topic.id(),
                 ops: vec![genesis.clone()],
@@ -513,7 +516,9 @@ mod tests {
         assert_eq!(request_for_alice.wants.len(), 1);
         assert_eq!(request_for_alice.actor_range_hints.len(), 1);
 
-        let bob_ack = bob.receive_sync_data(bob.peer_id(), data_for_bob).unwrap();
+        let bob_ack = bob
+            .receive_sync_data_from(alice.peer_id(), data_for_bob)
+            .unwrap();
         let data_for_alice = bob
             .plan_sync_response_data(alice.peer_id(), &request_for_alice)
             .unwrap();
@@ -521,7 +526,7 @@ mod tests {
         assert!(data_for_alice.ops[0].signed.body.deps.contains(&genesis.id));
 
         let alice_ack = alice
-            .receive_sync_data(alice.peer_id(), data_for_alice)
+            .receive_sync_data_from(bob.peer_id(), data_for_alice)
             .unwrap();
         alice.apply_sync_ack(&bob_ack).unwrap();
         bob.apply_sync_ack(&alice_ack).unwrap();
@@ -551,8 +556,8 @@ mod tests {
             })
             .unwrap();
         let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
-        bob.receive_sync_data(
-            bob.peer_id(),
+        bob.receive_sync_data_from(
+            alice.peer_id(),
             sync::SyncData {
                 topic_id: topic.id(),
                 ops: vec![genesis.clone()],
@@ -629,8 +634,8 @@ mod tests {
         let second = ops[2].clone();
 
         let ack = bob
-            .receive_sync_data(
-                bob.peer_id(),
+            .receive_sync_data_from(
+                alice.peer_id(),
                 sync::SyncData {
                     topic_id: topic.id(),
                     ops: vec![second.clone(), genesis.clone(), first.clone()],
@@ -671,8 +676,8 @@ mod tests {
         let second = ops[2].clone();
 
         let first_ack = bob
-            .receive_sync_data(
-                bob.peer_id(),
+            .receive_sync_data_from(
+                alice.peer_id(),
                 sync::SyncData {
                     topic_id: topic.id(),
                     ops: vec![second.clone()],
@@ -683,8 +688,8 @@ mod tests {
         assert!(bob.storage().get_op(&second.id).unwrap().is_none());
 
         let second_ack = bob
-            .receive_sync_data(
-                bob.peer_id(),
+            .receive_sync_data_from(
+                alice.peer_id(),
                 sync::SyncData {
                     topic_id: topic.id(),
                     ops: vec![genesis.clone(), first.clone()],
@@ -877,7 +882,7 @@ mod tests {
 
         let bob_summary = bob.sync_summary(topic.id()).unwrap();
         let data = alice.plan_sync_data(bob.peer_id(), &bob_summary).unwrap();
-        bob.receive_sync_data(bob.peer_id(), data).unwrap();
+        bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
         assert_eq!(bob.list_topics().unwrap().len(), 1);
 
         bob.reject_topic(topic.id()).unwrap();
@@ -888,7 +893,9 @@ mod tests {
 
         let alice_summary = alice.sync_summary(topic.id()).unwrap();
         let rejection = bob.plan_sync_data(alice.peer_id(), &alice_summary).unwrap();
-        alice.receive_sync_data(alice.peer_id(), rejection).unwrap();
+        alice
+            .receive_sync_data_from(bob.peer_id(), rejection)
+            .unwrap();
         assert!(
             !alice
                 .storage()
@@ -914,7 +921,11 @@ mod tests {
             .await
             .unwrap();
         let alice = Irokle::builder().with_net(alice_endpoint).build().unwrap();
-        let bob = Irokle::builder().with_net(bob_endpoint).build().unwrap();
+        let bob = Irokle::builder()
+            .with_peer_whitelist([alice.peer_id()])
+            .with_net(bob_endpoint)
+            .build()
+            .unwrap();
         let bob_addr = ready_iroh_addr(bob.endpoint().unwrap()).await;
 
         let topic = alice
@@ -997,6 +1008,77 @@ mod tests {
     }
 
     #[cfg(feature = "iroh")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn iroh_peer_whitelist_controls_unknown_topic_admission() {
+        let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let alice = Irokle::builder()
+            .with_iroh_secret_key(alice_endpoint.secret_key())
+            .build()
+            .unwrap();
+        let bob = Irokle::builder()
+            .with_iroh_secret_key(bob_endpoint.secret_key())
+            .build()
+            .unwrap();
+        let net = net::IrohNet::new(bob_endpoint, bob.clone()).unwrap();
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let data = sync::SyncData {
+            topic_id: topic.id(),
+            ops: oplog::topological(alice.storage(), &topic.id()).unwrap(),
+        };
+
+        let err = net
+            .handle_messages(
+                alice_endpoint.id(),
+                vec![
+                    sync::SyncMessage::Open(sync::SyncEngine::<MemoryStorage>::open(
+                        topic.id(),
+                        alice.peer_id(),
+                        None,
+                    )),
+                    sync::SyncMessage::Data(data.clone()),
+                ],
+            )
+            .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(bob.storage().topic_state(&topic.id()).unwrap().is_none());
+
+        bob.add_peer_to_whitelist(alice.peer_id()).unwrap();
+        let responses = net
+            .handle_messages(
+                alice_endpoint.id(),
+                vec![
+                    sync::SyncMessage::Open(sync::SyncEngine::<MemoryStorage>::open(
+                        topic.id(),
+                        alice.peer_id(),
+                        None,
+                    )),
+                    sync::SyncMessage::Data(data),
+                ],
+            )
+            .unwrap();
+
+        assert!(
+            responses
+                .iter()
+                .any(|response| matches!(response, sync::SyncMessage::Ack(_)))
+        );
+        assert!(bob.storage().topic_state(&topic.id()).unwrap().is_some());
+    }
+
+    #[cfg(feature = "iroh")]
     async fn ready_iroh_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
         use futures::StreamExt;
         use iroh::Watcher;
@@ -1031,8 +1113,8 @@ mod tests {
             .unwrap();
         let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
 
-        bob.receive_sync_data(
-            bob.peer_id(),
+        bob.receive_sync_data_from(
+            alice.peer_id(),
             sync::SyncData {
                 topic_id: topic.id(),
                 ops: vec![genesis.clone()],
@@ -1057,37 +1139,25 @@ mod tests {
 
         let replica_a = node(23);
         let replica_b = node(24);
-        for (replica, peer_id) in [
-            (&replica_a, replica_a.peer_id()),
-            (&replica_b, replica_b.peer_id()),
-        ] {
+        for replica in [&replica_a, &replica_b] {
             replica
-                .receive_sync_data(
-                    peer_id,
-                    sync::SyncData {
-                        topic_id: topic.id(),
-                        ops: vec![genesis.clone()],
-                    },
-                )
+                .receive_sync_data_as_local(sync::SyncData {
+                    topic_id: topic.id(),
+                    ops: vec![genesis.clone()],
+                })
                 .unwrap();
         }
         replica_a
-            .receive_sync_data(
-                replica_a.peer_id(),
-                sync::SyncData {
-                    topic_id: topic.id(),
-                    ops: vec![add.clone(), remove.clone()],
-                },
-            )
+            .receive_sync_data_as_local(sync::SyncData {
+                topic_id: topic.id(),
+                ops: vec![add.clone(), remove.clone()],
+            })
             .unwrap();
         replica_b
-            .receive_sync_data(
-                replica_b.peer_id(),
-                sync::SyncData {
-                    topic_id: topic.id(),
-                    ops: vec![remove, add],
-                },
-            )
+            .receive_sync_data_as_local(sync::SyncData {
+                topic_id: topic.id(),
+                ops: vec![remove, add],
+            })
             .unwrap();
 
         let members_a = replica_a
@@ -1132,7 +1202,7 @@ mod tests {
         };
 
         outsider
-            .receive_sync_data(outsider.peer_id(), raw_data)
+            .receive_sync_data_from(a.peer_id(), raw_data)
             .unwrap();
         assert!(outsider.raw_topic(topic.id()).unwrap().history().is_ok());
         assert!(matches!(
@@ -1171,41 +1241,71 @@ mod tests {
     fn ack_clears_only_satisfied_obligations_for_storage<S: Storage>(storage: S) {
         let ack_signer = Ed25519Signer::from_bytes(&[99; 32]);
         let peer = ack_signer.peer_id();
-        let topic = TopicId::hash(b"topic");
-        let other_topic = TopicId::hash(b"other-topic");
-        let satisfied = OpId::hash(b"satisfied");
-        let unsatisfied = OpId::hash(b"unsatisfied");
-        let other = OpId::hash(b"other");
         let irokle = Irokle::with_storage(storage.clone(), NodeConfig::default()).unwrap();
+        let topic = irokle
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let satisfied = topic
+            .publish(Note {
+                text: "satisfied".into(),
+            })
+            .unwrap();
+        let unsatisfied = topic
+            .publish(Note {
+                text: "unsatisfied".into(),
+            })
+            .unwrap();
+        let other_topic = irokle
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let other = other_topic
+            .publish(Note {
+                text: "other".into(),
+            })
+            .unwrap();
 
         irokle
-            .put_sync_obligation(peer, topic, [satisfied].into())
+            .put_sync_obligation(peer, topic.id(), [satisfied.meta.op_id].into())
             .unwrap();
         irokle
-            .put_sync_obligation(peer, topic, [unsatisfied].into())
+            .put_sync_obligation(peer, topic.id(), [unsatisfied.meta.op_id].into())
             .unwrap();
         irokle
-            .put_sync_obligation(peer, other_topic, [other].into())
+            .put_sync_obligation(peer, other_topic.id(), [other.meta.op_id].into())
             .unwrap();
 
+        let mut clock = ActorClock::new();
+        clock.observe(satisfied.meta.actor_id, satisfied.meta.actor_seq);
         let mut ack = sync::SyncAck {
-            topic_id: topic,
+            topic_id: topic.id(),
             peer_id: peer,
             accepted: BTreeSet::new(),
-            heads: [satisfied].into(),
-            clock: ActorClock::new(),
+            heads: [satisfied.meta.op_id].into(),
+            clock,
             signature: None,
         };
         ack.sign(&ack_signer).unwrap();
         irokle.apply_sync_ack(&ack).unwrap();
 
-        let report = irokle.sync_report(peer, topic).unwrap();
+        let report = irokle.sync_report(peer, topic.id()).unwrap();
         assert_eq!(report.obligations.len(), 1);
-        assert_eq!(report.obligations[0].op_ids, [unsatisfied].into());
+        assert_eq!(
+            report.obligations[0].op_ids,
+            [unsatisfied.meta.op_id].into()
+        );
 
-        let other_report = irokle.sync_report(peer, other_topic).unwrap();
+        let other_report = irokle.sync_report(peer, other_topic.id()).unwrap();
         assert_eq!(other_report.obligations.len(), 1);
-        assert_eq!(other_report.obligations[0].op_ids, [other].into());
+        assert_eq!(
+            other_report.obligations[0].op_ids,
+            [other.meta.op_id].into()
+        );
     }
 
     #[test]
@@ -1217,7 +1317,12 @@ mod tests {
     fn unsigned_sync_ack_does_not_clear_obligations() {
         let alice = node(47);
         let bob = node(48);
-        let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
         let record = topic.publish(Note { text: "ack".into() }).unwrap();
         alice
             .put_sync_obligation(bob.peer_id(), topic.id(), [record.meta.op_id].into())
@@ -1250,7 +1355,12 @@ mod tests {
         let alice = node(28);
         let ack_signer = Ed25519Signer::from_bytes(&[98; 32]);
         let peer = ack_signer.peer_id();
-        let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
         let record = topic
             .publish(Note {
                 text: "clocked".into(),
@@ -1279,6 +1389,91 @@ mod tests {
                 .unwrap()
                 .obligations
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn ack_clock_cannot_claim_future_local_state() {
+        let alice = node(94);
+        let ack_signer = Ed25519Signer::from_bytes(&[95; 32]);
+        let peer = ack_signer.peer_id();
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let record = topic
+            .publish(Note {
+                text: "future".into(),
+            })
+            .unwrap();
+        alice
+            .put_sync_obligation(peer, topic.id(), [record.meta.op_id].into())
+            .unwrap();
+
+        let mut clock = ActorClock::new();
+        clock.observe(record.meta.actor_id, record.meta.actor_seq + 1);
+        let mut ack = sync::SyncAck {
+            topic_id: topic.id(),
+            peer_id: peer,
+            accepted: BTreeSet::new(),
+            heads: BTreeSet::new(),
+            clock,
+            signature: None,
+        };
+        ack.sign(&ack_signer).unwrap();
+
+        let err = alice.apply_sync_ack(&ack).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidSyncAck(_)));
+        assert!(
+            alice
+                .storage()
+                .peer_ack(&peer, &topic.id())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            alice
+                .sync_report(peer, topic.id())
+                .unwrap()
+                .obligations
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn ack_heads_must_reference_known_topic_ops() {
+        let alice = node(96);
+        let ack_signer = Ed25519Signer::from_bytes(&[97; 32]);
+        let peer = ack_signer.peer_id();
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let mut ack = sync::SyncAck {
+            topic_id: topic.id(),
+            peer_id: peer,
+            accepted: BTreeSet::new(),
+            heads: [OpId::hash(b"unknown-head")].into(),
+            clock: ActorClock::new(),
+            signature: None,
+        };
+        ack.sign(&ack_signer).unwrap();
+
+        let err = alice.apply_sync_ack(&ack).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidSyncAck(_)));
+        assert!(
+            alice
+                .storage()
+                .peer_ack(&peer, &topic.id())
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -1325,8 +1520,8 @@ mod tests {
             })
             .unwrap();
         let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
-        bob.receive_sync_data(
-            bob.peer_id(),
+        bob.receive_sync_data_from(
+            alice.peer_id(),
             sync::SyncData {
                 topic_id: topic.id(),
                 ops: vec![genesis.clone()],
@@ -1393,8 +1588,8 @@ mod tests {
         let topic_b = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
         let op_b = oplog::topological(alice.storage(), &topic_b.id()).unwrap()[0].clone();
         assert!(matches!(
-            bob.receive_sync_data(
-                bob.peer_id(),
+            bob.receive_sync_data_from(
+                alice.peer_id(),
                 sync::SyncData {
                     topic_id: topic_a.id(),
                     ops: vec![op_b],
@@ -1592,7 +1787,6 @@ mod tests {
             .negotiate_sync(PeerId::hash(b"some-remote"), &summary)
             .unwrap();
         assert!(plan.need.is_empty());
-        assert!(plan.want.is_empty());
         assert!(plan.send.is_empty());
         assert!(plan.actor_range_hints.is_empty());
     }
@@ -1655,6 +1849,7 @@ mod tests {
         let config = NodeConfig {
             signer,
             default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
         };
         let (topic_id, genesis_id, op_id, actor_id, actor_seq) = {
             let storage = storage::FjallStorage::open(dir.path()).unwrap();
@@ -1713,34 +1908,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ack_signer = Ed25519Signer::from_bytes(&[97; 32]);
         let peer = ack_signer.peer_id();
-        let topic = TopicId::hash(b"durable-topic");
-        let satisfied = OpId::hash(b"durable-satisfied");
-        let unsatisfied = OpId::hash(b"durable-unsatisfied");
-
-        {
+        let (topic_id, unsatisfied_id) = {
             let storage = storage::FjallStorage::open(dir.path()).unwrap();
             let irokle = Irokle::with_storage(storage, NodeConfig::default()).unwrap();
+            let topic = irokle
+                .create_topic::<Note>(TopicConfig {
+                    initial_peers: [peer].into(),
+                    ..TopicConfig::default()
+                })
+                .unwrap();
+            let satisfied = topic
+                .publish(Note {
+                    text: "durable-satisfied".into(),
+                })
+                .unwrap();
+            let unsatisfied = topic
+                .publish(Note {
+                    text: "durable-unsatisfied".into(),
+                })
+                .unwrap();
+
             irokle
-                .put_sync_obligation(peer, topic, [satisfied].into())
+                .put_sync_obligation(peer, topic.id(), [satisfied.meta.op_id].into())
                 .unwrap();
             irokle
-                .put_sync_obligation(peer, topic, [unsatisfied].into())
+                .put_sync_obligation(peer, topic.id(), [unsatisfied.meta.op_id].into())
                 .unwrap();
+            let mut clock = ActorClock::new();
+            clock.observe(satisfied.meta.actor_id, satisfied.meta.actor_seq);
             let mut ack = sync::SyncAck {
-                topic_id: topic,
+                topic_id: topic.id(),
                 peer_id: peer,
                 accepted: BTreeSet::new(),
-                heads: [satisfied].into(),
-                clock: ActorClock::new(),
+                heads: [satisfied.meta.op_id].into(),
+                clock,
                 signature: None,
             };
             ack.sign(&ack_signer).unwrap();
             irokle.apply_sync_ack(&ack).unwrap();
-        }
+
+            (topic.id(), unsatisfied.meta.op_id)
+        };
 
         let storage = storage::FjallStorage::open(dir.path()).unwrap();
-        let obligations = storage.sync_obligations(&peer, &topic).unwrap();
+        let obligations = storage.sync_obligations(&peer, &topic_id).unwrap();
         assert_eq!(obligations.len(), 1);
-        assert_eq!(obligations[0].op_ids, [unsatisfied].into());
+        assert_eq!(obligations[0].op_ids, [unsatisfied_id].into());
     }
 }

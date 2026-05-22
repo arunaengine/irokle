@@ -14,8 +14,8 @@ struct Note {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secret_key = iroh::SecretKey::generate();
-    let path = std::env::temp_dir().join(format!("irokle-recovery-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().to_path_buf();
 
     let topic_id = {
         let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -51,6 +51,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     recovered.endpoint().expect("iroh endpoint").close().await;
-    let _ = std::fs::remove_dir_all(&path);
     Ok(())
 }
