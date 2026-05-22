@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use smallvec::{SmallVec, smallvec};
@@ -17,8 +17,26 @@ use super::{
     invalid_data, sync_data_messages,
 };
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const SYNC_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_SYNC_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_RESYNC_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IrohRuntimeConfig {
+    pub connect_timeout: Duration,
+    pub sync_io_timeout: Duration,
+    pub resync_interval: Duration,
+}
+
+impl Default for IrohRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            sync_io_timeout: DEFAULT_SYNC_IO_TIMEOUT,
+            resync_interval: DEFAULT_RESYNC_INTERVAL,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct ConnectionPool {
@@ -60,12 +78,13 @@ impl ConnectionPool {
     async fn get_or_connect(
         &self,
         peer: iroh::EndpointAddr,
+        connect_timeout: Duration,
     ) -> io::Result<iroh::endpoint::Connection> {
         if let Some(connection) = self.get(&peer.id)? {
             return Ok(connection);
         }
         let connection = tokio::time::timeout(
-            CONNECT_TIMEOUT,
+            connect_timeout,
             self.endpoint.connect(peer, IROKLE_SYNC_ALPN),
         )
         .await
@@ -79,7 +98,10 @@ impl ConnectionPool {
 pub struct IrohNet<S: Storage = MemoryStorage> {
     pool: ConnectionPool,
     node: Irokle<S>,
-    resync_started: Arc<AtomicBool>,
+    runtime: IrohRuntimeConfig,
+    accept_started: AtomicBool,
+    resync_started: AtomicBool,
+    shutdown: AtomicBool,
 }
 
 impl<S: Storage> IrohNet<S> {
@@ -87,10 +109,27 @@ impl<S: Storage> IrohNet<S> {
         Self::new_with_alpns(endpoint, node, Vec::new())
     }
 
+    pub fn new_with_config(
+        endpoint: iroh::Endpoint,
+        node: Irokle<S>,
+        runtime: IrohRuntimeConfig,
+    ) -> io::Result<Self> {
+        Self::new_with_alpns_and_config(endpoint, node, Vec::new(), runtime)
+    }
+
     pub fn new_with_alpns(
         endpoint: iroh::Endpoint,
         node: Irokle<S>,
         alpns: Vec<Vec<u8>>,
+    ) -> io::Result<Self> {
+        Self::new_with_alpns_and_config(endpoint, node, alpns, IrohRuntimeConfig::default())
+    }
+
+    pub fn new_with_alpns_and_config(
+        endpoint: iroh::Endpoint,
+        node: Irokle<S>,
+        alpns: Vec<Vec<u8>>,
+        runtime: IrohRuntimeConfig,
     ) -> io::Result<Self> {
         let endpoint_peer = peer_id_from_endpoint_id(endpoint.id());
         if endpoint_peer != node.peer_id() {
@@ -103,7 +142,10 @@ impl<S: Storage> IrohNet<S> {
         Ok(Self {
             pool: ConnectionPool::new(endpoint),
             node,
-            resync_started: Arc::new(AtomicBool::new(false)),
+            runtime,
+            accept_started: AtomicBool::new(false),
+            resync_started: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
         })
     }
 
@@ -113,6 +155,19 @@ impl<S: Storage> IrohNet<S> {
 
     pub fn endpoint(&self) -> &iroh::Endpoint {
         self.pool.endpoint()
+    }
+
+    pub fn runtime_config(&self) -> IrohRuntimeConfig {
+        self.runtime
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.endpoint().close().await;
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
     }
 
     pub async fn sync_peer_now(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<()> {
@@ -130,20 +185,44 @@ impl<S: Storage> IrohNet<S> {
     }
 
     pub fn start_accept_loop(self: &Arc<Self>) -> io::Result<()> {
+        let _ = self.spawn_accept_loop()?;
+        Ok(())
+    }
+
+    pub fn spawn_accept_loop(self: &Arc<Self>) -> io::Result<Option<tokio::task::JoinHandle<()>>> {
+        if self.accept_started.swap(true, Ordering::SeqCst) {
+            return Ok(None);
+        }
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| io::Error::other("iroh auto accept requires a Tokio runtime"))?;
-        let net = Arc::clone(self);
-        handle.spawn(async move {
+        let net = Arc::downgrade(self);
+        let endpoint = self.endpoint().clone();
+        Ok(Some(handle.spawn(async move {
             loop {
-                let Some(incoming) = net.endpoint().accept().await else {
+                let Some(current) = net.upgrade() else {
                     break;
                 };
+                if current.is_shutdown() || endpoint.is_closed() {
+                    break;
+                }
+                drop(current);
+
+                let Some(incoming) = endpoint.accept().await else {
+                    break;
+                };
+                let Some(current) = net.upgrade() else {
+                    break;
+                };
+                if current.is_shutdown() {
+                    break;
+                }
+                drop(current);
                 match incoming.await.map_err(other) {
                     Ok(connection) => {
                         let peer = connection.remote_id();
-                        let connection_net = Arc::clone(&net);
+                        let connection_net = Weak::clone(&net);
                         tokio::spawn(async move {
-                            connection_net.handle_connection(peer, connection).await;
+                            handle_connection(connection_net, peer, connection).await;
                         });
                     }
                     Err(error) => {
@@ -152,25 +231,39 @@ impl<S: Storage> IrohNet<S> {
                     }
                 }
             }
-        });
-        Ok(())
+        })))
     }
 
     pub fn start_resync_loop(self: &Arc<Self>, interval: Duration) -> io::Result<()> {
+        let _ = self.spawn_resync_loop(interval)?;
+        Ok(())
+    }
+
+    pub fn start_configured_resync_loop(self: &Arc<Self>) -> io::Result<()> {
+        self.start_resync_loop(self.runtime.resync_interval)
+    }
+
+    pub fn spawn_resync_loop(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> io::Result<Option<tokio::task::JoinHandle<()>>> {
         if self.resync_started.swap(true, Ordering::SeqCst) {
-            return Ok(());
+            return Ok(None);
         }
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| io::Error::other("iroh resync requires a Tokio runtime"))?;
-        let net = Arc::clone(self);
-        handle.spawn(async move {
+        let net = Arc::downgrade(self);
+        Ok(Some(handle.spawn(async move {
             let mut tick = tokio::time::interval(interval);
             loop {
                 tick.tick().await;
-                if net.endpoint().is_closed() {
+                let Some(current) = net.upgrade() else {
+                    break;
+                };
+                if current.is_shutdown() || current.endpoint().is_closed() {
                     break;
                 }
-                let obligations = match net.node.storage().all_sync_obligations() {
+                let obligations = match current.node.storage().all_sync_obligations() {
                     Ok(obligations) => obligations,
                     Err(error) => {
                         tracing::warn!(%error, "failed to read sync obligations");
@@ -181,33 +274,20 @@ impl<S: Storage> IrohNet<S> {
                     .into_iter()
                     .map(|obligation| (obligation.peer_id, obligation.topic_id))
                     .collect::<BTreeSet<_>>();
+                drop(current);
                 for (peer_id, topic_id) in targets {
-                    if let Err(error) = net.sync_peer_now(peer_id, topic_id).await {
+                    let Some(current) = net.upgrade() else {
+                        break;
+                    };
+                    if current.is_shutdown() {
+                        break;
+                    }
+                    if let Err(error) = current.sync_peer_now(peer_id, topic_id).await {
                         tracing::warn!(%peer_id, %topic_id, %error, "failed to resync peer");
                     }
                 }
             }
-        });
-        Ok(())
-    }
-
-    async fn handle_connection(
-        self: Arc<Self>,
-        peer: iroh::EndpointId,
-        connection: iroh::endpoint::Connection,
-    ) {
-        loop {
-            let (send, recv) = match connection.accept_bi().await {
-                Ok(streams) => streams,
-                Err(error) => {
-                    tracing::debug!(%peer, %error, "iroh connection stopped accepting streams");
-                    break;
-                }
-            };
-            if let Err(error) = self.handle_stream(peer, recv, send).await {
-                tracing::warn!(%peer, %error, "failed to handle iroh sync stream");
-            }
-        }
+        })))
     }
 
     pub async fn sync_with(
@@ -215,13 +295,17 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         messages: &[SyncMessage],
     ) -> io::Result<Vec<SyncMessage>> {
-        let connection = self.pool.get_or_connect(peer).await?;
-        let (mut send, mut recv) = tokio::time::timeout(SYNC_IO_TIMEOUT, connection.open_bi())
-            .await
-            .map_err(|_| timed_out("sync stream open timed out"))?
-            .map_err(other)?;
-        write_sync_messages(&mut send, messages).await?;
-        read_sync_messages(&mut recv).await
+        let connection = self
+            .pool
+            .get_or_connect(peer, self.runtime.connect_timeout)
+            .await?;
+        let (mut send, mut recv) =
+            tokio::time::timeout(self.runtime.sync_io_timeout, connection.open_bi())
+                .await
+                .map_err(|_| timed_out("sync stream open timed out"))?
+                .map_err(other)?;
+        write_sync_messages(&mut send, messages, self.runtime.sync_io_timeout).await?;
+        read_sync_messages(&mut recv, self.runtime.sync_io_timeout).await
     }
 
     pub async fn sync_now(
@@ -363,12 +447,12 @@ impl<S: Storage> IrohNet<S> {
         mut recv: iroh::endpoint::RecvStream,
         mut send: iroh::endpoint::SendStream,
     ) -> io::Result<()> {
-        let messages = read_sync_messages(&mut recv).await?;
+        let messages = read_sync_messages(&mut recv, self.runtime.sync_io_timeout).await?;
         let responses = self
             .handle_messages(peer, messages)?
             .into_iter()
             .collect::<Vec<_>>();
-        write_sync_messages(&mut send, &responses).await?;
+        write_sync_messages(&mut send, &responses, self.runtime.sync_io_timeout).await?;
         Ok(())
     }
 
@@ -526,9 +610,37 @@ impl<S: Storage> IrohNet<S> {
     }
 }
 
-async fn read_sync_messages(recv: &mut iroh::endpoint::RecvStream) -> io::Result<Vec<SyncMessage>> {
+async fn handle_connection<S: Storage>(
+    net: Weak<IrohNet<S>>,
+    peer: iroh::EndpointId,
+    connection: iroh::endpoint::Connection,
+) {
+    loop {
+        let (send, recv) = match connection.accept_bi().await {
+            Ok(streams) => streams,
+            Err(error) => {
+                tracing::debug!(%peer, %error, "iroh connection stopped accepting streams");
+                break;
+            }
+        };
+        let Some(current) = net.upgrade() else {
+            break;
+        };
+        if current.is_shutdown() {
+            break;
+        }
+        if let Err(error) = current.handle_stream(peer, recv, send).await {
+            tracing::warn!(%peer, %error, "failed to handle iroh sync stream");
+        }
+    }
+}
+
+async fn read_sync_messages(
+    recv: &mut iroh::endpoint::RecvStream,
+    sync_io_timeout: Duration,
+) -> io::Result<Vec<SyncMessage>> {
     let mut messages = Vec::new();
-    while let Some(frame) = read_next_frame(recv).await? {
+    while let Some(frame) = read_next_frame(recv, sync_io_timeout).await? {
         let frame_index = messages.len();
         let frame_len = frame.len();
         messages.push(decode_sync_message(&frame).map_err(|err| {
@@ -543,11 +655,12 @@ async fn read_sync_messages(recv: &mut iroh::endpoint::RecvStream) -> io::Result
 async fn write_sync_messages(
     send: &mut iroh::endpoint::SendStream,
     messages: &[SyncMessage],
+    sync_io_timeout: Duration,
 ) -> io::Result<()> {
     for message in messages {
         let payload = encode_sync_message(message)?;
         let frame = encode_frame(&payload)?;
-        tokio::time::timeout(SYNC_IO_TIMEOUT, send.write_all(&frame))
+        tokio::time::timeout(sync_io_timeout, send.write_all(&frame))
             .await
             .map_err(|_| timed_out("sync write timed out"))?
             .map_err(other)?;
@@ -555,9 +668,13 @@ async fn write_sync_messages(
     send.finish().map_err(other)
 }
 
-async fn read_next_frame(recv: &mut iroh::endpoint::RecvStream) -> io::Result<Option<Vec<u8>>> {
+async fn read_next_frame(
+    recv: &mut iroh::endpoint::RecvStream,
+    sync_io_timeout: Duration,
+) -> io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0_u8; 4];
-    let Some(first_read) = read_some_with_timeout(recv, &mut len_buf[..1]).await? else {
+    let Some(first_read) = read_some_with_timeout(recv, &mut len_buf[..1], sync_io_timeout).await?
+    else {
         return Ok(None);
     };
     if first_read == 0 {
@@ -566,7 +683,8 @@ async fn read_next_frame(recv: &mut iroh::endpoint::RecvStream) -> io::Result<Op
 
     let mut read = first_read;
     while read < len_buf.len() {
-        let Some(n) = read_some_with_timeout(recv, &mut len_buf[read..]).await? else {
+        let Some(n) = read_some_with_timeout(recv, &mut len_buf[read..], sync_io_timeout).await?
+        else {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "incomplete sync frame length",
@@ -590,7 +708,7 @@ async fn read_next_frame(recv: &mut iroh::endpoint::RecvStream) -> io::Result<Op
     }
     let mut payload = vec![0_u8; len];
     if len > 0 {
-        tokio::time::timeout(SYNC_IO_TIMEOUT, recv.read_exact(&mut payload))
+        tokio::time::timeout(sync_io_timeout, recv.read_exact(&mut payload))
             .await
             .map_err(|_| timed_out("sync read timed out"))?
             .map_err(other)?;
@@ -601,8 +719,9 @@ async fn read_next_frame(recv: &mut iroh::endpoint::RecvStream) -> io::Result<Op
 async fn read_some_with_timeout(
     recv: &mut iroh::endpoint::RecvStream,
     buf: &mut [u8],
+    sync_io_timeout: Duration,
 ) -> io::Result<Option<usize>> {
-    tokio::time::timeout(SYNC_IO_TIMEOUT, recv.read(buf))
+    tokio::time::timeout(sync_io_timeout, recv.read(buf))
         .await
         .map_err(|_| timed_out("sync read timed out"))?
         .map_err(other)

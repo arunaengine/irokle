@@ -19,6 +19,28 @@ async fn builder_sets_net() {
     assert!(irokle.list_topics().unwrap().is_empty());
 }
 
+#[cfg(feature = "iroh")]
+#[tokio::test]
+async fn builder_sets_runtime_config() {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let runtime = net::IrohRuntimeConfig {
+        connect_timeout: std::time::Duration::from_secs(7),
+        sync_io_timeout: std::time::Duration::from_secs(8),
+        resync_interval: std::time::Duration::from_secs(9),
+    };
+    let irokle = Irokle::builder()
+        .with_net(endpoint)
+        .with_iroh_runtime_config(runtime)
+        .without_auto_accept()
+        .build()
+        .unwrap();
+
+    assert_eq!(irokle.iroh_runtime_config(), Some(runtime));
+}
+
 #[cfg(all(feature = "iroh", feature = "fjall"))]
 #[tokio::test]
 async fn builder_selects_fjall() {
@@ -106,6 +128,55 @@ async fn sync_now_records_ack() {
             .obligations
             .is_empty()
     );
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_replication_records_scheduled_status() {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let alice = Irokle::builder()
+        .with_net(alice_endpoint)
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(bob_endpoint.secret_key())
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+
+    topic
+        .publish_with(
+            Note {
+                text: "scheduled".into(),
+            },
+            crate::PublishOptions {
+                write_concern: WriteConcern::AsyncReplication,
+            },
+        )
+        .unwrap();
+
+    let status = alice.sync_status(topic.id()).unwrap();
+    assert_eq!(status.len(), 1);
+    assert_eq!(status[0].peer_id, bob.peer_id());
+    assert!(matches!(
+        status[0].state,
+        crate::SyncPeerState::Behind | crate::SyncPeerState::Failed
+    ));
+    assert_eq!(status[0].pending_obligations, 1);
 }
 
 #[cfg(feature = "iroh")]

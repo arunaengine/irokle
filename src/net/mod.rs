@@ -20,7 +20,7 @@ pub use frame::{
     decode_sync_message, encode_frame, encode_frames, encode_sync_message,
 };
 #[cfg(feature = "iroh")]
-pub use iroh::IrohNet;
+pub use iroh::{IrohNet, IrohRuntimeConfig};
 
 #[cfg(any(feature = "iroh", test))]
 pub(crate) fn sync_data_messages(topic_id: TopicId, ops: Vec<Op>) -> Vec<SyncMessage> {
