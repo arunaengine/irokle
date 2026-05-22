@@ -10,7 +10,7 @@ struct Note {
 }
 
 #[test]
-fn derive_sets_type_id_and_uses_postcard_defaults() {
+fn sets_type_id() {
     let note = Note {
         text: "hello".into(),
     };
@@ -23,7 +23,7 @@ fn derive_sets_type_id_and_uses_postcard_defaults() {
 }
 
 #[test]
-fn derive_supports_renamed_crate_path() {
+fn supports_renamed_crate() {
     use irokle as renamed_irokle;
 
     #[derive(Clone, Debug, PartialEq, Eq, renamed_irokle::Event, Serialize, Deserialize)]
