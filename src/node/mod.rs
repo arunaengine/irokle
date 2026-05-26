@@ -84,6 +84,7 @@ pub struct IrokleBuilder<S = MemoryStorage> {
     storage: S,
     config: NodeConfig,
     signer_explicit: bool,
+    write_concern_explicit: bool,
     #[cfg(feature = "iroh")]
     endpoint: Option<iroh::Endpoint>,
     #[cfg(feature = "iroh")]

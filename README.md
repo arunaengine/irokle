@@ -149,7 +149,7 @@ Use `shutdown_iroh().await` during orderly shutdown to close the endpoint and ab
 
 ## Sync Failures And Status
 
-Iroh nodes start a periodic resync loop when auto-accept is enabled. The loop scans outstanding sync obligations and retries those peer/topic pairs. Publish with `WriteConcern::AsyncReplication` creates obligations for the bounded replication target set and wakes the same sync machinery. If the wake cannot start because no Tokio runtime is active, the obligation remains visible and sync status records the failure.
+Iroh-backed builders default to `WriteConcern::AsyncReplication` unless `with_write_concern` or `with_config` sets a different policy. Iroh nodes start a periodic resync loop whenever networking is configured; `without_auto_accept()` disables inbound auto-accept but does not disable outbound resync. The loop retries outstanding sync obligations and also performs bounded anti-entropy sync with the topic's selected peers. Publish with `WriteConcern::AsyncReplication` creates obligations for the bounded replication target set and wakes the same sync machinery. If the wake cannot start because no Tokio runtime is active, the obligation remains visible and sync status records the failure.
 
 Applications can inspect sync state:
 
