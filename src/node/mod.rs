@@ -32,6 +32,8 @@ use crate::{
 
 static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
 const SYNC_PEER_SHARED_OVERLAP: usize = 2;
+#[cfg(feature = "iroh")]
+const SYNC_TOPIC_CONCURRENCY: usize = 8;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum WriteConcern {
@@ -215,13 +217,19 @@ impl<S: Storage> Irokle<S> {
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "topic not found"))?;
         let peers = select_sync_peers(topic_id, self.peer_id(), &state);
+        let mut syncs = tokio::task::JoinSet::new();
         let mut first_error = None;
         for peer in peers {
-            if let Err(error) = net.sync_peer_now(peer, topic_id).await
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+            while syncs.len() >= SYNC_TOPIC_CONCURRENCY {
+                if let Some(result) = syncs.join_next().await {
+                    record_sync_topic_join_result(result, &mut first_error);
+                }
             }
+            let net = Arc::clone(net);
+            syncs.spawn(async move { (peer, net.sync_peer_now(peer, topic_id).await) });
+        }
+        while let Some(result) = syncs.join_next().await {
+            record_sync_topic_join_result(result, &mut first_error);
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -858,4 +866,24 @@ fn now_millis() -> Result<u64> {
     millis
         .try_into()
         .map_err(|_| Error::Storage("system time does not fit in u64 milliseconds".into()))
+}
+
+#[cfg(feature = "iroh")]
+fn record_sync_topic_join_result(
+    result: std::result::Result<(PeerId, std::io::Result<()>), tokio::task::JoinError>,
+    first_error: &mut Option<std::io::Error>,
+) {
+    match result {
+        Ok((_, Ok(()))) => {}
+        Ok((_, Err(error))) => {
+            if first_error.is_none() {
+                *first_error = Some(error);
+            }
+        }
+        Err(error) => {
+            if first_error.is_none() {
+                *first_error = Some(std::io::Error::other(error.to_string()));
+            }
+        }
+    }
 }

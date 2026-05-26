@@ -436,6 +436,70 @@ async fn open_hides_non_member_summary() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn former_member_can_confirm_matching_fingerprint() {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .build()
+        .unwrap();
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(bob_endpoint.secret_key())
+        .build()
+        .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    bob.receive_sync_data_from(
+        alice.peer_id(),
+        sync::SyncData {
+            topic_id: topic.id(),
+            ops: oplog::topological(alice.storage(), &topic.id()).unwrap(),
+        },
+    )
+    .unwrap();
+    bob.open_topic::<Note>(topic.id()).unwrap().leave().unwrap();
+    alice
+        .receive_sync_data_from(
+            bob.peer_id(),
+            sync::SyncData {
+                topic_id: topic.id(),
+                ops: oplog::topological(bob.storage(), &topic.id()).unwrap(),
+            },
+        )
+        .unwrap();
+    let net = net::IrohNet::new(alice_endpoint, alice.clone()).unwrap();
+
+    let responses = net
+        .handle_messages(
+            bob_endpoint.id(),
+            vec![
+                sync::SyncMessage::Open(sync::SyncEngine::<MemoryStorage>::open(
+                    topic.id(),
+                    bob.peer_id(),
+                    Some(Note::TYPE_ID.into()),
+                )),
+                sync::SyncMessage::Fingerprint(bob.sync_fingerprint(topic.id()).unwrap()),
+            ],
+        )
+        .unwrap();
+
+    assert!(responses.iter().any(|response| {
+        matches!(response, sync::SyncMessage::Fingerprint(fingerprint) if fingerprint.topic_id == topic.id())
+    }));
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn whitelist_controls_bootstrap() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
