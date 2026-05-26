@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use smallvec::{SmallVec, smallvec};
 
+use crate::node::select_sync_peers;
 use crate::sync::SyncMessage;
 use crate::{Irokle, MemoryStorage, PeerId, Storage};
 
@@ -308,17 +309,13 @@ impl<S: Storage> IrohNet<S> {
                 if current.is_shutdown() || current.endpoint().is_closed() {
                     break;
                 }
-                let obligations = match current.node.storage().all_sync_obligations() {
-                    Ok(obligations) => obligations,
+                let targets = match current.resync_targets() {
+                    Ok(targets) => targets,
                     Err(error) => {
-                        tracing::warn!(%error, "failed to read sync obligations");
+                        tracing::warn!(%error, "failed to build resync targets");
                         continue;
                     }
                 };
-                let targets = obligations
-                    .into_iter()
-                    .map(|obligation| (obligation.peer_id, obligation.topic_id))
-                    .collect::<BTreeSet<_>>();
                 drop(current);
                 for (peer_id, topic_id) in targets {
                     let Some(current) = net.upgrade() else {
@@ -443,13 +440,14 @@ impl<S: Storage> IrohNet<S> {
         let responses = self.sync_with(peer.clone(), &messages).await?;
         let mut followup: SmallVec<[SyncMessage; 2]> =
             smallvec![SyncMessage::Open(self.node.sync_open(topic_id))];
+        let mut acks = Vec::new();
         for response in responses {
             match response {
                 SyncMessage::Ack(ack) => {
                     if ack.peer_id != remote_peer_id || ack.topic_id != topic_id {
                         return Err(invalid_data("sync ack does not match remote peer/topic"));
                     }
-                    self.node.apply_sync_ack(&ack).map_err(invalid_data)?;
+                    acks.push(ack);
                 }
                 SyncMessage::Summary(summary) if summary.topic_id == topic_id => {}
                 SyncMessage::Data(data) => {
@@ -466,6 +464,9 @@ impl<S: Storage> IrohNet<S> {
                     )));
                 }
             }
+        }
+        for ack in acks {
+            self.node.apply_sync_ack(&ack).map_err(invalid_data)?;
         }
         if followup.len() > 1 {
             let responses = self.sync_with(peer, &followup).await?;
@@ -519,6 +520,7 @@ impl<S: Storage> IrohNet<S> {
         let mut remote_peer_id = None;
         let mut open_topic_id = None;
         let mut responses = Vec::new();
+        let mut acks = Vec::new();
         for message in messages {
             if let SyncMessage::Open(open) = &message {
                 if open.protocol.as_bytes() != IROKLE_SYNC_ALPN {
@@ -538,9 +540,51 @@ impl<S: Storage> IrohNet<S> {
                     "sync message topic does not match SyncOpen topic",
                 ));
             }
+            if let SyncMessage::Ack(ack) = message {
+                if remote_peer_id.is_none() {
+                    return Err(invalid_data(
+                        "sync ack requires a preceding SyncOpen with peer_id",
+                    ));
+                }
+                acks.push(ack);
+                continue;
+            }
             responses.extend(self.handle_message(message, remote_peer_id)?);
         }
+        for ack in acks {
+            responses.extend(self.handle_message(SyncMessage::Ack(ack), remote_peer_id)?);
+        }
         Ok(responses)
+    }
+
+    fn resync_targets(&self) -> io::Result<BTreeSet<(PeerId, crate::TopicId)>> {
+        let mut targets = self
+            .node
+            .storage()
+            .all_sync_obligations()
+            .map_err(invalid_data)?
+            .into_iter()
+            .map(|obligation| (obligation.peer_id, obligation.topic_id))
+            .collect::<BTreeSet<_>>();
+        for topic in self.node.storage().list_topics().map_err(invalid_data)? {
+            let Some(state) = self
+                .node
+                .storage()
+                .topic_state(&topic.topic_id)
+                .map_err(invalid_data)?
+            else {
+                continue;
+            };
+            if !state.members.contains(&self.node.peer_id()) {
+                continue;
+            }
+            targets.extend(
+                select_sync_peers(topic.topic_id, self.node.peer_id(), &state)
+                    .into_iter()
+                    .map(|peer_id| (peer_id, topic.topic_id)),
+            );
+        }
+        Ok(targets)
     }
 
     fn handle_message(
