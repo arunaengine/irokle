@@ -23,6 +23,16 @@ pub struct OpBody {
     pub payload: TopicPayload,
 }
 
+const OP_SIGNING_DOMAIN: &[u8] = b"irokle/op/v1\0";
+
+fn op_signing_message(body: &OpBody) -> Result<Vec<u8>> {
+    let body_bytes = canonical_bytes(body)?;
+    let mut msg = Vec::with_capacity(OP_SIGNING_DOMAIN.len() + body_bytes.len());
+    msg.extend_from_slice(OP_SIGNING_DOMAIN);
+    msg.extend_from_slice(&body_bytes);
+    Ok(msg)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedOp {
     pub body: OpBody,
@@ -34,14 +44,16 @@ impl SignedOp {
         if body.author != signer.peer_id() {
             return Err(Error::WrongSigner);
         }
-        let bytes = canonical_bytes(&body)?;
-        let signature = signer.sign(&bytes)?;
+        let signature = signer.sign(&op_signing_message(&body)?)?;
         Ok(Self { body, signature })
     }
 
     pub fn verify(&self) -> Result<()> {
-        let bytes = canonical_bytes(&self.body)?;
-        verify(self.body.author, &bytes, &self.signature)
+        verify(
+            self.body.author,
+            &op_signing_message(&self.body)?,
+            &self.signature,
+        )
     }
 }
 
