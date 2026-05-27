@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use smallvec::{SmallVec, smallvec};
 
+use crate::node::select_sync_peers;
 use crate::sync::SyncMessage;
 use crate::{Irokle, MemoryStorage, PeerId, Storage};
 
@@ -20,6 +21,10 @@ use super::{
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SYNC_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RESYNC_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_ACCEPT_CONNECTIONS: usize = 128;
+const MAX_RESYNC_CONCURRENCY: usize = 8;
+const MAX_SYNC_MESSAGES_PER_STREAM: usize = 4096;
+const MAX_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IrohRuntimeConfig {
@@ -63,6 +68,14 @@ impl ConnectionPool {
             .map_err(|_| io::Error::other("connection pool write lock poisoned"))?
             .insert(peer, connection);
         Ok(peer)
+    }
+
+    fn remove(&self, peer: &iroh::EndpointId) -> io::Result<()> {
+        self.connections
+            .write()
+            .map_err(|_| io::Error::other("connection pool write lock poisoned"))?
+            .remove(peer);
+        Ok(())
     }
 
     fn get(&self, peer: &iroh::EndpointId) -> io::Result<Option<iroh::endpoint::Connection>> {
@@ -202,6 +215,22 @@ impl<S: Storage> IrohNet<S> {
         Ok(Some(handle.spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
+                while connections.len() >= MAX_ACCEPT_CONNECTIONS {
+                    tokio::select! {
+                        Some(result) = connections.join_next() => {
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "iroh connection task failed");
+                            }
+                        }
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                connections.abort_all();
+                                while connections.join_next().await.is_some() {}
+                                return;
+                            }
+                        }
+                    }
+                }
                 let Some(current) = net.upgrade() else {
                     break;
                 };
@@ -308,37 +337,60 @@ impl<S: Storage> IrohNet<S> {
                 if current.is_shutdown() || current.endpoint().is_closed() {
                     break;
                 }
-                let obligations = match current.node.storage().all_sync_obligations() {
-                    Ok(obligations) => obligations,
+                let targets = match current.resync_targets() {
+                    Ok(targets) => targets,
                     Err(error) => {
-                        tracing::warn!(%error, "failed to read sync obligations");
+                        tracing::warn!(%error, "failed to build resync targets");
                         continue;
                     }
                 };
-                let targets = obligations
-                    .into_iter()
-                    .map(|obligation| (obligation.peer_id, obligation.topic_id))
-                    .collect::<BTreeSet<_>>();
                 drop(current);
+                let mut syncs = tokio::task::JoinSet::new();
+                let mut stopping = false;
                 for (peer_id, topic_id) in targets {
+                    while syncs.len() >= MAX_RESYNC_CONCURRENCY {
+                        tokio::select! {
+                            Some(result) = syncs.join_next() => log_resync_join_result(result),
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    stopping = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if stopping {
+                        break;
+                    }
                     let Some(current) = net.upgrade() else {
+                        stopping = true;
                         break;
                     };
                     if current.is_shutdown() {
+                        stopping = true;
                         break;
                     }
-                    let result = tokio::select! {
+                    syncs.spawn(async move {
+                        let result = current.sync_peer_now(peer_id, topic_id).await;
+                        (peer_id, topic_id, result)
+                    });
+                }
+
+                while !syncs.is_empty() {
+                    tokio::select! {
+                        Some(result) = syncs.join_next() => log_resync_join_result(result),
                         changed = shutdown.changed() => {
                             if changed.is_err() || *shutdown.borrow() {
+                                stopping = true;
                                 break;
                             }
-                            continue;
                         }
-                        result = current.sync_peer_now(peer_id, topic_id) => result,
-                    };
-                    if let Err(error) = result {
-                        tracing::warn!(%peer_id, %topic_id, %error, "failed to resync peer");
                     }
+                }
+                if stopping {
+                    syncs.abort_all();
+                    while syncs.join_next().await.is_some() {}
+                    break;
                 }
             }
         })))
@@ -349,10 +401,33 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         messages: &[SyncMessage],
     ) -> io::Result<Vec<SyncMessage>> {
-        let connection = self
-            .pool
-            .get_or_connect(peer, self.runtime.connect_timeout)
-            .await?;
+        let peer_id = peer.id;
+        let mut last_error = None;
+        for _ in 0..2 {
+            let connection = match self
+                .pool
+                .get_or_connect(peer.clone(), self.runtime.connect_timeout)
+                .await
+            {
+                Ok(connection) => connection,
+                Err(error) => return Err(error),
+            };
+            match self.sync_with_connection(connection, messages).await {
+                Ok(responses) => return Ok(responses),
+                Err(error) => {
+                    let _ = self.pool.remove(&peer_id);
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("sync failed")))
+    }
+
+    async fn sync_with_connection(
+        &self,
+        connection: iroh::endpoint::Connection,
+        messages: &[SyncMessage],
+    ) -> io::Result<Vec<SyncMessage>> {
         let (mut send, mut recv) =
             tokio::time::timeout(self.runtime.sync_io_timeout, connection.open_bi())
                 .await
@@ -368,7 +443,11 @@ impl<S: Storage> IrohNet<S> {
         topic_id: crate::TopicId,
     ) -> io::Result<()> {
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
+        let endpoint_id = peer.id;
         let result = self.sync_now_inner(peer, topic_id).await;
+        if result.is_err() {
+            let _ = self.pool.remove(&endpoint_id);
+        }
         let record_result = match &result {
             Ok(()) => Ok(()),
             Err(error) => Err(error),
@@ -443,13 +522,14 @@ impl<S: Storage> IrohNet<S> {
         let responses = self.sync_with(peer.clone(), &messages).await?;
         let mut followup: SmallVec<[SyncMessage; 2]> =
             smallvec![SyncMessage::Open(self.node.sync_open(topic_id))];
+        let mut acks = Vec::new();
         for response in responses {
             match response {
                 SyncMessage::Ack(ack) => {
                     if ack.peer_id != remote_peer_id || ack.topic_id != topic_id {
                         return Err(invalid_data("sync ack does not match remote peer/topic"));
                     }
-                    self.node.apply_sync_ack(&ack).map_err(invalid_data)?;
+                    acks.push(ack);
                 }
                 SyncMessage::Summary(summary) if summary.topic_id == topic_id => {}
                 SyncMessage::Data(data) => {
@@ -466,6 +546,9 @@ impl<S: Storage> IrohNet<S> {
                     )));
                 }
             }
+        }
+        for ack in acks {
+            self.node.apply_sync_ack(&ack).map_err(invalid_data)?;
         }
         if followup.len() > 1 {
             let responses = self.sync_with(peer, &followup).await?;
@@ -501,11 +584,20 @@ impl<S: Storage> IrohNet<S> {
         mut recv: iroh::endpoint::RecvStream,
         mut send: iroh::endpoint::SendStream,
     ) -> io::Result<()> {
-        let messages = read_sync_messages(&mut recv, self.runtime.sync_io_timeout).await?;
-        let responses = self
-            .handle_messages(peer, messages)?
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut session = SyncSession::new(peer);
+        let mut limits = SyncReadLimits::default();
+        let mut responses = Vec::new();
+        while let Some(frame) = read_next_frame(&mut recv, self.runtime.sync_io_timeout).await? {
+            let frame_index = limits.observe_frame(frame.len())?;
+            let message = decode_sync_message(&frame).map_err(|err| {
+                invalid_data(format!(
+                    "invalid sync message frame {frame_index} ({} bytes): {err}",
+                    frame.len()
+                ))
+            })?;
+            push_responses(&mut responses, session.handle(self, message)?)?;
+        }
+        push_responses(&mut responses, session.finish(self)?)?;
         write_sync_messages(&mut send, &responses, self.runtime.sync_io_timeout).await?;
         Ok(())
     }
@@ -515,32 +607,43 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointId,
         messages: Vec<SyncMessage>,
     ) -> io::Result<Vec<SyncMessage>> {
-        let authenticated_peer_id = peer_id_from_endpoint_id(peer);
-        let mut remote_peer_id = None;
-        let mut open_topic_id = None;
+        let mut session = SyncSession::new(peer);
         let mut responses = Vec::new();
         for message in messages {
-            if let SyncMessage::Open(open) = &message {
-                if open.protocol.as_bytes() != IROKLE_SYNC_ALPN {
-                    return Err(invalid_data("unsupported sync protocol"));
-                }
-                if open.peer_id != authenticated_peer_id {
-                    return Err(invalid_data(
-                        "sync open peer_id does not match iroh endpoint id",
-                    ));
-                }
-                remote_peer_id = Some(open.peer_id);
-                open_topic_id = Some(open.topic_id);
-            } else if let Some(topic_id) = message_topic_id(&message)
-                && open_topic_id != Some(topic_id)
-            {
-                return Err(invalid_data(
-                    "sync message topic does not match SyncOpen topic",
-                ));
-            }
-            responses.extend(self.handle_message(message, remote_peer_id)?);
+            push_responses(&mut responses, session.handle(self, message)?)?;
         }
+        push_responses(&mut responses, session.finish(self)?)?;
         Ok(responses)
+    }
+
+    fn resync_targets(&self) -> io::Result<BTreeSet<(PeerId, crate::TopicId)>> {
+        let mut targets = self
+            .node
+            .storage()
+            .all_sync_obligations()
+            .map_err(invalid_data)?
+            .into_iter()
+            .map(|obligation| (obligation.peer_id, obligation.topic_id))
+            .collect::<BTreeSet<_>>();
+        for topic in self.node.storage().list_topics().map_err(invalid_data)? {
+            let Some(state) = self
+                .node
+                .storage()
+                .topic_state(&topic.topic_id)
+                .map_err(invalid_data)?
+            else {
+                continue;
+            };
+            if !state.members.contains(&self.node.peer_id()) {
+                continue;
+            }
+            targets.extend(
+                select_sync_peers(topic.topic_id, self.node.peer_id(), &state)
+                    .into_iter()
+                    .map(|peer_id| (peer_id, topic.topic_id)),
+            );
+        }
+        Ok(targets)
     }
 
     fn handle_message(
@@ -557,7 +660,7 @@ impl<S: Storage> IrohNet<S> {
                     .storage()
                     .topic_state(&open.topic_id)
                     .map_err(invalid_data)?
-                    && !state.members.contains(&peer_id)
+                    && !peer_may_open_topic(&state, peer_id)
                 {
                     return Ok(Vec::new());
                 }
@@ -581,7 +684,7 @@ impl<S: Storage> IrohNet<S> {
                 else {
                     return Ok(Vec::new());
                 };
-                if !state.members.contains(&peer_id) {
+                if !peer_may_open_topic(&state, peer_id) {
                     return Ok(Vec::new());
                 }
                 let local = self
@@ -589,9 +692,11 @@ impl<S: Storage> IrohNet<S> {
                     .sync_fingerprint(fingerprint.topic_id)
                     .map_err(invalid_data)?;
                 if local.fingerprint == fingerprint.fingerprint {
-                    self.node
-                        .record_peer_synced(peer_id, fingerprint.topic_id)
-                        .map_err(invalid_data)?;
+                    if state.members.contains(&peer_id) {
+                        self.node
+                            .record_peer_synced(peer_id, fingerprint.topic_id)
+                            .map_err(invalid_data)?;
+                    }
                     Ok(vec![SyncMessage::Fingerprint(local)])
                 } else {
                     self.node
@@ -664,6 +769,124 @@ impl<S: Storage> IrohNet<S> {
     }
 }
 
+struct SyncSession {
+    authenticated_peer_id: PeerId,
+    remote_peer_id: Option<PeerId>,
+    open_topic_id: Option<crate::TopicId>,
+    acks: Vec<crate::sync::SyncAck>,
+}
+
+impl SyncSession {
+    fn new(peer: iroh::EndpointId) -> Self {
+        Self {
+            authenticated_peer_id: peer_id_from_endpoint_id(peer),
+            remote_peer_id: None,
+            open_topic_id: None,
+            acks: Vec::new(),
+        }
+    }
+
+    fn handle<S: Storage>(
+        &mut self,
+        net: &IrohNet<S>,
+        message: SyncMessage,
+    ) -> io::Result<Vec<SyncMessage>> {
+        if let SyncMessage::Open(open) = &message {
+            if open.protocol.as_bytes() != IROKLE_SYNC_ALPN {
+                return Err(invalid_data("unsupported sync protocol"));
+            }
+            if open.peer_id != self.authenticated_peer_id {
+                return Err(invalid_data(
+                    "sync open peer_id does not match iroh endpoint id",
+                ));
+            }
+            self.remote_peer_id = Some(open.peer_id);
+            self.open_topic_id = Some(open.topic_id);
+        } else if let Some(topic_id) = message_topic_id(&message)
+            && self.open_topic_id != Some(topic_id)
+        {
+            return Err(invalid_data(
+                "sync message topic does not match SyncOpen topic",
+            ));
+        }
+
+        if let SyncMessage::Ack(ack) = message {
+            if self.remote_peer_id.is_none() {
+                return Err(invalid_data(
+                    "sync ack requires a preceding SyncOpen with peer_id",
+                ));
+            }
+            self.acks.push(ack);
+            return Ok(Vec::new());
+        }
+
+        net.handle_message(message, self.remote_peer_id)
+    }
+
+    fn finish<S: Storage>(&mut self, net: &IrohNet<S>) -> io::Result<Vec<SyncMessage>> {
+        let mut responses = Vec::new();
+        for ack in std::mem::take(&mut self.acks) {
+            push_responses(
+                &mut responses,
+                net.handle_message(SyncMessage::Ack(ack), self.remote_peer_id)?,
+            )?;
+        }
+        Ok(responses)
+    }
+}
+
+#[derive(Default)]
+struct SyncReadLimits {
+    messages: usize,
+    bytes: usize,
+}
+
+impl SyncReadLimits {
+    fn observe_frame(&mut self, frame_len: usize) -> io::Result<usize> {
+        if self.messages >= MAX_SYNC_MESSAGES_PER_STREAM {
+            return Err(invalid_data("sync stream has too many messages"));
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(frame_len + 4)
+            .ok_or_else(|| invalid_data("sync stream byte count overflow"))?;
+        if self.bytes > MAX_SYNC_STREAM_BYTES {
+            return Err(invalid_data("sync stream exceeds maximum byte length"));
+        }
+        let frame_index = self.messages;
+        self.messages += 1;
+        Ok(frame_index)
+    }
+}
+
+fn push_responses(out: &mut Vec<SyncMessage>, responses: Vec<SyncMessage>) -> io::Result<()> {
+    if out.len().saturating_add(responses.len()) > MAX_SYNC_MESSAGES_PER_STREAM {
+        return Err(invalid_data("sync response has too many messages"));
+    }
+    out.extend(responses);
+    Ok(())
+}
+
+fn log_resync_join_result(
+    result: std::result::Result<(PeerId, crate::TopicId, io::Result<()>), tokio::task::JoinError>,
+) {
+    match result {
+        Ok((peer_id, topic_id, Err(error))) => {
+            tracing::warn!(%peer_id, %topic_id, %error, "failed to resync peer");
+        }
+        Ok((_, _, Ok(()))) => {}
+        Err(error) => tracing::warn!(%error, "resync task failed"),
+    }
+}
+
+fn peer_may_open_topic(state: &crate::storage::TopicState, peer_id: PeerId) -> bool {
+    state.members.contains(&peer_id)
+        || state
+            .membership_controls
+            .get(&peer_id)
+            .is_some_and(|(_, is_member)| !*is_member)
+}
+
 async fn handle_connection<S: Storage>(
     net: Weak<IrohNet<S>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -710,12 +933,13 @@ async fn read_sync_messages(
     sync_io_timeout: Duration,
 ) -> io::Result<Vec<SyncMessage>> {
     let mut messages = Vec::new();
+    let mut limits = SyncReadLimits::default();
     while let Some(frame) = read_next_frame(recv, sync_io_timeout).await? {
-        let frame_index = messages.len();
-        let frame_len = frame.len();
+        let frame_index = limits.observe_frame(frame.len())?;
         messages.push(decode_sync_message(&frame).map_err(|err| {
             invalid_data(format!(
-                "invalid sync message frame {frame_index} ({frame_len} bytes): {err}"
+                "invalid sync message frame {frame_index} ({} bytes): {err}",
+                frame.len()
             ))
         })?);
     }

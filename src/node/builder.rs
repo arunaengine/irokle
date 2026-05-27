@@ -13,6 +13,7 @@ impl Irokle<MemoryStorage> {
             storage: MemoryStorage::new(),
             config: NodeConfig::default(),
             signer_explicit: false,
+            write_concern_explicit: false,
             #[cfg(feature = "iroh")]
             endpoint: None,
             #[cfg(feature = "iroh")]
@@ -39,6 +40,7 @@ impl<S: Storage> IrokleBuilder<S> {
             storage,
             config: self.config,
             signer_explicit: self.signer_explicit,
+            write_concern_explicit: self.write_concern_explicit,
             #[cfg(feature = "iroh")]
             endpoint: self.endpoint,
             #[cfg(feature = "iroh")]
@@ -53,6 +55,7 @@ impl<S: Storage> IrokleBuilder<S> {
     pub fn with_config(mut self, config: NodeConfig) -> Self {
         self.config = config;
         self.signer_explicit = true;
+        self.write_concern_explicit = true;
         self
     }
 
@@ -64,6 +67,7 @@ impl<S: Storage> IrokleBuilder<S> {
 
     pub fn with_write_concern(mut self, write_concern: WriteConcern) -> Self {
         self.config.default_write_concern = write_concern;
+        self.write_concern_explicit = true;
         self
     }
 
@@ -97,6 +101,9 @@ impl<S: Storage> IrokleBuilder<S> {
     pub fn with_net(mut self, endpoint: iroh::Endpoint) -> Self {
         if !self.signer_explicit {
             self.config.signer = Ed25519Signer::from_iroh_secret_key(endpoint.secret_key());
+        }
+        if !self.write_concern_explicit {
+            self.config.default_write_concern = WriteConcern::AsyncReplication;
         }
         self.endpoint = Some(endpoint);
         self.auto_accept = true;
@@ -142,6 +149,7 @@ impl<S: Storage> IrokleBuilder<S> {
             storage: crate::FjallStorage::open(path)?,
             config: self.config,
             signer_explicit: self.signer_explicit,
+            write_concern_explicit: self.write_concern_explicit,
             #[cfg(feature = "iroh")]
             endpoint: self.endpoint,
             #[cfg(feature = "iroh")]
@@ -162,6 +170,7 @@ impl<S: Storage> IrokleBuilder<S> {
             storage: crate::FjallStorage::from_database(db)?,
             config: self.config,
             signer_explicit: self.signer_explicit,
+            write_concern_explicit: self.write_concern_explicit,
             #[cfg(feature = "iroh")]
             endpoint: self.endpoint,
             #[cfg(feature = "iroh")]
@@ -190,10 +199,10 @@ impl<S: Storage> IrokleBuilder<S> {
                 net.start_accept_loop().map_err(|err| {
                     Error::Storage(format!("failed to start iroh accept loop: {err}"))
                 })?;
-                net.start_configured_resync_loop().map_err(|err| {
-                    Error::Storage(format!("failed to start iroh resync loop: {err}"))
-                })?;
             }
+            net.start_configured_resync_loop().map_err(|err| {
+                Error::Storage(format!("failed to start iroh resync loop: {err}"))
+            })?;
             return Ok(node.with_net(net));
         }
 

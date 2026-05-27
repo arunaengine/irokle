@@ -751,6 +751,63 @@ fn receive_schedules_forwarding_only_for_missing_selected_peers() {
 }
 
 #[test]
+fn failed_sync_result_keeps_obligation_pending_for_retry() {
+    let alice = node(98);
+    let bob = node(99);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let record = topic
+        .publish(Note {
+            text: "retry".into(),
+        })
+        .unwrap();
+    alice
+        .put_sync_obligation(bob.peer_id(), topic.id(), [record.meta.op_id].into())
+        .unwrap();
+
+    let error = std::io::Error::new(std::io::ErrorKind::TimedOut, "dial timed out");
+    alice
+        .record_sync_result(bob.peer_id(), topic.id(), Err(&error))
+        .unwrap();
+
+    let status = alice.sync_status(topic.id()).unwrap();
+    assert_eq!(status.len(), 1);
+    assert_eq!(status[0].peer_id, bob.peer_id());
+    assert_eq!(status[0].state, crate_storage::SyncPeerState::Failed);
+    assert_eq!(status[0].pending_obligations, 1);
+    assert_eq!(status[0].failed_attempts, 1);
+    assert!(
+        status[0]
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("dial timed out")
+    );
+    assert_eq!(
+        alice
+            .storage()
+            .sync_obligations(&bob.peer_id(), &topic.id())
+            .unwrap()[0]
+            .op_ids,
+        [record.meta.op_id].into()
+    );
+
+    alice
+        .record_sync_result(bob.peer_id(), topic.id(), Ok(()))
+        .unwrap();
+
+    let status = alice.sync_status(topic.id()).unwrap();
+    assert_eq!(status[0].state, crate_storage::SyncPeerState::Behind);
+    assert_eq!(status[0].pending_obligations, 1);
+    assert_eq!(status[0].successful_attempts, 1);
+    assert_eq!(status[0].last_error, None);
+}
+
+#[test]
 fn clamps_oversized_hint() {
     let alice = node(80);
     let bob = node(81);

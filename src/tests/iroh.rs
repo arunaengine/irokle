@@ -41,6 +41,125 @@ async fn builder_sets_runtime_config() {
     assert_eq!(irokle.iroh_runtime_config(), Some(runtime));
 }
 
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resync_runs_without_auto_accept_and_without_obligations() {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_peer = PeerId::from_bytes(*bob_endpoint.id().as_bytes());
+    let runtime = net::IrohRuntimeConfig {
+        connect_timeout: std::time::Duration::from_millis(10),
+        sync_io_timeout: std::time::Duration::from_millis(10),
+        resync_interval: std::time::Duration::from_millis(10),
+    };
+    let alice = Irokle::builder()
+        .with_net(alice_endpoint)
+        .with_write_concern(WriteConcern::Local)
+        .with_iroh_runtime_config(runtime)
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob_peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let status = alice.sync_status(topic.id()).unwrap();
+            if status
+                .iter()
+                .any(|status| status.peer_id == bob_peer && status.failed_attempts > 0)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    alice.shutdown_iroh().await;
+    bob_endpoint.close().await;
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn iroh_defaults_to_async_replication() {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_peer = PeerId::from_bytes(*bob_endpoint.id().as_bytes());
+    let alice = Irokle::builder()
+        .with_net(alice_endpoint)
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob_peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
+
+    let report = alice.sync_report(bob_peer, topic.id()).unwrap();
+    assert!(
+        report
+            .obligations
+            .iter()
+            .any(|obligation| obligation.op_ids.contains(&genesis.id))
+    );
+
+    alice.shutdown_iroh().await;
+    bob_endpoint.close().await;
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test]
+async fn resync_and_accept_loops_start_once() {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let runtime = net::IrohRuntimeConfig {
+        connect_timeout: std::time::Duration::from_millis(20),
+        sync_io_timeout: std::time::Duration::from_millis(20),
+        resync_interval: std::time::Duration::from_secs(60),
+    };
+    let node = Irokle::builder()
+        .with_iroh_secret_key(endpoint.secret_key())
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let net = Arc::new(net::IrohNet::new_with_config(endpoint, node, runtime).unwrap());
+
+    let accept = net.spawn_accept_loop().unwrap();
+    let duplicate_accept = net.spawn_accept_loop().unwrap();
+    let resync = net.spawn_resync_loop(runtime.resync_interval).unwrap();
+    let duplicate_resync = net.spawn_resync_loop(runtime.resync_interval).unwrap();
+
+    assert!(accept.is_some());
+    assert!(duplicate_accept.is_none());
+    assert!(resync.is_some());
+    assert!(duplicate_resync.is_none());
+    assert_eq!(net.runtime_config(), runtime);
+
+    net.shutdown().await;
+}
+
 #[cfg(all(feature = "iroh", feature = "fjall"))]
 #[tokio::test]
 async fn builder_selects_fjall() {
@@ -143,6 +262,7 @@ async fn async_replication_records_scheduled_status() {
         .unwrap();
     let alice = Irokle::builder()
         .with_net(alice_endpoint)
+        .with_write_concern(WriteConcern::Local)
         .without_auto_accept()
         .build()
         .unwrap();
@@ -316,6 +436,70 @@ async fn open_hides_non_member_summary() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn former_member_can_confirm_matching_fingerprint() {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .build()
+        .unwrap();
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(bob_endpoint.secret_key())
+        .build()
+        .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    bob.receive_sync_data_from(
+        alice.peer_id(),
+        sync::SyncData {
+            topic_id: topic.id(),
+            ops: oplog::topological(alice.storage(), &topic.id()).unwrap(),
+        },
+    )
+    .unwrap();
+    bob.open_topic::<Note>(topic.id()).unwrap().leave().unwrap();
+    alice
+        .receive_sync_data_from(
+            bob.peer_id(),
+            sync::SyncData {
+                topic_id: topic.id(),
+                ops: oplog::topological(bob.storage(), &topic.id()).unwrap(),
+            },
+        )
+        .unwrap();
+    let net = net::IrohNet::new(alice_endpoint, alice.clone()).unwrap();
+
+    let responses = net
+        .handle_messages(
+            bob_endpoint.id(),
+            vec![
+                sync::SyncMessage::Open(sync::SyncEngine::<MemoryStorage>::open(
+                    topic.id(),
+                    bob.peer_id(),
+                    Some(Note::TYPE_ID.into()),
+                )),
+                sync::SyncMessage::Fingerprint(bob.sync_fingerprint(topic.id()).unwrap()),
+            ],
+        )
+        .unwrap();
+
+    assert!(responses.iter().any(|response| {
+        matches!(response, sync::SyncMessage::Fingerprint(fingerprint) if fingerprint.topic_id == topic.id())
+    }));
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn whitelist_controls_bootstrap() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
@@ -416,6 +600,96 @@ async fn whitelist_controls_bootstrap() {
             .any(|response| matches!(response, sync::SyncMessage::Ack(_)))
     );
     assert!(bob.storage().topic_state(&topic.id()).unwrap().is_some());
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handle_messages_accepts_ack_heads_that_arrive_before_data() {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(bob_endpoint.secret_key())
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let net = net::IrohNet::new(alice_endpoint, alice.clone()).unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let bootstrap = sync::SyncData {
+        topic_id: topic.id(),
+        ops: oplog::topological(alice.storage(), &topic.id()).unwrap(),
+    };
+    bob.receive_sync_data_from(alice.peer_id(), bootstrap)
+        .unwrap();
+
+    let alice_record = topic
+        .publish(Note {
+            text: "alice".into(),
+        })
+        .unwrap();
+    let bob_topic = bob.open_topic::<Note>(topic.id()).unwrap();
+    let bob_record = bob_topic.publish(Note { text: "bob".into() }).unwrap();
+    let mut ack = sync::SyncAck {
+        topic_id: topic.id(),
+        peer_id: bob.peer_id(),
+        accepted: [alice_record.meta.op_id].into(),
+        heads: bob.storage().heads(&topic.id()).unwrap(),
+        clock: bob.storage().actor_clock(&topic.id()).unwrap(),
+        signature: None,
+    };
+    ack.sign(bob.signer()).unwrap();
+    let data = sync::SyncData {
+        topic_id: topic.id(),
+        ops: vec![
+            bob.storage()
+                .get_op(&bob_record.meta.op_id)
+                .unwrap()
+                .unwrap(),
+        ],
+    };
+
+    net.handle_messages(
+        bob_endpoint.id(),
+        vec![
+            sync::SyncMessage::Open(sync::SyncEngine::<MemoryStorage>::open(
+                topic.id(),
+                bob.peer_id(),
+                Some(Note::TYPE_ID.into()),
+            )),
+            sync::SyncMessage::Ack(ack),
+            sync::SyncMessage::Data(data),
+        ],
+    )
+    .unwrap();
+
+    assert!(
+        alice
+            .storage()
+            .get_meta(&bob_record.meta.op_id)
+            .unwrap()
+            .is_some()
+    );
+    let peer_ack = alice
+        .storage()
+        .peer_ack(&bob.peer_id(), &topic.id())
+        .unwrap()
+        .unwrap();
+    assert!(peer_ack.heads.contains(&bob_record.meta.op_id));
 }
 
 #[cfg(feature = "iroh")]
