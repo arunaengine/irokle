@@ -1,8 +1,8 @@
 # Irokle
 
-Irokle is a signed Merkle-DAG operation log for invite-only topics. Application events and membership changes are stored as signed operations; heads, actor clocks, topic state, history, sync summaries, and reducer projections are derived from those operations.
+Irokle is a signed Merkle-DAG operation log for invite-only topics. Application events and membership changes are stored as signed operations. The graph of operations can be used to derive current heads, a history of changes, summaries for syncing, and projections.
 
-## What It Provides
+## Features
 
 - Signed operations: every event or control change is signed by the peer that authored it.
 - Topic membership: topics are not public broadcast channels; typed access is gated by the current signed member set.
@@ -10,7 +10,7 @@ Irokle is a signed Merkle-DAG operation log for invite-only topics. Application 
 - Bounded fanout: topic replication is capped by `ReplicationPolicy::max_sync_peers` so a node does not sync with every member by default.
 - Observability: sync status records expose pending obligations, failure counts, last errors, last success, and per-state counts.
 - Storage choices: `MemoryStorage` is available by default; `FjallStorage` is available behind the `fjall` feature.
-- Iroh integration: the `iroh` feature syncs over `iroh::Endpoint` using `PeerId`/NodeId dialing.
+- Iroh integration: the `iroh` feature syncs over `iroh::Endpoint` using `PeerId`/`NodeId` dialing.
 
 ## Minimal Example
 
@@ -59,7 +59,7 @@ fn main() -> irokle::Result<()> {
 }
 ```
 
-This example uses the transport-neutral sync API directly. Iroh examples use `sync_now(peer_id, topic_id)` instead.
+This example uses the transport-neutral sync API directly. Iroh examples can use `sync_now(peer_id, topic_id)` instead.
 
 ## Topics And Membership
 
