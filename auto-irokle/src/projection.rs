@@ -105,10 +105,17 @@ impl<T: AutoIrokle> AutoProjection<T> {
         self.state.as_ref().ok_or_else(missing_init)
     }
 
+    #[doc(hidden)]
+    pub fn state_opt(&self) -> Option<&T> {
+        self.state.as_ref()
+    }
+
+    #[doc(hidden)]
     pub fn state_mut(&mut self) -> irokle::Result<&mut T> {
         self.state.as_mut().ok_or_else(missing_init)
     }
 
+    #[doc(hidden)]
     pub fn replace_state(&mut self, state: T) {
         self.state = Some(state);
         self.registers.clear();
@@ -134,11 +141,13 @@ impl<T: AutoIrokle> AutoProjection<T> {
         }
     }
 
+    #[doc(hidden)]
     pub fn init_register(&mut self, path: Path, meta: &OpMeta) {
         self.registers
             .insert(path, RegisterMeta::from_op_meta(meta));
     }
 
+    #[doc(hidden)]
     pub fn init_set_values<I>(&mut self, path: Path, values: I, meta: &OpMeta)
     where
         I: IntoIterator<Item = Vec<u8>>,
@@ -155,6 +164,7 @@ impl<T: AutoIrokle> AutoProjection<T> {
         self.sets.insert(path, values);
     }
 
+    #[doc(hidden)]
     pub fn init_map_keys<I>(&mut self, path: Path, keys: I, meta: &OpMeta)
     where
         I: IntoIterator<Item = Vec<u8>>,
@@ -175,6 +185,7 @@ impl<T: AutoIrokle> AutoProjection<T> {
         self.maps.insert(path, keys);
     }
 
+    #[doc(hidden)]
     pub fn apply_register(&mut self, path: Path, meta: &OpMeta) -> bool {
         let incoming = RegisterMeta::from_op_meta(meta);
         if self
@@ -189,6 +200,7 @@ impl<T: AutoIrokle> AutoProjection<T> {
         }
     }
 
+    #[doc(hidden)]
     pub fn insert_set_value(&mut self, path: Path, value: Vec<u8>, meta: &OpMeta) -> bool {
         let dot = Dot::from_meta(meta);
         let entry = self.sets.entry(path).or_default().entry(value).or_default();
@@ -196,6 +208,7 @@ impl<T: AutoIrokle> AutoProjection<T> {
         entry.is_visible()
     }
 
+    #[doc(hidden)]
     pub fn remove_set_value(&mut self, path: Path, value: &[u8], meta: &OpMeta) -> bool {
         let entry = self
             .sets
@@ -208,6 +221,7 @@ impl<T: AutoIrokle> AutoProjection<T> {
         entry.is_visible()
     }
 
+    #[doc(hidden)]
     pub fn set_map_value(&mut self, path: Path, key: Vec<u8>, meta: &OpMeta) -> bool {
         let dot = Dot::from_meta(meta);
         let incoming = RegisterMeta::from_op_meta(meta);
@@ -225,6 +239,7 @@ impl<T: AutoIrokle> AutoProjection<T> {
         entry.is_visible() && value_wins
     }
 
+    #[doc(hidden)]
     pub fn remove_map_key(&mut self, path: Path, key: &[u8], meta: &OpMeta) -> bool {
         let entry = self
             .maps

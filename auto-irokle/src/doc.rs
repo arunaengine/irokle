@@ -34,11 +34,13 @@ impl<T: AutoIrokle, S: Storage> AutoDoc<T, S> {
         &self.projection
     }
 
+    #[tracing::instrument(skip_all, fields(topic_id = %self.topic.id()))]
     pub fn refresh(&mut self) -> irokle::Result<()> {
         self.projection = rebuild_projection(&self.topic)?;
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, fields(topic_id = %self.topic.id(), ops = tracing::field::Empty))]
     pub fn change<F>(&mut self, change: F) -> irokle::Result<Option<EventRecord<AutoEvent<T>>>>
     where
         F: FnOnce(&mut T),
@@ -48,6 +50,7 @@ impl<T: AutoIrokle, S: Storage> AutoDoc<T, S> {
         change(&mut next);
 
         let ops = T::diff(&old, &next)?;
+        tracing::Span::current().record("ops", ops.len());
         if ops.is_empty() {
             return Ok(None);
         }
@@ -69,6 +72,7 @@ pub trait AutoIrokleExt<S: Storage> {
 }
 
 impl<S: Storage> AutoIrokleExt<S> for Irokle<S> {
+    #[tracing::instrument(skip_all)]
     fn create_doc<T: AutoIrokle>(
         &self,
         initial: T,
@@ -81,6 +85,7 @@ impl<S: Storage> AutoIrokleExt<S> for Irokle<S> {
         Ok(AutoDoc::new(topic, projection))
     }
 
+    #[tracing::instrument(skip_all, fields(%topic_id))]
     fn open_doc<T: AutoIrokle>(&self, topic_id: TopicId) -> irokle::Result<AutoDoc<T, S>> {
         let topic = self.open_topic::<AutoEvent<T>>(topic_id)?;
         let projection = rebuild_projection(&topic)?;

@@ -2,11 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use auto_irokle::{AutoIrokle, AutoIrokleExt};
+use auto_irokle::{AutoEvent, AutoIrokle, AutoIrokleExt, PatchOp};
 use irokle::{Ed25519Signer, Irokle, TopicConfig, TopicId};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, facet::Facet, AutoIrokle)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, AutoIrokle)]
 #[auto_irokle(type_id = "test.auto.note")]
 struct Note {
     title: String,
@@ -68,15 +68,7 @@ fn document_id_is_topic_id() {
 fn derive_supports_renamed_auto_irokle_crate() {
     use auto_irokle as renamed_auto;
 
-    #[derive(
-        Clone,
-        Debug,
-        PartialEq,
-        Serialize,
-        Deserialize,
-        renamed_auto::facet::Facet,
-        renamed_auto::AutoIrokle,
-    )]
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, renamed_auto::AutoIrokle)]
     #[auto_irokle(type_id = "test.auto.renamed", crate = "renamed_auto")]
     struct Renamed {
         value: String,
@@ -275,6 +267,121 @@ fn observed_remove_set_keeps_concurrent_readd() {
 
     assert!(alice_doc.state().tags.contains("irokle"));
     assert!(bob_doc.state().tags.contains("irokle"));
+}
+
+#[test]
+fn empty_change_returns_none() {
+    let node = node(20);
+    let mut doc = node
+        .create_doc(Note::new("draft"), TopicConfig::default())
+        .unwrap();
+
+    let record = doc.change(|_note| {}).unwrap();
+    assert!(record.is_none());
+
+    let same_value_record = doc
+        .change(|note| {
+            note.title = "draft".into();
+        })
+        .unwrap();
+    assert!(same_value_record.is_none());
+}
+
+#[test]
+fn rogue_init_is_ignored() {
+    let node = node(21);
+    let mut doc = node
+        .create_doc(Note::new("first"), TopicConfig::default())
+        .unwrap();
+
+    doc.change(|note| note.title = "after-mutation".into())
+        .unwrap();
+
+    let mut wiped = Note::new("rogue-replacement");
+    wiped.tags.insert("rogue-tag".into());
+    let rogue_init = AutoEvent::init(&wiped).unwrap();
+    doc.topic().publish(rogue_init).unwrap();
+
+    doc.refresh().unwrap();
+
+    assert_eq!(doc.state().title, "after-mutation");
+    assert!(doc.state().tags.is_empty());
+}
+
+#[test]
+fn explicit_kind_lww_overrides_set_detection() {
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, AutoIrokle)]
+    #[auto_irokle(type_id = "test.auto.forced_lww")]
+    struct Doc {
+        #[auto_irokle(kind = "lww")]
+        tags: BTreeSet<String>,
+    }
+
+    let alice = node(30);
+    let bob = node(31);
+    let mut alice_doc = alice
+        .create_doc(
+            Doc {
+                tags: BTreeSet::new(),
+            },
+            TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            },
+        )
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+    let mut bob_doc = bob.open_doc::<Doc>(alice_doc.id()).unwrap();
+
+    let alice_record = alice_doc
+        .change(|doc| {
+            doc.tags.insert("alice".into());
+        })
+        .unwrap()
+        .unwrap();
+    let bob_record = bob_doc
+        .change(|doc| {
+            doc.tags.insert("bob".into());
+        })
+        .unwrap()
+        .unwrap();
+
+    sync_pair(&alice, &bob, alice_doc.id());
+    alice_doc.refresh().unwrap();
+    bob_doc.refresh().unwrap();
+
+    let winner: BTreeSet<String> = if alice_record.meta.op_id > bob_record.meta.op_id {
+        ["alice".to_owned()].into()
+    } else {
+        ["bob".to_owned()].into()
+    };
+    assert_eq!(alice_doc.state().tags, winner);
+    assert_eq!(bob_doc.state().tags, winner);
+}
+
+#[test]
+fn malformed_patch_surfaces_decode_error() {
+    let node = node(22);
+    let mut doc = node
+        .create_doc(Note::new("draft"), TopicConfig::default())
+        .unwrap();
+
+    let bogus = AutoEvent::patch(vec![PatchOp::set(
+        vec!["definitely_not_a_field".into()],
+        vec![0xff, 0xff, 0xff],
+    )]);
+    doc.topic().publish(bogus).unwrap();
+
+    let err = doc.refresh().unwrap_err();
+    match err {
+        irokle::Error::Decode(msg) => {
+            assert!(
+                msg.contains("unsupported auto-irokle patch op"),
+                "unexpected decode error: {msg}"
+            );
+        }
+        other => panic!("expected Error::Decode, got {other:?}"),
+    }
 }
 
 #[test]
