@@ -4,8 +4,20 @@ use crate::{AutoEvent, AutoIrokle, AutoProjection};
 use irokle::history::HistoryOrder;
 use irokle::reducer::EventRecord;
 use irokle::{Irokle, MemoryStorage, Storage, Topic, TopicConfig, TopicId};
+use serde::{Deserialize, Serialize};
 
-const SNAPSHOT_MAGIC: &[u8; 8] = b"AUTOIRK1";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"AUTOIRK2";
+
+#[derive(Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "T: Serialize",
+    deserialize = "T: serde::de::DeserializeOwned"
+))]
+struct Snapshot<T: AutoIrokle> {
+    topic_id: TopicId,
+    event_type_id: String,
+    projection: AutoProjection<T>,
+}
 
 #[derive(Clone)]
 pub struct AutoDoc<T: AutoIrokle, S: Storage = MemoryStorage> {
@@ -38,10 +50,13 @@ impl<T: AutoIrokle, S: Storage> AutoDoc<T, S> {
 
     #[tracing::instrument(skip_all, fields(topic_id = %self.topic.id()))]
     pub fn refresh(&mut self) -> irokle::Result<()> {
-        for record in self.topic.history(HistoryOrder::OldestFirst)? {
+        let applied_clock = self.projection.applied_clock().clone();
+        for record in self
+            .topic
+            .history_after(&applied_clock, HistoryOrder::OldestFirst)?
+        {
             self.projection.apply(&record)?;
         }
-        self.gc()?;
         Ok(())
     }
 
@@ -51,8 +66,14 @@ impl<T: AutoIrokle, S: Storage> AutoDoc<T, S> {
     }
 
     pub fn snapshot(&self) -> irokle::Result<Vec<u8>> {
+        self.projection.state()?;
+        let snapshot = Snapshot {
+            topic_id: self.topic.id(),
+            event_type_id: T::EVENT_TYPE_ID.to_owned(),
+            projection: self.projection.clone(),
+        };
         let mut bytes = SNAPSHOT_MAGIC.to_vec();
-        bytes.extend_from_slice(&postcard::to_allocvec(&self.projection)?);
+        bytes.extend_from_slice(&postcard::to_allocvec(&snapshot)?);
         Ok(bytes)
     }
 
@@ -61,6 +82,7 @@ impl<T: AutoIrokle, S: Storage> AutoDoc<T, S> {
     where
         F: FnOnce(&mut T),
     {
+        self.refresh()?;
         let old = self.projection.state()?.clone();
         let mut next = old.clone();
         change(&mut next);
@@ -112,7 +134,7 @@ impl<S: Storage> AutoIrokleExt<S> for Irokle<S> {
     fn open_doc<T: AutoIrokle>(&self, topic_id: TopicId) -> irokle::Result<AutoDoc<T, S>> {
         let topic = self.open_topic::<AutoEvent<T>>(topic_id)?;
         let mut projection = AutoProjection::new();
-        for record in topic.history(HistoryOrder::OldestFirst)? {
+        for record in topic.history_after(projection.applied_clock(), HistoryOrder::OldestFirst)? {
             projection.apply(&record)?;
         }
         projection.state()?;
@@ -132,11 +154,29 @@ impl<S: Storage> AutoIrokleExt<S> for Irokle<S> {
                 "auto-irokle snapshot magic mismatch".into(),
             ));
         }
-        let projection: AutoProjection<T> = postcard::from_bytes(&snapshot[SNAPSHOT_MAGIC.len()..])
+        let snapshot: Snapshot<T> = postcard::from_bytes(&snapshot[SNAPSHOT_MAGIC.len()..])
             .map_err(|err| irokle::Error::Decode(err.to_string()))?;
-        projection.state()?;
+        if snapshot.topic_id != topic_id {
+            return Err(irokle::Error::Decode(
+                "auto-irokle snapshot topic mismatch".into(),
+            ));
+        }
+        if snapshot.event_type_id != T::EVENT_TYPE_ID {
+            return Err(irokle::Error::Decode(
+                "auto-irokle snapshot event type mismatch".into(),
+            ));
+        }
+        snapshot.projection.state()?;
         let topic = self.open_topic::<AutoEvent<T>>(topic_id)?;
-        let mut doc = AutoDoc::new(topic, projection);
+        if !topic
+            .actor_clock()?
+            .dominates(snapshot.projection.applied_clock())
+        {
+            return Err(irokle::Error::Decode(
+                "auto-irokle snapshot frontier is missing from local topic".into(),
+            ));
+        }
+        let mut doc = AutoDoc::new(topic, snapshot.projection);
         doc.refresh()?;
         Ok(doc)
     }

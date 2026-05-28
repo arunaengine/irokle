@@ -262,8 +262,7 @@ impl ProjectionMeta {
 pub struct AutoProjection<T: AutoCrdt> {
     state: Option<T>,
     meta: ProjectionMeta,
-    #[serde(default)]
-    applied_ops: BTreeSet<OpId>,
+    applied_clock: ActorClock,
 }
 
 impl<T: AutoCrdt> Default for AutoProjection<T> {
@@ -277,7 +276,7 @@ impl<T: AutoCrdt> AutoProjection<T> {
         Self {
             state: None,
             meta: ProjectionMeta::new(),
-            applied_ops: BTreeSet::new(),
+            applied_clock: ActorClock::new(),
         }
     }
 
@@ -293,6 +292,10 @@ impl<T: AutoCrdt> AutoProjection<T> {
     pub fn gc(&mut self, stability: &ActorClock) -> usize {
         self.meta.gc(stability)
     }
+
+    pub fn applied_clock(&self) -> &ActorClock {
+        &self.applied_clock
+    }
 }
 
 impl<T: AutoIrokle> AutoProjection<T> {
@@ -300,9 +303,22 @@ impl<T: AutoIrokle> AutoProjection<T> {
         &mut self,
         record: &irokle::reducer::EventRecord<AutoEvent<T>>,
     ) -> irokle::Result<()> {
-        if !self.applied_ops.insert(record.meta.op_id) {
+        if self.applied_clock.get(&record.meta.actor_id) >= record.meta.actor_seq {
             return Ok(());
         }
+
+        let mut next = self.clone();
+        next.apply_unchecked(record)?;
+        next.applied_clock
+            .observe(record.meta.actor_id, record.meta.actor_seq);
+        *self = next;
+        Ok(())
+    }
+
+    fn apply_unchecked(
+        &mut self,
+        record: &irokle::reducer::EventRecord<AutoEvent<T>>,
+    ) -> irokle::Result<()> {
         match record.event.body() {
             AutoPatch::Init { value } => {
                 if self.state.is_some() {
@@ -310,10 +326,11 @@ impl<T: AutoIrokle> AutoProjection<T> {
                     return Ok(());
                 }
                 let value: T = decode_value(value)?;
+                let mut meta = ProjectionMeta::new();
+                T::init_into(&[], &value, &mut meta, &record.meta)?;
                 self.state = Some(value);
-                self.meta.clear();
-                let state = self.state.as_mut().expect("just set");
-                T::init_into(&[], state, &mut self.meta, &record.meta)
+                self.meta = meta;
+                Ok(())
             }
             AutoPatch::Patch { ops } => {
                 let state = self.state.as_mut().ok_or_else(missing_init)?;

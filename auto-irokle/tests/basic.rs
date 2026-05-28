@@ -118,6 +118,37 @@ fn syncs_document_to_peer() {
 }
 
 #[test]
+fn change_refreshes_before_diffing() {
+    let alice = node(58);
+    let bob = node(59);
+    let mut alice_doc = alice
+        .create_doc(
+            Note::new("draft"),
+            TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            },
+        )
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+    let mut bob_doc = bob.open_doc::<Note>(alice_doc.id()).unwrap();
+
+    bob_doc
+        .change(|note| {
+            note.tags.insert("from-bob".into());
+        })
+        .unwrap();
+    sync_pair(&bob, &alice, alice_doc.id());
+
+    alice_doc
+        .change(|note| note.title = "from-alice".into())
+        .unwrap();
+
+    assert_eq!(alice_doc.state().title, "from-alice");
+    assert!(alice_doc.state().tags.contains("from-bob"));
+}
+
+#[test]
 fn concurrent_lww_registers_converge_with_op_id_tiebreak() {
     let alice = node(4);
     let bob = node(5);
@@ -385,6 +416,30 @@ fn malformed_patch_surfaces_decode_error() {
 }
 
 #[test]
+fn malformed_multi_op_patch_does_not_partially_apply_or_get_marked_applied() {
+    let node = node(60);
+    let mut doc = node
+        .create_doc(Note::new("draft"), TopicConfig::default())
+        .unwrap();
+
+    let patch = AutoEvent::patch(vec![
+        PatchOp::set(
+            vec!["title".into()],
+            postcard::to_allocvec(&"partial".to_owned()).unwrap(),
+        ),
+        PatchOp::set(vec!["definitely_not_a_field".into()], vec![0xff]),
+    ]);
+    doc.topic().publish(patch).unwrap();
+
+    let first = doc.refresh().unwrap_err();
+    assert!(matches!(first, irokle::Error::Decode(_)));
+    assert_eq!(doc.state().title, "draft");
+
+    let second = doc.refresh().unwrap_err();
+    assert!(matches!(second, irokle::Error::Decode(_)));
+}
+
+#[test]
 fn map_fields_use_observed_remove_keys_and_lww_values() {
     let alice = node(12);
     let bob = node(13);
@@ -507,6 +562,75 @@ fn snapshot_magic_mismatch_fails() {
         .unwrap();
     match node.open_doc_from_snapshot::<Note>(doc.id(), b"GARBAGE_BYTES") {
         Err(irokle::Error::Decode(_)) => {}
+        Err(other) => panic!("expected Decode error, got {other:?}"),
+        Ok(_) => panic!("expected error, got Ok"),
+    }
+}
+
+#[test]
+fn snapshot_topic_mismatch_fails() {
+    let node = node(61);
+    let doc = node
+        .create_doc(Note::new("one"), TopicConfig::default())
+        .unwrap();
+    let other = node
+        .create_doc(Note::new("two"), TopicConfig::default())
+        .unwrap();
+    let snap = doc.snapshot().unwrap();
+
+    match node.open_doc_from_snapshot::<Note>(other.id(), &snap) {
+        Err(irokle::Error::Decode(msg)) => assert!(msg.contains("topic mismatch")),
+        Err(other) => panic!("expected Decode error, got {other:?}"),
+        Ok(_) => panic!("expected error, got Ok"),
+    }
+}
+
+#[test]
+fn snapshot_event_type_mismatch_fails() {
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, AutoIrokle)]
+    #[auto_irokle(type_id = "test.auto.other-note")]
+    struct OtherNote {
+        title: String,
+        tags: BTreeSet<String>,
+        attrs: BTreeMap<String, String>,
+        lines: Vec<String>,
+    }
+
+    let node = node(62);
+    let doc = node
+        .create_doc(Note::new("v0"), TopicConfig::default())
+        .unwrap();
+    let snap = doc.snapshot().unwrap();
+
+    match node.open_doc_from_snapshot::<OtherNote>(doc.id(), &snap) {
+        Err(irokle::Error::Decode(msg)) => assert!(msg.contains("event type mismatch")),
+        Err(other) => panic!("expected Decode error, got {other:?}"),
+        Ok(_) => panic!("expected error, got Ok"),
+    }
+}
+
+#[test]
+fn snapshot_frontier_must_exist_locally() {
+    let alice = node(63);
+    let bob = node(64);
+    let mut alice_doc = alice
+        .create_doc(
+            Note::new("draft"),
+            TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            },
+        )
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+
+    alice_doc
+        .change(|note| note.title = "not-on-bob-yet".into())
+        .unwrap();
+    let snap = alice_doc.snapshot().unwrap();
+
+    match bob.open_doc_from_snapshot::<Note>(alice_doc.id(), &snap) {
+        Err(irokle::Error::Decode(msg)) => assert!(msg.contains("frontier")),
         Err(other) => panic!("expected Decode error, got {other:?}"),
         Ok(_) => panic!("expected error, got Ok"),
     }
