@@ -7,7 +7,7 @@ use crate::history::{DagQuery, HistoryOrder, limited};
 use crate::oplog::{Oplog, topological, topological_subset};
 use crate::reducer::EventRecord;
 use crate::storage::{MemoryStorage, Storage};
-use crate::{ActorId, Error, Event, Op, OpId, PeerId, Result, TopicControl, TopicId};
+use crate::{ActorClock, ActorId, Error, Event, Op, OpId, PeerId, Result, TopicControl, TopicId};
 
 use super::{Irokle, PublishOptions};
 
@@ -76,12 +76,29 @@ impl<E: Event, S: Storage> Topic<E, S> {
         self.node.topic_history(self.topic_id, order)
     }
 
+    pub fn history_after(
+        &self,
+        clock: &ActorClock,
+        order: HistoryOrder,
+    ) -> Result<Vec<EventRecord<E>>> {
+        self.node
+            .topic_history_after_clock(self.topic_id, clock, order)
+    }
+
     pub fn dag(&self, query: DagQuery<OpId>) -> Result<Vec<Op>> {
         self.node.topic_dag(self.topic_id, query)
     }
 
     pub fn heads(&self) -> Result<BTreeSet<OpId>> {
         self.node.topic_heads(self.topic_id)
+    }
+
+    pub fn actor_clock(&self) -> Result<ActorClock> {
+        self.node.topic_actor_clock(self.topic_id)
+    }
+
+    pub fn observed_clock(&self) -> Result<ActorClock> {
+        self.node.topic_observed_clock(self.topic_id)
     }
 
     pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {

@@ -37,6 +37,16 @@ impl ActorClock {
         }
     }
 
+    pub fn intersect(&self, other: &Self) -> Self {
+        let mut entries = BTreeMap::new();
+        for (actor, counter) in &self.entries {
+            if let Some(other_counter) = other.entries.get(actor) {
+                entries.insert(*actor, (*counter).min(*other_counter));
+            }
+        }
+        Self { entries }
+    }
+
     pub fn dominates(&self, other: &Self) -> bool {
         other
             .entries
