@@ -13,7 +13,6 @@ mod topic;
 pub(crate) use peers::select_sync_peers;
 pub use topic::{RawTopic, Topic};
 
-#[cfg(feature = "iroh")]
 use crate::ActorClock;
 use crate::history::{DagQuery, HistoryOrder, ordered};
 use crate::oplog::{Oplog, topological};
@@ -840,6 +839,25 @@ impl<S: Storage> Irokle<S> {
 
     pub(crate) fn topic_heads(&self, topic_id: TopicId) -> Result<BTreeSet<OpId>> {
         self.oplog.storage().heads(&topic_id)
+    }
+
+    pub(crate) fn topic_observed_clock(&self, topic_id: TopicId) -> Result<ActorClock> {
+        let storage = self.oplog.storage();
+        let state = storage
+            .topic_state(&topic_id)?
+            .ok_or(Error::TopicNotFound)?;
+        let local_peer = self.peer_id();
+        let mut clock = storage.actor_clock(&topic_id)?;
+        for peer in &state.members {
+            if *peer == local_peer {
+                continue;
+            }
+            match storage.peer_ack(peer, &topic_id)? {
+                Some(ack) => clock = clock.intersect(&ack.clock),
+                None => return Ok(ActorClock::new()),
+            }
+        }
+        Ok(clock)
     }
 }
 
