@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use auto_irokle::{AutoEvent, AutoIrokle, AutoIrokleExt, PatchOp};
+use auto_irokle::{AutoDoc, AutoEvent, AutoIrokle, AutoIrokleExt, PatchOp};
 use irokle::{Ed25519Signer, Irokle, TopicConfig, TopicId};
 use serde::{Deserialize, Serialize};
 
@@ -434,4 +434,388 @@ fn map_fields_use_observed_remove_keys_and_lww_values() {
     bob_doc.refresh().unwrap();
 
     assert!(!bob_doc.state().attrs.contains_key("status"));
+}
+
+#[test]
+fn refresh_is_incremental() {
+    let node = node(40);
+    let mut doc = node
+        .create_doc(Note::new("v0"), TopicConfig::default())
+        .unwrap();
+
+    doc.change(|note| note.title = "v1".into()).unwrap();
+    doc.change(|note| note.title = "v2".into()).unwrap();
+    doc.change(|note| {
+        note.tags.insert("hot".into());
+    })
+    .unwrap();
+
+    let before = doc.projection().clone();
+    doc.refresh().unwrap();
+    let after = doc.projection().clone();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn snapshot_round_trip() {
+    let node = node(41);
+    let mut doc = node
+        .create_doc(Note::new("v0"), TopicConfig::default())
+        .unwrap();
+    doc.change(|note| {
+        note.title = "snap-state".into();
+        note.tags.insert("a".into());
+        note.tags.insert("b".into());
+        note.attrs.insert("k".into(), "v".into());
+    })
+    .unwrap();
+    let topic_id = doc.id();
+    let snap = doc.snapshot().unwrap();
+    drop(doc);
+
+    let restored: AutoDoc<Note> = node.open_doc_from_snapshot(topic_id, &snap).unwrap();
+    assert_eq!(restored.state().title, "snap-state");
+    assert!(restored.state().tags.contains("a"));
+    assert!(restored.state().tags.contains("b"));
+    assert_eq!(
+        restored.state().attrs.get("k").map(String::as_str),
+        Some("v")
+    );
+}
+
+#[test]
+fn snapshot_then_refresh_picks_up_new_ops() {
+    let node = node(42);
+    let mut doc = node
+        .create_doc(Note::new("v0"), TopicConfig::default())
+        .unwrap();
+    doc.change(|note| note.title = "snap".into()).unwrap();
+    let topic_id = doc.id();
+    let snap = doc.snapshot().unwrap();
+
+    doc.change(|note| note.title = "after-snap".into()).unwrap();
+
+    let restored: AutoDoc<Note> = node.open_doc_from_snapshot(topic_id, &snap).unwrap();
+    assert_eq!(restored.state().title, "after-snap");
+}
+
+#[test]
+fn snapshot_magic_mismatch_fails() {
+    let node = node(43);
+    let doc = node
+        .create_doc(Note::new("v0"), TopicConfig::default())
+        .unwrap();
+    match node.open_doc_from_snapshot::<Note>(doc.id(), b"GARBAGE_BYTES") {
+        Err(irokle::Error::Decode(_)) => {}
+        Err(other) => panic!("expected Decode error, got {other:?}"),
+        Ok(_) => panic!("expected error, got Ok"),
+    }
+}
+
+#[test]
+fn gc_prunes_stable_tombstone() {
+    let alice = node(44);
+    let bob = node(45);
+    let mut alice_doc = alice
+        .create_doc(
+            Note::new("draft"),
+            TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            },
+        )
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+    let mut bob_doc = bob.open_doc::<Note>(alice_doc.id()).unwrap();
+
+    alice_doc
+        .change(|note| {
+            note.tags.insert("temp".into());
+        })
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+    bob_doc.refresh().unwrap();
+
+    alice_doc
+        .change(|note| {
+            note.tags.remove("temp");
+        })
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+    bob_doc.refresh().unwrap();
+    sync_pair(&bob, &alice, alice_doc.id());
+
+    let pruned = alice_doc.gc().unwrap();
+    assert!(
+        pruned >= 1,
+        "expected at least one pruned tombstone, got {pruned}"
+    );
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, AutoIrokle)]
+#[auto_irokle(nested)]
+struct Inner {
+    title: String,
+    tags: BTreeSet<String>,
+}
+
+impl Inner {
+    fn empty() -> Self {
+        Self {
+            title: String::new(),
+            tags: BTreeSet::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, AutoIrokle)]
+#[auto_irokle(type_id = "test.auto.nested.doc")]
+struct NestedDoc {
+    label: String,
+    #[auto_irokle(kind = "nested")]
+    inner: Inner,
+}
+
+#[test]
+fn nested_struct_field_diff_merges_concurrently() {
+    let alice = node(50);
+    let bob = node(51);
+    let mut alice_doc = alice
+        .create_doc(
+            NestedDoc {
+                label: "start".into(),
+                inner: Inner::empty(),
+            },
+            TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            },
+        )
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+    let mut bob_doc = bob.open_doc::<NestedDoc>(alice_doc.id()).unwrap();
+
+    alice_doc
+        .change(|doc| doc.inner.title = "from-alice".into())
+        .unwrap();
+    bob_doc
+        .change(|doc| {
+            doc.inner.tags.insert("from-bob".into());
+        })
+        .unwrap();
+
+    sync_pair(&alice, &bob, alice_doc.id());
+    alice_doc.refresh().unwrap();
+    bob_doc.refresh().unwrap();
+
+    assert_eq!(alice_doc.state().inner.title, "from-alice");
+    assert!(alice_doc.state().inner.tags.contains("from-bob"));
+    assert_eq!(bob_doc.state().inner.title, "from-alice");
+    assert!(bob_doc.state().inner.tags.contains("from-bob"));
+}
+
+#[test]
+fn nested_set_field_merges_concurrent_inserts() {
+    let alice = node(52);
+    let bob = node(53);
+    let mut alice_doc = alice
+        .create_doc(
+            NestedDoc {
+                label: "draft".into(),
+                inner: Inner::empty(),
+            },
+            TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            },
+        )
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+    let mut bob_doc = bob.open_doc::<NestedDoc>(alice_doc.id()).unwrap();
+
+    alice_doc
+        .change(|doc| {
+            doc.inner.tags.insert("alice".into());
+        })
+        .unwrap();
+    bob_doc
+        .change(|doc| {
+            doc.inner.tags.insert("bob".into());
+        })
+        .unwrap();
+
+    sync_pair(&alice, &bob, alice_doc.id());
+    alice_doc.refresh().unwrap();
+    bob_doc.refresh().unwrap();
+
+    assert!(alice_doc.state().inner.tags.contains("alice"));
+    assert!(alice_doc.state().inner.tags.contains("bob"));
+    assert_eq!(alice_doc.state(), bob_doc.state());
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, AutoIrokle)]
+#[auto_irokle(nested)]
+struct Leaf {
+    value: String,
+    tags: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, AutoIrokle)]
+#[auto_irokle(nested)]
+struct Mid {
+    #[auto_irokle(kind = "nested")]
+    leaf: Leaf,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, AutoIrokle)]
+#[auto_irokle(type_id = "test.auto.deep")]
+struct Deep {
+    #[auto_irokle(kind = "nested")]
+    mid: Mid,
+}
+
+#[test]
+fn deeply_nested_two_levels_merge() {
+    let alice = node(54);
+    let bob = node(55);
+    let initial = Deep {
+        mid: Mid {
+            leaf: Leaf {
+                value: String::new(),
+                tags: BTreeSet::new(),
+            },
+        },
+    };
+    let mut alice_doc = alice
+        .create_doc(
+            initial,
+            TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            },
+        )
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+    let mut bob_doc = bob.open_doc::<Deep>(alice_doc.id()).unwrap();
+
+    alice_doc
+        .change(|doc| doc.mid.leaf.value = "alice".into())
+        .unwrap();
+    bob_doc
+        .change(|doc| {
+            doc.mid.leaf.tags.insert("bob".into());
+        })
+        .unwrap();
+
+    sync_pair(&alice, &bob, alice_doc.id());
+    alice_doc.refresh().unwrap();
+    bob_doc.refresh().unwrap();
+
+    assert_eq!(alice_doc.state().mid.leaf.value, "alice");
+    assert!(alice_doc.state().mid.leaf.tags.contains("bob"));
+    assert_eq!(bob_doc.state(), alice_doc.state());
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PlainStruct {
+    name: String,
+    count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, AutoIrokle)]
+#[auto_irokle(type_id = "test.auto.legacy")]
+struct LegacyDoc {
+    title: String,
+    plain: PlainStruct,
+}
+
+#[test]
+fn nested_struct_without_kind_attr_stays_lww() {
+    let alice = node(56);
+    let bob = node(57);
+    let mut alice_doc = alice
+        .create_doc(
+            LegacyDoc {
+                title: "draft".into(),
+                plain: PlainStruct {
+                    name: "init".into(),
+                    count: 0,
+                },
+            },
+            TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            },
+        )
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+    let mut bob_doc = bob.open_doc::<LegacyDoc>(alice_doc.id()).unwrap();
+
+    let alice_record = alice_doc
+        .change(|doc| {
+            doc.plain.name = "alice".into();
+        })
+        .unwrap()
+        .unwrap();
+    let bob_record = bob_doc
+        .change(|doc| {
+            doc.plain.count = 42;
+        })
+        .unwrap()
+        .unwrap();
+
+    sync_pair(&alice, &bob, alice_doc.id());
+    alice_doc.refresh().unwrap();
+    bob_doc.refresh().unwrap();
+
+    let winner = if alice_record.meta.op_id > bob_record.meta.op_id {
+        PlainStruct {
+            name: "alice".into(),
+            count: 0,
+        }
+    } else {
+        PlainStruct {
+            name: "init".into(),
+            count: 42,
+        }
+    };
+    assert_eq!(alice_doc.state().plain, winner);
+    assert_eq!(bob_doc.state().plain, winner);
+}
+
+#[test]
+fn gc_preserves_tombstone_with_lagging_member() {
+    let alice = node(46);
+    let bob = node(47);
+    let carol = node(48);
+    let mut alice_doc = alice
+        .create_doc(
+            Note::new("draft"),
+            TopicConfig {
+                initial_peers: [bob.peer_id(), carol.peer_id()].into(),
+                ..TopicConfig::default()
+            },
+        )
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+    let _bob_doc = bob.open_doc::<Note>(alice_doc.id()).unwrap();
+
+    alice_doc
+        .change(|note| {
+            note.tags.insert("temp".into());
+        })
+        .unwrap();
+    alice_doc
+        .change(|note| {
+            note.tags.remove("temp");
+        })
+        .unwrap();
+    sync_pair(&alice, &bob, alice_doc.id());
+    sync_pair(&bob, &alice, alice_doc.id());
+
+    let pruned = alice_doc.gc().unwrap();
+    assert_eq!(
+        pruned, 0,
+        "expected no prune while carol is lagging, got {pruned}"
+    );
 }

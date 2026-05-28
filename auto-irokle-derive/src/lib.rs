@@ -16,7 +16,7 @@ use syn::{
 pub fn derive_auto_irokle(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
-    match expand_auto_irokle(&input) {
+    match expand(&input) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
@@ -29,34 +29,34 @@ struct StructArgs {
 enum StructArg {
     TypeId(LitStr),
     Crate(LitStr),
+    Nested,
 }
 
 impl Parse for StructArgs {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let mut entries = Vec::new();
-
         while !input.is_empty() {
             let key = syn::Ident::parse_any(input)?;
-            input.parse::<Token![=]>()?;
-
-            if key == "type_id" {
-                entries.push(StructArg::TypeId(input.parse()?));
-            } else if key == "crate" {
-                entries.push(StructArg::Crate(input.parse()?));
+            if key == "nested" {
+                entries.push(StructArg::Nested);
             } else {
-                return Err(syn::Error::new(
-                    key.span(),
-                    "unsupported struct-level auto_irokle attribute; expected `type_id` or `crate`",
-                ));
+                input.parse::<Token![=]>()?;
+                if key == "type_id" {
+                    entries.push(StructArg::TypeId(input.parse()?));
+                } else if key == "crate" {
+                    entries.push(StructArg::Crate(input.parse()?));
+                } else {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "unsupported struct-level auto_irokle attribute; expected `type_id`, `crate`, or `nested`",
+                    ));
+                }
             }
-
             if input.is_empty() {
                 break;
             }
-
             input.parse::<Token![,]>()?;
         }
-
         Ok(Self { entries })
     }
 }
@@ -70,27 +70,27 @@ enum KindOverride {
     Lww,
     Set,
     Map,
+    Nested,
 }
 
 impl Parse for FieldArgs {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let mut kind = None;
-
         while !input.is_empty() {
             let key = syn::Ident::parse_any(input)?;
             input.parse::<Token![=]>()?;
-
             if key == "kind" {
                 let value: LitStr = input.parse()?;
                 let parsed = match value.value().as_str() {
                     "lww" => KindOverride::Lww,
                     "set" => KindOverride::Set,
                     "map" => KindOverride::Map,
+                    "nested" => KindOverride::Nested,
                     other => {
                         return Err(syn::Error::new(
                             value.span(),
                             format!(
-                                "auto_irokle `kind` must be one of \"lww\", \"set\", or \"map\"; got {other:?}"
+                                "auto_irokle `kind` must be one of \"lww\", \"set\", \"map\", or \"nested\"; got {other:?}"
                             ),
                         ));
                     }
@@ -108,21 +108,18 @@ impl Parse for FieldArgs {
                     "unsupported field-level auto_irokle attribute; expected `kind`",
                 ));
             }
-
             if input.is_empty() {
                 break;
             }
-
             input.parse::<Token![,]>()?;
         }
-
         Ok(Self { kind })
     }
 }
 
 struct Config {
+    is_root: bool,
     event_type_id: proc_macro2::TokenStream,
-    type_label: proc_macro2::TokenStream,
     crate_path: Path,
 }
 
@@ -130,6 +127,7 @@ enum FieldKind {
     Lww,
     Set { item: Box<Type> },
     Map { key: Box<Type>, value: Box<Type> },
+    Nested { ty: Box<Type> },
 }
 
 struct AutoField<'a> {
@@ -138,17 +136,15 @@ struct AutoField<'a> {
     kind: FieldKind,
 }
 
-fn expand_auto_irokle(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let config = parse_config(input)?;
     let ident = &input.ident;
     let fields = parse_fields(input)?;
     let crate_path = &config.crate_path;
 
-    let diff_fields = fields.iter().map(|field| diff_field(crate_path, field));
-    let init_fields = fields.iter().map(|field| init_field(crate_path, field));
-    let apply_arms = fields
-        .iter()
-        .flat_map(|field| apply_field(crate_path, field));
+    let diff_arms = fields.iter().map(|f| diff_field(crate_path, f));
+    let init_arms = fields.iter().map(|f| init_field(crate_path, f));
+    let apply_arms = fields.iter().map(|f| apply_field(crate_path, f));
 
     let mut generics = input.generics.clone();
     generics.make_where_clause().predicates.push(parse_quote!(
@@ -162,62 +158,67 @@ fn expand_auto_irokle(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
     ));
     let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
 
-    let event_type_id = &config.event_type_id;
-    let type_label = &config.type_label;
-
-    Ok(quote! {
-        impl #impl_generics #crate_path::AutoIrokle for #ident #type_generics #where_clause {
-            const EVENT_TYPE_ID: &'static str = #event_type_id;
-
-            fn diff(old: &Self, new: &Self) -> #crate_path::irokle::Result<Vec<#crate_path::PatchOp>> {
-                let mut ops = Vec::new();
-                #(#diff_fields)*
-                Ok(ops)
-            }
-
-            fn apply_init(
-                projection: &mut #crate_path::AutoProjection<Self>,
-                value: Self,
-                meta: &#crate_path::__private::OpMeta,
+    let auto_crdt_impl = quote! {
+        impl #impl_generics #crate_path::AutoCrdt for #ident #type_generics #where_clause {
+            fn diff_into(
+                prefix: &[String],
+                old: &Self,
+                new: &Self,
+                ops: &mut Vec<#crate_path::PatchOp>,
             ) -> #crate_path::irokle::Result<()> {
-                if projection.state_opt().is_some() {
-                    #crate_path::__private::log_replayed_init(#type_label);
-                    return Ok(());
-                }
-                projection.replace_state(value);
-                #(#init_fields)*
+                #(#diff_arms)*
                 Ok(())
             }
 
-            fn apply_patch_op(
-                projection: &mut #crate_path::AutoProjection<Self>,
-                op: &#crate_path::PatchOp,
-                meta: &#crate_path::__private::OpMeta,
+            fn init_into(
+                prefix: &[String],
+                state: &Self,
+                meta: &mut #crate_path::ProjectionMeta,
+                op_meta: &#crate_path::__private::OpMeta,
             ) -> #crate_path::irokle::Result<()> {
-                match op {
-                    #(#apply_arms)*
-                    _ => {
-                        #crate_path::__private::log_unsupported_patch_op(#type_label);
-                        Err(#crate_path::irokle::Error::Decode(format!(
-                            "unsupported auto-irokle patch op for {}",
-                            #type_label,
-                        )))
-                    }
-                }
+                #(#init_arms)*
+                Ok(())
+            }
+
+            fn apply_into(
+                prefix: &[String],
+                state: &mut Self,
+                meta: &mut #crate_path::ProjectionMeta,
+                op: &#crate_path::PatchOp,
+                op_meta: &#crate_path::__private::OpMeta,
+            ) -> #crate_path::irokle::Result<bool> {
+                #(#apply_arms)*
+                Ok(false)
             }
         }
+    };
+
+    let auto_irokle_impl = if config.is_root {
+        let event_type_id = &config.event_type_id;
+        quote! {
+            impl #impl_generics #crate_path::AutoIrokle for #ident #type_generics #where_clause {
+                const EVENT_TYPE_ID: &'static str = #event_type_id;
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    Ok(quote! {
+        #auto_crdt_impl
+        #auto_irokle_impl
     })
 }
 
 fn parse_config(input: &DeriveInput) -> syn::Result<Config> {
-    let mut type_id = None;
-    let mut crate_path = None;
+    let mut type_id: Option<LitStr> = None;
+    let mut crate_path: Option<Path> = None;
+    let mut nested = false;
 
     for attr in &input.attrs {
         if !attr.path().is_ident("auto_irokle") {
             continue;
         }
-
         let args = attr.parse_args::<StructArgs>()?;
         for entry in args.entries {
             match entry {
@@ -242,35 +243,48 @@ fn parse_config(input: &DeriveInput) -> syn::Result<Config> {
                         syn::Error::new(value.span(), "auto_irokle `crate` must be a Rust path")
                     })?);
                 }
+                StructArg::Nested => {
+                    if nested {
+                        return Err(syn::Error::new(
+                            input.ident.span(),
+                            "duplicate auto_irokle `nested` attribute",
+                        ));
+                    }
+                    nested = true;
+                }
             }
         }
     }
 
+    if nested && type_id.is_some() {
+        return Err(syn::Error::new(
+            input.ident.span(),
+            "auto_irokle struct cannot be both `nested` and have a `type_id`",
+        ));
+    }
+
     let ident = &input.ident;
-    let (event_type_id, type_label) = match type_id {
+    let event_type_id = match type_id {
         Some(type_id) => {
             let event_type_id = LitStr::new(
                 &format!("{}/auto-patch.v1", type_id.value()),
                 type_id.span(),
             );
-            (quote!(#event_type_id), quote!(#type_id))
+            quote!(#event_type_id)
         }
-        None => (
-            quote!(concat!(
-                module_path!(),
-                "::",
-                stringify!(#ident),
-                "/auto-patch.v1"
-            )),
-            quote!(concat!(module_path!(), "::", stringify!(#ident))),
-        ),
+        None => quote!(concat!(
+            module_path!(),
+            "::",
+            stringify!(#ident),
+            "/auto-patch.v1"
+        )),
     };
 
     let crate_path = crate_path.unwrap_or_else(|| syn::parse_quote!(::auto_irokle));
 
     Ok(Config {
+        is_root: !nested,
         event_type_id,
-        type_label,
         crate_path,
     })
 }
@@ -313,7 +327,6 @@ fn parse_fields(input: &DeriveInput) -> syn::Result<Vec<AutoField<'_>>> {
 
 fn resolve_field_kind(field: &Field) -> syn::Result<FieldKind> {
     let mut override_kind: Option<KindOverride> = None;
-
     for attr in &field.attrs {
         if !attr.path().is_ident("auto_irokle") {
             continue;
@@ -342,22 +355,29 @@ fn kind_from_override(field: &Field, kind: KindOverride) -> syn::Result<FieldKin
     match kind {
         KindOverride::Lww => Ok(FieldKind::Lww),
         KindOverride::Set => match args.and_then(|a| generic_type(a, 0)) {
-            Some(item) => Ok(FieldKind::Set { item: Box::new(item) }),
+            Some(item) => Ok(FieldKind::Set {
+                item: Box::new(item),
+            }),
             None => Err(syn::Error::new(
                 field.ty.span(),
                 "auto_irokle(kind = \"set\") requires the field type to expose its item type as the first generic parameter (e.g. `BTreeSet<T>`)",
             )),
         },
-        KindOverride::Map => match args.and_then(|a| Some((generic_type(a, 0)?, generic_type(a, 1)?))) {
-            Some((key, value)) => Ok(FieldKind::Map {
-                key: Box::new(key),
-                value: Box::new(value),
-            }),
-            None => Err(syn::Error::new(
-                field.ty.span(),
-                "auto_irokle(kind = \"map\") requires the field type to expose its key/value types as the first two generic parameters (e.g. `BTreeMap<K, V>`)",
-            )),
-        },
+        KindOverride::Map => {
+            match args.and_then(|a| Some((generic_type(a, 0)?, generic_type(a, 1)?))) {
+                Some((key, value)) => Ok(FieldKind::Map {
+                    key: Box::new(key),
+                    value: Box::new(value),
+                }),
+                None => Err(syn::Error::new(
+                    field.ty.span(),
+                    "auto_irokle(kind = \"map\") requires the field type to expose its key/value types as the first two generic parameters (e.g. `BTreeMap<K, V>`)",
+                )),
+            }
+        }
+        KindOverride::Nested => Ok(FieldKind::Nested {
+            ty: Box::new(field.ty.clone()),
+        }),
     }
 }
 
@@ -377,7 +397,9 @@ fn detect_field_kind(ty: &Type) -> FieldKind {
                 return FieldKind::Lww;
             }
             generic_type(args, 0)
-                .map(|item| FieldKind::Set { item: Box::new(item) })
+                .map(|item| FieldKind::Set {
+                    item: Box::new(item),
+                })
                 .unwrap_or(FieldKind::Lww)
         }
         "BTreeMap" | "HashMap" => {
@@ -416,43 +438,55 @@ fn diff_field(crate_path: &Path, field: &AutoField<'_>) -> proc_macro2::TokenStr
         FieldKind::Lww => quote! {
             if old.#ident != new.#ident {
                 ops.push(#crate_path::PatchOp::set(
-                    #crate_path::__private::field_path(#name),
+                    #crate_path::__private::extend_prefix(prefix, #name),
                     #crate_path::__private::encode_value(&new.#ident)?,
                 ));
             }
         },
         FieldKind::Set { .. } => quote! {
-            for value in new.#ident.difference(&old.#ident) {
-                ops.push(#crate_path::PatchOp::set_insert(
-                    #crate_path::__private::field_path(#name),
-                    #crate_path::__private::encode_value(value)?,
-                ));
-            }
-            for value in old.#ident.difference(&new.#ident) {
-                ops.push(#crate_path::PatchOp::set_remove(
-                    #crate_path::__private::field_path(#name),
-                    #crate_path::__private::encode_value(value)?,
-                ));
+            {
+                let here = #crate_path::__private::extend_prefix(prefix, #name);
+                for value in new.#ident.difference(&old.#ident) {
+                    ops.push(#crate_path::PatchOp::set_insert(
+                        here.clone(),
+                        #crate_path::__private::encode_value(value)?,
+                    ));
+                }
+                for value in old.#ident.difference(&new.#ident) {
+                    ops.push(#crate_path::PatchOp::set_remove(
+                        here.clone(),
+                        #crate_path::__private::encode_value(value)?,
+                    ));
+                }
             }
         },
         FieldKind::Map { .. } => quote! {
-            for (key, value) in &new.#ident {
-                match old.#ident.get(key) {
-                    Some(old_value) if old_value == value => {}
-                    _ => ops.push(#crate_path::PatchOp::map_set(
-                        #crate_path::__private::field_path(#name),
-                        #crate_path::__private::encode_value(key)?,
-                        #crate_path::__private::encode_value(value)?,
-                    )),
+            {
+                let here = #crate_path::__private::extend_prefix(prefix, #name);
+                for (key, value) in &new.#ident {
+                    match old.#ident.get(key) {
+                        Some(old_value) if old_value == value => {}
+                        _ => ops.push(#crate_path::PatchOp::map_set(
+                            here.clone(),
+                            #crate_path::__private::encode_value(key)?,
+                            #crate_path::__private::encode_value(value)?,
+                        )),
+                    }
+                }
+                for key in old.#ident.keys() {
+                    if !new.#ident.contains_key(key) {
+                        ops.push(#crate_path::PatchOp::map_remove(
+                            here.clone(),
+                            #crate_path::__private::encode_value(key)?,
+                        ));
+                    }
                 }
             }
-            for key in old.#ident.keys() {
-                if !new.#ident.contains_key(key) {
-                    ops.push(#crate_path::PatchOp::map_remove(
-                        #crate_path::__private::field_path(#name),
-                        #crate_path::__private::encode_value(key)?,
-                    ));
-                }
+        },
+        FieldKind::Nested { ty } => quote! {
+            {
+                let here = #crate_path::__private::extend_prefix(prefix, #name);
+                <#ty as #crate_path::AutoCrdt>::diff_into(&here, &old.#ident, &new.#ident, ops)?;
             }
         },
     }
@@ -465,89 +499,124 @@ fn init_field(crate_path: &Path, field: &AutoField<'_>) -> proc_macro2::TokenStr
     let keys_name = format_ident!("__auto_irokle_{}_keys", ident);
     match &field.kind {
         FieldKind::Lww => quote! {
-            projection.init_register(#crate_path::__private::field_path(#name), meta);
+            meta.init_register(#crate_path::__private::extend_prefix(prefix, #name), op_meta);
         },
         FieldKind::Set { .. } => quote! {
-            let #values_name = {
-                let state = projection.state()?;
-                state
+            {
+                let here = #crate_path::__private::extend_prefix(prefix, #name);
+                let #values_name = state
                     .#ident
                     .iter()
                     .map(|value| #crate_path::__private::encode_value(value))
-                    .collect::<#crate_path::irokle::Result<Vec<_>>>()?
-            };
-            projection.init_set_values(#crate_path::__private::field_path(#name), #values_name, meta);
+                    .collect::<#crate_path::irokle::Result<Vec<_>>>()?;
+                meta.init_set_values(here, #values_name, op_meta);
+            }
         },
         FieldKind::Map { .. } => quote! {
-            let #keys_name = {
-                let state = projection.state()?;
-                state
+            {
+                let here = #crate_path::__private::extend_prefix(prefix, #name);
+                let #keys_name = state
                     .#ident
                     .keys()
                     .map(|key| #crate_path::__private::encode_value(key))
-                    .collect::<#crate_path::irokle::Result<Vec<_>>>()?
-            };
-            projection.init_map_keys(#crate_path::__private::field_path(#name), #keys_name, meta);
+                    .collect::<#crate_path::irokle::Result<Vec<_>>>()?;
+                meta.init_map_keys(here, #keys_name, op_meta);
+            }
+        },
+        FieldKind::Nested { ty } => quote! {
+            {
+                let here = #crate_path::__private::extend_prefix(prefix, #name);
+                <#ty as #crate_path::AutoCrdt>::init_into(&here, &state.#ident, meta, op_meta)?;
+            }
         },
     }
 }
 
-fn apply_field(crate_path: &Path, field: &AutoField<'_>) -> Vec<proc_macro2::TokenStream> {
+fn apply_field(crate_path: &Path, field: &AutoField<'_>) -> proc_macro2::TokenStream {
     let ident = field.ident;
     let name = &field.name;
     match &field.kind {
-        FieldKind::Lww => vec![quote! {
-            #crate_path::PatchOp::Set { path, value } if #crate_path::__private::path_is(path, &[#name]) => {
-                if projection.apply_register(#crate_path::__private::field_path(#name), meta) {
-                    projection.state_mut()?.#ident = #crate_path::__private::decode_value(value)?;
+        FieldKind::Lww => quote! {
+            if let #crate_path::PatchOp::Set { path, value } = op {
+                if #crate_path::__private::path_matches(path, prefix, #name) {
+                    let here = #crate_path::__private::extend_prefix(prefix, #name);
+                    if meta.apply_register(here, op_meta) {
+                        state.#ident = #crate_path::__private::decode_value(value)?;
+                    }
+                    return Ok(true);
                 }
-                Ok(())
             }
-        }],
-        FieldKind::Set { item } => vec![
-            quote! {
-                #crate_path::PatchOp::SetInsert { path, value } if #crate_path::__private::path_is(path, &[#name]) => {
-                    if projection.insert_set_value(#crate_path::__private::field_path(#name), value.clone(), meta) {
-                        projection.state_mut()?.#ident.insert(#crate_path::__private::decode_value::<#item>(value)?);
+        },
+        FieldKind::Set { item } => quote! {
+            match op {
+                #crate_path::PatchOp::SetInsert { path, value }
+                    if #crate_path::__private::path_matches(path, prefix, #name) =>
+                {
+                    let here = #crate_path::__private::extend_prefix(prefix, #name);
+                    if meta.insert_set_value(here, value.clone(), op_meta) {
+                        state.#ident.insert(
+                            #crate_path::__private::decode_value::<#item>(value)?,
+                        );
                     }
-                    Ok(())
+                    return Ok(true);
                 }
-            },
-            quote! {
-                #crate_path::PatchOp::SetRemove { path, value } if #crate_path::__private::path_is(path, &[#name]) => {
-                    if !projection.remove_set_value(#crate_path::__private::field_path(#name), value, meta) {
+                #crate_path::PatchOp::SetRemove { path, value }
+                    if #crate_path::__private::path_matches(path, prefix, #name) =>
+                {
+                    let here = #crate_path::__private::extend_prefix(prefix, #name);
+                    if !meta.remove_set_value(here, value, op_meta) {
                         let value = #crate_path::__private::decode_value::<#item>(value)?;
-                        projection.state_mut()?.#ident.remove(&value);
+                        state.#ident.remove(&value);
                     }
-                    Ok(())
+                    return Ok(true);
                 }
-            },
-        ],
+                _ => {}
+            }
+        },
         FieldKind::Map {
             key,
             value: map_value,
-        } => vec![
-            quote! {
-                #crate_path::PatchOp::MapSet { path, key, value } if #crate_path::__private::path_is(path, &[#name]) => {
-                    if projection.set_map_value(#crate_path::__private::field_path(#name), key.clone(), meta) {
-                        projection
-                            .state_mut()?
-                            .#ident
-                            .insert(#crate_path::__private::decode_value::<#key>(key)?, #crate_path::__private::decode_value::<#map_value>(value)?);
+        } => quote! {
+            match op {
+                #crate_path::PatchOp::MapSet { path, key, value }
+                    if #crate_path::__private::path_matches(path, prefix, #name) =>
+                {
+                    let here = #crate_path::__private::extend_prefix(prefix, #name);
+                    if meta.set_map_value(here, key.clone(), op_meta) {
+                        state.#ident.insert(
+                            #crate_path::__private::decode_value::<#key>(key)?,
+                            #crate_path::__private::decode_value::<#map_value>(value)?,
+                        );
                     }
-                    Ok(())
+                    return Ok(true);
                 }
-            },
-            quote! {
-                #crate_path::PatchOp::MapRemove { path, key } if #crate_path::__private::path_is(path, &[#name]) => {
-                    if !projection.remove_map_key(#crate_path::__private::field_path(#name), key, meta) {
+                #crate_path::PatchOp::MapRemove { path, key }
+                    if #crate_path::__private::path_matches(path, prefix, #name) =>
+                {
+                    let here = #crate_path::__private::extend_prefix(prefix, #name);
+                    if !meta.remove_map_key(here, key, op_meta) {
                         let key = #crate_path::__private::decode_value::<#key>(key)?;
-                        projection.state_mut()?.#ident.remove(&key);
+                        state.#ident.remove(&key);
                     }
-                    Ok(())
+                    return Ok(true);
                 }
-            },
-        ],
+                _ => {}
+            }
+        },
+        FieldKind::Nested { ty } => quote! {
+            {
+                let here = #crate_path::__private::extend_prefix(prefix, #name);
+                if <#ty as #crate_path::AutoCrdt>::apply_into(
+                    &here,
+                    &mut state.#ident,
+                    meta,
+                    op,
+                    op_meta,
+                )? {
+                    return Ok(true);
+                }
+            }
+        },
     }
 }
 
@@ -574,14 +643,12 @@ fn generic_type(arguments: &PathArguments, index: usize) -> Option<Type> {
 
 fn validate_type_id(type_id: &LitStr) -> syn::Result<()> {
     let value = type_id.value();
-
     if value.is_empty() {
         return Err(syn::Error::new(
             type_id.span(),
             "auto_irokle `type_id` must not be empty",
         ));
     }
-
     if value
         .chars()
         .any(|ch| ch.is_control() || ch.is_whitespace())
@@ -591,6 +658,5 @@ fn validate_type_id(type_id: &LitStr) -> syn::Result<()> {
             "auto_irokle `type_id` must not contain whitespace or control characters",
         ));
     }
-
     Ok(())
 }

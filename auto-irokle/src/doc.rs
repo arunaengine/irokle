@@ -5,6 +5,8 @@ use irokle::history::HistoryOrder;
 use irokle::reducer::EventRecord;
 use irokle::{Irokle, MemoryStorage, Storage, Topic, TopicConfig, TopicId};
 
+const SNAPSHOT_MAGIC: &[u8; 8] = b"AUTOIRK1";
+
 #[derive(Clone)]
 pub struct AutoDoc<T: AutoIrokle, S: Storage = MemoryStorage> {
     topic: Topic<AutoEvent<T>, S>,
@@ -36,8 +38,22 @@ impl<T: AutoIrokle, S: Storage> AutoDoc<T, S> {
 
     #[tracing::instrument(skip_all, fields(topic_id = %self.topic.id()))]
     pub fn refresh(&mut self) -> irokle::Result<()> {
-        self.projection = rebuild_projection(&self.topic)?;
+        for record in self.topic.history(HistoryOrder::OldestFirst)? {
+            self.projection.apply(&record)?;
+        }
+        self.gc()?;
         Ok(())
+    }
+
+    pub fn gc(&mut self) -> irokle::Result<usize> {
+        let stability = self.topic.observed_clock()?;
+        Ok(self.projection.gc(&stability))
+    }
+
+    pub fn snapshot(&self) -> irokle::Result<Vec<u8>> {
+        let mut bytes = SNAPSHOT_MAGIC.to_vec();
+        bytes.extend_from_slice(&postcard::to_allocvec(&self.projection)?);
+        Ok(bytes)
     }
 
     #[tracing::instrument(skip_all, fields(topic_id = %self.topic.id(), ops = tracing::field::Empty))]
@@ -49,7 +65,8 @@ impl<T: AutoIrokle, S: Storage> AutoDoc<T, S> {
         let mut next = old.clone();
         change(&mut next);
 
-        let ops = T::diff(&old, &next)?;
+        let mut ops = Vec::new();
+        T::diff_into(&[], &old, &next, &mut ops)?;
         tracing::Span::current().record("ops", ops.len());
         if ops.is_empty() {
             return Ok(None);
@@ -69,6 +86,12 @@ pub trait AutoIrokleExt<S: Storage> {
     ) -> irokle::Result<AutoDoc<T, S>>;
 
     fn open_doc<T: AutoIrokle>(&self, topic_id: TopicId) -> irokle::Result<AutoDoc<T, S>>;
+
+    fn open_doc_from_snapshot<T: AutoIrokle>(
+        &self,
+        topic_id: TopicId,
+        snapshot: &[u8],
+    ) -> irokle::Result<AutoDoc<T, S>>;
 }
 
 impl<S: Storage> AutoIrokleExt<S> for Irokle<S> {
@@ -88,18 +111,33 @@ impl<S: Storage> AutoIrokleExt<S> for Irokle<S> {
     #[tracing::instrument(skip_all, fields(%topic_id))]
     fn open_doc<T: AutoIrokle>(&self, topic_id: TopicId) -> irokle::Result<AutoDoc<T, S>> {
         let topic = self.open_topic::<AutoEvent<T>>(topic_id)?;
-        let projection = rebuild_projection(&topic)?;
+        let mut projection = AutoProjection::new();
+        for record in topic.history(HistoryOrder::OldestFirst)? {
+            projection.apply(&record)?;
+        }
         projection.state()?;
         Ok(AutoDoc::new(topic, projection))
     }
-}
 
-fn rebuild_projection<T: AutoIrokle, S: Storage>(
-    topic: &Topic<AutoEvent<T>, S>,
-) -> irokle::Result<AutoProjection<T>> {
-    let mut projection = AutoProjection::new();
-    for record in topic.history(HistoryOrder::OldestFirst)? {
-        projection.apply(&record)?;
+    #[tracing::instrument(skip_all, fields(%topic_id))]
+    fn open_doc_from_snapshot<T: AutoIrokle>(
+        &self,
+        topic_id: TopicId,
+        snapshot: &[u8],
+    ) -> irokle::Result<AutoDoc<T, S>> {
+        if snapshot.len() < SNAPSHOT_MAGIC.len()
+            || &snapshot[..SNAPSHOT_MAGIC.len()] != SNAPSHOT_MAGIC
+        {
+            return Err(irokle::Error::Decode(
+                "auto-irokle snapshot magic mismatch".into(),
+            ));
+        }
+        let projection: AutoProjection<T> = postcard::from_bytes(&snapshot[SNAPSHOT_MAGIC.len()..])
+            .map_err(|err| irokle::Error::Decode(err.to_string()))?;
+        projection.state()?;
+        let topic = self.open_topic::<AutoEvent<T>>(topic_id)?;
+        let mut doc = AutoDoc::new(topic, projection);
+        doc.refresh()?;
+        Ok(doc)
     }
-    Ok(projection)
 }

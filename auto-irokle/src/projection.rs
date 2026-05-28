@@ -2,11 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{AutoEvent, AutoIrokle, AutoPatch, Path, decode_value};
+use serde::{Deserialize, Serialize};
+
+use crate::{__private, AutoCrdt, AutoEvent, AutoIrokle, AutoPatch, Path, decode_value};
 use irokle::reducer::OpMeta;
 use irokle::{ActorClock, ActorId, OpId};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 struct Dot {
     actor_id: ActorId,
     actor_seq: u64,
@@ -21,7 +23,7 @@ impl Dot {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RegisterMeta {
     dot: Dot,
     observed_clock: ActorClock,
@@ -38,7 +40,7 @@ impl RegisterMeta {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 struct SetEntry {
     add_dots: BTreeSet<Dot>,
     remove_clock: ActorClock,
@@ -55,9 +57,19 @@ impl SetEntry {
         self.add_dots
             .retain(|dot| self.remove_clock.get(&dot.actor_id) < dot.actor_seq);
     }
+
+    fn is_fully_observed(&self, stability: &ActorClock) -> bool {
+        self.add_dots
+            .iter()
+            .all(|dot| stability.get(&dot.actor_id) >= dot.actor_seq)
+            && self
+                .remove_clock
+                .iter()
+                .all(|(actor, seq)| stability.get(actor) >= *seq)
+    }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 struct MapEntry {
     add_dots: BTreeSet<Dot>,
     remove_clock: ActorClock,
@@ -75,70 +87,59 @@ impl MapEntry {
         self.add_dots
             .retain(|dot| self.remove_clock.get(&dot.actor_id) < dot.actor_seq);
     }
+
+    fn is_fully_observed(&self, stability: &ActorClock) -> bool {
+        self.add_dots
+            .iter()
+            .all(|dot| stability.get(&dot.actor_id) >= dot.actor_seq)
+            && self
+                .remove_clock
+                .iter()
+                .all(|(actor, seq)| stability.get(actor) >= *seq)
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AutoProjection<T: AutoIrokle> {
-    state: Option<T>,
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionMeta {
     registers: BTreeMap<Path, RegisterMeta>,
     sets: BTreeMap<Path, BTreeMap<Vec<u8>, SetEntry>>,
     maps: BTreeMap<Path, BTreeMap<Vec<u8>, MapEntry>>,
 }
 
-impl<T: AutoIrokle> Default for AutoProjection<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T: AutoIrokle> AutoProjection<T> {
+impl ProjectionMeta {
     pub fn new() -> Self {
-        Self {
-            state: None,
-            registers: BTreeMap::new(),
-            sets: BTreeMap::new(),
-            maps: BTreeMap::new(),
-        }
+        Self::default()
     }
 
-    pub fn state(&self) -> irokle::Result<&T> {
-        self.state.as_ref().ok_or_else(missing_init)
-    }
-
-    #[doc(hidden)]
-    pub fn state_opt(&self) -> Option<&T> {
-        self.state.as_ref()
-    }
-
-    #[doc(hidden)]
-    pub fn state_mut(&mut self) -> irokle::Result<&mut T> {
-        self.state.as_mut().ok_or_else(missing_init)
-    }
-
-    #[doc(hidden)]
-    pub fn replace_state(&mut self, state: T) {
-        self.state = Some(state);
+    pub fn clear(&mut self) {
         self.registers.clear();
         self.sets.clear();
         self.maps.clear();
     }
 
-    pub fn apply(
-        &mut self,
-        record: &irokle::reducer::EventRecord<AutoEvent<T>>,
-    ) -> irokle::Result<()> {
-        match record.event.body() {
-            AutoPatch::Init { value } => {
-                let value = decode_value(value)?;
-                T::apply_init(self, value, &record.meta)
-            }
-            AutoPatch::Patch { ops } => {
-                for op in ops {
-                    T::apply_patch_op(self, op, &record.meta)?;
+    pub fn gc(&mut self, stability: &ActorClock) -> usize {
+        let mut pruned = 0;
+        for entries in self.sets.values_mut() {
+            entries.retain(|_, entry| {
+                if !entry.is_visible() && entry.is_fully_observed(stability) {
+                    pruned += 1;
+                    false
+                } else {
+                    true
                 }
-                Ok(())
-            }
+            });
         }
+        for entries in self.maps.values_mut() {
+            entries.retain(|_, entry| {
+                if !entry.is_visible() && entry.is_fully_observed(stability) {
+                    pruned += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        pruned
     }
 
     #[doc(hidden)]
@@ -250,6 +251,85 @@ impl<T: AutoIrokle> AutoProjection<T> {
         entry.remove_clock.merge(&meta.observed_clock);
         entry.prune_removed();
         entry.is_visible()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "T: Serialize",
+    deserialize = "T: serde::de::DeserializeOwned"
+))]
+pub struct AutoProjection<T: AutoCrdt> {
+    state: Option<T>,
+    meta: ProjectionMeta,
+    #[serde(default)]
+    applied_ops: BTreeSet<OpId>,
+}
+
+impl<T: AutoCrdt> Default for AutoProjection<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: AutoCrdt> AutoProjection<T> {
+    pub fn new() -> Self {
+        Self {
+            state: None,
+            meta: ProjectionMeta::new(),
+            applied_ops: BTreeSet::new(),
+        }
+    }
+
+    pub fn state(&self) -> irokle::Result<&T> {
+        self.state.as_ref().ok_or_else(missing_init)
+    }
+
+    #[doc(hidden)]
+    pub fn state_opt(&self) -> Option<&T> {
+        self.state.as_ref()
+    }
+
+    pub fn gc(&mut self, stability: &ActorClock) -> usize {
+        self.meta.gc(stability)
+    }
+}
+
+impl<T: AutoIrokle> AutoProjection<T> {
+    pub fn apply(
+        &mut self,
+        record: &irokle::reducer::EventRecord<AutoEvent<T>>,
+    ) -> irokle::Result<()> {
+        if !self.applied_ops.insert(record.meta.op_id) {
+            return Ok(());
+        }
+        match record.event.body() {
+            AutoPatch::Init { value } => {
+                if self.state.is_some() {
+                    __private::log_replayed_init(T::EVENT_TYPE_ID);
+                    return Ok(());
+                }
+                let value: T = decode_value(value)?;
+                self.state = Some(value);
+                self.meta.clear();
+                let state = self.state.as_mut().expect("just set");
+                T::init_into(&[], state, &mut self.meta, &record.meta)
+            }
+            AutoPatch::Patch { ops } => {
+                let state = self.state.as_mut().ok_or_else(missing_init)?;
+                for op in ops {
+                    let matched = T::apply_into(&[], state, &mut self.meta, op, &record.meta)?;
+                    if !matched {
+                        __private::log_unsupported_patch_op(T::EVENT_TYPE_ID);
+                        return Err(irokle::Error::Decode(format!(
+                            "unsupported auto-irokle patch op for {}",
+                            T::EVENT_TYPE_ID,
+                        )));
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 }
 

@@ -10,32 +10,42 @@ use serde::{Serialize, de::DeserializeOwned};
 pub use auto_irokle_derive::AutoIrokle;
 pub use doc::{AutoDoc, AutoIrokleExt};
 pub use event::{AutoEvent, AutoPatch, PatchOp, Path};
-pub use projection::{AutoProjection, RegisterMeta};
+pub use projection::{AutoProjection, ProjectionMeta, RegisterMeta};
 
 pub use irokle;
 
-pub trait AutoIrokle:
+pub trait AutoCrdt:
     Clone + PartialEq + Serialize + DeserializeOwned + Send + Sync + 'static
 {
     #[doc(hidden)]
-    const EVENT_TYPE_ID: &'static str;
-
-    #[doc(hidden)]
-    fn diff(old: &Self, new: &Self) -> irokle::Result<Vec<PatchOp>>;
-
-    #[doc(hidden)]
-    fn apply_init(
-        projection: &mut AutoProjection<Self>,
-        value: Self,
-        meta: &irokle::reducer::OpMeta,
+    fn diff_into(
+        prefix: &[String],
+        old: &Self,
+        new: &Self,
+        ops: &mut Vec<PatchOp>,
     ) -> irokle::Result<()>;
 
     #[doc(hidden)]
-    fn apply_patch_op(
-        projection: &mut AutoProjection<Self>,
+    fn init_into(
+        prefix: &[String],
+        state: &Self,
+        meta: &mut ProjectionMeta,
+        op_meta: &irokle::reducer::OpMeta,
+    ) -> irokle::Result<()>;
+
+    #[doc(hidden)]
+    fn apply_into(
+        prefix: &[String],
+        state: &mut Self,
+        meta: &mut ProjectionMeta,
         op: &PatchOp,
-        meta: &irokle::reducer::OpMeta,
-    ) -> irokle::Result<()>;
+        op_meta: &irokle::reducer::OpMeta,
+    ) -> irokle::Result<bool>;
+}
+
+pub trait AutoIrokle: AutoCrdt {
+    #[doc(hidden)]
+    const EVENT_TYPE_ID: &'static str;
 }
 
 #[doc(hidden)]
@@ -43,7 +53,7 @@ pub mod __private {
     use serde::{Serialize, de::DeserializeOwned};
 
     pub use crate::event::{AutoEvent, AutoPatch, PatchOp, Path};
-    pub use crate::projection::{AutoProjection, RegisterMeta};
+    pub use crate::projection::{AutoProjection, ProjectionMeta, RegisterMeta};
     pub use ::irokle;
     pub use ::irokle::reducer::OpMeta;
 
@@ -55,12 +65,17 @@ pub mod __private {
         super::decode_value(bytes)
     }
 
-    pub fn field_path(name: &str) -> Path {
-        super::field_path(name)
+    pub fn extend_prefix(prefix: &[String], segment: &str) -> Path {
+        let mut out = Vec::with_capacity(prefix.len() + 1);
+        out.extend_from_slice(prefix);
+        out.push(segment.to_owned());
+        out
     }
 
-    pub fn path_is(path: &[String], segments: &[&str]) -> bool {
-        super::path_is(path, segments)
+    pub fn path_matches(path: &[String], prefix: &[String], leaf: &str) -> bool {
+        path.len() == prefix.len() + 1
+            && path[..prefix.len()] == *prefix
+            && path[prefix.len()] == leaf
     }
 
     pub fn log_replayed_init(type_id: &'static str) {
@@ -86,16 +101,4 @@ pub(crate) fn encode_value<T: Serialize + ?Sized>(value: &T) -> irokle::Result<V
 
 pub(crate) fn decode_value<T: DeserializeOwned>(bytes: &[u8]) -> irokle::Result<T> {
     postcard::from_bytes(bytes).map_err(|err| irokle::Error::Decode(err.to_string()))
-}
-
-pub(crate) fn field_path(name: &str) -> Path {
-    vec![name.to_owned()]
-}
-
-pub(crate) fn path_is(path: &[String], segments: &[&str]) -> bool {
-    path.len() == segments.len()
-        && path
-            .iter()
-            .zip(segments.iter())
-            .all(|(actual, expected)| actual == expected)
 }

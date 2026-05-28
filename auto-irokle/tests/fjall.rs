@@ -58,5 +58,8 @@ fn fjall_round_trip_survives_node_restart() {
     let doc = node.open_doc::<Note>(topic_id).unwrap();
     assert_eq!(doc.state().title, "after-restart");
     assert!(doc.state().tags.contains("persisted"));
-    assert_eq!(doc.state().attrs.get("kind").map(String::as_str), Some("note"));
+    assert_eq!(
+        doc.state().attrs.get("kind").map(String::as_str),
+        Some("note")
+    );
 }
