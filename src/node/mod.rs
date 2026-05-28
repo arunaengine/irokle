@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! High-level node, topic, publishing, and sync facade APIs.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +15,7 @@ pub use topic::{RawTopic, Topic};
 
 use crate::ActorClock;
 use crate::history::{DagQuery, HistoryOrder, ordered};
-use crate::oplog::{Oplog, topological};
+use crate::oplog::{Oplog, topological, topological_subset};
 use crate::reducer::EventRecord;
 #[cfg(feature = "iroh")]
 use crate::storage::{AdmissionEffects, OpMeta, SyncObligation, TopicState};
@@ -833,12 +833,69 @@ impl<S: Storage> Irokle<S> {
         Ok(ordered(records, order))
     }
 
+    pub(crate) fn topic_history_after_clock<E: Event>(
+        &self,
+        topic_id: TopicId,
+        clock: &ActorClock,
+        order: HistoryOrder,
+    ) -> Result<Vec<EventRecord<E>>> {
+        let storage = self.oplog.storage();
+        let mut seen = BTreeSet::new();
+        let mut needed = BTreeSet::new();
+        let mut queue = storage
+            .heads(&topic_id)?
+            .into_iter()
+            .collect::<VecDeque<_>>();
+
+        while let Some(op_id) = queue.pop_front() {
+            if !seen.insert(op_id) {
+                continue;
+            }
+            let meta = storage
+                .get_meta(&op_id)?
+                .ok_or_else(|| Error::Storage(format!("missing op meta for {op_id}")))?;
+            if meta.topic_id != topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            if clock.get(&meta.actor_id) >= meta.actor_seq {
+                continue;
+            }
+            needed.insert(op_id);
+            queue.extend(meta.deps);
+        }
+
+        let mut records = Vec::new();
+        for op in topological_subset(storage, &needed)? {
+            if let crate::TopicPayload::Event(envelope) = &op.signed.body.payload {
+                let meta = storage
+                    .get_meta(&op.id)?
+                    .ok_or(Error::Storage("missing op meta".into()))?;
+                records.push(EventRecord::new(
+                    envelope.decode_event::<E>()?,
+                    op.id,
+                    meta.actor_id,
+                    meta.actor_seq,
+                    meta.observed_clock,
+                ));
+            }
+        }
+        Ok(ordered(records, order))
+    }
+
     pub(crate) fn topic_dag(&self, topic_id: TopicId, query: DagQuery<OpId>) -> Result<Vec<Op>> {
         topic::dag_ops(self.oplog.storage(), topic_id, query)
     }
 
     pub(crate) fn topic_heads(&self, topic_id: TopicId) -> Result<BTreeSet<OpId>> {
         self.oplog.storage().heads(&topic_id)
+    }
+
+    pub(crate) fn topic_actor_clock(&self, topic_id: TopicId) -> Result<ActorClock> {
+        let storage = self.oplog.storage();
+        storage
+            .topic_state(&topic_id)?
+            .ok_or(Error::TopicNotFound)?;
+        storage.actor_clock(&topic_id)
     }
 
     pub(crate) fn topic_observed_clock(&self, topic_id: TopicId) -> Result<ActorClock> {
