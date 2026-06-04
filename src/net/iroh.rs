@@ -525,11 +525,10 @@ impl<S: Storage> IrohNet<S> {
         };
         let mut shutdown = self.shutdown.subscribe();
         Ok(Some(handle.spawn(async move {
-            if let Some(current) = net.upgrade() {
-                if let Err(error) = current.schedule_startup_resync() {
+            if let Some(current) = net.upgrade()
+                && let Err(error) = current.schedule_startup_resync() {
                     tracing::warn!(%error, "failed to schedule startup resync sweep");
                 }
-            }
             let mut full_sweep = Box::pin(tokio::time::sleep_until(next_full_sweep_deadline(
                 runtime.full_sweep_interval,
                 runtime.full_sweep_time_of_day,
@@ -554,11 +553,10 @@ impl<S: Storage> IrohNet<S> {
                     _ = notify.notified() => {}
                     _ = &mut due_sleep => {}
                     _ = &mut full_sweep, if !runtime.full_sweep_interval.is_zero() => {
-                        if let Some(current) = net.upgrade() {
-                            if let Err(error) = current.schedule_full_sweep_resync() {
+                        if let Some(current) = net.upgrade()
+                            && let Err(error) = current.schedule_full_sweep_resync() {
                                 tracing::warn!(%error, "failed to schedule full resync sweep");
                             }
-                        }
                         full_sweep.as_mut().reset(tokio::time::Instant::now() + runtime.full_sweep_interval);
                     }
                 }
@@ -1306,70 +1304,6 @@ fn initial_full_sweep_delay(interval: Duration, time_of_day: Duration) -> Durati
     Duration::from_secs(delay_secs)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::TopicId;
-
-    fn peer(byte: u8) -> PeerId {
-        PeerId::from_bytes([byte; 32])
-    }
-
-    fn topic(byte: u8) -> TopicId {
-        TopicId::from_bytes([byte; 32])
-    }
-
-    #[test]
-    fn scheduler_deduplicates_targets() {
-        let scheduler = ResyncScheduler::default();
-        scheduler.schedule_now(peer(1), topic(2), false);
-        scheduler.schedule_now(peer(1), topic(2), false);
-
-        let due = scheduler.due_targets(8);
-
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].key.peer_id, peer(1));
-        assert_eq!(due[0].key.topic_id, topic(2));
-        scheduler.complete_clean(peer(1), topic(2));
-        assert!(scheduler.next_due().is_none());
-    }
-
-    #[test]
-    fn scheduler_uses_capped_failure_backoff() {
-        let scheduler = ResyncScheduler::default();
-        let peer_id = peer(3);
-        let topic_id = topic(4);
-        scheduler.schedule_now(peer_id, topic_id, false);
-        assert_eq!(scheduler.due_targets(8).len(), 1);
-
-        scheduler.complete_failed(
-            peer_id,
-            topic_id,
-            Duration::from_secs(1),
-            Duration::from_secs(600),
-        );
-        let first_delay = scheduler
-            .next_due()
-            .unwrap()
-            .saturating_duration_since(tokio::time::Instant::now());
-        assert!(first_delay <= Duration::from_secs(1));
-
-        for _ in 0..16 {
-            scheduler.complete_failed(
-                peer_id,
-                topic_id,
-                Duration::from_secs(1),
-                Duration::from_secs(600),
-            );
-        }
-        let capped_delay = scheduler
-            .next_due()
-            .unwrap()
-            .saturating_duration_since(tokio::time::Instant::now());
-        assert!(capped_delay <= Duration::from_secs(600));
-    }
-}
-
 fn peer_may_open_topic(state: &crate::storage::TopicState, peer_id: PeerId) -> bool {
     state.members.contains(&peer_id)
         || state
@@ -1547,4 +1481,68 @@ fn timed_out(message: &'static str) -> io::Error {
 
 fn other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TopicId;
+
+    fn peer(byte: u8) -> PeerId {
+        PeerId::from_bytes([byte; 32])
+    }
+
+    fn topic(byte: u8) -> TopicId {
+        TopicId::from_bytes([byte; 32])
+    }
+
+    #[test]
+    fn scheduler_deduplicates_targets() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(1), topic(2), false);
+        scheduler.schedule_now(peer(1), topic(2), false);
+
+        let due = scheduler.due_targets(8);
+
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].key.peer_id, peer(1));
+        assert_eq!(due[0].key.topic_id, topic(2));
+        scheduler.complete_clean(peer(1), topic(2));
+        assert!(scheduler.next_due().is_none());
+    }
+
+    #[test]
+    fn scheduler_uses_capped_failure_backoff() {
+        let scheduler = ResyncScheduler::default();
+        let peer_id = peer(3);
+        let topic_id = topic(4);
+        scheduler.schedule_now(peer_id, topic_id, false);
+        assert_eq!(scheduler.due_targets(8).len(), 1);
+
+        scheduler.complete_failed(
+            peer_id,
+            topic_id,
+            Duration::from_secs(1),
+            Duration::from_secs(600),
+        );
+        let first_delay = scheduler
+            .next_due()
+            .unwrap()
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(first_delay <= Duration::from_secs(1));
+
+        for _ in 0..16 {
+            scheduler.complete_failed(
+                peer_id,
+                topic_id,
+                Duration::from_secs(1),
+                Duration::from_secs(600),
+            );
+        }
+        let capped_delay = scheduler
+            .next_due()
+            .unwrap()
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(capped_delay <= Duration::from_secs(600));
+    }
 }
