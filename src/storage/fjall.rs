@@ -670,6 +670,14 @@ impl Storage for FjallStorage {
         Ok(out)
     }
 
+    fn has_sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<bool> {
+        let prefix = [b"ob".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat();
+        let read_tx = self.db.read_tx();
+        Ok(fjall::Readable::prefix(&read_tx, &self.records, prefix)
+            .next()
+            .is_some())
+    }
+
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()> {
         self.put(
             [

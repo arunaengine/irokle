@@ -30,6 +30,7 @@ async fn builder_sets_runtime_config() {
         connect_timeout: std::time::Duration::from_secs(7),
         sync_io_timeout: std::time::Duration::from_secs(8),
         resync_interval: std::time::Duration::from_secs(9),
+        ..net::IrohRuntimeConfig::default()
     };
     let irokle = Irokle::builder()
         .with_net(endpoint)
@@ -39,6 +40,30 @@ async fn builder_sets_runtime_config() {
         .unwrap();
 
     assert_eq!(irokle.iroh_runtime_config(), Some(runtime));
+}
+
+#[cfg(feature = "iroh")]
+#[test]
+fn runtime_defaults_use_dirty_sync_and_daily_sweep() {
+    let runtime = net::IrohRuntimeConfig::default();
+
+    assert_eq!(runtime.resync_interval, std::time::Duration::from_secs(5));
+    assert_eq!(
+        runtime.resync_initial_backoff,
+        std::time::Duration::from_secs(1)
+    );
+    assert_eq!(
+        runtime.resync_max_backoff,
+        std::time::Duration::from_secs(10 * 60)
+    );
+    assert_eq!(
+        runtime.full_sweep_interval,
+        std::time::Duration::from_secs(24 * 60 * 60)
+    );
+    assert_eq!(
+        runtime.full_sweep_time_of_day,
+        std::time::Duration::from_secs(3 * 60 * 60)
+    );
 }
 
 #[cfg(feature = "iroh")]
@@ -57,6 +82,9 @@ async fn resync_runs_without_auto_accept_and_without_obligations() {
         connect_timeout: std::time::Duration::from_millis(10),
         sync_io_timeout: std::time::Duration::from_millis(10),
         resync_interval: std::time::Duration::from_millis(10),
+        resync_initial_backoff: std::time::Duration::from_millis(10),
+        resync_max_backoff: std::time::Duration::from_millis(20),
+        ..net::IrohRuntimeConfig::default()
     };
     let alice = Irokle::builder()
         .with_net(alice_endpoint)
@@ -138,6 +166,7 @@ async fn resync_and_accept_loops_start_once() {
         connect_timeout: std::time::Duration::from_millis(20),
         sync_io_timeout: std::time::Duration::from_millis(20),
         resync_interval: std::time::Duration::from_secs(60),
+        ..net::IrohRuntimeConfig::default()
     };
     let node = Irokle::builder()
         .with_iroh_secret_key(endpoint.secret_key())

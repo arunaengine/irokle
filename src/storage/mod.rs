@@ -137,6 +137,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize>;
     fn sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId)
     -> Result<Vec<SyncObligation>>;
+    fn has_sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<bool> {
+        Ok(!self.sync_obligations(peer_id, topic_id)?.is_empty())
+    }
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()>;
     fn sync_statuses(&self, topic_id: &TopicId) -> Result<Vec<SyncPeerStatus>>;
 

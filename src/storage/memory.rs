@@ -442,6 +442,14 @@ impl Storage for MemoryStorage {
             .collect())
     }
 
+    fn has_sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<bool> {
+        Ok(self
+            .lock()?
+            .obligations
+            .iter()
+            .any(|o| o.peer_id == *peer_id && o.topic_id == *topic_id))
+    }
+
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()> {
         self.lock()?
             .sync_statuses

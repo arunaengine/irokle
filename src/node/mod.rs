@@ -508,7 +508,12 @@ impl<S: Storage> Irokle<S> {
         topic_id: TopicId,
         op_ids: BTreeSet<OpId>,
     ) -> Result<()> {
-        self.sync.put_obligation(peer_id, topic_id, op_ids)
+        self.sync.put_obligation(peer_id, topic_id, op_ids)?;
+        #[cfg(feature = "iroh")]
+        if let Some(net) = &self.net {
+            net.schedule_resync(peer_id, topic_id);
+        }
+        Ok(())
     }
 
     fn put_receive_forward_obligations(
@@ -578,39 +583,26 @@ impl<S: Storage> Irokle<S> {
         write_concern: &WriteConcern,
         wake_failed_message: &'static str,
     ) -> Result<()> {
-        if !matches!(write_concern, WriteConcern::AsyncReplication) || self.net.is_none() {
+        let Some(net) = &self.net else {
             return Ok(());
-        }
+        };
 
         let state = self
             .storage()
             .topic_state(&topic_id)?
             .ok_or(Error::TopicNotFound)?;
         let peers = select_sync_peers(topic_id, self.peer_id(), &state);
-        for peer_id in peers.iter().copied() {
-            self.record_replication_scheduled(peer_id, topic_id)?;
-        }
-        if peers.is_empty() {
-            return Ok(());
+
+        if matches!(write_concern, WriteConcern::AsyncReplication) {
+            for peer_id in peers.iter().copied() {
+                self.record_replication_scheduled(peer_id, topic_id)?;
+            }
         }
 
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                let node = self.clone();
-                handle.spawn(async move {
-                    if let Err(error) = node.sync_topic_now(topic_id).await {
-                        tracing::warn!(%topic_id, %error, "{}", wake_failed_message);
-                    }
-                });
-            }
-            Err(error) => {
-                let error =
-                    std::io::Error::other(format!("async replication not started: {error}"));
-                for peer_id in peers {
-                    self.record_sync_result(peer_id, topic_id, Err(&error))?;
-                }
-            }
-        }
+        net.schedule_topic_recheck(topic_id).map_err(|error| {
+            tracing::warn!(%topic_id, %error, "{}", wake_failed_message);
+            Error::Storage(format!("failed to schedule iroh resync: {error}"))
+        })?;
 
         Ok(())
     }
