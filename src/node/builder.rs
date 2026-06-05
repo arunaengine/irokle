@@ -145,8 +145,22 @@ impl<S: Storage> IrokleBuilder<S> {
         self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<IrokleBuilder<crate::FjallStorage>> {
+        self.with_fjall_path_and_persist_mode(path, fjall::PersistMode::SyncAll)
+    }
+
+    #[cfg(feature = "fjall")]
+    /// Use Fjall storage with an explicit transaction persist mode.
+    ///
+    /// The default `with_fjall_path` uses `SyncAll`. `Buffer` avoids a
+    /// foreground fsync per Irokle transaction when the caller has a separate
+    /// durability boundary.
+    pub fn with_fjall_path_and_persist_mode(
+        self,
+        path: impl AsRef<std::path::Path>,
+        persist_mode: fjall::PersistMode,
+    ) -> Result<IrokleBuilder<crate::FjallStorage>> {
         Ok(IrokleBuilder {
-            storage: crate::FjallStorage::open(path)?,
+            storage: crate::FjallStorage::open_with_persist_mode(path, persist_mode)?,
             config: self.config,
             signer_explicit: self.signer_explicit,
             write_concern_explicit: self.write_concern_explicit,
@@ -166,8 +180,18 @@ impl<S: Storage> IrokleBuilder<S> {
         self,
         db: fjall::OptimisticTxDatabase,
     ) -> Result<IrokleBuilder<crate::FjallStorage>> {
+        self.with_fjall_database_and_persist_mode(db, fjall::PersistMode::SyncAll)
+    }
+
+    #[cfg(feature = "fjall")]
+    /// Use an existing Fjall database with an explicit transaction persist mode.
+    pub fn with_fjall_database_and_persist_mode(
+        self,
+        db: fjall::OptimisticTxDatabase,
+        persist_mode: fjall::PersistMode,
+    ) -> Result<IrokleBuilder<crate::FjallStorage>> {
         Ok(IrokleBuilder {
-            storage: crate::FjallStorage::from_database(db)?,
+            storage: crate::FjallStorage::from_database_with_persist_mode(db, persist_mode)?,
             config: self.config,
             signer_explicit: self.signer_explicit,
             write_concern_explicit: self.write_concern_explicit,

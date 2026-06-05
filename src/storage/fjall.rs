@@ -18,6 +18,7 @@ use super::{
 pub struct FjallStorage {
     db: fjall::OptimisticTxDatabase,
     records: fjall::OptimisticTxKeyspace,
+    persist_mode: fjall::PersistMode,
 }
 
 #[cfg(feature = "fjall")]
@@ -28,14 +29,36 @@ const FJALL_SCHEMA_VERSION_KEY: &[u8] = b"sv";
 #[cfg(feature = "fjall")]
 impl FjallStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_persist_mode(path, fjall::PersistMode::SyncAll)
+    }
+
+    /// Open Fjall storage with an explicit transaction persist mode.
+    ///
+    /// `SyncAll` preserves the historical fully durable behavior. `Buffer`
+    /// avoids a foreground fsync on every Irokle transaction and is useful when
+    /// callers provide their own durability boundary.
+    pub fn open_with_persist_mode(
+        path: impl AsRef<Path>,
+        persist_mode: fjall::PersistMode,
+    ) -> Result<Self> {
         let db = fjall::OptimisticTxDatabase::builder(path).open()?;
-        Self::from_database(db)
+        Self::from_database_with_persist_mode(db, persist_mode)
     }
 
     pub fn from_database(db: fjall::OptimisticTxDatabase) -> Result<Self> {
+        Self::from_database_with_persist_mode(db, fjall::PersistMode::SyncAll)
+    }
+
+    /// Build Fjall storage from an existing database with an explicit
+    /// transaction persist mode.
+    pub fn from_database_with_persist_mode(
+        db: fjall::OptimisticTxDatabase,
+        persist_mode: fjall::PersistMode,
+    ) -> Result<Self> {
         let storage = Self {
             records: db.keyspace("records", fjall::KeyspaceCreateOptions::default)?,
             db,
+            persist_mode,
         };
         storage.ensure_schema_version()?;
         Ok(storage)
@@ -56,10 +79,7 @@ impl FjallStorage {
         mut f: impl FnMut(&mut fjall::OptimisticWriteTx) -> Result<R>,
     ) -> Result<R> {
         for _ in 0..64 {
-            let mut tx = self
-                .db
-                .write_tx()?
-                .durability(Some(fjall::PersistMode::SyncAll));
+            let mut tx = self.db.write_tx()?.durability(Some(self.persist_mode));
             let result = f(&mut tx)?;
             match tx.commit()? {
                 Ok(()) => return Ok(result),
