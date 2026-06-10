@@ -111,12 +111,15 @@ pub(super) fn is_semantic_rejection(err: &Error) -> bool {
 }
 
 pub(super) fn is_local_admission_race(err: &Error) -> bool {
+    // InvalidOpId covers a concurrent admission advancing max_generation
+    // between the heads read and op validation; a retry re-reads fresh state.
     matches!(
         err,
         Error::AdmissionConflict
             | Error::ActorSeqGap { .. }
             | Error::ActorPrevMismatch
             | Error::ActorFork
+            | Error::InvalidOpId
     )
 }
 
