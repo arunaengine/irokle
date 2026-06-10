@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "Signed Merkle-DAG operation log for invite-only topics"
 
 [workspace]
-members = [".", "auto-irokle", "auto-irokle-derive", "irokle-derive"]
+members = [".", "irokle-derive"]
 resolver = "3"
 
 [features]

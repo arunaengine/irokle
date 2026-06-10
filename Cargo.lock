@@ -138,27 +138,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "auto-irokle"
-version = "0.1.0"
-dependencies = [
- "auto-irokle-derive",
- "irokle",
- "postcard",
- "serde",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "auto-irokle-derive"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
