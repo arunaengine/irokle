@@ -558,7 +558,9 @@ async fn whitelist_controls_bootstrap() {
         ops: oplog::topological(alice.storage(), &topic.id()).unwrap(),
     };
 
-    let err = net
+    // A non-whitelisted Data message is skipped (no ack, nothing admitted)
+    // without aborting the stream.
+    let responses = net
         .handle_messages(
             alice_endpoint.id(),
             vec![
@@ -570,9 +572,13 @@ async fn whitelist_controls_bootstrap() {
                 sync::SyncMessage::Data(data.clone()),
             ],
         )
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        !responses
+            .iter()
+            .any(|response| matches!(response, sync::SyncMessage::Ack(_)))
+    );
     assert!(bob.storage().topic_state(&topic.id()).unwrap().is_none());
 
     bob.add_peer_to_whitelist(alice.peer_id()).unwrap();
@@ -587,7 +593,7 @@ async fn whitelist_controls_bootstrap() {
         topic_id: excluded_topic.id(),
         ops: oplog::topological(alice.storage(), &excluded_topic.id()).unwrap(),
     };
-    let err = net
+    let responses = net
         .handle_messages(
             alice_endpoint.id(),
             vec![
@@ -599,9 +605,13 @@ async fn whitelist_controls_bootstrap() {
                 sync::SyncMessage::Data(excluded_data),
             ],
         )
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        !responses
+            .iter()
+            .any(|response| matches!(response, sync::SyncMessage::Ack(_)))
+    );
     assert!(
         bob.storage()
             .topic_state(&excluded_topic.id())
@@ -719,6 +729,84 @@ async fn handle_messages_accepts_ack_heads_that_arrive_before_data() {
         .unwrap()
         .unwrap();
     assert!(peer_ack.heads.contains(&bob_record.meta.op_id));
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batched_resync_drains_topic_backlog_with_few_streams() {
+    const TOPICS: usize = 1000;
+    let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .address_lookup(lookup.clone())
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .address_lookup(lookup.clone())
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .with_write_concern(WriteConcern::Local)
+        .build()
+        .unwrap();
+    let bob = Irokle::builder()
+        .with_peer_whitelist([alice.peer_id()])
+        .with_net(bob_endpoint)
+        .build()
+        .unwrap();
+    let bob_peer = bob.peer_id();
+    lookup.add_endpoint_info(ready_addr(bob.endpoint().unwrap()).await);
+
+    for index in 0..TOPICS {
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob_peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let record = topic
+            .publish(Note {
+                text: format!("doc-{index}"),
+            })
+            .unwrap();
+        alice
+            .put_sync_obligation(bob_peer, topic.id(), [record.meta.op_id].into())
+            .unwrap();
+    }
+
+    let net = Arc::new(net::IrohNet::new(alice_endpoint, alice.clone()).unwrap());
+    let started = std::time::Instant::now();
+    net.start_configured_resync_loop().unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            if bob.list_topics().unwrap().len() == TOPICS
+                && alice.storage().all_sync_obligations().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("bob did not receive the full topic backlog in time");
+    let elapsed = started.elapsed();
+    let streams = net.outbound_sync_streams();
+    println!(
+        "drained {TOPICS} single-op topics in {elapsed:?} using {streams} outbound sync streams"
+    );
+    assert!(
+        streams <= 40,
+        "per-topic round-trip amplification: {TOPICS} topics used {streams} outbound sync streams"
+    );
+
+    net.shutdown().await;
+    bob.shutdown_iroh().await;
 }
 
 #[cfg(feature = "iroh")]

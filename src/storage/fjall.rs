@@ -710,6 +710,30 @@ impl Storage for FjallStorage {
         )
     }
 
+    fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize> {
+        self.transaction(|tx| {
+            let prefix = [b"ob".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat();
+            let mut keys = Vec::new();
+            for item in fjall::Readable::prefix(tx, &self.records, prefix) {
+                let (key, _) = item.into_inner()?;
+                keys.push(key.to_vec());
+            }
+            let cleared = keys.len();
+            for key in keys {
+                tx.remove(&self.records, key);
+            }
+            tx.remove(
+                &self.records,
+                [b"ss".as_slice(), topic_id.as_ref(), peer_id.as_ref()].concat(),
+            );
+            tx.remove(
+                &self.records,
+                [b"ak".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat(),
+            );
+            Ok(cleared)
+        })
+    }
+
     fn sync_statuses(&self, topic_id: &TopicId) -> Result<Vec<SyncPeerStatus>> {
         let prefix = [b"ss".as_slice(), topic_id.as_ref()].concat();
         let mut out = Vec::new();

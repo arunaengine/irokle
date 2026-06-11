@@ -2,17 +2,15 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use smallvec::{SmallVec, smallvec};
-
 use crate::node::select_sync_peers;
-use crate::sync::SyncMessage;
+use crate::sync::{SyncMessage, SyncSummary};
 use crate::{Irokle, MemoryStorage, PeerId, Storage};
 
-use super::frame::MAX_FRAME_LEN;
+use super::frame::{MAX_FRAME_LEN, MAX_SYNC_DATA_OPS_PER_MESSAGE};
 use super::{
     _message_type_name, IROKLE_SYNC_ALPN, decode_sync_message, encode_frame, encode_sync_message,
     invalid_data, sync_data_messages,
@@ -28,8 +26,13 @@ const DEFAULT_FULL_SWEEP_TIME_OF_DAY: Duration = Duration::from_secs(3 * 60 * 60
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const EMPTY_RESYNC_SLEEP: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 const MAX_ACCEPT_CONNECTIONS: usize = 128;
-const MAX_RESYNC_CONCURRENCY: usize = 8;
+const MAX_RESYNC_PEER_CONCURRENCY: usize = 8;
+const MAX_RESYNC_TARGETS_PER_PEER_PASS: usize = 16 * 1024;
+const MAX_TOPICS_PER_RESYNC_BATCH: usize = 1024;
 const MAX_SYNC_MESSAGES_PER_STREAM: usize = 4096;
+// Keep batched streams at half the per-stream message cap so the responder's
+// reply (which can echo up to two messages per topic) stays under its own cap.
+const MAX_BATCH_STREAM_MESSAGES: usize = MAX_SYNC_MESSAGES_PER_STREAM / 2;
 const MAX_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,24 +128,44 @@ impl ResyncScheduler {
         self.notify.notify_waiters();
     }
 
-    fn due_targets(&self, limit: usize) -> Vec<ResyncTarget> {
+    fn due_targets_by_peer(
+        &self,
+        max_peers: usize,
+        max_targets_per_peer: usize,
+    ) -> Vec<(PeerId, Vec<ResyncTarget>)> {
         let now = tokio::time::Instant::now();
         let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
-        let due = targets
-            .iter()
-            .filter(|(_, target)| !target.in_flight && target.next_due <= now)
-            .map(|(key, _)| *key)
-            .take(limit)
-            .collect::<Vec<_>>();
-        let mut out = Vec::with_capacity(due.len());
-        for key in due {
-            if let Some(target) = targets.get_mut(&key) {
-                target.in_flight = true;
-                out.push(ResyncTarget {
-                    key,
-                    force: std::mem::take(&mut target.force),
-                });
+        let mut due: BTreeMap<PeerId, Vec<ResyncTargetKey>> = BTreeMap::new();
+        for (key, target) in targets.iter() {
+            if target.in_flight || target.next_due > now {
+                continue;
             }
+            match due.get_mut(&key.peer_id) {
+                Some(keys) => {
+                    if keys.len() < max_targets_per_peer {
+                        keys.push(*key);
+                    }
+                }
+                None => {
+                    if due.len() < max_peers {
+                        due.insert(key.peer_id, vec![*key]);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(due.len());
+        for (peer_id, keys) in due {
+            let mut batch = Vec::with_capacity(keys.len());
+            for key in keys {
+                if let Some(target) = targets.get_mut(&key) {
+                    target.in_flight = true;
+                    batch.push(ResyncTarget {
+                        key,
+                        force: std::mem::take(&mut target.force),
+                    });
+                }
+            }
+            out.push((peer_id, batch));
         }
         out
     }
@@ -179,6 +202,25 @@ impl ResyncScheduler {
         target.in_flight = false;
         drop(targets);
         self.notify.notify_waiters();
+    }
+
+    fn peer_reachable(&self, peer_id: PeerId) {
+        let now = tokio::time::Instant::now();
+        let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
+        let mut changed = false;
+        for (key, target) in targets.iter_mut() {
+            if key.peer_id == peer_id && target.failures > 0 {
+                target.failures = 0;
+                if !target.in_flight && target.next_due > now {
+                    target.next_due = now;
+                }
+                changed = true;
+            }
+        }
+        drop(targets);
+        if changed {
+            self.notify.notify_waiters();
+        }
     }
 
     fn complete_failed(
@@ -244,13 +286,18 @@ impl ConnectionPool {
     }
 
     fn get(&self, peer: &iroh::EndpointId) -> io::Result<Option<iroh::endpoint::Connection>> {
-        Ok(self
+        let mut connections = self
             .connections
-            .read()
-            .map_err(|_| io::Error::other("connection pool read lock poisoned"))?
-            .get(peer)
-            .filter(|connection| connection.close_reason().is_none())
-            .cloned())
+            .write()
+            .map_err(|_| io::Error::other("connection pool write lock poisoned"))?;
+        match connections.get(peer) {
+            Some(connection) if connection.close_reason().is_none() => Ok(Some(connection.clone())),
+            Some(_) => {
+                connections.remove(peer);
+                Ok(None)
+            }
+            None => Ok(None),
+        }
     }
 
     async fn get_or_connect(
@@ -280,6 +327,7 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
     resync_scheduler: ResyncScheduler,
     accept_started: AtomicBool,
     resync_started: AtomicBool,
+    outbound_streams: AtomicU64,
     shutdown: tokio::sync::watch::Sender<bool>,
 }
 
@@ -326,6 +374,7 @@ impl<S: Storage> IrohNet<S> {
             resync_scheduler: ResyncScheduler::default(),
             accept_started: AtomicBool::new(false),
             resync_started: AtomicBool::new(false),
+            outbound_streams: AtomicU64::new(0),
             shutdown,
         })
     }
@@ -340,6 +389,12 @@ impl<S: Storage> IrohNet<S> {
 
     pub fn runtime_config(&self) -> IrohRuntimeConfig {
         self.runtime
+    }
+
+    /// Number of outbound sync streams opened so far. One stream is one
+    /// request/response round trip with a peer.
+    pub fn outbound_sync_streams(&self) -> u64 {
+        self.outbound_streams.load(Ordering::Relaxed)
     }
 
     pub async fn shutdown(&self) {
@@ -374,6 +429,19 @@ impl<S: Storage> IrohNet<S> {
 
     pub fn schedule_resync(&self, peer_id: PeerId, topic_id: crate::TopicId) {
         self.resync_scheduler.schedule_now(peer_id, topic_id, false);
+    }
+
+    pub fn note_peer_reachable(&self, peer_id: PeerId) {
+        self.resync_scheduler.peer_reachable(peer_id);
+    }
+
+    /// Registers an externally accepted connection in the connection pool so
+    /// future outbound syncs can reuse it instead of dialing by endpoint id.
+    pub fn register_connection(&self, connection: iroh::endpoint::Connection) -> io::Result<()> {
+        let peer = self.pool.insert(connection)?;
+        self.resync_scheduler
+            .peer_reachable(peer_id_from_endpoint_id(peer));
+        Ok(())
     }
 
     pub fn schedule_topic_recheck(&self, topic_id: crate::TopicId) -> io::Result<usize> {
@@ -725,10 +793,19 @@ impl<S: Storage> IrohNet<S> {
                 Ok(connection) => connection,
                 Err(error) => return Err(error),
             };
-            match self.sync_with_connection(connection, messages).await {
+            match self
+                .sync_with_connection(connection.clone(), messages)
+                .await
+            {
                 Ok(responses) => return Ok(responses),
                 Err(error) => {
-                    let _ = self.pool.remove(&peer_id);
+                    // Keep healthy connections pooled on stream-level failures;
+                    // drop them when closed or unresponsive (timed out).
+                    if connection.close_reason().is_some()
+                        || error.kind() == io::ErrorKind::TimedOut
+                    {
+                        let _ = self.pool.remove(&peer_id);
+                    }
                     last_error = Some(error);
                 }
             }
@@ -746,6 +823,7 @@ impl<S: Storage> IrohNet<S> {
                 .await
                 .map_err(|_| timed_out("sync stream open timed out"))?
                 .map_err(other)?;
+        self.outbound_streams.fetch_add(1, Ordering::Relaxed);
         write_sync_messages(&mut send, messages, self.runtime.sync_io_timeout).await?;
         read_sync_messages(&mut recv, self.runtime.sync_io_timeout).await
     }
@@ -767,9 +845,11 @@ impl<S: Storage> IrohNet<S> {
     ) -> io::Result<()> {
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
         let endpoint_id = peer.id;
-        let result = self.sync_now_inner(peer, topic_id).await;
+        let mut outcomes = self.run_topic_batch(peer, &[topic_id]).await;
+        let result = outcomes.remove(&topic_id).unwrap_or(Ok(()));
         if result.is_err() {
-            let _ = self.pool.remove(&endpoint_id);
+            // Drops the pooled connection only when it is already closed.
+            let _ = self.pool.get(&endpoint_id);
         }
         let record_result = match &result {
             Ok(()) => Ok(()),
@@ -782,49 +862,245 @@ impl<S: Storage> IrohNet<S> {
         result
     }
 
-    async fn sync_now_inner(
+    /// Services a peer's due resync targets as multi-topic batches over the
+    /// pooled connection, recording per-topic results.
+    async fn sync_peer_batch_with_runtime(
+        &self,
+        peer_id: PeerId,
+        targets: Vec<ResyncTarget>,
+        runtime: IrohRuntimeConfig,
+    ) {
+        let addr = match peer_id_to_endpoint_addr(peer_id) {
+            Ok(addr) => addr,
+            Err(error) => {
+                for target in targets {
+                    self.finish_resync_attempt(peer_id, target.key.topic_id, Err(&error), runtime);
+                }
+                return;
+            }
+        };
+        let mut topics = Vec::with_capacity(targets.len());
+        for target in targets {
+            let topic_id = target.key.topic_id;
+            match self.should_attempt_resync_target(target) {
+                Ok(true) => topics.push(topic_id),
+                Ok(false) => {
+                    if let Err(error) = self.gc_stale_obligations(peer_id, topic_id) {
+                        tracing::warn!(%peer_id, %topic_id, %error, "failed to gc stale sync obligations");
+                    }
+                    self.resync_scheduler.complete_clean(peer_id, topic_id);
+                }
+                Err(error) => self.finish_resync_attempt(peer_id, topic_id, Err(&error), runtime),
+            }
+        }
+        for chunk in topics.chunks(MAX_TOPICS_PER_RESYNC_BATCH) {
+            self.sync_topic_chunk(addr.clone(), chunk, runtime).await;
+        }
+    }
+
+    /// Drops persisted obligations toward a peer that is no longer a topic
+    /// member (or whose topic state is gone) so sweeps stop rescheduling them.
+    fn gc_stale_obligations(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<()> {
+        if !self
+            .node
+            .storage()
+            .has_sync_obligations(&peer_id, &topic_id)
+            .map_err(invalid_data)?
+        {
+            return Ok(());
+        }
+        let stale = match self
+            .node
+            .storage()
+            .topic_state(&topic_id)
+            .map_err(invalid_data)?
+        {
+            Some(state) => {
+                !state.members.contains(&peer_id) || !state.members.contains(&self.node.peer_id())
+            }
+            None => true,
+        };
+        if stale {
+            self.node
+                .storage()
+                .clear_peer_sync_state(&peer_id, &topic_id)
+                .map_err(invalid_data)?;
+        }
+        Ok(())
+    }
+
+    async fn sync_topic_chunk(
         &self,
         peer: iroh::EndpointAddr,
-        topic_id: crate::TopicId,
-    ) -> io::Result<()> {
+        topic_ids: &[crate::TopicId],
+        runtime: IrohRuntimeConfig,
+    ) {
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
-        let local_fingerprint = self.node.sync_fingerprint(topic_id).map_err(invalid_data)?;
-        let responses = self
-            .sync_with(
-                peer.clone(),
-                &[
-                    SyncMessage::Open(self.node.sync_open(topic_id)),
-                    SyncMessage::Fingerprint(local_fingerprint.clone()),
-                ],
-            )
-            .await?;
-        let mut summary = None;
-        for response in responses {
-            match response {
-                SyncMessage::Fingerprint(remote)
-                    if remote.topic_id == topic_id
-                        && remote.fingerprint == local_fingerprint.fingerprint =>
-                {
-                    self.node
-                        .record_peer_synced(remote_peer_id, topic_id)
-                        .map_err(invalid_data)?;
-                    return Ok(());
+        let endpoint_id = peer.id;
+        let outcomes = self.run_topic_batch(peer, topic_ids).await;
+        let mut failures = 0_usize;
+        let mut first_error = None;
+        for (topic_id, outcome) in outcomes {
+            let record_result = match &outcome {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    failures += 1;
+                    if first_error.is_none() {
+                        first_error = Some(clone_error(error));
+                    }
+                    Err(error)
                 }
-                SyncMessage::Summary(remote_summary) if remote_summary.topic_id == topic_id => {
-                    summary = Some(remote_summary)
+            };
+            let _ = self
+                .node
+                .record_sync_result(remote_peer_id, topic_id, record_result);
+            self.finish_resync_attempt(remote_peer_id, topic_id, record_result, runtime);
+        }
+        if let Some(error) = first_error {
+            // Drops the pooled connection only when it is already closed.
+            let _ = self.pool.get(&endpoint_id);
+            tracing::warn!(
+                peer_id = %remote_peer_id,
+                failures,
+                %error,
+                "failed to resync topics with peer"
+            );
+        }
+    }
+
+    /// Syncs every topic in `topic_ids` with one peer using batched streams:
+    /// one fingerprint round trip for the whole batch, then data/request and
+    /// ack round trips that carry only the diverged topics. Returns an outcome
+    /// per topic.
+    async fn run_topic_batch(
+        &self,
+        peer: iroh::EndpointAddr,
+        topic_ids: &[crate::TopicId],
+    ) -> BTreeMap<crate::TopicId, io::Result<()>> {
+        let remote_peer_id = peer_id_from_endpoint_id(peer.id);
+        let mut outcomes = BTreeMap::new();
+
+        let mut fingerprints = BTreeMap::new();
+        let mut request = Vec::with_capacity(topic_ids.len() * 2);
+        for topic_id in topic_ids {
+            match self.node.sync_fingerprint(*topic_id) {
+                Ok(fingerprint) => {
+                    request.push(SyncMessage::Open(self.node.sync_open(*topic_id)));
+                    fingerprints.insert(*topic_id, fingerprint.fingerprint);
+                    request.push(SyncMessage::Fingerprint(fingerprint));
                 }
-                other => {
-                    return Err(invalid_data(format!(
-                        "unexpected sync response {}",
-                        _message_type_name(&other)
-                    )));
+                Err(error) => {
+                    outcomes.insert(*topic_id, Err(invalid_data(error)));
                 }
             }
         }
-        let summary = summary.ok_or_else(|| invalid_data("peer did not return a sync summary"))?;
+        if fingerprints.is_empty() {
+            return outcomes;
+        }
+        let responses = match self.sync_with(peer.clone(), &request).await {
+            Ok(responses) => responses,
+            Err(error) => {
+                for topic_id in fingerprints.keys() {
+                    outcomes.insert(*topic_id, Err(clone_error(&error)));
+                }
+                return outcomes;
+            }
+        };
+
+        let mut matched = BTreeSet::new();
+        let mut summaries = BTreeMap::new();
+        for response in responses {
+            match response {
+                SyncMessage::Fingerprint(remote) => {
+                    if fingerprints.get(&remote.topic_id) == Some(&remote.fingerprint) {
+                        matched.insert(remote.topic_id);
+                    }
+                }
+                SyncMessage::Summary(summary) if fingerprints.contains_key(&summary.topic_id) => {
+                    summaries.insert(summary.topic_id, summary);
+                }
+                other => {
+                    let error = invalid_data(format!(
+                        "unexpected sync response {}",
+                        _message_type_name(&other)
+                    ));
+                    for topic_id in fingerprints.keys() {
+                        outcomes
+                            .entry(*topic_id)
+                            .or_insert_with(|| Err(clone_error(&error)));
+                    }
+                    return outcomes;
+                }
+            }
+        }
+        for topic_id in &matched {
+            summaries.remove(topic_id);
+            let outcome = self
+                .node
+                .record_peer_synced(remote_peer_id, *topic_id)
+                .map_err(invalid_data);
+            outcomes.insert(*topic_id, outcome);
+        }
+        for topic_id in fingerprints.keys() {
+            if !matched.contains(topic_id) && !summaries.contains_key(topic_id) {
+                outcomes.insert(
+                    *topic_id,
+                    Err(invalid_data("peer did not return a sync summary")),
+                );
+            }
+        }
+
+        let mut pending = Vec::with_capacity(summaries.len());
+        for (topic_id, summary) in summaries {
+            match self.plan_topic_messages(remote_peer_id, topic_id, &summary) {
+                Ok(Some(planned)) => pending.push(planned),
+                Ok(None) => {
+                    outcomes.insert(topic_id, Ok(()));
+                }
+                Err(error) => {
+                    outcomes.insert(topic_id, Err(error));
+                }
+            }
+        }
+
+        let mut group = Vec::new();
+        let mut group_messages = 0_usize;
+        let mut group_responses = 0_usize;
+        for planned in pending {
+            if !group.is_empty()
+                && (group_messages + planned.messages.len() > MAX_BATCH_STREAM_MESSAGES
+                    || group_responses + planned.estimated_responses > MAX_BATCH_STREAM_MESSAGES)
+            {
+                self.run_topic_batch_exchange(
+                    peer.clone(),
+                    remote_peer_id,
+                    std::mem::take(&mut group),
+                    &mut outcomes,
+                )
+                .await;
+                group_messages = 0;
+                group_responses = 0;
+            }
+            group_messages += planned.messages.len();
+            group_responses += planned.estimated_responses;
+            group.push(planned);
+        }
+        if !group.is_empty() {
+            self.run_topic_batch_exchange(peer, remote_peer_id, group, &mut outcomes)
+                .await;
+        }
+        outcomes
+    }
+
+    fn plan_topic_messages(
+        &self,
+        remote_peer_id: PeerId,
+        topic_id: crate::TopicId,
+        summary: &SyncSummary,
+    ) -> io::Result<Option<PlannedTopicSync>> {
         let plan = self
             .node
-            .negotiate_sync(remote_peer_id, &summary)
+            .negotiate_sync(remote_peer_id, summary)
             .map_err(invalid_data)?;
         let request = crate::sync::SyncRequest {
             topic_id: plan.topic_id,
@@ -1106,6 +1382,12 @@ impl<S: Storage> IrohNet<S> {
     }
 }
 
+struct PlannedTopicSync {
+    topic_id: crate::TopicId,
+    messages: Vec<SyncMessage>,
+    estimated_responses: usize,
+}
+
 struct SyncSession {
     authenticated_peer_id: PeerId,
     remote_peer_id: Option<PeerId>,
@@ -1157,6 +1439,20 @@ impl SyncSession {
             return Ok(Vec::new());
         }
 
+        // Admission failures for one topic's Data must not abort the whole
+        // stream: other topics' Data in the same stream would lose their acks
+        // and the sender would resend the identical range forever.
+        if let SyncMessage::Data(data) = &message {
+            let topic_id = data.topic_id;
+            return match net.handle_message(message, self.remote_peer_id) {
+                Ok(responses) => Ok(responses),
+                Err(error) => {
+                    tracing::warn!(%topic_id, %error, "skipping sync data after admission failure");
+                    Ok(Vec::new())
+                }
+            };
+        }
+
         net.handle_message(message, self.remote_peer_id)
     }
 
@@ -1204,18 +1500,6 @@ fn push_responses(out: &mut Vec<SyncMessage>, responses: Vec<SyncMessage>) -> io
     Ok(())
 }
 
-fn log_resync_join_result(
-    result: std::result::Result<(PeerId, crate::TopicId, io::Result<()>), tokio::task::JoinError>,
-) {
-    match result {
-        Ok((peer_id, topic_id, Err(error))) => {
-            tracing::warn!(%peer_id, %topic_id, %error, "failed to resync peer");
-        }
-        Ok((_, _, Ok(()))) => {}
-        Err(error) => tracing::warn!(%error, "resync task failed"),
-    }
-}
-
 async fn run_due_resyncs<S: Storage>(
     net: &Weak<IrohNet<S>>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
@@ -1228,14 +1512,17 @@ async fn run_due_resyncs<S: Storage>(
         if current.is_shutdown() || current.endpoint().is_closed() {
             return false;
         }
-        let targets = current.resync_scheduler.due_targets(MAX_RESYNC_CONCURRENCY);
+        let due = current.resync_scheduler.due_targets_by_peer(
+            MAX_RESYNC_PEER_CONCURRENCY,
+            MAX_RESYNC_TARGETS_PER_PEER_PASS,
+        );
         drop(current);
-        if targets.is_empty() {
+        if due.is_empty() {
             return true;
         }
 
         let mut syncs = tokio::task::JoinSet::new();
-        for target in targets {
+        for (peer_id, targets) in due {
             let Some(current) = net.upgrade() else {
                 return false;
             };
@@ -1243,30 +1530,19 @@ async fn run_due_resyncs<S: Storage>(
                 return false;
             }
             syncs.spawn(async move {
-                let peer_id = target.key.peer_id;
-                let topic_id = target.key.topic_id;
-                let result = match current.should_attempt_resync_target(target) {
-                    Ok(true) => {
-                        current
-                            .sync_peer_now_with_runtime(peer_id, topic_id, runtime)
-                            .await
-                    }
-                    Ok(false) => {
-                        current.resync_scheduler.complete_clean(peer_id, topic_id);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        current.finish_resync_attempt(peer_id, topic_id, Err(&error), runtime);
-                        Err(error)
-                    }
-                };
-                (peer_id, topic_id, result)
+                current
+                    .sync_peer_batch_with_runtime(peer_id, targets, runtime)
+                    .await;
             });
         }
 
         while !syncs.is_empty() {
             tokio::select! {
-                Some(result) = syncs.join_next() => log_resync_join_result(result),
+                Some(result) = syncs.join_next() => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "resync batch task failed");
+                    }
+                }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         syncs.abort_all();
@@ -1318,6 +1594,12 @@ async fn handle_connection<S: Storage>(
     peer: iroh::EndpointId,
     connection: iroh::endpoint::Connection,
 ) {
+    if let Some(current) = net.upgrade() {
+        let _ = current.pool.insert(connection.clone());
+        current
+            .resync_scheduler
+            .peer_reachable(peer_id_from_endpoint_id(peer));
+    }
     loop {
         let streams = tokio::select! {
             changed = shutdown.changed() => {
@@ -1479,6 +1761,10 @@ fn timed_out(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, message)
 }
 
+fn clone_error(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), error.to_string())
+}
+
 fn other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
@@ -1502,13 +1788,37 @@ mod tests {
         scheduler.schedule_now(peer(1), topic(2), false);
         scheduler.schedule_now(peer(1), topic(2), false);
 
-        let due = scheduler.due_targets(8);
+        let due = scheduler.due_targets_by_peer(8, 8);
 
         assert_eq!(due.len(), 1);
-        assert_eq!(due[0].key.peer_id, peer(1));
-        assert_eq!(due[0].key.topic_id, topic(2));
+        let (peer_id, targets) = &due[0];
+        assert_eq!(*peer_id, peer(1));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].key.topic_id, topic(2));
         scheduler.complete_clean(peer(1), topic(2));
         assert!(scheduler.next_due().is_none());
+    }
+
+    #[test]
+    fn scheduler_groups_due_targets_by_peer() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(1), topic(1), false);
+        scheduler.schedule_now(peer(1), topic(2), false);
+        scheduler.schedule_now(peer(1), topic(3), false);
+        scheduler.schedule_now(peer(2), topic(1), false);
+
+        let due = scheduler.due_targets_by_peer(8, 2);
+
+        assert_eq!(due.len(), 2);
+        let (first_peer, first_targets) = &due[0];
+        assert_eq!(*first_peer, peer(1));
+        assert_eq!(first_targets.len(), 2);
+        let (second_peer, second_targets) = &due[1];
+        assert_eq!(*second_peer, peer(2));
+        assert_eq!(second_targets.len(), 1);
+
+        // Targets handed out stay in flight until completed.
+        assert!(scheduler.due_targets_by_peer(8, 8).len() == 1);
     }
 
     #[test]
@@ -1517,7 +1827,7 @@ mod tests {
         let peer_id = peer(3);
         let topic_id = topic(4);
         scheduler.schedule_now(peer_id, topic_id, false);
-        assert_eq!(scheduler.due_targets(8).len(), 1);
+        assert_eq!(scheduler.due_targets_by_peer(8, 8).len(), 1);
 
         scheduler.complete_failed(
             peer_id,

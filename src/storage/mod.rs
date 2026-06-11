@@ -142,6 +142,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     }
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()>;
     fn sync_statuses(&self, topic_id: &TopicId) -> Result<Vec<SyncPeerStatus>>;
+    /// Drop obligations, sync status, and the stored ack for a peer that left
+    /// a topic. Returns the number of cleared obligations.
+    fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize>;
 
     fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
         let Some(meta) = self.get_meta(op_id)? else {

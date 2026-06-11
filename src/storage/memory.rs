@@ -457,6 +457,18 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
+    fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize> {
+        let mut inner = self.lock()?;
+        let before = inner.obligations.len();
+        inner
+            .obligations
+            .retain(|o| !(o.peer_id == *peer_id && o.topic_id == *topic_id));
+        let cleared = before - inner.obligations.len();
+        inner.sync_statuses.remove(&(*topic_id, *peer_id));
+        inner.peer_acks.remove(&(*peer_id, *topic_id));
+        Ok(cleared)
+    }
+
     fn sync_statuses(&self, topic_id: &TopicId) -> Result<Vec<SyncPeerStatus>> {
         Ok(self
             .lock()?

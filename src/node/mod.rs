@@ -771,6 +771,10 @@ impl<S: Storage> Irokle<S> {
         actor_id: ActorId,
         control: TopicControl,
     ) -> Result<()> {
+        let removed_peer = match &control {
+            TopicControl::RemovePeer { peer } => Some(*peer),
+            _ => None,
+        };
         #[cfg(feature = "iroh")]
         let op = self.oplog.create_control_op_with_effects(
             topic_id,
@@ -797,6 +801,11 @@ impl<S: Storage> Irokle<S> {
             &self.config.default_write_concern,
             "topic control replication wake failed",
         )?;
+        if let Some(peer) = removed_peer
+            && peer != self.peer_id()
+        {
+            self.storage().clear_peer_sync_state(&peer, &topic_id)?;
+        }
         Ok(())
     }
 
