@@ -166,11 +166,24 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
     ) -> Result<BTreeSet<crate::OpId>> {
-        self.receive_ops_admission(source_peer, ops)
+        self.receive_ops_admission(source_peer, ops, &BTreeSet::new())
+    }
+
+    /// Like [`Self::receive_ops_from_peer`], but skips signature verification
+    /// for ops whose id is in `verified`. The caller must have run
+    /// [`Op::validate`] on those exact ops; op ids are content-addressed over
+    /// the signed envelope, so a verified id proves the signature.
+    pub(crate) fn receive_ops_from_peer_preverified(
+        &self,
+        source_peer: Option<crate::PeerId>,
+        ops: Vec<Op>,
+        verified: &BTreeSet<crate::OpId>,
+    ) -> Result<BTreeSet<crate::OpId>> {
+        self.receive_ops_admission(source_peer, ops, verified)
     }
 
     pub fn reconcile_pending_ops(&self) -> Result<BTreeSet<crate::OpId>> {
-        self.receive_ops_admission(None, Vec::new())
+        self.receive_ops_admission(None, Vec::new(), &BTreeSet::new())
     }
 
     pub fn receive_signed_op(&self, signed: SignedOp) -> Result<Op> {
@@ -183,6 +196,7 @@ impl<S: Storage> Oplog<S> {
         &self,
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
+        verified: &BTreeSet<crate::OpId>,
     ) -> Result<BTreeSet<crate::OpId>> {
         let mut accepted = BTreeSet::new();
         let mut queue = VecDeque::new();
@@ -201,7 +215,10 @@ impl<S: Storage> Oplog<S> {
             for op_id in &pending_op_ids {
                 queued_pending.remove(op_id);
             }
-            let batch_accepted = match self.admit_ops_batch_retry(batch_source_peer, ops) {
+            // Pending ops re-queued from storage are not in `verified`; they
+            // get re-verified during admission like before.
+            let batch_accepted = match self.admit_ops_batch_retry(batch_source_peer, ops, verified)
+            {
                 Ok(accepted) => accepted,
                 Err(err) if from_pending && is_semantic_rejection(&err) => {
                     for op_id in pending_op_ids {
@@ -252,9 +269,10 @@ impl<S: Storage> Oplog<S> {
         &self,
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
+        verified: &BTreeSet<crate::OpId>,
     ) -> Result<BTreeSet<crate::OpId>> {
         for _ in 0..MAX_ADMISSION_RETRIES {
-            match self.admit_ops_batch(source_peer, ops.clone()) {
+            match self.admit_ops_batch(source_peer, ops.clone(), verified) {
                 Err(Error::AdmissionConflict) => continue,
                 result => return result,
             }
@@ -266,6 +284,7 @@ impl<S: Storage> Oplog<S> {
         &self,
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
+        verified: &BTreeSet<crate::OpId>,
     ) -> Result<BTreeSet<crate::OpId>> {
         let ops = topological_ops(ops)?;
         let mut accepted = BTreeSet::new();
@@ -289,26 +308,30 @@ impl<S: Storage> Oplog<S> {
         let mut pending = Vec::new();
 
         for op in ops {
-            op.validate()?;
+            if !verified.contains(&op.id) {
+                op.validate()?;
+            }
             if self.storage.get_op(&op.id)?.is_some() {
                 continue;
             }
 
             let missing_deps = self.missing_deps_projected(&op, &overlay_ops)?;
             if !missing_deps.is_empty() {
-                self.validate_pending_op_projected(
+                match self.validate_pending_op_projected(
                     &op,
                     &missing_deps,
                     &overlay_meta,
                     &overlay_tips,
                     &overlay_index,
                     state.as_ref(),
-                )?;
-                pending.push((op, missing_deps));
+                )? {
+                    OpAdmission::Duplicate => {}
+                    OpAdmission::Admit => pending.push((op, missing_deps)),
+                }
                 continue;
             }
 
-            self.validate_op_projected(
+            if let OpAdmission::Duplicate = self.validate_op_projected(
                 &op,
                 &overlay_ops,
                 &overlay_meta,

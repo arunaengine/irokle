@@ -901,3 +901,284 @@ fn unknown_topic_empty_plan() {
     assert!(plan.send.is_empty());
     assert!(plan.actor_range_hints.is_empty());
 }
+
+#[test]
+fn duplicate_sync_data_is_idempotent() {
+    let alice = node(85);
+    let bob = node(86);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    topic.publish(Note { text: "one".into() }).unwrap();
+
+    let data = alice
+        .plan_sync_data(bob.peer_id(), &bob.sync_summary(topic.id()).unwrap())
+        .unwrap();
+    let ack = bob
+        .receive_sync_data_from(alice.peer_id(), data.clone())
+        .unwrap();
+    assert_eq!(ack.accepted.len(), 2);
+
+    // Full overlap: every op is already admitted.
+    let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+    assert!(ack.accepted.is_empty());
+    assert_eq!(ack.heads, bob.storage().heads(&topic.id()).unwrap());
+
+    // Partial overlap: resend the full history plus one new op.
+    topic.publish(Note { text: "two".into() }).unwrap();
+    let all_ops = oplog::topological(alice.storage(), &topic.id()).unwrap();
+    assert_eq!(all_ops.len(), 3);
+    let new_id = all_ops.last().unwrap().id;
+    let ack = bob
+        .receive_sync_data_from(
+            alice.peer_id(),
+            crate_sync::SyncData {
+                topic_id: topic.id(),
+                ops: all_ops,
+            },
+        )
+        .unwrap();
+    assert_eq!(ack.accepted, [new_id].into());
+    assert_eq!(
+        bob.open_topic::<Note>(topic.id())
+            .unwrap()
+            .history(history::HistoryOrder::OldestFirst)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+/// Receive-side admission throughput for a backlog of unknown single-op
+/// topics, the hot path of a bulk drain. Wall time is dominated by op
+/// signature verification: each op must be verified exactly once even though
+/// the unknown-topic check and the real admission both inspect it.
+#[test]
+fn unknown_topic_backlog_admission_verifies_ops_once() {
+    const TOPICS: usize = 1000;
+    let alice = node(95);
+    let bob = node(96);
+    let mut batches = Vec::with_capacity(TOPICS);
+    for index in 0..TOPICS {
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        topic
+            .publish(Note {
+                text: format!("doc-{index}"),
+            })
+            .unwrap();
+        batches.push(crate_sync::SyncData {
+            topic_id: topic.id(),
+            ops: oplog::topological(alice.storage(), &topic.id()).unwrap(),
+        });
+    }
+
+    let started = std::time::Instant::now();
+    for data in batches {
+        let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+        assert_eq!(ack.accepted.len(), 2);
+    }
+    let elapsed = started.elapsed();
+    println!("admitted {TOPICS} unknown single-op topics in {elapsed:?}");
+    assert_eq!(bob.list_topics().unwrap().len(), TOPICS);
+}
+
+/// Storage wrapper that simulates the stale reads of a concurrent admission:
+/// `get_op`/`actor_index` report "unknown" exactly once for ops in the
+/// one-shot sets, so a duplicate slips past the batch dedup check and reaches
+/// seq validation while the actor tip already covers it. Ops in
+/// `mid_commit_ops` stay invisible to `get_op` permanently, modelling a
+/// commit whose actor index/tip keys are visible before the op record.
+#[derive(Clone)]
+struct StaleReadStorage {
+    inner: MemoryStorage,
+    hidden_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
+    hidden_index: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
+    mid_commit_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
+}
+
+impl StaleReadStorage {
+    fn new(inner: MemoryStorage) -> Self {
+        Self {
+            inner,
+            hidden_ops: Arc::default(),
+            hidden_index: Arc::default(),
+            mid_commit_ops: Arc::default(),
+        }
+    }
+}
+
+impl Storage for StaleReadStorage {
+    fn put_admitted_batch(&self, batch: crate_storage::AdmittedBatch) -> Result<(), Error> {
+        self.inner.put_admitted_batch(batch)
+    }
+    fn get_op(&self, id: &OpId) -> Result<Option<Op>, Error> {
+        if self.mid_commit_ops.lock().unwrap().contains(id) {
+            return Ok(None);
+        }
+        if self.hidden_ops.lock().unwrap().remove(id) {
+            return Ok(None);
+        }
+        self.inner.get_op(id)
+    }
+    fn get_meta(&self, id: &OpId) -> Result<Option<crate_storage::OpMeta>, Error> {
+        self.inner.get_meta(id)
+    }
+    fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>, Error> {
+        self.inner.list_ops(topic_id)
+    }
+    fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.list_op_ids(topic_id)
+    }
+    fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.heads(topic_id)
+    }
+    fn children(&self, op_id: &OpId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.children(op_id)
+    }
+    fn actor_tip(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+    ) -> Result<Option<(u64, OpId)>, Error> {
+        self.inner.actor_tip(topic_id, actor_id)
+    }
+    fn actor_index(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+        seq: u64,
+    ) -> Result<Option<OpId>, Error> {
+        let existing = self.inner.actor_index(topic_id, actor_id, seq)?;
+        if let Some(id) = existing
+            && self.hidden_index.lock().unwrap().remove(&id)
+        {
+            return Ok(None);
+        }
+        Ok(existing)
+    }
+    fn actor_clock(&self, topic_id: &TopicId) -> Result<ActorClock, Error> {
+        self.inner.actor_clock(topic_id)
+    }
+    fn topic_fingerprint(&self, topic_id: &TopicId) -> Result<[u8; 32], Error> {
+        self.inner.topic_fingerprint(topic_id)
+    }
+    fn max_generation(&self, topic_id: &TopicId) -> Result<u64, Error> {
+        self.inner.max_generation(topic_id)
+    }
+    fn topic_state(&self, topic_id: &TopicId) -> Result<Option<crate_storage::TopicState>, Error> {
+        self.inner.topic_state(topic_id)
+    }
+    fn list_topics(&self) -> Result<Vec<crate::TopicInfo>, Error> {
+        self.inner.list_topics()
+    }
+    fn put_pending_op(
+        &self,
+        source_peer: PeerId,
+        op: Op,
+        meta: crate_storage::OpMeta,
+    ) -> Result<(), Error> {
+        self.inner.put_pending_op(source_peer, op, meta)
+    }
+    fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>, Error> {
+        self.inner.pending_waiters(dep_id)
+    }
+    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>, Error> {
+        self.inner.ready_pending_ops()
+    }
+    fn remove_pending_op(&self, op_id: &OpId) -> Result<(), Error> {
+        self.inner.remove_pending_op(op_id)
+    }
+    fn peer_ack(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+    ) -> Result<Option<crate_storage::PeerAck>, Error> {
+        self.inner.peer_ack(peer_id, topic_id)
+    }
+    fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<crate_storage::PeerAck>, Error> {
+        self.inner.peer_acks(topic_id)
+    }
+    fn put_sync_obligation(&self, obligation: crate_storage::SyncObligation) -> Result<(), Error> {
+        self.inner.put_sync_obligation(obligation)
+    }
+    fn all_sync_obligations(&self) -> Result<Vec<crate_storage::SyncObligation>, Error> {
+        self.inner.all_sync_obligations()
+    }
+    fn apply_peer_ack(&self, ack: crate_storage::PeerAck) -> Result<usize, Error> {
+        self.inner.apply_peer_ack(ack)
+    }
+    fn sync_obligations(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+    ) -> Result<Vec<crate_storage::SyncObligation>, Error> {
+        self.inner.sync_obligations(peer_id, topic_id)
+    }
+    fn put_sync_status(&self, status: crate_storage::SyncPeerStatus) -> Result<(), Error> {
+        self.inner.put_sync_status(status)
+    }
+    fn sync_statuses(
+        &self,
+        topic_id: &TopicId,
+    ) -> Result<Vec<crate_storage::SyncPeerStatus>, Error> {
+        self.inner.sync_statuses(topic_id)
+    }
+    fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize, Error> {
+        self.inner.clear_peer_sync_state(peer_id, topic_id)
+    }
+}
+
+#[test]
+fn duplicate_op_with_stale_dedup_read_is_skipped_not_a_gap() {
+    let alice = node(87);
+    let bob_signer = Ed25519Signer::from_bytes(&[88; 32]);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob_signer.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    topic.publish(Note { text: "one".into() }).unwrap();
+    topic.publish(Note { text: "two".into() }).unwrap();
+    let mut ops = oplog::topological(alice.storage(), &topic.id()).unwrap();
+    assert_eq!(ops.len(), 3);
+    let newest = ops.pop().unwrap();
+
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let receiver = oplog::Oplog::with_storage(storage.clone());
+    let accepted = receiver
+        .receive_ops_from_peer(Some(alice.peer_id()), ops.clone())
+        .unwrap();
+    assert_eq!(accepted.len(), 2);
+
+    // Simulate a concurrent admission racing the dedup check. The duplicate
+    // genesis models a mid-flight commit: its op record is not visible yet
+    // while its actor-index entry already is (fork-check duplicate path).
+    // The second op passes a stale `get_op` and a stale actor-index read and
+    // reaches the tip/seq check (seq-gap duplicate path).
+    storage.mid_commit_ops.lock().unwrap().insert(ops[0].id);
+    storage.hidden_ops.lock().unwrap().insert(ops[1].id);
+    storage.hidden_index.lock().unwrap().insert(ops[1].id);
+
+    let mut resend = ops.clone();
+    resend.push(newest.clone());
+    let accepted = receiver
+        .receive_ops_from_peer(Some(alice.peer_id()), resend)
+        .unwrap();
+    assert_eq!(accepted, [newest.id].into());
+    assert_eq!(
+        storage
+            .actor_clock(&topic.id())
+            .unwrap()
+            .get(&actor_id_for(topic.id(), alice.peer_id())),
+        3
+    );
+}

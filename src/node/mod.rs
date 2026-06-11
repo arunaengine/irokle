@@ -385,10 +385,38 @@ impl<S: Storage> Irokle<S> {
         source_peer_id: PeerId,
         data: SyncData,
     ) -> Result<SyncAck> {
-        self.check_unknown_topic(source_peer_id, &data)?;
-        let mut ack = self
-            .sync
-            .receive_data(source_peer_id, self.peer_id(), data)?;
+        // Verify each op once up front; both the unknown-topic dry run and
+        // the real admission below reuse the result instead of re-running
+        // the ed25519 verification per pass.
+        for op in &data.ops {
+            if op.signed.body.topic_id != data.topic_id {
+                return Err(Error::TopicMismatch);
+            }
+        }
+        let mut verified = BTreeSet::new();
+        for op in &data.ops {
+            op.validate()?;
+            verified.insert(op.id);
+        }
+        self.check_unknown_topic(source_peer_id, &data, &verified)?;
+        let removals = data
+            .ops
+            .iter()
+            .filter_map(|op| match &op.signed.body.payload {
+                crate::TopicPayload::Control(TopicControl::RemovePeer { peer }) => {
+                    Some((op.id, *peer))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut ack =
+            self.sync
+                .receive_data_preverified(source_peer_id, self.peer_id(), data, &verified)?;
+        for (op_id, peer) in removals {
+            if peer != self.peer_id() && ack.accepted.contains(&op_id) {
+                self.storage().clear_peer_sync_state(&peer, &ack.topic_id)?;
+            }
+        }
         self.put_receive_forward_obligations(source_peer_id, ack.topic_id, &ack.accepted)?;
         ack.sign(&self.config.signer)?;
         Ok(ack)
@@ -475,16 +503,25 @@ impl<S: Storage> Irokle<S> {
         if !peer_allowed {
             return Err(Error::PeerNotWhitelisted(source_peer_id));
         }
-        self.check_unknown_topic(source_peer_id, data)
+        Ok(())
     }
 
-    fn check_unknown_topic(&self, source_peer_id: PeerId, data: &SyncData) -> Result<()> {
+    fn check_unknown_topic(
+        &self,
+        source_peer_id: PeerId,
+        data: &SyncData,
+        verified: &BTreeSet<crate::OpId>,
+    ) -> Result<()> {
         if self.storage().topic_state(&data.topic_id)?.is_some() {
             return Ok(());
         }
         let dry_storage = MemoryStorage::new();
         let dry_oplog = Oplog::with_storage(dry_storage.clone());
-        dry_oplog.receive_ops_from_peer(Some(source_peer_id), data.ops.clone())?;
+        dry_oplog.receive_ops_from_peer_preverified(
+            Some(source_peer_id),
+            data.ops.clone(),
+            verified,
+        )?;
         let Some(state) = dry_storage.topic_state(&data.topic_id)? else {
             return Err(Error::InvalidGenesis);
         };

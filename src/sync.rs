@@ -368,14 +368,27 @@ impl<S: Storage> SyncEngine<S> {
         ack_peer_id: PeerId,
         data: SyncData,
     ) -> Result<SyncAck> {
+        self.receive_data_preverified(source_peer_id, ack_peer_id, data, &BTreeSet::new())
+    }
+
+    /// Like [`Self::receive_data`], but skips signature verification for ops
+    /// whose id is in `verified` (the caller already ran [`Op::validate`] on
+    /// those exact ops).
+    pub(crate) fn receive_data_preverified(
+        &self,
+        source_peer_id: PeerId,
+        ack_peer_id: PeerId,
+        data: SyncData,
+        verified: &BTreeSet<OpId>,
+    ) -> Result<SyncAck> {
         for op in &data.ops {
             if op.signed.body.topic_id != data.topic_id {
                 return Err(Error::TopicMismatch);
             }
         }
-        let accepted = self
-            .oplog
-            .receive_ops_from_peer(Some(source_peer_id), data.ops)?;
+        let accepted =
+            self.oplog
+                .receive_ops_from_peer_preverified(Some(source_peer_id), data.ops, verified)?;
         Ok(SyncAck {
             topic_id: data.topic_id,
             peer_id: ack_peer_id,
