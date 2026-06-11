@@ -14,6 +14,21 @@ default = []
 fjall = ["dep:fjall"]
 iroh = ["dep:iroh", "dep:tokio"]
 
+# Ed25519 verification dominates sync tests in debug builds (~15 ms per op
+# instead of ~40 µs); optimize the crypto crates so test timings reflect
+# protocol behavior.
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.blake3]
+opt-level = 3
+
 [dependencies]
 blake3 = "1.8.5"
 bytes = { version = "1.11.1", features = ["serde"] }
