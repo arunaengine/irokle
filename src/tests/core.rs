@@ -147,6 +147,100 @@ fn event_envelope_checks_type() {
 }
 
 #[test]
+fn create_topic_with_event_matches_two_call_path() {
+    let signer = Ed25519Signer::from_bytes(&[71; 32]);
+    let topic_id = TopicId::hash(b"combined-create");
+    let actor_id = actor_id_for(topic_id, signer.peer_id());
+    let genesis = TopicGenesis {
+        event_type_id: Note::TYPE_ID.to_owned(),
+        initial_peers: BTreeSet::new(),
+        replication_policy: ReplicationPolicy::all(),
+    };
+    let envelope = EventEnvelope::encode_event(&Note {
+        text: "combined".into(),
+    })
+    .unwrap();
+
+    let combined = oplog::Oplog::new();
+    let (genesis_op, event_op) = combined
+        .create_topic_genesis_with_event(
+            topic_id,
+            actor_id,
+            genesis.clone(),
+            envelope.clone(),
+            &signer,
+        )
+        .unwrap();
+
+    let split = oplog::Oplog::new();
+    let split_genesis = split
+        .create_topic_genesis(topic_id, actor_id, genesis, &signer)
+        .unwrap();
+    let split_event = split
+        .create_event_op(topic_id, actor_id, envelope, &signer)
+        .unwrap();
+
+    // Ed25519 signing is deterministic, so the same signer and bodies yield
+    // identical ops in both stores.
+    assert_eq!(genesis_op, split_genesis);
+    assert_eq!(event_op, split_event);
+    assert_eq!(event_op.signed.body.actor_seq, 2);
+    assert_eq!(event_op.signed.body.actor_prev, Some(genesis_op.id));
+    assert_eq!(event_op.signed.body.deps, [genesis_op.id].into());
+    assert_eq!(
+        combined.storage().topic_state(&topic_id).unwrap(),
+        split.storage().topic_state(&topic_id).unwrap()
+    );
+    assert_eq!(
+        combined.storage().heads(&topic_id).unwrap(),
+        split.storage().heads(&topic_id).unwrap()
+    );
+    assert_eq!(
+        combined.storage().actor_tip(&topic_id, &actor_id).unwrap(),
+        split.storage().actor_tip(&topic_id, &actor_id).unwrap()
+    );
+    for id in [genesis_op.id, event_op.id] {
+        assert_eq!(
+            combined.storage().get_meta(&id).unwrap(),
+            split.storage().get_meta(&id).unwrap()
+        );
+    }
+}
+
+#[test]
+fn create_topic_with_event_surfaces_genesis_race() {
+    let signer = Ed25519Signer::from_bytes(&[72; 32]);
+    let topic_id = TopicId::hash(b"combined-race");
+    let actor_id = actor_id_for(topic_id, signer.peer_id());
+    let genesis = TopicGenesis {
+        event_type_id: Note::TYPE_ID.to_owned(),
+        initial_peers: BTreeSet::new(),
+        replication_policy: ReplicationPolicy::all(),
+    };
+    let envelope = EventEnvelope::encode_event(&Note {
+        text: "raced".into(),
+    })
+    .unwrap();
+
+    let oplog = oplog::Oplog::new();
+    oplog
+        .create_topic_genesis(topic_id, actor_id, genesis.clone(), &signer)
+        .unwrap();
+
+    let err = oplog
+        .create_topic_genesis_with_event(topic_id, actor_id, genesis, envelope.clone(), &signer)
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidGenesis));
+
+    // Same fallback as the two-call path: the topic exists, so the caller
+    // re-reads state and publishes the event directly.
+    let op = oplog
+        .create_event_op(topic_id, actor_id, envelope, &signer)
+        .unwrap();
+    assert_eq!(op.signed.body.actor_seq, 2);
+}
+
+#[test]
 fn event_rejects_type_mismatch() {
     let alice = node(90);
     let bob_signer = Ed25519Signer::from_bytes(&[91; 32]);

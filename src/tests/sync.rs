@@ -46,6 +46,44 @@ fn transfers_missing_ops() {
 }
 
 #[test]
+fn create_topic_with_event_replicates() {
+    let a = node(53);
+    let b = node(54);
+    let (topic, record) = a
+        .create_topic_with_event(
+            TopicConfig {
+                initial_peers: [b.peer_id()].into(),
+                ..TopicConfig::default()
+            },
+            Note {
+                text: "sync me".into(),
+            },
+        )
+        .unwrap();
+
+    let summary_b = b.sync_summary(topic.id()).unwrap();
+    let data = a.plan_sync_data(b.peer_id(), &summary_b).unwrap();
+    assert_eq!(data.ops.len(), 2);
+    let ack = b.receive_sync_data_from(a.peer_id(), data).unwrap();
+    a.apply_sync_ack(&ack).unwrap();
+
+    let opened = b.open_topic::<Note>(topic.id()).unwrap();
+    let replicated = opened.history(history::HistoryOrder::OldestFirst).unwrap();
+    assert_eq!(replicated.len(), 1);
+    assert_eq!(replicated[0].meta.op_id, record.meta.op_id);
+    assert_eq!(
+        replicated[0].event,
+        Note {
+            text: "sync me".into()
+        }
+    );
+    assert_eq!(
+        b.storage().heads(&topic.id()).unwrap(),
+        a.storage().heads(&topic.id()).unwrap()
+    );
+}
+
+#[test]
 fn summary_has_fingerprint() {
     let alice = node(35);
     let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();

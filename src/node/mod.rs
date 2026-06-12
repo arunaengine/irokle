@@ -274,6 +274,68 @@ impl<S: Storage> Irokle<S> {
         Ok(Topic::new(self.clone(), topic_id, actor_id))
     }
 
+    /// Create a topic and publish its first event in one storage transaction.
+    pub fn create_topic_with_event<E: Event>(
+        &self,
+        mut config: TopicConfig,
+        event: E,
+    ) -> Result<(Topic<E, S>, EventRecord<E>)> {
+        config.initial_peers.insert(self.peer_id());
+        let topic_id = self.next_topic_id::<E>()?;
+        let actor_id = actor_id_for(topic_id, self.peer_id());
+        let genesis = TopicGenesis {
+            event_type_id: E::TYPE_ID.to_owned(),
+            initial_peers: config.initial_peers,
+            replication_policy: config.replication_policy,
+        };
+        let envelope = EventEnvelope::encode_event(&event)?;
+        #[cfg(feature = "iroh")]
+        let (_, event_op) = self.oplog.create_topic_genesis_with_event_with_effects(
+            topic_id,
+            actor_id,
+            genesis,
+            envelope,
+            &self.config.signer,
+            |op, meta, state| {
+                self.replication_admission_effects(
+                    topic_id,
+                    op.id,
+                    meta,
+                    state,
+                    &self.config.default_write_concern,
+                )
+            },
+        )?;
+        #[cfg(not(feature = "iroh"))]
+        let (_, event_op) = self.oplog.create_topic_genesis_with_event(
+            topic_id,
+            actor_id,
+            genesis,
+            envelope,
+            &self.config.signer,
+        )?;
+        let meta = self
+            .oplog
+            .storage()
+            .get_meta(&event_op.id)?
+            .ok_or(Error::Storage("missing op meta after publish".into()))?;
+        let record = EventRecord::new(
+            event,
+            event_op.id,
+            meta.actor_id,
+            meta.actor_seq,
+            meta.observed_clock,
+        );
+        #[cfg(feature = "iroh")]
+        self.wake_async_replication(
+            topic_id,
+            event_op.id,
+            &self.config.default_write_concern,
+            "topic genesis replication wake failed",
+        )?;
+        Ok((Topic::new(self.clone(), topic_id, actor_id), record))
+    }
+
     fn next_topic_id<E: Event>(&self) -> Result<TopicId> {
         for _ in 0..16 {
             let counter = TOPIC_NONCE.fetch_add(1, Ordering::Relaxed);

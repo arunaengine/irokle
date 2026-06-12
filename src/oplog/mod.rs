@@ -24,6 +24,11 @@ pub use topology::{topological, topological_subset};
 
 const MAX_ADMISSION_RETRIES: usize = 64;
 
+enum OpAdmission {
+    Admit,
+    Duplicate,
+}
+
 #[derive(Clone)]
 pub struct Oplog<S = MemoryStorage> {
     storage: S,
@@ -87,6 +92,63 @@ impl<S: Storage> Oplog<S> {
             signer,
             effects,
         )
+    }
+
+    /// Create a topic genesis op plus its first event op and admit both in a
+    /// single storage transaction. The event op chains off the genesis
+    /// (actor_seq 2, actor_prev/deps = genesis op). Returns `(genesis, event)`.
+    /// Fails with [`Error::InvalidGenesis`] if the topic already exists, same
+    /// as [`Self::create_topic_genesis`].
+    pub fn create_topic_genesis_with_event(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        genesis: TopicGenesis,
+        event: EventEnvelope,
+        signer: &impl Signer,
+    ) -> Result<(Op, Op)> {
+        self.create_topic_genesis_with_event_with_effects(
+            topic_id,
+            actor_id,
+            genesis,
+            event,
+            signer,
+            |_, _, _| Ok(AdmissionEffects::default()),
+        )
+    }
+
+    pub(crate) fn create_topic_genesis_with_event_with_effects<F>(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        genesis: TopicGenesis,
+        event: EventEnvelope,
+        signer: &impl Signer,
+        effects: F,
+    ) -> Result<(Op, Op)>
+    where
+        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
+    {
+        let mut peers = genesis.initial_peers.clone();
+        peers.insert(signer.peer_id());
+        let genesis = TopicGenesis {
+            initial_peers: peers,
+            ..genesis
+        };
+        for _ in 0..MAX_ADMISSION_RETRIES {
+            match self.try_create_and_admit_genesis_with_event(
+                topic_id,
+                actor_id,
+                genesis.clone(),
+                event.clone(),
+                signer,
+                &effects,
+            ) {
+                Err(err) if is_local_admission_race(&err) => continue,
+                result => return result,
+            }
+        }
+        Err(Error::AdmissionConflict)
     }
 
     pub fn create_event_op(
@@ -339,7 +401,9 @@ impl<S: Storage> Oplog<S> {
                 &overlay_index,
                 &heads,
                 state.as_ref(),
-            )?;
+            )? {
+                continue;
+            }
             let meta = self.meta_for_projected(&op, &overlay_meta)?;
             heads = heads_after(&heads, &op);
             match &op.signed.body.payload {
@@ -453,6 +517,94 @@ impl<S: Storage> Oplog<S> {
         let meta = self.meta_for(&op)?;
         self.commit_admission(op.clone(), meta, expected_heads, expected_state, effects)?;
         Ok(op)
+    }
+
+    fn try_create_and_admit_genesis_with_event<F>(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        genesis: TopicGenesis,
+        event: EventEnvelope,
+        signer: &impl Signer,
+        effects: &F,
+    ) -> Result<(Op, Op)>
+    where
+        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
+    {
+        let expected_heads = self.storage.heads(&topic_id)?;
+        let expected_state = self.storage.topic_state(&topic_id)?;
+        let genesis_op = self.next_local_op(
+            topic_id,
+            actor_id,
+            expected_heads.clone(),
+            TopicPayload::Genesis(genesis),
+            signer,
+        )?;
+        genesis_op.validate()?;
+        self.validate_op(&genesis_op)?;
+        let genesis_meta = self.meta_for(&genesis_op)?;
+
+        let event_op = Op::sign(
+            OpBody {
+                topic_id,
+                author: signer.peer_id(),
+                actor_id,
+                actor_seq: checked_next(genesis_meta.actor_seq)?,
+                actor_prev: Some(genesis_op.id),
+                deps: [genesis_op.id].into(),
+                generation: checked_next(genesis_meta.generation)?,
+                payload: TopicPayload::Event(event),
+            },
+            signer,
+        )?;
+        event_op.validate()?;
+
+        let genesis_heads = heads_after(&expected_heads, &genesis_op);
+        let mut state = self
+            .topic_state_after(&genesis_op, genesis_heads.clone(), expected_state.clone())?
+            .ok_or(Error::TopicNotFound)?;
+        let overlay_ops = BTreeMap::from([(genesis_op.id, genesis_op.clone())]);
+        let overlay_meta = BTreeMap::from([(genesis_op.id, genesis_meta.clone())]);
+        let overlay_tips = BTreeMap::from([(
+            (topic_id, actor_id),
+            (genesis_meta.actor_seq, genesis_op.id),
+        )]);
+        let overlay_index = BTreeMap::from([(
+            (topic_id, actor_id, genesis_meta.actor_seq),
+            genesis_op.id,
+        )]);
+        if let OpAdmission::Duplicate = self.validate_op_projected(
+            &event_op,
+            &overlay_ops,
+            &overlay_meta,
+            &overlay_tips,
+            &overlay_index,
+            &genesis_heads,
+            Some(&state),
+        )? {
+            return Err(Error::AdmissionConflict);
+        }
+        let event_meta = self.meta_for_projected(&event_op, &overlay_meta)?;
+
+        let mut admission_effects = effects(&genesis_op, &genesis_meta, &state)?;
+        let heads = heads_after(&genesis_heads, &event_op);
+        state.heads = heads.clone();
+        admission_effects
+            .sync_obligations
+            .extend(effects(&event_op, &event_meta, &state)?.sync_obligations);
+        self.storage.put_admitted_batch(AdmittedBatch {
+            topic_id,
+            expected_heads,
+            expected_topic_state: expected_state,
+            entries: vec![
+                (genesis_op.clone(), genesis_meta),
+                (event_op.clone(), event_meta),
+            ],
+            heads,
+            topic_state: Some(state),
+            effects: admission_effects,
+        })?;
+        Ok((genesis_op, event_op))
     }
 
     fn next_local_op(
@@ -678,7 +830,7 @@ impl<S: Storage> Oplog<S> {
         overlay_tips: &BTreeMap<(TopicId, ActorId), (u64, crate::OpId)>,
         overlay_index: &BTreeMap<(TopicId, ActorId, u64), crate::OpId>,
         state: Option<&TopicState>,
-    ) -> Result<()> {
+    ) -> Result<OpAdmission> {
         let body = &op.signed.body;
         if missing_deps.len() > MAX_PENDING_MISSING_DEPS {
             return Err(Error::Storage(
@@ -693,6 +845,22 @@ impl<S: Storage> Oplog<S> {
                 expected: 1,
                 actual: 0,
             });
+        }
+        if let Some(existing) = self
+            .storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+            .or_else(|| {
+                overlay_index
+                    .get(&(body.topic_id, body.actor_id, body.actor_seq))
+                    .copied()
+            })
+        {
+            if existing != op.id {
+                return Err(Error::ActorFork);
+            }
+            if self.is_admitted_duplicate(op)? {
+                return Ok(OpAdmission::Duplicate);
+            }
         }
         match &body.payload {
             TopicPayload::Genesis(_) => {
@@ -752,18 +920,6 @@ impl<S: Storage> Oplog<S> {
                 }
             }
         }
-        if let Some(existing) = self
-            .storage
-            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            .or_else(|| {
-                overlay_index
-                    .get(&(body.topic_id, body.actor_id, body.actor_seq))
-                    .copied()
-            })
-            && existing != op.id
-        {
-            return Err(Error::ActorFork);
-        }
         let expected = match overlay_tips.get(&(body.topic_id, body.actor_id)).copied() {
             Some(tip) => Some(tip),
             None => self.storage.actor_tip(&body.topic_id, &body.actor_id)?,
@@ -771,6 +927,9 @@ impl<S: Storage> Oplog<S> {
         if let Some((tip_seq, tip_id)) = expected {
             let next_seq = checked_next(tip_seq)?;
             if body.actor_seq <= tip_seq {
+                if self.is_admitted_duplicate(op)? {
+                    return Ok(OpAdmission::Duplicate);
+                }
                 return Err(Error::ActorSeqGap {
                     expected: next_seq,
                     actual: body.actor_seq,
@@ -795,7 +954,7 @@ impl<S: Storage> Oplog<S> {
                 return Err(Error::InvalidOpId);
             }
         }
-        Ok(())
+        Ok(OpAdmission::Admit)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -808,10 +967,26 @@ impl<S: Storage> Oplog<S> {
         overlay_index: &BTreeMap<(TopicId, ActorId, u64), crate::OpId>,
         heads: &BTreeSet<crate::OpId>,
         state: Option<&TopicState>,
-    ) -> Result<()> {
+    ) -> Result<OpAdmission> {
         let body = &op.signed.body;
         if body.actor_id != actor_id_for(body.topic_id, body.author) {
             return Err(Error::ActorAuthorMismatch);
+        }
+        if let Some(existing) = self
+            .storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+            .or_else(|| {
+                overlay_index
+                    .get(&(body.topic_id, body.actor_id, body.actor_seq))
+                    .copied()
+            })
+        {
+            if existing != op.id {
+                return Err(Error::ActorFork);
+            }
+            if self.is_admitted_duplicate(op)? {
+                return Ok(OpAdmission::Duplicate);
+            }
         }
         match &body.payload {
             TopicPayload::Genesis(_) => {
@@ -861,24 +1036,15 @@ impl<S: Storage> Oplog<S> {
                 }
             }
         }
-        if let Some(existing) = self
-            .storage
-            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            .or_else(|| {
-                overlay_index
-                    .get(&(body.topic_id, body.actor_id, body.actor_seq))
-                    .copied()
-            })
-            && existing != op.id
-        {
-            return Err(Error::ActorFork);
-        }
         let expected = match overlay_tips.get(&(body.topic_id, body.actor_id)).copied() {
             Some(tip) => Some(tip),
             None => self.storage.actor_tip(&body.topic_id, &body.actor_id)?,
         };
         let (expected_seq, expected_prev) = next_actor_position(expected)?;
         if body.actor_seq != expected_seq {
+            if body.actor_seq < expected_seq && self.is_admitted_duplicate(op)? {
+                return Ok(OpAdmission::Duplicate);
+            }
             return Err(Error::ActorSeqGap {
                 expected: expected_seq,
                 actual: body.actor_seq,
@@ -895,7 +1061,24 @@ impl<S: Storage> Oplog<S> {
         if body.generation != generation {
             return Err(Error::InvalidOpId);
         }
-        Ok(())
+        Ok(OpAdmission::Admit)
+    }
+
+    /// Re-reads storage after a tip/seq mismatch: a concurrent admission may
+    /// have committed this exact op between the batch dedup check and the
+    /// validation reads. Such ops are duplicates, not gaps or forks. Op ids
+    /// are content-addressed, so an actor-index entry mapping the op's seq to
+    /// its exact id also proves admission even while the op record itself is
+    /// not yet visible mid-commit.
+    fn is_admitted_duplicate(&self, op: &Op) -> Result<bool> {
+        if self.storage.get_op(&op.id)?.is_some() {
+            return Ok(true);
+        }
+        let body = &op.signed.body;
+        Ok(self
+            .storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+            == Some(op.id))
     }
 
     fn projected_state_for_deps(
