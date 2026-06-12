@@ -386,9 +386,11 @@ impl<S: Storage> SyncEngine<S> {
                 return Err(Error::TopicMismatch);
             }
         }
-        let accepted =
-            self.oplog
-                .receive_ops_from_peer_preverified(Some(source_peer_id), data.ops, verified)?;
+        let accepted = self.oplog.receive_ops_from_peer_preverified(
+            Some(source_peer_id),
+            data.ops,
+            verified,
+        )?;
         Ok(SyncAck {
             topic_id: data.topic_id,
             peer_id: ack_peer_id,
@@ -420,10 +422,7 @@ impl<S: Storage> SyncEngine<S> {
         let mut validated = Vec::new();
         let mut peer_acks = Vec::new();
         for (index, ack) in acks.iter().enumerate() {
-            match ack
-                .verify_signature()
-                .and_then(|()| self.validate_ack(ack))
-            {
+            match ack.verify_signature().and_then(|()| self.validate_ack(ack)) {
                 Ok(()) => {
                     validated.push(index);
                     peer_acks.push(PeerAck {

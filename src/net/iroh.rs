@@ -1155,12 +1155,12 @@ impl<S: Storage> IrohNet<S> {
         for planned in group {
             messages.extend(planned.messages);
         }
-        let fail_group =
-            |outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>, error: &io::Error| {
-                for topic_id in &group_topics {
-                    outcomes.insert(*topic_id, Err(clone_error(error)));
-                }
-            };
+        let fail_group = |outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
+                          error: &io::Error| {
+            for topic_id in &group_topics {
+                outcomes.insert(*topic_id, Err(clone_error(error)));
+            }
+        };
         let responses = match self.sync_with(peer.clone(), &messages).await {
             Ok(responses) => responses,
             Err(error) => {
@@ -1243,8 +1243,8 @@ impl<S: Storage> IrohNet<S> {
                 Ok(responses) => {
                     for response in responses {
                         match response {
-                            SyncMessage::Summary(summary)
-                                if topics.contains(&summary.topic_id) => {}
+                            SyncMessage::Summary(summary) if topics.contains(&summary.topic_id) => {
+                            }
                             other => {
                                 let error = invalid_data(format!(
                                     "unexpected sync ack response {}",

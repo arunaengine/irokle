@@ -569,10 +569,8 @@ impl<S: Storage> Oplog<S> {
             (topic_id, actor_id),
             (genesis_meta.actor_seq, genesis_op.id),
         )]);
-        let overlay_index = BTreeMap::from([(
-            (topic_id, actor_id, genesis_meta.actor_seq),
-            genesis_op.id,
-        )]);
+        let overlay_index =
+            BTreeMap::from([((topic_id, actor_id, genesis_meta.actor_seq), genesis_op.id)]);
         if let OpAdmission::Duplicate = self.validate_op_projected(
             &event_op,
             &overlay_ops,

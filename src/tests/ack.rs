@@ -327,13 +327,7 @@ fn batch_ack_fixture<S: Storage>(
         })
         .unwrap();
         let (_, event_op) = oplog
-            .create_topic_genesis_with_event(
-                topic_id,
-                actor_id,
-                genesis,
-                envelope,
-                irokle.signer(),
-            )
+            .create_topic_genesis_with_event(topic_id, actor_id, genesis, envelope, irokle.signer())
             .unwrap();
         irokle
             .put_sync_obligation(peer, topic_id, [event_op.id].into())
@@ -436,7 +430,11 @@ fn batch_acks_isolate_bad_ack() {
             .is_empty()
     );
     assert_eq!(
-        irokle.sync_report(peer, topics[1]).unwrap().obligations.len(),
+        irokle
+            .sync_report(peer, topics[1])
+            .unwrap()
+            .obligations
+            .len(),
         1
     );
     assert!(
