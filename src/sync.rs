@@ -412,6 +412,42 @@ impl<S: Storage> SyncEngine<S> {
         Ok(())
     }
 
+    /// Apply many acks with the storage writes batched into one operation.
+    /// Each ack is verified and validated individually so a bad ack does not
+    /// block the others. Returns one result per input ack, in order.
+    pub fn apply_acks(&self, acks: &[SyncAck]) -> Vec<Result<()>> {
+        let mut results = Vec::with_capacity(acks.len());
+        let mut validated = Vec::new();
+        let mut peer_acks = Vec::new();
+        for (index, ack) in acks.iter().enumerate() {
+            match ack
+                .verify_signature()
+                .and_then(|()| self.validate_ack(ack))
+            {
+                Ok(()) => {
+                    validated.push(index);
+                    peer_acks.push(PeerAck {
+                        peer_id: ack.peer_id,
+                        topic_id: ack.topic_id,
+                        heads: ack.heads.clone(),
+                        clock: ack.clock.clone(),
+                    });
+                    results.push(Ok(()));
+                }
+                Err(err) => results.push(Err(err)),
+            }
+        }
+        if !peer_acks.is_empty()
+            && let Err(err) = self.oplog.storage().apply_peer_acks(peer_acks)
+        {
+            let message = err.to_string();
+            for index in validated {
+                results[index] = Err(Error::Storage(message.clone()));
+            }
+        }
+        results
+    }
+
     pub fn record_peer_synced(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
         let state = self
             .oplog

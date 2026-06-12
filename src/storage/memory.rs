@@ -417,15 +417,16 @@ impl Storage for MemoryStorage {
 
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {
         let mut inner = self.lock()?;
-        let key = (ack.peer_id, ack.topic_id);
-        let effective_ack = match inner.peer_acks.get(&key) {
-            Some(existing) if stored_ack_dominates(existing, &ack) => existing.clone(),
-            _ => {
-                inner.peer_acks.insert(key, ack.clone());
-                ack
-            }
-        };
-        Ok(clear_satisfied_locked(&mut inner, &effective_ack))
+        Ok(apply_peer_ack_locked(&mut inner, ack))
+    }
+
+    fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<usize> {
+        let mut inner = self.lock()?;
+        let mut cleared = 0;
+        for ack in acks {
+            cleared += apply_peer_ack_locked(&mut inner, ack);
+        }
+        Ok(cleared)
     }
 
     fn sync_obligations(
@@ -478,6 +479,18 @@ impl Storage for MemoryStorage {
             .cloned()
             .collect())
     }
+}
+
+fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> usize {
+    let key = (ack.peer_id, ack.topic_id);
+    let effective_ack = match inner.peer_acks.get(&key) {
+        Some(existing) if stored_ack_dominates(existing, &ack) => existing.clone(),
+        _ => {
+            inner.peer_acks.insert(key, ack.clone());
+            ack
+        }
+    };
+    clear_satisfied_locked(inner, &effective_ack)
 }
 
 fn clear_satisfied_locked(inner: &mut MemoryInner, ack: &PeerAck) -> usize {

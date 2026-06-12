@@ -496,6 +496,13 @@ impl<S: Storage> Irokle<S> {
         self.sync.apply_ack(ack)
     }
 
+    /// Apply many sync acks with batched storage writes. Each ack is verified
+    /// and validated individually; a failed ack does not block the others.
+    /// Returns one result per input ack, in order.
+    pub fn apply_sync_acks(&self, acks: &[SyncAck]) -> Vec<Result<()>> {
+        self.sync.apply_acks(acks)
+    }
+
     pub fn peer_whitelist(&self) -> Result<Option<BTreeSet<PeerId>>> {
         Ok(self
             .peer_whitelist

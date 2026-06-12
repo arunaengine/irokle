@@ -135,6 +135,16 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// between them cannot leave the ack visible while obligations remain,
     /// or vice-versa. Returns the number of cleared obligations.
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize>;
+    /// Apply many peer acks in order, equivalent to calling
+    /// [`Storage::apply_peer_ack`] per ack. Backends may batch all writes into
+    /// one durable operation. Returns the total number of cleared obligations.
+    fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<usize> {
+        let mut cleared = 0;
+        for ack in acks {
+            cleared += self.apply_peer_ack(ack)?;
+        }
+        Ok(cleared)
+    }
     fn sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId)
     -> Result<Vec<SyncObligation>>;
     fn has_sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<bool> {

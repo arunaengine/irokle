@@ -298,6 +298,167 @@ fn rejects_unknown_heads() {
     );
 }
 
+fn batch_ack_fixture<S: Storage>(
+    storage: S,
+) -> (Irokle<S>, Vec<sync::SyncAck>, Vec<TopicId>, PeerId) {
+    let ack_signer = Ed25519Signer::from_bytes(&[88; 32]);
+    let peer = ack_signer.peer_id();
+    let irokle = Irokle::with_storage(
+        storage,
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[87; 32]),
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let oplog = oplog::Oplog::with_storage(irokle.storage().clone());
+    let mut acks = Vec::new();
+    let mut topics = Vec::new();
+    for index in 0..3u8 {
+        let topic_id = TopicId::hash([b"batch-ack".as_slice(), &[index]].concat());
+        let actor_id = actor_id_for(topic_id, irokle.peer_id());
+        let genesis = TopicGenesis {
+            event_type_id: Note::TYPE_ID.to_owned(),
+            initial_peers: [peer].into(),
+            replication_policy: ReplicationPolicy::all(),
+        };
+        let envelope = EventEnvelope::encode_event(&Note {
+            text: format!("note {index}"),
+        })
+        .unwrap();
+        let (_, event_op) = oplog
+            .create_topic_genesis_with_event(
+                topic_id,
+                actor_id,
+                genesis,
+                envelope,
+                irokle.signer(),
+            )
+            .unwrap();
+        irokle
+            .put_sync_obligation(peer, topic_id, [event_op.id].into())
+            .unwrap();
+        let mut clock = ActorClock::new();
+        clock.observe(actor_id, event_op.signed.body.actor_seq);
+        let mut ack = sync::SyncAck {
+            topic_id,
+            peer_id: peer,
+            accepted: BTreeSet::new(),
+            heads: [event_op.id].into(),
+            clock,
+            signature: None,
+        };
+        ack.sign(&ack_signer).unwrap();
+        acks.push(ack);
+        topics.push(topic_id);
+    }
+    (irokle, acks, topics, peer)
+}
+
+fn assert_batch_acks_match_loop<S: Storage>(loop_storage: S, batch_storage: S) {
+    let (loop_node, acks, topics, peer) = batch_ack_fixture(loop_storage);
+    let (batch_node, batch_acks, _, _) = batch_ack_fixture(batch_storage);
+    assert_eq!(acks, batch_acks);
+
+    for ack in &acks {
+        loop_node.apply_sync_ack(ack).unwrap();
+    }
+    let results = batch_node.apply_sync_acks(&batch_acks);
+    assert!(results.iter().all(|result| result.is_ok()));
+
+    for topic_id in &topics {
+        assert_eq!(
+            loop_node.storage().peer_ack(&peer, topic_id).unwrap(),
+            batch_node.storage().peer_ack(&peer, topic_id).unwrap()
+        );
+        assert!(
+            batch_node
+                .storage()
+                .peer_ack(&peer, topic_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            loop_node.sync_report(peer, *topic_id).unwrap().obligations,
+            batch_node.sync_report(peer, *topic_id).unwrap().obligations
+        );
+        assert!(
+            batch_node
+                .sync_report(peer, *topic_id)
+                .unwrap()
+                .obligations
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn memory_batch_acks_match_loop() {
+    assert_batch_acks_match_loop(MemoryStorage::new(), MemoryStorage::new());
+}
+
+#[test]
+fn batch_acks_isolate_bad_ack() {
+    let (irokle, mut acks, topics, peer) = batch_ack_fixture(MemoryStorage::new());
+    acks[1].signature = None;
+
+    let results = irokle.apply_sync_acks(&acks);
+
+    assert!(results[0].is_ok());
+    assert!(matches!(results[1], Err(Error::MissingSignature)));
+    assert!(results[2].is_ok());
+    assert!(
+        irokle
+            .storage()
+            .peer_ack(&peer, &topics[0])
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        irokle
+            .storage()
+            .peer_ack(&peer, &topics[1])
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        irokle
+            .storage()
+            .peer_ack(&peer, &topics[2])
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        irokle
+            .sync_report(peer, topics[0])
+            .unwrap()
+            .obligations
+            .is_empty()
+    );
+    assert_eq!(
+        irokle.sync_report(peer, topics[1]).unwrap().obligations.len(),
+        1
+    );
+    assert!(
+        irokle
+            .sync_report(peer, topics[2])
+            .unwrap()
+            .obligations
+            .is_empty()
+    );
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_batch_acks_match_loop() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    assert_batch_acks_match_loop(
+        crate_storage::FjallStorage::open(dir_a.path()).unwrap(),
+        crate_storage::FjallStorage::open(dir_b.path()).unwrap(),
+    );
+}
+
 #[cfg(feature = "fjall")]
 #[test]
 fn fjall_clears_satisfied() {

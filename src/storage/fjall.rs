@@ -187,6 +187,27 @@ impl FjallStorage {
             .transpose()?)
     }
 
+    fn tx_apply_peer_ack(
+        tx: &mut fjall::OptimisticWriteTx,
+        records: &fjall::OptimisticTxKeyspace,
+        ack: &PeerAck,
+    ) -> Result<usize> {
+        let ack_key = [
+            b"ak".as_slice(),
+            ack.peer_id.as_ref(),
+            ack.topic_id.as_ref(),
+        ]
+        .concat();
+        let effective_ack = match Self::tx_get::<PeerAck>(tx, records, ack_key.as_slice())? {
+            Some(existing) if stored_ack_dominates(&existing, ack) => existing,
+            _ => {
+                Self::tx_put(tx, records, ack_key, ack)?;
+                ack.clone()
+            }
+        };
+        clear_satisfied_tx(tx, records, &effective_ack)
+    }
+
     fn op_id_from_key(key: &[u8], offset: usize) -> Result<OpId> {
         let bytes = key
             .get(offset..offset + OpId::LEN)
@@ -656,22 +677,19 @@ impl Storage for FjallStorage {
     }
 
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {
+        self.transaction(|tx| Self::tx_apply_peer_ack(tx, &self.records, &ack))
+    }
+
+    fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<usize> {
+        if acks.is_empty() {
+            return Ok(0);
+        }
         self.transaction(|tx| {
-            let ack_key = [
-                b"ak".as_slice(),
-                ack.peer_id.as_ref(),
-                ack.topic_id.as_ref(),
-            ]
-            .concat();
-            let effective_ack =
-                match Self::tx_get::<PeerAck>(tx, &self.records, ack_key.as_slice())? {
-                    Some(existing) if stored_ack_dominates(&existing, &ack) => existing,
-                    _ => {
-                        Self::tx_put(tx, &self.records, ack_key, &ack)?;
-                        ack.clone()
-                    }
-                };
-            clear_satisfied_tx(tx, &self.records, &effective_ack)
+            let mut cleared = 0;
+            for ack in &acks {
+                cleared += Self::tx_apply_peer_ack(tx, &self.records, ack)?;
+            }
+            Ok(cleared)
         })
     }
 
