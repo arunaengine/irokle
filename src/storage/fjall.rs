@@ -762,6 +762,96 @@ impl Storage for FjallStorage {
         }
         Ok(out)
     }
+
+    fn reset_topic(&self, topic_id: &TopicId) -> Result<usize> {
+        self.transaction(|tx| {
+            // Topic op ids come from the `to` index; op records, meta, and the
+            // children edges are keyed by op id, not by topic.
+            let to_prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
+            let mut op_ids = Vec::new();
+            for item in fjall::Readable::prefix(tx, &self.records, to_prefix) {
+                let (key, _) = item.into_inner()?;
+                op_ids.push(Self::op_id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
+            }
+            let removed = op_ids.len();
+            for op_id in &op_ids {
+                tx.remove(&self.records, Self::key_id(b"o", op_id));
+                tx.remove(&self.records, Self::key_id(b"m", op_id));
+                let ch_prefix = [b"ch".as_slice(), op_id.as_ref()].concat();
+                let mut ch_keys = Vec::new();
+                for item in fjall::Readable::prefix(tx, &self.records, ch_prefix) {
+                    let (key, _) = item.into_inner()?;
+                    ch_keys.push(key.to_vec());
+                }
+                for key in ch_keys {
+                    tx.remove(&self.records, key);
+                }
+                tx.remove(
+                    &self.records,
+                    [b"to".as_slice(), topic_id.as_ref(), op_id.as_ref()].concat(),
+                );
+            }
+            for prefix in [
+                b"h".as_slice(),
+                b"ac".as_slice(),
+                b"fp".as_slice(),
+                b"mg".as_slice(),
+                b"ts".as_slice(),
+            ] {
+                tx.remove(&self.records, Self::key_id(prefix, topic_id));
+            }
+            // Actor index/tip and sync status share a `<prefix><topic>` layout.
+            for prefix in [b"as".as_slice(), b"at".as_slice(), b"ss".as_slice()] {
+                let scan = [prefix, topic_id.as_ref()].concat();
+                let mut keys = Vec::new();
+                for item in fjall::Readable::prefix(tx, &self.records, scan) {
+                    let (key, _) = item.into_inner()?;
+                    keys.push(key.to_vec());
+                }
+                for key in keys {
+                    tx.remove(&self.records, key);
+                }
+            }
+            // Peer acks key on `<peer><topic>` and obligations on
+            // `<peer><topic><digest>`, so the topic is not a scan prefix; filter
+            // by the decoded record instead.
+            let mut ak_keys = Vec::new();
+            for item in fjall::Readable::prefix(tx, &self.records, b"ak".as_slice()) {
+                let (key, value) = item.into_inner()?;
+                let ack: PeerAck = postcard::from_bytes(value.as_ref())?;
+                if ack.topic_id == *topic_id {
+                    ak_keys.push(key.to_vec());
+                }
+            }
+            for key in ak_keys {
+                tx.remove(&self.records, key);
+            }
+            let mut ob_keys = Vec::new();
+            for item in fjall::Readable::prefix(tx, &self.records, b"ob".as_slice()) {
+                let (key, value) = item.into_inner()?;
+                let obligation: SyncObligation = postcard::from_bytes(value.as_ref())?;
+                if obligation.topic_id == *topic_id {
+                    ob_keys.push(key.to_vec());
+                }
+            }
+            for key in ob_keys {
+                tx.remove(&self.records, key);
+            }
+            // Pending ops key on op id; the topic lives in the stored meta.
+            let mut pending_ids = Vec::new();
+            for item in fjall::Readable::prefix(tx, &self.records, b"po".as_slice()) {
+                let (key, value) = item.into_inner()?;
+                let (_, _, meta): (PeerId, Op, OpMeta) = postcard::from_bytes(value.as_ref())?;
+                if meta.topic_id == *topic_id {
+                    pending_ids.push(Self::op_id_from_key(key.as_ref(), 2)?);
+                }
+            }
+            for op_id in pending_ids {
+                Self::tx_remove_pending_op(tx, &self.records, &op_id)?;
+            }
+            Ok(removed)
+        })
+    }
 }
 
 #[cfg(feature = "fjall")]

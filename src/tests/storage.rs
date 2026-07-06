@@ -170,6 +170,177 @@ fn memory_reconciles_pending() {
     assert_pending_reconciles(MemoryStorage::new());
 }
 
+fn assert_reset_topic_clears_everything<S: Storage>(storage: S) {
+    let signer = Ed25519Signer::from_bytes(&[71; 32]);
+    let peer = signer.peer_id();
+    let other_peer = PeerId::hash(b"reset-other-peer");
+    let config = NodeConfig {
+        signer,
+        default_write_concern: WriteConcern::Local,
+        ..NodeConfig::default()
+    };
+    let node = Irokle::with_storage(storage.clone(), config).unwrap();
+
+    let topic = node
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [other_peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let topic_id = topic.id();
+    topic.publish(Note { text: "one".into() }).unwrap();
+    topic.publish(Note { text: "two".into() }).unwrap();
+    let genesis_id = oplog::topological(&storage, &topic_id).unwrap()[0].id;
+    let actor_id = actor_id_for(topic_id, peer);
+
+    // A second topic that reset must leave untouched.
+    let survivor = node.create_topic::<Note>(TopicConfig::default()).unwrap();
+    let survivor_id = survivor.id();
+    survivor
+        .publish(Note {
+            text: "keep".into(),
+        })
+        .unwrap();
+    let survivor_ops = storage.list_op_ids(&survivor_id).unwrap();
+
+    // Buffered pending op targeting the topic whose dependency never arrives.
+    let author_signer = Ed25519Signer::from_bytes(&[72; 32]);
+    let author = author_signer.peer_id();
+    let missing_dep = OpId::hash(b"reset-missing-dep");
+    let author_actor = actor_id_for(topic_id, author);
+    let pending_op = Op::sign(
+        OpBody {
+            topic_id,
+            author,
+            actor_id: author_actor,
+            actor_seq: 5,
+            actor_prev: Some(missing_dep),
+            deps: [missing_dep].into(),
+            generation: 9,
+            payload: TopicPayload::Event(
+                EventEnvelope::encode_event(&Note {
+                    text: "pending".into(),
+                })
+                .unwrap(),
+            ),
+        },
+        &author_signer,
+    )
+    .unwrap();
+    let pending_meta = crate_storage::OpMeta {
+        id: pending_op.id,
+        topic_id,
+        author,
+        actor_id: author_actor,
+        actor_seq: 5,
+        actor_prev: Some(missing_dep),
+        deps: [missing_dep].into(),
+        generation: 9,
+        observed_clock: ActorClock::new(),
+        ready: false,
+        missing_deps: [missing_dep].into(),
+    };
+    storage
+        .put_pending_op(author, pending_op, pending_meta)
+        .unwrap();
+
+    // Stored peer ack, sync obligation, and sync status for the topic.
+    let mut ack_clock = ActorClock::new();
+    ack_clock.observe(actor_id, 3);
+    storage
+        .apply_peer_ack(crate_storage::PeerAck {
+            peer_id: other_peer,
+            topic_id,
+            heads: storage.heads(&topic_id).unwrap(),
+            clock: ack_clock,
+        })
+        .unwrap();
+    storage
+        .put_sync_obligation(crate_storage::SyncObligation {
+            peer_id: other_peer,
+            topic_id,
+            op_ids: [OpId::hash(b"reset-obligation-op")].into(),
+            target_clock: ActorClock::new(),
+        })
+        .unwrap();
+    storage
+        .put_sync_status(crate_storage::SyncPeerStatus {
+            peer_id: other_peer,
+            topic_id,
+            ..crate_storage::SyncPeerStatus::default()
+        })
+        .unwrap();
+
+    let topic_op_ids = storage.list_op_ids(&topic_id).unwrap();
+    assert_eq!(topic_op_ids.len(), 3);
+    assert!(!storage.pending_waiters(&missing_dep).unwrap().is_empty());
+
+    let removed = storage.reset_topic(&topic_id).unwrap();
+    assert_eq!(removed, 3);
+
+    // Every per-topic keyspace is empty.
+    assert!(storage.topic_state(&topic_id).unwrap().is_none());
+    assert!(storage.list_op_ids(&topic_id).unwrap().is_empty());
+    assert!(storage.list_ops(&topic_id).unwrap().is_empty());
+    assert!(storage.heads(&topic_id).unwrap().is_empty());
+    assert!(storage.actor_clock(&topic_id).unwrap().is_empty());
+    assert_eq!(storage.max_generation(&topic_id).unwrap(), 0);
+    assert!(storage.actor_tip(&topic_id, &actor_id).unwrap().is_none());
+    assert!(
+        storage
+            .actor_index(&topic_id, &actor_id, 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(storage.children(&genesis_id).unwrap().is_empty());
+    assert_eq!(
+        storage.topic_fingerprint(&topic_id).unwrap(),
+        storage
+            .topic_fingerprint(&TopicId::hash(b"reset-empty"))
+            .unwrap()
+    );
+    for op_id in &topic_op_ids {
+        assert!(storage.get_op(op_id).unwrap().is_none());
+        assert!(storage.get_meta(op_id).unwrap().is_none());
+    }
+    assert!(storage.peer_acks(&topic_id).unwrap().is_empty());
+    assert!(storage.peer_ack(&other_peer, &topic_id).unwrap().is_none());
+    assert!(
+        storage
+            .sync_obligations(&other_peer, &topic_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        storage
+            .all_sync_obligations()
+            .unwrap()
+            .iter()
+            .all(|o| o.topic_id != topic_id)
+    );
+    assert!(storage.sync_statuses(&topic_id).unwrap().is_empty());
+    assert!(storage.pending_waiters(&missing_dep).unwrap().is_empty());
+
+    // The survivor topic is intact.
+    assert!(storage.topic_state(&survivor_id).unwrap().is_some());
+    assert_eq!(storage.list_op_ids(&survivor_id).unwrap(), survivor_ops);
+    assert!(!storage.heads(&survivor_id).unwrap().is_empty());
+    assert_eq!(storage.list_topics().unwrap().len(), 1);
+}
+
+#[test]
+fn memory_reset_topic_clears_everything() {
+    assert_reset_topic_clears_everything(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reset_topic_clears_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    assert_reset_topic_clears_everything(storage);
+}
+
 #[test]
 fn rejects_too_many_pending_deps() {
     let signer = Ed25519Signer::from_bytes(&[49; 32]);

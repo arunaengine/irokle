@@ -1172,6 +1172,9 @@ impl Storage for StaleReadStorage {
     fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize, Error> {
         self.inner.clear_peer_sync_state(peer_id, topic_id)
     }
+    fn reset_topic(&self, topic_id: &TopicId) -> Result<usize, Error> {
+        self.inner.reset_topic(topic_id)
+    }
 }
 
 #[test]

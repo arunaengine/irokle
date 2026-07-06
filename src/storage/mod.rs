@@ -156,6 +156,17 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// a topic. Returns the number of cleared obligations.
     fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize>;
 
+    /// Atomically remove every local record for `topic_id`: topic/genesis
+    /// registration, all ops and their metadata, actor indexes/tips, heads,
+    /// fingerprint, max generation, the topic's actor clock, buffered pending
+    /// ops targeting the topic, and every peer's stored acks, sync
+    /// obligations, and sync statuses for the topic. Used by genesis tie-break
+    /// resolution to adopt a winning foreign genesis; a partial reset would
+    /// leave stale actor tips or acks that keep sync clocks diverging, so
+    /// backends must clear all per-topic keyspaces. Returns the number of
+    /// admitted ops removed.
+    fn reset_topic(&self, topic_id: &TopicId) -> Result<usize>;
+
     fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
         let Some(meta) = self.get_meta(op_id)? else {
             return Ok(false);

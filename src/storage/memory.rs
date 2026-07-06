@@ -479,6 +479,37 @@ impl Storage for MemoryStorage {
             .cloned()
             .collect())
     }
+
+    fn reset_topic(&self, topic_id: &TopicId) -> Result<usize> {
+        let mut inner = self.lock()?;
+        let op_ids = inner.topic_ops.remove(topic_id).unwrap_or_default();
+        let removed = op_ids.len();
+        for op_id in &op_ids {
+            inner.ops.remove(op_id);
+            inner.meta.remove(op_id);
+            inner.children.remove(op_id);
+        }
+        inner.heads.remove(topic_id);
+        inner.actor_clock.remove(topic_id);
+        inner.topic_fingerprint.remove(topic_id);
+        inner.max_generation.remove(topic_id);
+        inner.topics.remove(topic_id);
+        inner.actor_by_seq.retain(|(t, _, _), _| t != topic_id);
+        inner.actor_tip.retain(|(t, _), _| t != topic_id);
+        inner.peer_acks.retain(|(_, t), _| t != topic_id);
+        inner.obligations.retain(|o| o.topic_id != *topic_id);
+        inner.sync_statuses.retain(|(t, _), _| t != topic_id);
+        let pending: Vec<OpId> = inner
+            .pending_ops
+            .iter()
+            .filter(|(_, (_, _, meta))| meta.topic_id == *topic_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for op_id in pending {
+            remove_pending_locked(&mut inner, &op_id);
+        }
+        Ok(removed)
+    }
 }
 
 fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> usize {
