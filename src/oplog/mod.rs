@@ -419,8 +419,12 @@ impl<S: Storage> Oplog<S> {
         } else {
             (ops, None)
         };
+        // A won foreign genesis discards the local chain: admit the winner
+        // batch against a fresh topic and fold the reset into the same storage
+        // transaction as its admission (`reset_topic_and_admit`).
+        let reset = eviction.is_some();
         for _ in 0..MAX_ADMISSION_RETRIES {
-            match self.admit_ops_batch(source_peer, ops.clone(), verified) {
+            match self.admit_ops_batch(source_peer, ops.clone(), verified, reset) {
                 Err(Error::AdmissionConflict) => continue,
                 Ok(accepted) => return Ok((accepted, eviction)),
                 Err(err) => return Err(err),
@@ -479,7 +483,7 @@ impl<S: Storage> Oplog<S> {
                 let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
                 return Ok((filtered, None));
             }
-            let eviction = self.evict_and_reset_topic(topic_id, &state, genesis.id)?;
+            let eviction = self.extract_eviction(topic_id, &state, genesis.id)?;
             tracing::warn!(
                 %topic_id,
                 losing_genesis = %state.genesis,
@@ -502,9 +506,12 @@ impl<S: Storage> Oplog<S> {
     }
 
     /// Extract the local topic chain's non-genesis payloads (ordered by actor,
-    /// then sequence) and then wipe every local record for the topic so the
-    /// winning genesis can be admitted from a clean slate.
-    fn evict_and_reset_topic(
+    /// then sequence) so the application can re-emit them under the winning
+    /// genesis. The actual reset is deferred: the winner batch's admission runs
+    /// the reset and the writes in one storage transaction
+    /// (`reset_topic_and_admit`), so a crash cannot land between them. These
+    /// reads stay outside that transaction.
+    fn extract_eviction(
         &self,
         topic_id: TopicId,
         local_state: &TopicState,
@@ -533,7 +540,6 @@ impl<S: Storage> Oplog<S> {
                 payload: op.signed.body.payload.clone(),
             });
         }
-        self.storage.reset_topic(&topic_id)?;
         Ok(TopicEviction {
             topic_id,
             losing_genesis: local_state.genesis,
@@ -547,6 +553,7 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
+        reset: bool,
     ) -> Result<BTreeSet<crate::OpId>> {
         let ops = topological_ops(ops)?;
         let mut accepted = BTreeSet::new();
@@ -557,8 +564,17 @@ impl<S: Storage> Oplog<S> {
             return Err(Error::TopicMismatch);
         }
 
-        let expected_heads = self.storage.heads(&topic_id)?;
-        let expected_state = self.storage.topic_state(&topic_id)?;
+        // On the reset path the local topic is wiped and the winner batch is
+        // self-contained, so validate and admit it against a fresh topic; the
+        // reset is applied atomically with these writes below.
+        let (expected_heads, expected_state) = if reset {
+            (BTreeSet::new(), None)
+        } else {
+            (
+                self.storage.heads(&topic_id)?,
+                self.storage.topic_state(&topic_id)?,
+            )
+        };
         let mut heads = expected_heads.clone();
         let mut state = expected_state.clone();
         let mut topic_state_changed = false;
@@ -650,7 +666,22 @@ impl<S: Storage> Oplog<S> {
             )?;
         }
 
-        if !entries.is_empty() {
+        if reset {
+            // Reset and winner admission share one storage transaction so a
+            // crash never leaves the topic empty with the winner uninstalled.
+            self.storage.reset_topic_and_admit(
+                &topic_id,
+                AdmittedBatch {
+                    topic_id,
+                    expected_heads,
+                    expected_topic_state: expected_state,
+                    entries,
+                    heads,
+                    topic_state: topic_state_changed.then(|| state.clone()).flatten(),
+                    effects: AdmissionEffects::default(),
+                },
+            )?;
+        } else if !entries.is_empty() {
             self.storage.put_admitted_batch(AdmittedBatch {
                 topic_id,
                 expected_heads,

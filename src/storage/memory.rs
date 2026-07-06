@@ -49,139 +49,8 @@ impl MemoryStorage {
 
 impl Storage for MemoryStorage {
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
-        let AdmittedBatch {
-            topic_id,
-            expected_heads,
-            expected_topic_state,
-            entries,
-            heads,
-            topic_state,
-            effects,
-        } = batch;
         let mut inner = self.lock()?;
-        if inner.heads.get(&topic_id).cloned().unwrap_or_default() != expected_heads {
-            return Err(Error::AdmissionConflict);
-        }
-        if memory_topic_state_locked(&inner, &topic_id) != expected_topic_state {
-            return Err(Error::AdmissionConflict);
-        }
-        let mut actor_tips = BTreeMap::new();
-        let mut new_entries = Vec::new();
-        for (op, meta) in entries {
-            if let Some(existing) = inner.ops.get(&op.id) {
-                if existing != &op {
-                    return Err(Error::Storage("op id collision with different op".into()));
-                }
-                continue;
-            }
-            if let Some(existing) =
-                inner
-                    .actor_by_seq
-                    .get(&(meta.topic_id, meta.actor_id, meta.actor_seq))
-                && *existing != op.id
-            {
-                return Err(Error::ActorFork);
-            }
-            let tip = actor_tips
-                .get(&(meta.topic_id, meta.actor_id))
-                .copied()
-                .or_else(|| {
-                    inner
-                        .actor_tip
-                        .get(&(meta.topic_id, meta.actor_id))
-                        .copied()
-                });
-            match tip {
-                Some((seq, id)) => {
-                    let expected = seq.checked_add(1).ok_or(Error::InvalidOpId)?;
-                    if meta.actor_seq != expected {
-                        return Err(Error::ActorSeqGap {
-                            expected,
-                            actual: meta.actor_seq,
-                        });
-                    }
-                    if meta.actor_prev != Some(id) {
-                        return Err(Error::ActorPrevMismatch);
-                    }
-                }
-                None => {
-                    if meta.actor_seq != 1 {
-                        return Err(Error::ActorSeqGap {
-                            expected: 1,
-                            actual: meta.actor_seq,
-                        });
-                    }
-                    if meta.actor_prev.is_some() {
-                        return Err(Error::ActorPrevMismatch);
-                    }
-                }
-            }
-            actor_tips.insert((meta.topic_id, meta.actor_id), (meta.actor_seq, op.id));
-            new_entries.push((op, meta));
-        }
-
-        let topic_id = topic_state
-            .as_ref()
-            .map(|state| state.topic_id)
-            .or_else(|| new_entries.first().map(|(_, meta)| meta.topic_id));
-        if let Some(topic_id) = topic_id
-            && new_entries
-                .iter()
-                .any(|(_, meta)| meta.topic_id != topic_id)
-        {
-            return Err(Error::TopicMismatch);
-        }
-
-        for (op, meta) in new_entries {
-            inner
-                .topic_ops
-                .entry(meta.topic_id)
-                .or_default()
-                .insert(op.id);
-            for dep in &meta.deps {
-                inner.children.entry(*dep).or_default().insert(op.id);
-            }
-            inner
-                .actor_by_seq
-                .insert((meta.topic_id, meta.actor_id, meta.actor_seq), op.id);
-            inner
-                .actor_tip
-                .insert((meta.topic_id, meta.actor_id), (meta.actor_seq, op.id));
-            inner
-                .actor_clock
-                .entry(meta.topic_id)
-                .or_default()
-                .observe(meta.actor_id, meta.actor_seq);
-            inner
-                .max_generation
-                .entry(meta.topic_id)
-                .and_modify(|generation| *generation = (*generation).max(meta.generation))
-                .or_insert(meta.generation);
-            remove_pending_locked(&mut inner, &op.id);
-            inner.meta.insert(op.id, meta);
-            inner.ops.insert(op.id, op);
-        }
-
-        if let Some(topic_id) = topic_id {
-            inner.heads.insert(topic_id, heads.clone());
-            let clock = inner
-                .actor_clock
-                .get(&topic_id)
-                .cloned()
-                .unwrap_or_default();
-            inner
-                .topic_fingerprint
-                .insert(topic_id, topic_fingerprint_for(&heads, &clock)?);
-        }
-        if let Some(state) = topic_state {
-            inner.topics.insert(state.topic_id, state);
-        }
-        for obligation in effects.sync_obligations {
-            if !inner.obligations.contains(&obligation) {
-                inner.obligations.push(obligation);
-            }
-        }
-        Ok(())
+        put_admitted_batch_locked(&mut inner, batch)
     }
 
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
@@ -482,34 +351,180 @@ impl Storage for MemoryStorage {
 
     fn reset_topic(&self, topic_id: &TopicId) -> Result<usize> {
         let mut inner = self.lock()?;
-        let op_ids = inner.topic_ops.remove(topic_id).unwrap_or_default();
-        let removed = op_ids.len();
-        for op_id in &op_ids {
-            inner.ops.remove(op_id);
-            inner.meta.remove(op_id);
-            inner.children.remove(op_id);
-        }
-        inner.heads.remove(topic_id);
-        inner.actor_clock.remove(topic_id);
-        inner.topic_fingerprint.remove(topic_id);
-        inner.max_generation.remove(topic_id);
-        inner.topics.remove(topic_id);
-        inner.actor_by_seq.retain(|(t, _, _), _| t != topic_id);
-        inner.actor_tip.retain(|(t, _), _| t != topic_id);
-        inner.peer_acks.retain(|(_, t), _| t != topic_id);
-        inner.obligations.retain(|o| o.topic_id != *topic_id);
-        inner.sync_statuses.retain(|(t, _), _| t != topic_id);
-        let pending: Vec<OpId> = inner
-            .pending_ops
-            .iter()
-            .filter(|(_, (_, _, meta))| meta.topic_id == *topic_id)
-            .map(|(id, _)| *id)
-            .collect();
-        for op_id in pending {
-            remove_pending_locked(&mut inner, &op_id);
-        }
+        Ok(reset_topic_locked(&mut inner, topic_id))
+    }
+
+    fn reset_topic_and_admit(&self, topic_id: &TopicId, batch: AdmittedBatch) -> Result<usize> {
+        let mut inner = self.lock()?;
+        let removed = reset_topic_locked(&mut inner, topic_id);
+        put_admitted_batch_locked(&mut inner, batch)?;
         Ok(removed)
     }
+}
+
+fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<()> {
+    let AdmittedBatch {
+        topic_id,
+        expected_heads,
+        expected_topic_state,
+        entries,
+        heads,
+        topic_state,
+        effects,
+    } = batch;
+    if inner.heads.get(&topic_id).cloned().unwrap_or_default() != expected_heads {
+        return Err(Error::AdmissionConflict);
+    }
+    if memory_topic_state_locked(inner, &topic_id) != expected_topic_state {
+        return Err(Error::AdmissionConflict);
+    }
+    let mut actor_tips = BTreeMap::new();
+    let mut new_entries = Vec::new();
+    for (op, meta) in entries {
+        if let Some(existing) = inner.ops.get(&op.id) {
+            if existing != &op {
+                return Err(Error::Storage("op id collision with different op".into()));
+            }
+            continue;
+        }
+        if let Some(existing) =
+            inner
+                .actor_by_seq
+                .get(&(meta.topic_id, meta.actor_id, meta.actor_seq))
+            && *existing != op.id
+        {
+            return Err(Error::ActorFork);
+        }
+        let tip = actor_tips
+            .get(&(meta.topic_id, meta.actor_id))
+            .copied()
+            .or_else(|| {
+                inner
+                    .actor_tip
+                    .get(&(meta.topic_id, meta.actor_id))
+                    .copied()
+            });
+        match tip {
+            Some((seq, id)) => {
+                let expected = seq.checked_add(1).ok_or(Error::InvalidOpId)?;
+                if meta.actor_seq != expected {
+                    return Err(Error::ActorSeqGap {
+                        expected,
+                        actual: meta.actor_seq,
+                    });
+                }
+                if meta.actor_prev != Some(id) {
+                    return Err(Error::ActorPrevMismatch);
+                }
+            }
+            None => {
+                if meta.actor_seq != 1 {
+                    return Err(Error::ActorSeqGap {
+                        expected: 1,
+                        actual: meta.actor_seq,
+                    });
+                }
+                if meta.actor_prev.is_some() {
+                    return Err(Error::ActorPrevMismatch);
+                }
+            }
+        }
+        actor_tips.insert((meta.topic_id, meta.actor_id), (meta.actor_seq, op.id));
+        new_entries.push((op, meta));
+    }
+
+    let topic_id = topic_state
+        .as_ref()
+        .map(|state| state.topic_id)
+        .or_else(|| new_entries.first().map(|(_, meta)| meta.topic_id));
+    if let Some(topic_id) = topic_id
+        && new_entries
+            .iter()
+            .any(|(_, meta)| meta.topic_id != topic_id)
+    {
+        return Err(Error::TopicMismatch);
+    }
+
+    for (op, meta) in new_entries {
+        inner
+            .topic_ops
+            .entry(meta.topic_id)
+            .or_default()
+            .insert(op.id);
+        for dep in &meta.deps {
+            inner.children.entry(*dep).or_default().insert(op.id);
+        }
+        inner
+            .actor_by_seq
+            .insert((meta.topic_id, meta.actor_id, meta.actor_seq), op.id);
+        inner
+            .actor_tip
+            .insert((meta.topic_id, meta.actor_id), (meta.actor_seq, op.id));
+        inner
+            .actor_clock
+            .entry(meta.topic_id)
+            .or_default()
+            .observe(meta.actor_id, meta.actor_seq);
+        inner
+            .max_generation
+            .entry(meta.topic_id)
+            .and_modify(|generation| *generation = (*generation).max(meta.generation))
+            .or_insert(meta.generation);
+        remove_pending_locked(inner, &op.id);
+        inner.meta.insert(op.id, meta);
+        inner.ops.insert(op.id, op);
+    }
+
+    if let Some(topic_id) = topic_id {
+        inner.heads.insert(topic_id, heads.clone());
+        let clock = inner
+            .actor_clock
+            .get(&topic_id)
+            .cloned()
+            .unwrap_or_default();
+        inner
+            .topic_fingerprint
+            .insert(topic_id, topic_fingerprint_for(&heads, &clock)?);
+    }
+    if let Some(state) = topic_state {
+        inner.topics.insert(state.topic_id, state);
+    }
+    for obligation in effects.sync_obligations {
+        if !inner.obligations.contains(&obligation) {
+            inner.obligations.push(obligation);
+        }
+    }
+    Ok(())
+}
+
+fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> usize {
+    let op_ids = inner.topic_ops.remove(topic_id).unwrap_or_default();
+    let removed = op_ids.len();
+    for op_id in &op_ids {
+        inner.ops.remove(op_id);
+        inner.meta.remove(op_id);
+        inner.children.remove(op_id);
+    }
+    inner.heads.remove(topic_id);
+    inner.actor_clock.remove(topic_id);
+    inner.topic_fingerprint.remove(topic_id);
+    inner.max_generation.remove(topic_id);
+    inner.topics.remove(topic_id);
+    inner.actor_by_seq.retain(|(t, _, _), _| t != topic_id);
+    inner.actor_tip.retain(|(t, _), _| t != topic_id);
+    inner.peer_acks.retain(|(_, t), _| t != topic_id);
+    inner.obligations.retain(|o| o.topic_id != *topic_id);
+    inner.sync_statuses.retain(|(t, _), _| t != topic_id);
+    let pending: Vec<OpId> = inner
+        .pending_ops
+        .iter()
+        .filter(|(_, (_, _, meta))| meta.topic_id == *topic_id)
+        .map(|(id, _)| *id)
+        .collect();
+    for op_id in pending {
+        remove_pending_locked(inner, &op_id);
+    }
+    removed
 }
 
 fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> usize {
