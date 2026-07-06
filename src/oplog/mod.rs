@@ -2,14 +2,15 @@
 //! Operation-log admission, DAG validation, and topic-state materialization.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use crate::storage::{
     AdmissionEffects, AdmittedBatch, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage,
     TopicState,
 };
 use crate::{
-    ActorId, Error, EventEnvelope, Op, OpBody, PeerId, Result, SignedOp, Signer, TopicControl,
-    TopicGenesis, TopicId, TopicPayload, actor_id_for,
+    ActorId, Error, EventEnvelope, Op, OpBody, OpId, PeerId, Result, SignedOp, Signer,
+    TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
 };
 
 mod helpers;
@@ -29,9 +30,51 @@ enum OpAdmission {
     Duplicate,
 }
 
+/// A single op removed from the losing side of a genesis collision, carrying
+/// enough for the application to re-emit it under the winning genesis.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvictedOp {
+    pub op_id: OpId,
+    pub actor_id: ActorId,
+    pub author: PeerId,
+    pub actor_seq: u64,
+    pub payload: TopicPayload,
+}
+
+/// Reports that a topic's local chain was discarded in favour of a foreign
+/// genesis with a smaller op id. `evicted` holds the reset chain's non-genesis
+/// payloads ordered by `(actor_id, actor_seq)`; re-emission is the embedder's
+/// responsibility.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopicEviction {
+    pub topic_id: TopicId,
+    pub losing_genesis: OpId,
+    pub winning_genesis: OpId,
+    pub evicted: Vec<EvictedOp>,
+}
+
+/// Outcome of an admission pass: the accepted op ids plus any topic evictions
+/// produced by genesis tie-break resolution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Admitted {
+    pub accepted: BTreeSet<OpId>,
+    pub evictions: Vec<TopicEviction>,
+}
+
+fn is_structural_genesis(op: &Op) -> bool {
+    let body = &op.signed.body;
+    matches!(body.payload, TopicPayload::Genesis(_))
+        && body.actor_seq == 1
+        && body.actor_prev.is_none()
+        && body.deps.is_empty()
+}
+
 #[derive(Clone)]
 pub struct Oplog<S = MemoryStorage> {
     storage: S,
+    // Serializes genesis tie-break resolution so two concurrent admissions
+    // cannot both reset the same topic; shared across clones via `Arc`.
+    resolution_lock: Arc<Mutex<()>>,
 }
 
 impl Default for Oplog<MemoryStorage> {
@@ -44,13 +87,17 @@ impl Oplog<MemoryStorage> {
     pub fn new() -> Self {
         Self {
             storage: MemoryStorage::new(),
+            resolution_lock: Arc::new(Mutex::new(())),
         }
     }
 }
 
 impl<S: Storage> Oplog<S> {
     pub fn with_storage(storage: S) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            resolution_lock: Arc::new(Mutex::new(())),
+        }
     }
     pub fn storage(&self) -> &S {
         &self.storage
@@ -228,11 +275,23 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
     ) -> Result<BTreeSet<crate::OpId>> {
+        Ok(self
+            .receive_ops_admission(source_peer, ops, &BTreeSet::new())?
+            .accepted)
+    }
+
+    /// Like [`Self::receive_ops_from_peer`], but also returns any topic
+    /// evictions produced by genesis tie-break resolution.
+    pub fn receive_ops_from_peer_evicting(
+        &self,
+        source_peer: Option<crate::PeerId>,
+        ops: Vec<Op>,
+    ) -> Result<Admitted> {
         self.receive_ops_admission(source_peer, ops, &BTreeSet::new())
     }
 
-    /// Like [`Self::receive_ops_from_peer`], but skips signature verification
-    /// for ops whose id is in `verified`. The caller must have run
+    /// Like [`Self::receive_ops_from_peer_evicting`], but skips signature
+    /// verification for ops whose id is in `verified`. The caller must have run
     /// [`Op::validate`] on those exact ops; op ids are content-addressed over
     /// the signed envelope, so a verified id proves the signature.
     pub(crate) fn receive_ops_from_peer_preverified(
@@ -240,12 +299,14 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
-    ) -> Result<BTreeSet<crate::OpId>> {
+    ) -> Result<Admitted> {
         self.receive_ops_admission(source_peer, ops, verified)
     }
 
     pub fn reconcile_pending_ops(&self) -> Result<BTreeSet<crate::OpId>> {
-        self.receive_ops_admission(None, Vec::new(), &BTreeSet::new())
+        Ok(self
+            .receive_ops_admission(None, Vec::new(), &BTreeSet::new())?
+            .accepted)
     }
 
     pub fn receive_signed_op(&self, signed: SignedOp) -> Result<Op> {
@@ -259,8 +320,9 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
-    ) -> Result<BTreeSet<crate::OpId>> {
+    ) -> Result<Admitted> {
         let mut accepted = BTreeSet::new();
+        let mut evictions = Vec::new();
         let mut queue = VecDeque::new();
         let mut queued_pending = BTreeSet::new();
         if !ops.is_empty() {
@@ -279,17 +341,20 @@ impl<S: Storage> Oplog<S> {
             }
             // Pending ops re-queued from storage are not in `verified`; they
             // get re-verified during admission like before.
-            let batch_accepted = match self.admit_ops_batch_retry(batch_source_peer, ops, verified)
-            {
-                Ok(accepted) => accepted,
-                Err(err) if from_pending && is_semantic_rejection(&err) => {
-                    for op_id in pending_op_ids {
-                        self.storage.remove_pending_op(&op_id)?;
+            let (batch_accepted, batch_eviction) =
+                match self.admit_ops_batch_retry(batch_source_peer, ops, verified) {
+                    Ok(outcome) => outcome,
+                    Err(err) if from_pending && is_semantic_rejection(&err) => {
+                        for op_id in pending_op_ids {
+                            self.storage.remove_pending_op(&op_id)?;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
+                    Err(err) => return Err(err),
+                };
+            if let Some(eviction) = batch_eviction {
+                evictions.push(eviction);
+            }
             for op_id in &batch_accepted {
                 self.enqueue_pending_ops(
                     &mut queue,
@@ -301,7 +366,10 @@ impl<S: Storage> Oplog<S> {
             accepted.extend(batch_accepted);
         }
 
-        Ok(accepted)
+        Ok(Admitted {
+            accepted,
+            evictions,
+        })
     }
 
     fn enqueue_ready_pending_ops(
@@ -332,14 +400,127 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
-    ) -> Result<BTreeSet<crate::OpId>> {
+    ) -> Result<(BTreeSet<crate::OpId>, Option<TopicEviction>)> {
+        // A batch bearing a genesis may collide with an existing topic. Hold
+        // the resolution lock across both the tie-break and the admission that
+        // consumes it, so a concurrent admission cannot reset the topic in
+        // between. Non-genesis batches (the common path) never lock.
+        let _guard = if ops.iter().any(is_structural_genesis) {
+            Some(
+                self.resolution_lock
+                    .lock()
+                    .map_err(|_| Error::Storage("resolution lock poisoned".into()))?,
+            )
+        } else {
+            None
+        };
+        let (ops, eviction) = if _guard.is_some() {
+            self.resolve_genesis_collision(ops, verified)?
+        } else {
+            (ops, None)
+        };
         for _ in 0..MAX_ADMISSION_RETRIES {
             match self.admit_ops_batch(source_peer, ops.clone(), verified) {
                 Err(Error::AdmissionConflict) => continue,
-                result => return result,
+                Ok(accepted) => return Ok((accepted, eviction)),
+                Err(err) => return Err(err),
             }
         }
         Err(Error::AdmissionConflict)
+    }
+
+    /// Resolve a genesis tie-break for a batch that carries a structurally
+    /// valid genesis. The caller holds `resolution_lock`, so the reads and the
+    /// reset here are single-flight per oplog. Returns the ops to admit
+    /// (unchanged when the incoming genesis wins or there is no collision; with
+    /// a losing foreign genesis filtered out when the local one wins) plus any
+    /// eviction produced when the local topic is reset.
+    fn resolve_genesis_collision(
+        &self,
+        ops: Vec<Op>,
+        verified: &BTreeSet<crate::OpId>,
+    ) -> Result<(Vec<Op>, Option<TopicEviction>)> {
+        let Some(genesis) = ops.iter().find(|op| is_structural_genesis(op)).cloned() else {
+            return Ok((ops, None));
+        };
+        let topic_id = genesis.signed.body.topic_id;
+        let Some(state) = self.storage.topic_state(&topic_id)? else {
+            // Fresh topic: normal admission accepts the genesis.
+            return Ok((ops, None));
+        };
+        if state.genesis == genesis.id {
+            // Same node re-sending its genesis: normal dedup handles it.
+            return Ok((ops, None));
+        }
+        // Only a signature-valid genesis may win the tie-break.
+        if !verified.contains(&genesis.id) {
+            genesis.validate()?;
+        }
+        // Op ids are content-addressed 32-byte blake3 digests; the derived
+        // `Ord` is lexicographic over those bytes, so both nodes pick the same
+        // winner with no coordination.
+        if genesis.id < state.genesis {
+            let eviction = self.evict_and_reset_topic(topic_id, &state, genesis.id)?;
+            tracing::warn!(
+                %topic_id,
+                losing_genesis = %state.genesis,
+                winning_genesis = %genesis.id,
+                evicted = eviction.evicted.len(),
+                "genesis collision resolved: reset local topic for smaller winning genesis"
+            );
+            Ok((ops, Some(eviction)))
+        } else {
+            tracing::warn!(
+                %topic_id,
+                local_genesis = %state.genesis,
+                foreign_genesis = %genesis.id,
+                evicted = 0,
+                "genesis collision resolved: kept local genesis, rejected larger foreign genesis"
+            );
+            let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
+            Ok((filtered, None))
+        }
+    }
+
+    /// Extract the local topic chain's non-genesis payloads (ordered by actor,
+    /// then sequence) and then wipe every local record for the topic so the
+    /// winning genesis can be admitted from a clean slate.
+    fn evict_and_reset_topic(
+        &self,
+        topic_id: TopicId,
+        local_state: &TopicState,
+        winning_genesis: OpId,
+    ) -> Result<TopicEviction> {
+        let mut metas = Vec::new();
+        for op_id in self.storage.list_op_ids(&topic_id)? {
+            if let Some(meta) = self.storage.get_meta(&op_id)? {
+                metas.push(meta);
+            }
+        }
+        metas.sort_by_key(|meta| (meta.actor_id, meta.actor_seq));
+        let mut evicted = Vec::new();
+        for meta in metas {
+            if meta.id == local_state.genesis {
+                continue;
+            }
+            let op = self.storage.get_op(&meta.id)?.ok_or_else(|| {
+                Error::Storage(format!("missing op during eviction: {}", meta.id))
+            })?;
+            evicted.push(EvictedOp {
+                op_id: meta.id,
+                actor_id: meta.actor_id,
+                author: meta.author,
+                actor_seq: meta.actor_seq,
+                payload: op.signed.body.payload.clone(),
+            });
+        }
+        self.storage.reset_topic(&topic_id)?;
+        Ok(TopicEviction {
+            topic_id,
+            losing_genesis: local_state.genesis,
+            winning_genesis,
+            evicted,
+        })
     }
 
     fn admit_ops_batch(

@@ -26,7 +26,7 @@ use crate::sync::{
 };
 use crate::{
     ActorId, Ed25519Signer, Error, Event, EventEnvelope, Op, OpId, PeerId, Result, Signer,
-    TopicConfig, TopicControl, TopicGenesis, TopicId, actor_id_for,
+    TopicConfig, TopicControl, TopicEviction, TopicGenesis, TopicId, actor_id_for,
 };
 
 static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -447,6 +447,21 @@ impl<S: Storage> Irokle<S> {
         source_peer_id: PeerId,
         data: SyncData,
     ) -> Result<SyncAck> {
+        Ok(self
+            .receive_sync_data_from_evicting(source_peer_id, data)?
+            .0)
+    }
+
+    /// Like [`Self::receive_sync_data_from`], but also returns the topic
+    /// evictions produced when a genesis tie-break resets a local topic in
+    /// favour of a smaller foreign genesis. The embedder consumes these to
+    /// re-emit the discarded payloads under the winning genesis; re-emission
+    /// itself is out of scope for irokle.
+    pub fn receive_sync_data_from_evicting(
+        &self,
+        source_peer_id: PeerId,
+        data: SyncData,
+    ) -> Result<(SyncAck, Vec<TopicEviction>)> {
         // Verify each op once up front; both the unknown-topic dry run and
         // the real admission below reuse the result instead of re-running
         // the ed25519 verification per pass.
@@ -471,7 +486,7 @@ impl<S: Storage> Irokle<S> {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let mut ack =
+        let (mut ack, evictions) =
             self.sync
                 .receive_data_preverified(source_peer_id, self.peer_id(), data, &verified)?;
         for (op_id, peer) in removals {
@@ -481,7 +496,7 @@ impl<S: Storage> Irokle<S> {
         }
         self.put_receive_forward_obligations(source_peer_id, ack.topic_id, &ack.accepted)?;
         ack.sign(&self.config.signer)?;
-        Ok(ack)
+        Ok((ack, evictions))
     }
 
     pub fn receive_sync_data_as_local(&self, data: SyncData) -> Result<SyncAck> {
