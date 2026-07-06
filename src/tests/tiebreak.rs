@@ -156,6 +156,93 @@ fn fork_resolves_to_smaller_genesis() {
 }
 
 #[test]
+fn non_member_smaller_genesis_does_not_reset() {
+    let topic_id = TopicId::hash(b"genesis-fork-topic");
+    // Local chain with no other members, so its membership is exactly {local}.
+    let local_signer = Ed25519Signer::from_bytes(&[1; 32]);
+    let local = Oplog::with_storage(MemoryStorage::new());
+    let local_actor = actor_id_for(topic_id, local_signer.peer_id());
+    let local_genesis = local
+        .create_topic_genesis(
+            topic_id,
+            local_actor,
+            TopicGenesis {
+                event_type_id: Note::TYPE_ID.into(),
+                initial_peers: BTreeSet::new(),
+                replication_policy: ReplicationPolicy::default(),
+            },
+            &local_signer,
+        )
+        .unwrap();
+    let local_event = local
+        .create_event_op(
+            topic_id,
+            local_actor,
+            EventEnvelope::encode_event(&Note {
+                text: "local".into(),
+            })
+            .unwrap(),
+            &local_signer,
+        )
+        .unwrap();
+
+    // A non-member foreign genesis whose id is smaller than the local one, so
+    // only the membership gate — not id ordering — keeps the local chain.
+    let (foreign_signer, foreign_genesis) = (2..=255_u8)
+        .find_map(|seed| {
+            let signer = Ed25519Signer::from_bytes(&[seed; 32]);
+            let source = Oplog::with_storage(MemoryStorage::new());
+            let actor = actor_id_for(topic_id, signer.peer_id());
+            let genesis = source
+                .create_topic_genesis(
+                    topic_id,
+                    actor,
+                    TopicGenesis {
+                        event_type_id: Note::TYPE_ID.into(),
+                        initial_peers: BTreeSet::new(),
+                        replication_policy: ReplicationPolicy::default(),
+                    },
+                    &signer,
+                )
+                .unwrap();
+            (genesis.id < local_genesis.id).then_some((signer, genesis))
+        })
+        .expect("a smaller-id non-member genesis seed exists");
+
+    let members = local
+        .storage()
+        .topic_state(&topic_id)
+        .unwrap()
+        .unwrap()
+        .members;
+    assert!(!members.contains(&foreign_signer.peer_id()));
+
+    let result = local
+        .receive_ops_from_peer_evicting(
+            Some(foreign_signer.peer_id()),
+            vec![foreign_genesis.clone()],
+        )
+        .unwrap();
+    assert!(result.evictions.is_empty());
+    assert!(result.accepted.is_empty());
+
+    // The local chain survives untouched despite the smaller foreign id.
+    assert_eq!(
+        local
+            .storage()
+            .topic_state(&topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis,
+        local_genesis.id
+    );
+    assert_eq!(
+        admitted_ids(&local, &topic_id),
+        [local_genesis.id, local_event.id].into()
+    );
+}
+
+#[test]
 fn fork_resolution_is_symmetric() {
     // Deterministic ed25519 signing makes genesis ids stable, so scanning seed
     // pairs surfaces both orderings (each physical side wins at least once).

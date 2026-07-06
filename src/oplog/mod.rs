@@ -460,6 +460,25 @@ impl<S: Storage> Oplog<S> {
         // `Ord` is lexicographic over those bytes, so both nodes pick the same
         // winner with no coordination.
         if genesis.id < state.genesis {
+            // A smaller foreign genesis only wins if its author is a current
+            // member of the LOCAL chain — the same membership the admission
+            // path enforces for NotTopicMember (`state.members`, which folds in
+            // AddPeer/RemovePeer control ops), not the genesis `initial_peers`
+            // alone. Genesis op ids are grindable, so an unauthenticated
+            // smaller id must not be allowed to force a topic reset.
+            // Consequence: two forks with disjoint memberships never auto-
+            // converge; the warn below is the intended, deliberate signal.
+            if !state.members.contains(&genesis.signed.body.author) {
+                tracing::warn!(
+                    %topic_id,
+                    local_genesis = %state.genesis,
+                    foreign_genesis = %genesis.id,
+                    author = %genesis.signed.body.author,
+                    "rejected non-member genesis collision"
+                );
+                let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
+                return Ok((filtered, None));
+            }
             let eviction = self.evict_and_reset_topic(topic_id, &state, genesis.id)?;
             tracing::warn!(
                 %topic_id,
