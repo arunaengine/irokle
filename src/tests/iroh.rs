@@ -810,6 +810,154 @@ async fn batched_resync_drains_topic_backlog_with_few_streams() {
 }
 
 #[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn genesis_tiebreak_eviction_reaches_sink_via_handle_messages() {
+    use crate::TopicEviction;
+
+    let topic_id = TopicId::hash(b"iroh-genesis-fork-topic");
+    let seed_x = [11u8; 32];
+    let seed_y = [22u8; 32];
+    // Both sides list each other as members so each can admit the other's chain.
+    let members: BTreeSet<PeerId> = [
+        Ed25519Signer::from_bytes(&seed_x).peer_id(),
+        Ed25519Signer::from_bytes(&seed_y).peer_id(),
+    ]
+    .into();
+
+    // Two independently created genesis chains for the same deterministic topic.
+    let build_chain = |seed: &[u8; 32]| {
+        let signer = Ed25519Signer::from_bytes(seed);
+        let chain = oplog::Oplog::with_storage(MemoryStorage::new());
+        let actor = actor_id_for(topic_id, signer.peer_id());
+        let genesis = chain
+            .create_topic_genesis(
+                topic_id,
+                actor,
+                TopicGenesis {
+                    event_type_id: Note::TYPE_ID.into(),
+                    initial_peers: members.clone(),
+                    replication_policy: ReplicationPolicy::default(),
+                },
+                &signer,
+            )
+            .unwrap();
+        let event = chain
+            .create_event_op(
+                topic_id,
+                actor,
+                EventEnvelope::encode_event(&Note {
+                    text: "forked".into(),
+                })
+                .unwrap(),
+                &signer,
+            )
+            .unwrap();
+        (signer, genesis, event)
+    };
+
+    let (signer_x, genesis_x, event_x) = build_chain(&seed_x);
+    let (signer_y, genesis_y, event_y) = build_chain(&seed_y);
+
+    // alice hosts the larger genesis (the loser that gets reset); the incoming
+    // smaller genesis wins the tie-break.
+    let (
+        alice_seed,
+        peer_seed,
+        loser_signer,
+        loser_genesis,
+        loser_event,
+        winner_genesis,
+        winner_event,
+    ) = if genesis_x.id > genesis_y.id {
+        (
+            seed_x, seed_y, signer_x, genesis_x, event_x, genesis_y, event_y,
+        )
+    } else {
+        (
+            seed_y, seed_x, signer_y, genesis_y, event_y, genesis_x, event_x,
+        )
+    };
+
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .secret_key(iroh::SecretKey::from_bytes(&alice_seed))
+        .bind()
+        .await
+        .unwrap();
+    let peer_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .secret_key(iroh::SecretKey::from_bytes(&peer_seed))
+        .bind()
+        .await
+        .unwrap();
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .build()
+        .unwrap();
+    // Seed alice with the losing chain so the incoming winning genesis collides.
+    alice
+        .receive_sync_data_from(
+            loser_signer.peer_id(),
+            sync::SyncData {
+                topic_id,
+                ops: vec![loser_genesis.clone(), loser_event.clone()],
+            },
+        )
+        .unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TopicEviction>();
+    let net = net::IrohNet::new_with_alpns_config_and_sink(
+        alice_endpoint,
+        alice.clone(),
+        Vec::new(),
+        net::IrohRuntimeConfig::default(),
+        Some(tx),
+    )
+    .unwrap();
+
+    let peer_peer_id = PeerId::from_bytes(*peer_endpoint.id().as_bytes());
+    let responses = net
+        .handle_messages(
+            peer_endpoint.id(),
+            vec![
+                sync::SyncMessage::Open(sync::SyncEngine::<MemoryStorage>::open(
+                    topic_id,
+                    peer_peer_id,
+                    Some(Note::TYPE_ID.into()),
+                )),
+                sync::SyncMessage::Data(sync::SyncData {
+                    topic_id,
+                    ops: vec![winner_genesis.clone(), winner_event.clone()],
+                }),
+            ],
+        )
+        .unwrap();
+
+    assert!(responses.iter().any(|response| {
+        matches!(response, sync::SyncMessage::Ack(ack) if ack.topic_id == topic_id)
+    }));
+
+    let eviction = rx.try_recv().expect("eviction delivered to sink");
+    assert_eq!(eviction.topic_id, topic_id);
+    assert_eq!(eviction.losing_genesis, loser_genesis.id);
+    assert_eq!(eviction.winning_genesis, winner_genesis.id);
+    assert_eq!(eviction.evicted.len(), 1);
+    assert_eq!(eviction.evicted[0].op_id, loser_event.id);
+    assert_eq!(eviction.evicted[0].author, loser_signer.peer_id());
+    assert!(rx.try_recv().is_err());
+
+    assert_eq!(
+        alice
+            .storage()
+            .topic_state(&topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis,
+        winner_genesis.id
+    );
+
+    net.shutdown().await;
+}
+
+#[cfg(feature = "iroh")]
 async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
     use futures::StreamExt;
     use iroh::Watcher;
