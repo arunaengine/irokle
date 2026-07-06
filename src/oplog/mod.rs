@@ -414,10 +414,10 @@ impl<S: Storage> Oplog<S> {
         } else {
             None
         };
-        let (ops, eviction) = if _guard.is_some() {
+        let (ops, eviction, rejected_genesis) = if _guard.is_some() {
             self.resolve_genesis_collision(ops, verified)?
         } else {
-            (ops, None)
+            (ops, None, None)
         };
         // A won foreign genesis discards the local chain: admit the winner
         // batch against a fresh topic and fold the reset into the same storage
@@ -426,11 +426,35 @@ impl<S: Storage> Oplog<S> {
         for _ in 0..MAX_ADMISSION_RETRIES {
             match self.admit_ops_batch(source_peer, ops.clone(), verified, reset) {
                 Err(Error::AdmissionConflict) => continue,
-                Ok(accepted) => return Ok((accepted, eviction)),
+                Ok(accepted) => {
+                    if let Some(losing) = rejected_genesis {
+                        self.purge_losing_pending(losing)?;
+                    }
+                    return Ok((accepted, eviction));
+                }
                 Err(err) => return Err(err),
             }
         }
         Err(Error::AdmissionConflict)
+    }
+
+    /// Drain pending ops that transitively wait on a genesis that lost (or was
+    /// rejected by) a collision resolution: the local topic keeps a different
+    /// genesis, so that id will never be admitted here and nothing depending on
+    /// it can ever become ready. Walks the waiter index breadth-first;
+    /// `remove_pending_op` keeps the pending counters consistent.
+    fn purge_losing_pending(&self, losing_genesis: OpId) -> Result<()> {
+        let mut frontier = vec![losing_genesis];
+        let mut seen = BTreeSet::new();
+        while let Some(dep) = frontier.pop() {
+            for (_, op) in self.storage.pending_waiters(&dep)? {
+                if seen.insert(op.id) {
+                    self.storage.remove_pending_op(&op.id)?;
+                    frontier.push(op.id);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve a genesis tie-break for a batch that carries a structurally
@@ -443,18 +467,18 @@ impl<S: Storage> Oplog<S> {
         &self,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
-    ) -> Result<(Vec<Op>, Option<TopicEviction>)> {
+    ) -> Result<(Vec<Op>, Option<TopicEviction>, Option<OpId>)> {
         let Some(genesis) = ops.iter().find(|op| is_structural_genesis(op)).cloned() else {
-            return Ok((ops, None));
+            return Ok((ops, None, None));
         };
         let topic_id = genesis.signed.body.topic_id;
         let Some(state) = self.storage.topic_state(&topic_id)? else {
             // Fresh topic: normal admission accepts the genesis.
-            return Ok((ops, None));
+            return Ok((ops, None, None));
         };
         if state.genesis == genesis.id {
             // Same node re-sending its genesis: normal dedup handles it.
-            return Ok((ops, None));
+            return Ok((ops, None, None));
         }
         // Only a signature-valid genesis may win the tie-break.
         if !verified.contains(&genesis.id) {
@@ -481,7 +505,7 @@ impl<S: Storage> Oplog<S> {
                     "rejected non-member genesis collision"
                 );
                 let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
-                return Ok((filtered, None));
+                return Ok((filtered, None, Some(genesis.id)));
             }
             let eviction = self.extract_eviction(topic_id, &state, genesis.id)?;
             tracing::warn!(
@@ -491,7 +515,7 @@ impl<S: Storage> Oplog<S> {
                 evicted = eviction.evicted.len(),
                 "genesis collision resolved: reset local topic for smaller winning genesis"
             );
-            Ok((ops, Some(eviction)))
+            Ok((ops, Some(eviction), None))
         } else {
             tracing::warn!(
                 %topic_id,
@@ -501,7 +525,7 @@ impl<S: Storage> Oplog<S> {
                 "genesis collision resolved: kept local genesis, rejected larger foreign genesis"
             );
             let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
-            Ok((filtered, None))
+            Ok((filtered, None, Some(genesis.id)))
         }
     }
 
@@ -657,15 +681,6 @@ impl<S: Storage> Oplog<S> {
             entries.push((op, meta));
         }
 
-        for (op, missing_deps) in pending {
-            let source_peer = source_peer.unwrap_or(op.signed.body.author);
-            self.storage.put_pending_op(
-                source_peer,
-                op.clone(),
-                pending_meta_for(&op, missing_deps),
-            )?;
-        }
-
         if reset {
             // Reset and winner admission share one storage transaction so a
             // crash never leaves the topic empty with the winner uninstalled.
@@ -691,6 +706,19 @@ impl<S: Storage> Oplog<S> {
                 topic_state: topic_state_changed.then(|| state.clone()).flatten(),
                 effects: AdmissionEffects::default(),
             })?;
+        }
+
+        // Buffer not-yet-ready ops last: on the reset path the reset above wipes
+        // the topic's pending, so a partial winner batch's descendants must be
+        // written after it to survive. A pending op's missing deps are never in
+        // `entries`, so ordering after admission cannot spuriously reject it.
+        for (op, missing_deps) in pending {
+            let source_peer = source_peer.unwrap_or(op.signed.body.author);
+            self.storage.put_pending_op(
+                source_peer,
+                op.clone(),
+                pending_meta_for(&op, missing_deps),
+            )?;
         }
 
         Ok(accepted)

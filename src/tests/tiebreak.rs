@@ -331,6 +331,134 @@ fn reset_completeness_lets_acks_converge() {
 }
 
 #[test]
+fn winner_purges_losing_pending() {
+    // `build_fork` feeds the loser's [genesis, event] to the winner in one
+    // batch. The winner keeps its own smaller genesis and filters the loser
+    // genesis, so the loser event lands in pending waiting on a genesis that
+    // will never arrive. The resolution must purge it.
+    let fork = build_fork(1, 2);
+    assert_fork_converged(&fork);
+
+    assert!(
+        fork.winner_oplog
+            .storage()
+            .pending_waiters(&fork.loser_genesis.id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        fork.winner_oplog
+            .storage()
+            .pending_waiters(&fork.loser_event.id)
+            .unwrap()
+            .is_empty()
+    );
+    // No pending op references the topic at all: the loser event is gone.
+    assert!(
+        fork.winner_oplog
+            .storage()
+            .ready_pending_ops()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        fork.winner_oplog
+            .storage()
+            .get_op(&fork.loser_event.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn adoption_preserves_partial_winner_pending() {
+    // The winning chain can arrive partially: a descendant whose parent is not
+    // in the batch must survive in pending through the adoption reset instead
+    // of being wiped by it.
+    let topic_id = TopicId::hash(b"genesis-fork-topic");
+    let seed_three = |seed: u8, peer_seed: u8| {
+        let signer = Ed25519Signer::from_bytes(&[seed; 32]);
+        let peer = Ed25519Signer::from_bytes(&[peer_seed; 32]).peer_id();
+        let oplog = Oplog::with_storage(MemoryStorage::new());
+        let actor = actor_id_for(topic_id, signer.peer_id());
+        let g = oplog
+            .create_topic_genesis(
+                topic_id,
+                actor,
+                TopicGenesis {
+                    event_type_id: Note::TYPE_ID.into(),
+                    initial_peers: [peer].into(),
+                    replication_policy: ReplicationPolicy::default(),
+                },
+                &signer,
+            )
+            .unwrap();
+        let e1 = oplog
+            .create_event_op(
+                topic_id,
+                actor,
+                EventEnvelope::encode_event(&Note { text: "e1".into() }).unwrap(),
+                &signer,
+            )
+            .unwrap();
+        let e2 = oplog
+            .create_event_op(
+                topic_id,
+                actor,
+                EventEnvelope::encode_event(&Note { text: "e2".into() }).unwrap(),
+                &signer,
+            )
+            .unwrap();
+        (signer, oplog, g, e1, e2)
+    };
+
+    let (a_signer, a_oplog, a_g, a_e1, a_e2) = seed_three(1, 2);
+    let (b_signer, b_oplog, b_g, b_e1, b_e2) = seed_three(2, 1);
+
+    // The loser adopts the winner (smaller) genesis; feed it the winner's
+    // partial batch [genesis, e2], omitting e1.
+    let (winner_g, winner_e1, winner_e2, winner_peer, loser_oplog) = if a_g.id < b_g.id {
+        (a_g, a_e1, a_e2, a_signer.peer_id(), b_oplog)
+    } else {
+        (b_g, b_e1, b_e2, b_signer.peer_id(), a_oplog)
+    };
+
+    let result = loser_oplog
+        .receive_ops_from_peer_evicting(
+            Some(winner_peer),
+            vec![winner_g.clone(), winner_e2.clone()],
+        )
+        .unwrap();
+
+    // The loser reset and adopted the winner genesis; only the genesis admits.
+    assert_eq!(result.evictions.len(), 1);
+    assert_eq!(result.accepted, [winner_g.id].into());
+    assert_eq!(
+        loser_oplog
+            .storage()
+            .topic_state(&topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis,
+        winner_g.id
+    );
+    // The partial descendant survived the reset, still waiting on its parent.
+    assert!(
+        loser_oplog
+            .storage()
+            .get_op(&winner_e2.id)
+            .unwrap()
+            .is_none()
+    );
+    let waiters = loser_oplog
+        .storage()
+        .pending_waiters(&winner_e1.id)
+        .unwrap();
+    assert_eq!(waiters.len(), 1);
+    assert_eq!(waiters[0].1.id, winner_e2.id);
+}
+
+#[test]
 fn resending_winner_genesis_is_a_noop() {
     let fork = build_fork(1, 2);
     let before = admitted_ids(&fork.winner_oplog, &fork.topic_id);
