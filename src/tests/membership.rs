@@ -72,7 +72,8 @@ fn late_peer_accepts_batch() {
         .unwrap();
     let ack = charlie
         .receive_sync_data_from(alice.peer_id(), data)
-        .unwrap();
+        .unwrap()
+        .0;
     alice.apply_sync_ack(&ack).unwrap();
 
     let charlie_topic = charlie.open_topic::<Note>(topic.id()).unwrap();

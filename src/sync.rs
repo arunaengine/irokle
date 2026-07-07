@@ -7,7 +7,7 @@ use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::oplog::{Oplog, topological_subset};
+use crate::oplog::{Oplog, TopicEviction, topological_subset};
 use crate::storage::{PeerAck, Storage, SyncObligation};
 use crate::{
     ActorClock, ActorId, Error, Op, OpId, PeerId, Result, Signer, TopicId, canonical_bytes, verify,
@@ -367,38 +367,39 @@ impl<S: Storage> SyncEngine<S> {
         source_peer_id: PeerId,
         ack_peer_id: PeerId,
         data: SyncData,
-    ) -> Result<SyncAck> {
+    ) -> Result<(SyncAck, Vec<TopicEviction>)> {
         self.receive_data_preverified(source_peer_id, ack_peer_id, data, &BTreeSet::new())
     }
 
-    /// Like [`Self::receive_data`], but skips signature verification for ops
-    /// whose id is in `verified` (the caller already ran [`Op::validate`] on
-    /// those exact ops).
+    /// Like [`Self::receive_data`], but skips signature verification for ops whose
+    /// id is in `verified` (the caller already ran [`Op::validate`] on those exact
+    /// ops).
     pub(crate) fn receive_data_preverified(
         &self,
         source_peer_id: PeerId,
         ack_peer_id: PeerId,
         data: SyncData,
         verified: &BTreeSet<OpId>,
-    ) -> Result<SyncAck> {
+    ) -> Result<(SyncAck, Vec<TopicEviction>)> {
         for op in &data.ops {
             if op.signed.body.topic_id != data.topic_id {
                 return Err(Error::TopicMismatch);
             }
         }
-        let accepted = self.oplog.receive_ops_from_peer_preverified(
+        let admitted = self.oplog.receive_ops_from_peer_preverified(
             Some(source_peer_id),
             data.ops,
             verified,
         )?;
-        Ok(SyncAck {
+        let ack = SyncAck {
             topic_id: data.topic_id,
             peer_id: ack_peer_id,
-            accepted,
+            accepted: admitted.accepted,
             heads: self.oplog.storage().heads(&data.topic_id)?,
             clock: self.oplog.storage().actor_clock(&data.topic_id)?,
             signature: None,
-        })
+        };
+        Ok((ack, admitted.evictions))
     }
 
     pub fn apply_ack(&self, ack: &SyncAck) -> Result<()> {

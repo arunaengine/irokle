@@ -22,6 +22,8 @@ impl Irokle<MemoryStorage> {
             auto_accept: true,
             #[cfg(feature = "iroh")]
             iroh_runtime: crate::net::IrohRuntimeConfig::default(),
+            #[cfg(feature = "iroh")]
+            eviction_sink: None,
         }
     }
 
@@ -49,6 +51,8 @@ impl<S: Storage> IrokleBuilder<S> {
             auto_accept: self.auto_accept,
             #[cfg(feature = "iroh")]
             iroh_runtime: self.iroh_runtime,
+            #[cfg(feature = "iroh")]
+            eviction_sink: self.eviction_sink,
         }
     }
 
@@ -87,6 +91,17 @@ impl<S: Storage> IrokleBuilder<S> {
     #[cfg(feature = "iroh")]
     pub fn with_iroh_runtime_config(mut self, runtime: crate::net::IrohRuntimeConfig) -> Self {
         self.iroh_runtime = runtime;
+        self
+    }
+
+    /// Forward genesis tie-break evictions produced by the builder-managed Iroh
+    /// transport to `sink`.
+    #[cfg(feature = "iroh")]
+    pub fn with_eviction_sink(
+        mut self,
+        sink: tokio::sync::mpsc::UnboundedSender<crate::TopicEviction>,
+    ) -> Self {
+        self.eviction_sink = Some(sink);
         self
     }
 
@@ -172,6 +187,8 @@ impl<S: Storage> IrokleBuilder<S> {
             auto_accept: self.auto_accept,
             #[cfg(feature = "iroh")]
             iroh_runtime: self.iroh_runtime,
+            #[cfg(feature = "iroh")]
+            eviction_sink: self.eviction_sink,
         })
     }
 
@@ -203,6 +220,8 @@ impl<S: Storage> IrokleBuilder<S> {
             auto_accept: self.auto_accept,
             #[cfg(feature = "iroh")]
             iroh_runtime: self.iroh_runtime,
+            #[cfg(feature = "iroh")]
+            eviction_sink: self.eviction_sink,
         })
     }
 
@@ -211,11 +230,12 @@ impl<S: Storage> IrokleBuilder<S> {
         if let Some(endpoint) = self.endpoint {
             let node = Irokle::with_storage(self.storage, self.config)?;
             let net = std::sync::Arc::new(
-                crate::net::IrohNet::new_with_alpns_and_config(
+                crate::net::IrohNet::new_with_alpns_config_and_sink(
                     endpoint,
                     node.clone(),
                     self.alpns,
                     self.iroh_runtime,
+                    self.eviction_sink,
                 )
                 .map_err(|err| Error::Storage(format!("failed to configure iroh: {err}")))?,
             );

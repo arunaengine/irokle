@@ -28,6 +28,7 @@ pub use ids::{ActorId, IdParseError, OpId, PeerId, TopicId, actor_id_for};
 pub use irokle_derive::Event;
 pub use node::{Irokle, IrokleBuilder, NodeConfig, PublishOptions, RawTopic, Topic, WriteConcern};
 pub use op::{Op, OpBody, SignedOp};
+pub use oplog::{Admitted, EvictedOp, TopicEviction};
 #[cfg(feature = "fjall")]
 pub use storage::FjallStorage;
 pub use storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};

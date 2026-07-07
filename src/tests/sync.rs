@@ -21,7 +21,7 @@ fn transfers_missing_ops() {
     let summary_b = b.sync_summary(topic.id()).unwrap();
     let data = a.plan_sync_data(b.peer_id(), &summary_b).unwrap();
     assert_eq!(data.ops.len(), 2);
-    let ack = b.receive_sync_data_from(a.peer_id(), data).unwrap();
+    let ack = b.receive_sync_data_from(a.peer_id(), data).unwrap().0;
     assert!(
         b.storage()
             .peer_ack(&b.peer_id(), &topic.id())
@@ -64,7 +64,7 @@ fn create_topic_with_event_replicates() {
     let summary_b = b.sync_summary(topic.id()).unwrap();
     let data = a.plan_sync_data(b.peer_id(), &summary_b).unwrap();
     assert_eq!(data.ops.len(), 2);
-    let ack = b.receive_sync_data_from(a.peer_id(), data).unwrap();
+    let ack = b.receive_sync_data_from(a.peer_id(), data).unwrap().0;
     a.apply_sync_ack(&ack).unwrap();
 
     let opened = b.open_topic::<Note>(topic.id()).unwrap();
@@ -214,7 +214,8 @@ fn request_converges() {
 
     let bob_ack = bob
         .receive_sync_data_from(alice.peer_id(), data_for_bob)
-        .unwrap();
+        .unwrap()
+        .0;
     let data_for_alice = bob
         .plan_sync_response_data(alice.peer_id(), &request_for_alice)
         .unwrap();
@@ -223,7 +224,8 @@ fn request_converges() {
 
     let alice_ack = alice
         .receive_sync_data_from(bob.peer_id(), data_for_alice)
-        .unwrap();
+        .unwrap()
+        .0;
     alice.apply_sync_ack(&bob_ack).unwrap();
     bob.apply_sync_ack(&alice_ack).unwrap();
 
@@ -373,7 +375,8 @@ fn accepts_out_of_order_batch() {
                 ops: vec![second.clone(), genesis.clone(), first.clone()],
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
 
     assert_eq!(ack.accepted, [genesis.id, first.id, second.id].into());
     assert_eq!(
@@ -424,7 +427,8 @@ fn defers_until_dependency() {
                 ops: vec![second.clone()],
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(first_ack.accepted.is_empty());
     assert!(bob.storage().get_op(&second.id).unwrap().is_none());
 
@@ -436,7 +440,8 @@ fn defers_until_dependency() {
                 ops: vec![genesis.clone(), first.clone()],
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(second_ack.accepted, [first.id, second.id].into());
     assert!(bob.storage().get_op(&second.id).unwrap().is_some());
 }
@@ -534,7 +539,8 @@ fn receive_forwarding_obligates_other_selected_peers() {
                 ops: vec![op],
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(ack.accepted, [record.meta.op_id].into());
 
     let state = bob.storage().topic_state(&topic.id()).unwrap().unwrap();
@@ -713,7 +719,7 @@ fn exposes_sync_metadata() {
         topic_id: topic.id(),
         ops: oplog::topological(alice.storage(), &topic.id()).unwrap(),
     };
-    let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+    let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap().0;
     alice.apply_sync_ack(&ack).unwrap();
 
     assert!(
@@ -760,7 +766,7 @@ fn receive_schedules_forwarding_only_for_missing_selected_peers() {
         })
         .unwrap();
 
-    let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+    let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap().0;
 
     assert!(
         bob.storage()
@@ -957,11 +963,12 @@ fn duplicate_sync_data_is_idempotent() {
         .unwrap();
     let ack = bob
         .receive_sync_data_from(alice.peer_id(), data.clone())
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(ack.accepted.len(), 2);
 
     // Full overlap: every op is already admitted.
-    let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+    let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap().0;
     assert!(ack.accepted.is_empty());
     assert_eq!(ack.heads, bob.storage().heads(&topic.id()).unwrap());
 
@@ -978,7 +985,8 @@ fn duplicate_sync_data_is_idempotent() {
                 ops: all_ops,
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(ack.accepted, [new_id].into());
     assert_eq!(
         bob.open_topic::<Note>(topic.id())
@@ -1020,7 +1028,7 @@ fn unknown_topic_backlog_admission_verifies_ops_once() {
 
     let started = std::time::Instant::now();
     for data in batches {
-        let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+        let ack = bob.receive_sync_data_from(alice.peer_id(), data).unwrap().0;
         assert_eq!(ack.accepted.len(), 2);
     }
     let elapsed = started.elapsed();
@@ -1171,6 +1179,9 @@ impl Storage for StaleReadStorage {
     }
     fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize, Error> {
         self.inner.clear_peer_sync_state(peer_id, topic_id)
+    }
+    fn reset_topic(&self, topic_id: &TopicId) -> Result<usize, Error> {
+        self.inner.reset_topic(topic_id)
     }
 }
 

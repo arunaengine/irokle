@@ -141,7 +141,8 @@ fn assert_pending_reconciles<S: Storage>(storage: S) {
                 ops: vec![second.clone()],
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(pending_ack.accepted.is_empty());
     assert!(storage.get_op(&second.id).unwrap().is_none());
 
@@ -168,6 +169,385 @@ fn assert_pending_reconciles<S: Storage>(storage: S) {
 #[test]
 fn memory_reconciles_pending() {
     assert_pending_reconciles(MemoryStorage::new());
+}
+
+fn assert_reset_topic_clears_everything<S: Storage>(storage: S) {
+    let signer = Ed25519Signer::from_bytes(&[71; 32]);
+    let peer = signer.peer_id();
+    let other_peer = PeerId::hash(b"reset-other-peer");
+    let config = NodeConfig {
+        signer,
+        default_write_concern: WriteConcern::Local,
+        ..NodeConfig::default()
+    };
+    let node = Irokle::with_storage(storage.clone(), config).unwrap();
+
+    let topic = node
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [other_peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let topic_id = topic.id();
+    topic.publish(Note { text: "one".into() }).unwrap();
+    topic.publish(Note { text: "two".into() }).unwrap();
+    let genesis_id = oplog::topological(&storage, &topic_id).unwrap()[0].id;
+    let actor_id = actor_id_for(topic_id, peer);
+
+    // A second topic that reset must leave untouched.
+    let survivor = node.create_topic::<Note>(TopicConfig::default()).unwrap();
+    let survivor_id = survivor.id();
+    survivor
+        .publish(Note {
+            text: "keep".into(),
+        })
+        .unwrap();
+    let survivor_ops = storage.list_op_ids(&survivor_id).unwrap();
+
+    // Buffered pending op targeting the topic whose dependency never arrives.
+    let author_signer = Ed25519Signer::from_bytes(&[72; 32]);
+    let author = author_signer.peer_id();
+    let missing_dep = OpId::hash(b"reset-missing-dep");
+    let author_actor = actor_id_for(topic_id, author);
+    let pending_op = Op::sign(
+        OpBody {
+            topic_id,
+            author,
+            actor_id: author_actor,
+            actor_seq: 5,
+            actor_prev: Some(missing_dep),
+            deps: [missing_dep].into(),
+            generation: 9,
+            payload: TopicPayload::Event(
+                EventEnvelope::encode_event(&Note {
+                    text: "pending".into(),
+                })
+                .unwrap(),
+            ),
+        },
+        &author_signer,
+    )
+    .unwrap();
+    let pending_meta = crate_storage::OpMeta {
+        id: pending_op.id,
+        topic_id,
+        author,
+        actor_id: author_actor,
+        actor_seq: 5,
+        actor_prev: Some(missing_dep),
+        deps: [missing_dep].into(),
+        generation: 9,
+        observed_clock: ActorClock::new(),
+        ready: false,
+        missing_deps: [missing_dep].into(),
+    };
+    storage
+        .put_pending_op(author, pending_op, pending_meta)
+        .unwrap();
+
+    // Stored peer ack, sync obligation, and sync status for the topic.
+    let mut ack_clock = ActorClock::new();
+    ack_clock.observe(actor_id, 3);
+    storage
+        .apply_peer_ack(crate_storage::PeerAck {
+            peer_id: other_peer,
+            topic_id,
+            heads: storage.heads(&topic_id).unwrap(),
+            clock: ack_clock,
+        })
+        .unwrap();
+    storage
+        .put_sync_obligation(crate_storage::SyncObligation {
+            peer_id: other_peer,
+            topic_id,
+            op_ids: [OpId::hash(b"reset-obligation-op")].into(),
+            target_clock: ActorClock::new(),
+        })
+        .unwrap();
+    storage
+        .put_sync_status(crate_storage::SyncPeerStatus {
+            peer_id: other_peer,
+            topic_id,
+            ..crate_storage::SyncPeerStatus::default()
+        })
+        .unwrap();
+
+    let topic_op_ids = storage.list_op_ids(&topic_id).unwrap();
+    assert_eq!(topic_op_ids.len(), 3);
+    assert!(!storage.pending_waiters(&missing_dep).unwrap().is_empty());
+
+    let removed = storage.reset_topic(&topic_id).unwrap();
+    assert_eq!(removed, 3);
+
+    // Every per-topic keyspace is empty.
+    assert!(storage.topic_state(&topic_id).unwrap().is_none());
+    assert!(storage.list_op_ids(&topic_id).unwrap().is_empty());
+    assert!(storage.list_ops(&topic_id).unwrap().is_empty());
+    assert!(storage.heads(&topic_id).unwrap().is_empty());
+    assert!(storage.actor_clock(&topic_id).unwrap().is_empty());
+    assert_eq!(storage.max_generation(&topic_id).unwrap(), 0);
+    assert!(storage.actor_tip(&topic_id, &actor_id).unwrap().is_none());
+    assert!(
+        storage
+            .actor_index(&topic_id, &actor_id, 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(storage.children(&genesis_id).unwrap().is_empty());
+    assert_eq!(
+        storage.topic_fingerprint(&topic_id).unwrap(),
+        storage
+            .topic_fingerprint(&TopicId::hash(b"reset-empty"))
+            .unwrap()
+    );
+    for op_id in &topic_op_ids {
+        assert!(storage.get_op(op_id).unwrap().is_none());
+        assert!(storage.get_meta(op_id).unwrap().is_none());
+    }
+    assert!(storage.peer_acks(&topic_id).unwrap().is_empty());
+    assert!(storage.peer_ack(&other_peer, &topic_id).unwrap().is_none());
+    assert!(
+        storage
+            .sync_obligations(&other_peer, &topic_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        storage
+            .all_sync_obligations()
+            .unwrap()
+            .iter()
+            .all(|o| o.topic_id != topic_id)
+    );
+    assert!(storage.sync_statuses(&topic_id).unwrap().is_empty());
+    assert!(storage.pending_waiters(&missing_dep).unwrap().is_empty());
+
+    // The survivor topic is intact.
+    assert!(storage.topic_state(&survivor_id).unwrap().is_some());
+    assert_eq!(storage.list_op_ids(&survivor_id).unwrap(), survivor_ops);
+    assert!(!storage.heads(&survivor_id).unwrap().is_empty());
+    assert_eq!(storage.list_topics().unwrap().len(), 1);
+}
+
+#[test]
+fn memory_reset_topic_clears_everything() {
+    assert_reset_topic_clears_everything(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reset_topic_clears_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    assert_reset_topic_clears_everything(storage);
+}
+
+fn seed_chain<S: Storage>(storage: &S, topic_id: TopicId, seed: u8, events: &[&str]) -> ActorId {
+    let signer = Ed25519Signer::from_bytes(&[seed; 32]);
+    let actor = actor_id_for(topic_id, signer.peer_id());
+    let log = oplog::Oplog::with_storage(storage.clone());
+    log.create_topic_genesis(
+        topic_id,
+        actor,
+        TopicGenesis {
+            event_type_id: Note::TYPE_ID.into(),
+            initial_peers: BTreeSet::new(),
+            replication_policy: ReplicationPolicy::default(),
+        },
+        &signer,
+    )
+    .unwrap();
+    for text in events {
+        log.create_event_op(
+            topic_id,
+            actor,
+            EventEnvelope::encode_event(&Note {
+                text: (*text).into(),
+            })
+            .unwrap(),
+            &signer,
+        )
+        .unwrap();
+    }
+    actor
+}
+
+fn assert_reset_topic_and_admit_is_atomic<S: Storage>(storage: S) {
+    let topic_id = TopicId::hash(b"reset-admit-topic");
+    let local_actor = seed_chain(&storage, topic_id, 61, &["one", "two"]);
+    let old_ids = storage.list_op_ids(&topic_id).unwrap();
+    assert_eq!(old_ids.len(), 3);
+
+    // A survivor topic that the combined op must leave untouched.
+    let survivor_id = TopicId::hash(b"reset-admit-survivor");
+    seed_chain(&storage, survivor_id, 62, &["keep"]);
+    let survivor_ids = storage.list_op_ids(&survivor_id).unwrap();
+
+    // A winning foreign genesis for the same topic, built against a fresh
+    // topic (empty expected heads/state), just as the adoption path does.
+    let winner_signer = Ed25519Signer::from_bytes(&[63; 32]);
+    let winner_src = oplog::Oplog::with_storage(MemoryStorage::new());
+    let winner_actor = actor_id_for(topic_id, winner_signer.peer_id());
+    let winner_genesis = winner_src
+        .create_topic_genesis(
+            topic_id,
+            winner_actor,
+            TopicGenesis {
+                event_type_id: Note::TYPE_ID.into(),
+                initial_peers: BTreeSet::new(),
+                replication_policy: ReplicationPolicy::default(),
+            },
+            &winner_signer,
+        )
+        .unwrap();
+    let winner_meta = winner_src
+        .storage()
+        .get_meta(&winner_genesis.id)
+        .unwrap()
+        .unwrap();
+    let winner_state = winner_src
+        .storage()
+        .topic_state(&topic_id)
+        .unwrap()
+        .unwrap();
+
+    let expected_state = storage.topic_state(&topic_id).unwrap().unwrap();
+    let removed = storage
+        .reset_topic_and_admit(
+            &topic_id,
+            &expected_state,
+            crate_storage::AdmittedBatch {
+                topic_id,
+                expected_heads: BTreeSet::new(),
+                expected_topic_state: None,
+                entries: vec![(winner_genesis.clone(), winner_meta)],
+                heads: [winner_genesis.id].into(),
+                topic_state: Some(winner_state),
+                effects: crate_storage::AdmissionEffects::default(),
+            },
+        )
+        .unwrap();
+
+    // Both effects landed together: the old chain is gone and the winner is in.
+    assert_eq!(removed, 3);
+    for id in &old_ids {
+        assert!(storage.get_op(id).unwrap().is_none());
+        assert!(storage.get_meta(id).unwrap().is_none());
+    }
+    assert_eq!(
+        storage.list_op_ids(&topic_id).unwrap(),
+        [winner_genesis.id].into()
+    );
+    assert!(storage.get_op(&winner_genesis.id).unwrap().is_some());
+    assert_eq!(
+        storage.topic_state(&topic_id).unwrap().unwrap().genesis,
+        winner_genesis.id
+    );
+    assert_eq!(
+        storage.heads(&topic_id).unwrap(),
+        [winner_genesis.id].into()
+    );
+    assert_eq!(
+        storage.actor_tip(&topic_id, &winner_actor).unwrap(),
+        Some((1, winner_genesis.id))
+    );
+    assert!(
+        storage
+            .actor_tip(&topic_id, &local_actor)
+            .unwrap()
+            .is_none()
+    );
+
+    // Survivor topic non-interference.
+    assert_eq!(storage.list_op_ids(&survivor_id).unwrap(), survivor_ids);
+    assert!(storage.topic_state(&survivor_id).unwrap().is_some());
+}
+
+fn assert_reset_topic_and_admit_rejects_stale_state<S: Storage>(storage: S) {
+    let topic_id = TopicId::hash(b"stale-reset-admit-topic");
+    let actor = seed_chain(&storage, topic_id, 64, &["one"]);
+    let stale_state = storage.topic_state(&topic_id).unwrap().unwrap();
+
+    let signer = Ed25519Signer::from_bytes(&[64; 32]);
+    oplog::Oplog::with_storage(storage.clone())
+        .create_event_op(
+            topic_id,
+            actor,
+            EventEnvelope::encode_event(&Note { text: "two".into() }).unwrap(),
+            &signer,
+        )
+        .unwrap();
+
+    let winner_signer = Ed25519Signer::from_bytes(&[65; 32]);
+    let winner_src = oplog::Oplog::with_storage(MemoryStorage::new());
+    let winner_actor = actor_id_for(topic_id, winner_signer.peer_id());
+    let winner_genesis = winner_src
+        .create_topic_genesis(
+            topic_id,
+            winner_actor,
+            TopicGenesis {
+                event_type_id: Note::TYPE_ID.into(),
+                initial_peers: BTreeSet::new(),
+                replication_policy: ReplicationPolicy::default(),
+            },
+            &winner_signer,
+        )
+        .unwrap();
+    let winner_meta = winner_src
+        .storage()
+        .get_meta(&winner_genesis.id)
+        .unwrap()
+        .unwrap();
+    let winner_state = winner_src
+        .storage()
+        .topic_state(&topic_id)
+        .unwrap()
+        .unwrap();
+
+    let err = storage
+        .reset_topic_and_admit(
+            &topic_id,
+            &stale_state,
+            crate_storage::AdmittedBatch {
+                topic_id,
+                expected_heads: BTreeSet::new(),
+                expected_topic_state: None,
+                entries: vec![(winner_genesis.clone(), winner_meta)],
+                heads: [winner_genesis.id].into(),
+                topic_state: Some(winner_state),
+                effects: crate_storage::AdmissionEffects::default(),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::AdmissionConflict));
+    assert!(storage.get_op(&winner_genesis.id).unwrap().is_none());
+    assert_eq!(storage.list_op_ids(&topic_id).unwrap().len(), 3);
+}
+
+#[test]
+fn memory_reset_topic_and_admit_is_atomic() {
+    assert_reset_topic_and_admit_is_atomic(MemoryStorage::new());
+}
+
+#[test]
+fn memory_reset_topic_and_admit_rejects_stale_state() {
+    assert_reset_topic_and_admit_rejects_stale_state(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reset_topic_and_admit_is_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    assert_reset_topic_and_admit_is_atomic(storage);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reset_topic_and_admit_rejects_stale_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    assert_reset_topic_and_admit_rejects_stale_state(storage);
 }
 
 #[test]

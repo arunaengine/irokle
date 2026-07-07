@@ -156,6 +156,43 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// a topic. Returns the number of cleared obligations.
     fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize>;
 
+    /// Atomically remove every local record for `topic_id`: topic/genesis
+    /// registration, all ops and their metadata, actor indexes/tips, heads,
+    /// fingerprint, max generation, the topic's actor clock, buffered pending
+    /// ops targeting the topic, and every peer's stored acks, sync
+    /// obligations, and sync statuses for the topic. Used by genesis tie-break
+    /// resolution to adopt a winning foreign genesis; a partial reset would
+    /// leave stale actor tips or acks that keep sync clocks diverging, so
+    /// backends must clear all per-topic keyspaces. Returns the number of
+    /// admitted ops removed.
+    fn reset_topic(&self, topic_id: &TopicId) -> Result<usize>;
+
+    /// Atomically verify that the current topic state is exactly
+    /// `expected_topic_state`, then [`Storage::reset_topic`] and apply `batch`
+    /// in one durable operation. Genesis tie-break adoption uses this to
+    /// discard the local chain and install the winning foreign genesis with no
+    /// crash window between the two: a crash either leaves the whole local
+    /// chain or the fully installed winner, never an empty topic. The expected
+    /// state check prevents a stale resolver from overwriting a smaller genesis
+    /// admitted by another facade. `batch` must be built against a fresh topic
+    /// (empty `expected_heads`, `None` `expected_topic_state`). Returns the
+    /// number of admitted ops the reset removed. The default composition is
+    /// correct but not atomic; durable backends override it with a single
+    /// transaction.
+    fn reset_topic_and_admit(
+        &self,
+        topic_id: &TopicId,
+        expected_topic_state: &TopicState,
+        batch: AdmittedBatch,
+    ) -> Result<usize> {
+        if self.topic_state(topic_id)?.as_ref() != Some(expected_topic_state) {
+            return Err(crate::Error::AdmissionConflict);
+        }
+        let removed = self.reset_topic(topic_id)?;
+        self.put_admitted_batch(batch)?;
+        Ok(removed)
+    }
+
     fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
         let Some(meta) = self.get_meta(op_id)? else {
             return Ok(false);

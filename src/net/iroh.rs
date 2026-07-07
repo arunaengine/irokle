@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::node::select_sync_peers;
 use crate::sync::{SyncMessage, SyncSummary};
-use crate::{Irokle, MemoryStorage, PeerId, Storage};
+use crate::{Irokle, MemoryStorage, PeerId, Storage, TopicEviction};
 
 use super::frame::{MAX_FRAME_LEN, MAX_SYNC_DATA_OPS_PER_MESSAGE};
 use super::{
@@ -329,6 +329,11 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
     resync_started: AtomicBool,
     outbound_streams: AtomicU64,
     shutdown: tokio::sync::watch::Sender<bool>,
+    // Optional sink for genesis tie-break evictions produced while admitting
+    // remote sync data. The embedder consumes these to re-emit the discarded
+    // payloads under the winning genesis; when unset the payloads are dropped
+    // (the oplog already logs the reset).
+    eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
 }
 
 impl<S: Storage> IrohNet<S> {
@@ -358,6 +363,21 @@ impl<S: Storage> IrohNet<S> {
         alpns: Vec<Vec<u8>>,
         runtime: IrohRuntimeConfig,
     ) -> io::Result<Self> {
+        Self::new_with_alpns_config_and_sink(endpoint, node, alpns, runtime, None)
+    }
+
+    /// Like [`Self::new_with_alpns_and_config`], but also wires an optional
+    /// eviction sink. When set, every [`TopicEviction`] produced while admitting
+    /// remote sync data (genesis tie-break resolution) is forwarded to the sink
+    /// so the embedder can re-emit the discarded payloads under the winning
+    /// genesis; when `None` the payloads are dropped (the reset is still logged).
+    pub fn new_with_alpns_config_and_sink(
+        endpoint: iroh::Endpoint,
+        node: Irokle<S>,
+        alpns: Vec<Vec<u8>>,
+        runtime: IrohRuntimeConfig,
+        eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
+    ) -> io::Result<Self> {
         let endpoint_peer = peer_id_from_endpoint_id(endpoint.id());
         if endpoint_peer != node.peer_id() {
             return Err(invalid_data("iroh endpoint id does not match node signer"));
@@ -376,7 +396,34 @@ impl<S: Storage> IrohNet<S> {
             resync_started: AtomicBool::new(false),
             outbound_streams: AtomicU64::new(0),
             shutdown,
+            eviction_sink,
         })
+    }
+
+    /// Forwards genesis tie-break evictions to the configured sink, or drops
+    /// them with a warning when no sink is wired.
+    fn forward_evictions(&self, evictions: Vec<TopicEviction>) {
+        if evictions.is_empty() {
+            return;
+        }
+        match &self.eviction_sink {
+            Some(sink) => {
+                for eviction in evictions {
+                    if sink.send(eviction).is_err() {
+                        tracing::warn!("eviction sink closed; dropping genesis tie-break eviction");
+                    }
+                }
+            }
+            None => {
+                for eviction in evictions {
+                    tracing::warn!(
+                        topic_id = %eviction.topic_id,
+                        evicted = eviction.evicted.len(),
+                        "no eviction sink configured; dropping genesis tie-break payloads"
+                    );
+                }
+            }
+        }
     }
 
     pub fn node(&self) -> &Irokle<S> {
@@ -1184,8 +1231,12 @@ impl<S: Storage> IrohNet<S> {
                 SyncMessage::Summary(summary) if group_topics.contains(&summary.topic_id) => {}
                 SyncMessage::Data(data) if group_topics.contains(&data.topic_id) => {
                     let data_topic_id = data.topic_id;
-                    match self.node.receive_sync_data_from(remote_peer_id, data) {
-                        Ok(ack) => {
+                    match self
+                        .node
+                        .receive_sync_data_from_evicting(remote_peer_id, data)
+                    {
+                        Ok((ack, evictions)) => {
+                            self.forward_evictions(evictions);
                             if let Err(error) = self.schedule_topic_recheck(data_topic_id) {
                                 tracing::warn!(%data_topic_id, %error, "failed to schedule received topic resync");
                             }
@@ -1449,16 +1500,15 @@ impl<S: Storage> IrohNet<S> {
                 self.node
                     .ensure_iroh_peer_whitelisted(source_peer, &data)
                     .map_err(invalid_data)?;
-                self.node
-                    .receive_sync_data_from(source_peer, data)
-                    .map(SyncMessage::Ack)
-                    .map(|message| {
-                        if let Err(error) = self.schedule_topic_recheck(data_topic_id) {
-                            tracing::warn!(%data_topic_id, %error, "failed to schedule received topic resync");
-                        }
-                        vec![message]
-                    })
-                    .map_err(invalid_data)
+                let (ack, evictions) = self
+                    .node
+                    .receive_sync_data_from_evicting(source_peer, data)
+                    .map_err(invalid_data)?;
+                self.forward_evictions(evictions);
+                if let Err(error) = self.schedule_topic_recheck(data_topic_id) {
+                    tracing::warn!(%data_topic_id, %error, "failed to schedule received topic resync");
+                }
+                Ok(vec![SyncMessage::Ack(ack)])
             }
             SyncMessage::Ack(ack) => {
                 let peer_id = remote_peer_id.ok_or_else(|| {
