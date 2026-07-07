@@ -34,6 +34,13 @@ enum OpAdmission {
     Duplicate,
 }
 
+type GenesisResolution = (
+    Vec<Op>,
+    Option<TopicEviction>,
+    Option<OpId>,
+    Option<TopicState>,
+);
+
 /// A single op removed from the losing side of a genesis collision, carrying
 /// enough for the application to re-emit it under the winning genesis.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -461,12 +468,7 @@ impl<S: Storage> Oplog<S> {
         &self,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
-    ) -> Result<(
-        Vec<Op>,
-        Option<TopicEviction>,
-        Option<OpId>,
-        Option<TopicState>,
-    )> {
+    ) -> Result<GenesisResolution> {
         let Some(genesis) = ops.iter().find(|op| is_structural_genesis(op)).cloned() else {
             return Ok((ops, None, None, None));
         };
