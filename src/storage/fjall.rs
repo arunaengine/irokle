@@ -541,8 +541,25 @@ impl Storage for FjallStorage {
         self.transaction(|tx| self.tx_put_admitted_batch(tx, &batch))
     }
 
-    fn reset_topic_and_admit(&self, topic_id: &TopicId, batch: AdmittedBatch) -> Result<usize> {
+    fn reset_topic_and_admit(
+        &self,
+        topic_id: &TopicId,
+        expected_topic_state: &TopicState,
+        batch: AdmittedBatch,
+    ) -> Result<usize> {
         self.transaction(|tx| {
+            let current_heads: BTreeSet<OpId> =
+                Self::tx_get(tx, &self.records, Self::key_id(b"h", topic_id))?.unwrap_or_default();
+            let current_topic_state: Option<TopicState> =
+                Self::tx_get::<TopicState>(tx, &self.records, Self::key_id(b"ts", topic_id))?.map(
+                    |mut state| {
+                        state.heads = current_heads;
+                        state
+                    },
+                );
+            if current_topic_state.as_ref() != Some(expected_topic_state) {
+                return Err(Error::AdmissionConflict);
+            }
             let removed = self.tx_reset_topic(tx, topic_id)?;
             self.tx_put_admitted_batch(tx, &batch)?;
             Ok(removed)

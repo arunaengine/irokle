@@ -2,7 +2,7 @@
 //! Operation-log admission, DAG validation, and topic-state materialization.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::storage::{
     AdmissionEffects, AdmittedBatch, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage,
@@ -24,6 +24,10 @@ use topology::topological_ops;
 pub use topology::{topological, topological_subset};
 
 const MAX_ADMISSION_RETRIES: usize = 64;
+// Genesis collisions are rare. Serialize their resolution across all Oplog
+// facades in this process; storage reset preconditions still provide the
+// authoritative stale-write guard.
+static GENESIS_RESOLUTION_LOCK: Mutex<()> = Mutex::new(());
 
 enum OpAdmission {
     Admit,
@@ -72,9 +76,6 @@ fn is_structural_genesis(op: &Op) -> bool {
 #[derive(Clone)]
 pub struct Oplog<S = MemoryStorage> {
     storage: S,
-    // Serializes genesis tie-break resolution so two concurrent admissions
-    // cannot both reset the same topic; shared across clones via `Arc`.
-    resolution_lock: Arc<Mutex<()>>,
 }
 
 impl Default for Oplog<MemoryStorage> {
@@ -87,17 +88,13 @@ impl Oplog<MemoryStorage> {
     pub fn new() -> Self {
         Self {
             storage: MemoryStorage::new(),
-            resolution_lock: Arc::new(Mutex::new(())),
         }
     }
 }
 
 impl<S: Storage> Oplog<S> {
     pub fn with_storage(storage: S) -> Self {
-        Self {
-            storage,
-            resolution_lock: Arc::new(Mutex::new(())),
-        }
+        Self { storage }
     }
     pub fn storage(&self) -> &S {
         &self.storage
@@ -401,30 +398,26 @@ impl<S: Storage> Oplog<S> {
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
     ) -> Result<(BTreeSet<crate::OpId>, Option<TopicEviction>)> {
-        // A batch bearing a genesis may collide with an existing topic. Hold
-        // the resolution lock across both the tie-break and the admission that
-        // consumes it, so a concurrent admission cannot reset the topic in
-        // between. Non-genesis batches (the common path) never lock.
-        let _guard = if ops.iter().any(is_structural_genesis) {
+        let has_genesis = ops.iter().any(is_structural_genesis);
+        let _genesis_guard = if has_genesis {
             Some(
-                self.resolution_lock
+                GENESIS_RESOLUTION_LOCK
                     .lock()
-                    .map_err(|_| Error::Storage("resolution lock poisoned".into()))?,
+                    .map_err(|_| Error::Storage("genesis resolution lock poisoned".into()))?,
             )
         } else {
             None
         };
-        let (ops, eviction, rejected_genesis) = if _guard.is_some() {
-            self.resolve_genesis_collision(ops, verified)?
-        } else {
-            (ops, None, None)
-        };
-        // A won foreign genesis discards the local chain: admit the winner
-        // batch against a fresh topic and fold the reset into the same storage
-        // transaction as its admission (`reset_topic_and_admit`).
-        let reset = eviction.is_some();
         for _ in 0..MAX_ADMISSION_RETRIES {
-            match self.admit_ops_batch(source_peer, ops.clone(), verified, reset) {
+            let (ops_to_admit, eviction, rejected_genesis, reset_expected_state) = if has_genesis {
+                self.resolve_genesis_collision(ops.clone(), verified)?
+            } else {
+                (ops.clone(), None, None, None)
+            };
+            // A won foreign genesis discards the local chain: admit the winner
+            // batch against a fresh topic and fold the reset into the same
+            // storage transaction as its admission (`reset_topic_and_admit`).
+            match self.admit_ops_batch(source_peer, ops_to_admit, verified, reset_expected_state) {
                 Err(Error::AdmissionConflict) => continue,
                 Ok(accepted) => {
                     if let Some(losing) = rejected_genesis {
@@ -458,27 +451,33 @@ impl<S: Storage> Oplog<S> {
     }
 
     /// Resolve a genesis tie-break for a batch that carries a structurally
-    /// valid genesis. The caller holds `resolution_lock`, so the reads and the
-    /// reset here are single-flight per oplog. Returns the ops to admit
-    /// (unchanged when the incoming genesis wins or there is no collision; with
-    /// a losing foreign genesis filtered out when the local one wins) plus any
-    /// eviction produced when the local topic is reset.
+    /// valid genesis. Returns the ops to admit (unchanged when the incoming
+    /// genesis wins or there is no collision; with a losing foreign genesis
+    /// filtered out when the local one wins), any eviction produced when the
+    /// local topic is reset, any rejected genesis to purge from pending, and
+    /// the exact pre-reset state that must still be current for the reset to
+    /// proceed.
     fn resolve_genesis_collision(
         &self,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
-    ) -> Result<(Vec<Op>, Option<TopicEviction>, Option<OpId>)> {
+    ) -> Result<(
+        Vec<Op>,
+        Option<TopicEviction>,
+        Option<OpId>,
+        Option<TopicState>,
+    )> {
         let Some(genesis) = ops.iter().find(|op| is_structural_genesis(op)).cloned() else {
-            return Ok((ops, None, None));
+            return Ok((ops, None, None, None));
         };
         let topic_id = genesis.signed.body.topic_id;
         let Some(state) = self.storage.topic_state(&topic_id)? else {
             // Fresh topic: normal admission accepts the genesis.
-            return Ok((ops, None, None));
+            return Ok((ops, None, None, None));
         };
         if state.genesis == genesis.id {
             // Same node re-sending its genesis: normal dedup handles it.
-            return Ok((ops, None, None));
+            return Ok((ops, None, None, None));
         }
         // Only a signature-valid genesis may win the tie-break.
         if !verified.contains(&genesis.id) {
@@ -505,7 +504,7 @@ impl<S: Storage> Oplog<S> {
                     "rejected non-member genesis collision"
                 );
                 let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
-                return Ok((filtered, None, Some(genesis.id)));
+                return Ok((filtered, None, Some(genesis.id), None));
             }
             let eviction = self.extract_eviction(topic_id, &state, genesis.id)?;
             tracing::warn!(
@@ -515,7 +514,7 @@ impl<S: Storage> Oplog<S> {
                 evicted = eviction.evicted.len(),
                 "genesis collision resolved: reset local topic for smaller winning genesis"
             );
-            Ok((ops, Some(eviction), None))
+            Ok((ops, Some(eviction), None, Some(state)))
         } else {
             tracing::warn!(
                 %topic_id,
@@ -525,7 +524,7 @@ impl<S: Storage> Oplog<S> {
                 "genesis collision resolved: kept local genesis, rejected larger foreign genesis"
             );
             let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
-            Ok((filtered, None, Some(genesis.id)))
+            Ok((filtered, None, Some(genesis.id), None))
         }
     }
 
@@ -577,7 +576,7 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
-        reset: bool,
+        reset_expected_state: Option<TopicState>,
     ) -> Result<BTreeSet<crate::OpId>> {
         let ops = topological_ops(ops)?;
         let mut accepted = BTreeSet::new();
@@ -591,6 +590,7 @@ impl<S: Storage> Oplog<S> {
         // On the reset path the local topic is wiped and the winner batch is
         // self-contained, so validate and admit it against a fresh topic; the
         // reset is applied atomically with these writes below.
+        let reset = reset_expected_state.is_some();
         let (expected_heads, expected_state) = if reset {
             (BTreeSet::new(), None)
         } else {
@@ -684,8 +684,12 @@ impl<S: Storage> Oplog<S> {
         if reset {
             // Reset and winner admission share one storage transaction so a
             // crash never leaves the topic empty with the winner uninstalled.
+            let reset_expected_state = reset_expected_state
+                .as_ref()
+                .ok_or(Error::AdmissionConflict)?;
             self.storage.reset_topic_and_admit(
                 &topic_id,
+                reset_expected_state,
                 AdmittedBatch {
                     topic_id,
                     expected_heads,

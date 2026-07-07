@@ -354,8 +354,16 @@ impl Storage for MemoryStorage {
         Ok(reset_topic_locked(&mut inner, topic_id))
     }
 
-    fn reset_topic_and_admit(&self, topic_id: &TopicId, batch: AdmittedBatch) -> Result<usize> {
+    fn reset_topic_and_admit(
+        &self,
+        topic_id: &TopicId,
+        expected_topic_state: &TopicState,
+        batch: AdmittedBatch,
+    ) -> Result<usize> {
         let mut inner = self.lock()?;
+        if memory_topic_state_locked(&inner, topic_id).as_ref() != Some(expected_topic_state) {
+            return Err(Error::AdmissionConflict);
+        }
         let removed = reset_topic_locked(&mut inner, topic_id);
         put_admitted_batch_locked(&mut inner, batch)?;
         Ok(removed)

@@ -367,16 +367,13 @@ impl<S: Storage> SyncEngine<S> {
         source_peer_id: PeerId,
         ack_peer_id: PeerId,
         data: SyncData,
-    ) -> Result<SyncAck> {
-        Ok(self
-            .receive_data_preverified(source_peer_id, ack_peer_id, data, &BTreeSet::new())?
-            .0)
+    ) -> Result<(SyncAck, Vec<TopicEviction>)> {
+        self.receive_data_preverified(source_peer_id, ack_peer_id, data, &BTreeSet::new())
     }
 
-    /// Like [`Self::receive_data`], but skips signature verification for ops
-    /// whose id is in `verified` (the caller already ran [`Op::validate`] on
-    /// those exact ops) and returns any topic evictions from genesis tie-break
-    /// resolution alongside the ack.
+    /// Like [`Self::receive_data`], but skips signature verification for ops whose
+    /// id is in `verified` (the caller already ran [`Op::validate`] on those exact
+    /// ops).
     pub(crate) fn receive_data_preverified(
         &self,
         source_peer_id: PeerId,

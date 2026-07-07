@@ -167,16 +167,27 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// admitted ops removed.
     fn reset_topic(&self, topic_id: &TopicId) -> Result<usize>;
 
-    /// Atomically [`Storage::reset_topic`] then apply `batch`, in one durable
-    /// operation. Genesis tie-break adoption uses this to discard the local
-    /// chain and install the winning foreign genesis with no crash window
-    /// between the two: a crash either leaves the whole local chain or the
-    /// fully installed winner, never an empty topic. `batch` must be built
-    /// against a fresh topic (empty `expected_heads`, `None`
-    /// `expected_topic_state`). Returns the number of admitted ops the reset
-    /// removed. The default composition is correct but not atomic; durable
-    /// backends override it with a single transaction.
-    fn reset_topic_and_admit(&self, topic_id: &TopicId, batch: AdmittedBatch) -> Result<usize> {
+    /// Atomically verify that the current topic state is exactly
+    /// `expected_topic_state`, then [`Storage::reset_topic`] and apply `batch`
+    /// in one durable operation. Genesis tie-break adoption uses this to
+    /// discard the local chain and install the winning foreign genesis with no
+    /// crash window between the two: a crash either leaves the whole local
+    /// chain or the fully installed winner, never an empty topic. The expected
+    /// state check prevents a stale resolver from overwriting a smaller genesis
+    /// admitted by another facade. `batch` must be built against a fresh topic
+    /// (empty `expected_heads`, `None` `expected_topic_state`). Returns the
+    /// number of admitted ops the reset removed. The default composition is
+    /// correct but not atomic; durable backends override it with a single
+    /// transaction.
+    fn reset_topic_and_admit(
+        &self,
+        topic_id: &TopicId,
+        expected_topic_state: &TopicState,
+        batch: AdmittedBatch,
+    ) -> Result<usize> {
+        if self.topic_state(topic_id)?.as_ref() != Some(expected_topic_state) {
+            return Err(crate::Error::AdmissionConflict);
+        }
         let removed = self.reset_topic(topic_id)?;
         self.put_admitted_batch(batch)?;
         Ok(removed)

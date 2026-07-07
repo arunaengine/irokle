@@ -141,7 +141,8 @@ fn assert_pending_reconciles<S: Storage>(storage: S) {
                 ops: vec![second.clone()],
             },
         )
-        .unwrap();
+        .unwrap()
+        .0;
     assert!(pending_ack.accepted.is_empty());
     assert!(storage.get_op(&second.id).unwrap().is_none());
 
@@ -410,9 +411,11 @@ fn assert_reset_topic_and_admit_is_atomic<S: Storage>(storage: S) {
         .unwrap()
         .unwrap();
 
+    let expected_state = storage.topic_state(&topic_id).unwrap().unwrap();
     let removed = storage
         .reset_topic_and_admit(
             &topic_id,
+            &expected_state,
             crate_storage::AdmittedBatch {
                 topic_id,
                 expected_heads: BTreeSet::new(),
@@ -460,9 +463,75 @@ fn assert_reset_topic_and_admit_is_atomic<S: Storage>(storage: S) {
     assert!(storage.topic_state(&survivor_id).unwrap().is_some());
 }
 
+fn assert_reset_topic_and_admit_rejects_stale_state<S: Storage>(storage: S) {
+    let topic_id = TopicId::hash(b"stale-reset-admit-topic");
+    let actor = seed_chain(&storage, topic_id, 64, &["one"]);
+    let stale_state = storage.topic_state(&topic_id).unwrap().unwrap();
+
+    let signer = Ed25519Signer::from_bytes(&[64; 32]);
+    oplog::Oplog::with_storage(storage.clone())
+        .create_event_op(
+            topic_id,
+            actor,
+            EventEnvelope::encode_event(&Note { text: "two".into() }).unwrap(),
+            &signer,
+        )
+        .unwrap();
+
+    let winner_signer = Ed25519Signer::from_bytes(&[65; 32]);
+    let winner_src = oplog::Oplog::with_storage(MemoryStorage::new());
+    let winner_actor = actor_id_for(topic_id, winner_signer.peer_id());
+    let winner_genesis = winner_src
+        .create_topic_genesis(
+            topic_id,
+            winner_actor,
+            TopicGenesis {
+                event_type_id: Note::TYPE_ID.into(),
+                initial_peers: BTreeSet::new(),
+                replication_policy: ReplicationPolicy::default(),
+            },
+            &winner_signer,
+        )
+        .unwrap();
+    let winner_meta = winner_src
+        .storage()
+        .get_meta(&winner_genesis.id)
+        .unwrap()
+        .unwrap();
+    let winner_state = winner_src
+        .storage()
+        .topic_state(&topic_id)
+        .unwrap()
+        .unwrap();
+
+    let err = storage
+        .reset_topic_and_admit(
+            &topic_id,
+            &stale_state,
+            crate_storage::AdmittedBatch {
+                topic_id,
+                expected_heads: BTreeSet::new(),
+                expected_topic_state: None,
+                entries: vec![(winner_genesis.clone(), winner_meta)],
+                heads: [winner_genesis.id].into(),
+                topic_state: Some(winner_state),
+                effects: crate_storage::AdmissionEffects::default(),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::AdmissionConflict));
+    assert!(storage.get_op(&winner_genesis.id).unwrap().is_none());
+    assert_eq!(storage.list_op_ids(&topic_id).unwrap().len(), 3);
+}
+
 #[test]
 fn memory_reset_topic_and_admit_is_atomic() {
     assert_reset_topic_and_admit_is_atomic(MemoryStorage::new());
+}
+
+#[test]
+fn memory_reset_topic_and_admit_rejects_stale_state() {
+    assert_reset_topic_and_admit_rejects_stale_state(MemoryStorage::new());
 }
 
 #[cfg(feature = "fjall")]
@@ -471,6 +540,14 @@ fn fjall_reset_topic_and_admit_is_atomic() {
     let dir = tempfile::tempdir().unwrap();
     let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
     assert_reset_topic_and_admit_is_atomic(storage);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reset_topic_and_admit_rejects_stale_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    assert_reset_topic_and_admit_rejects_stale_state(storage);
 }
 
 #[test]

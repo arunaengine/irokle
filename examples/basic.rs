@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bob_summary = bob.sync_summary(alice_topic.id())?;
     let data_for_bob = alice.plan_sync_data(bob.peer_id(), &bob_summary)?;
-    let ack = bob.receive_sync_data_from(alice.peer_id(), data_for_bob)?;
+    let (ack, _) = bob.receive_sync_data_from(alice.peer_id(), data_for_bob)?;
     alice.apply_sync_ack(&ack)?;
 
     let bob_topic = bob.open_topic::<ChatEvent>(alice_topic.id())?;
@@ -43,9 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bob_summary = bob.sync_summary(alice_topic.id())?;
     let data_for_bob = alice.plan_sync_data(bob.peer_id(), &bob_summary)?;
     let request_for_alice = alice.plan_sync_request(bob.peer_id(), &bob_summary)?;
-    let bob_ack = bob.receive_sync_data_from(alice.peer_id(), data_for_bob)?;
+    let (bob_ack, _) = bob.receive_sync_data_from(alice.peer_id(), data_for_bob)?;
     let data_for_alice = bob.plan_sync_response_data(alice.peer_id(), &request_for_alice)?;
-    let alice_ack = alice.receive_sync_data_from(bob.peer_id(), data_for_alice)?;
+    let (alice_ack, _) = alice.receive_sync_data_from(bob.peer_id(), data_for_alice)?;
     alice.apply_sync_ack(&bob_ack)?;
     bob.apply_sync_ack(&alice_ack)?;
 

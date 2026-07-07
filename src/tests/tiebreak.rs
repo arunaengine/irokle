@@ -156,6 +156,103 @@ fn fork_resolves_to_smaller_genesis() {
 }
 
 #[test]
+fn sync_receive_data_returns_genesis_eviction() {
+    let topic_id = TopicId::hash(b"genesis-fork-sync-receive");
+    let (oplog_a, signer_a, g_a, e_a) = seed_side(topic_id, 1, 2, "a-branch");
+    let (oplog_b, signer_b, g_b, e_b) = seed_side(topic_id, 2, 1, "b-branch");
+    let (
+        loser_oplog,
+        loser_peer,
+        winner_peer,
+        loser_genesis,
+        loser_event,
+        winner_genesis,
+        winner_event,
+    ) = if g_a.id < g_b.id {
+        (
+            oplog_b,
+            signer_b.peer_id(),
+            signer_a.peer_id(),
+            g_b,
+            e_b,
+            g_a,
+            e_a,
+        )
+    } else {
+        (
+            oplog_a,
+            signer_a.peer_id(),
+            signer_b.peer_id(),
+            g_a,
+            e_a,
+            g_b,
+            e_b,
+        )
+    };
+
+    let engine = SyncEngine::new(loser_oplog);
+    let (ack, evictions) = engine
+        .receive_data(
+            winner_peer,
+            loser_peer,
+            sync::SyncData {
+                topic_id,
+                ops: vec![winner_genesis.clone(), winner_event],
+            },
+        )
+        .unwrap();
+
+    assert!(ack.accepted.contains(&winner_genesis.id));
+    assert_eq!(evictions.len(), 1);
+    assert_eq!(evictions[0].losing_genesis, loser_genesis.id);
+    assert_eq!(evictions[0].winning_genesis, winner_genesis.id);
+    assert_eq!(evictions[0].evicted[0].op_id, loser_event.id);
+}
+
+#[test]
+fn node_receive_sync_data_from_returns_genesis_eviction() {
+    let topic_id = TopicId::hash(b"genesis-fork-node-receive");
+    let (_, signer_a, g_a, e_a) = seed_side(topic_id, 1, 2, "a-branch");
+    let (_, signer_b, g_b, e_b) = seed_side(topic_id, 2, 1, "b-branch");
+    let (loser_signer, loser_genesis, loser_event, winner_signer, winner_genesis, winner_event) =
+        if g_a.id < g_b.id {
+            (signer_b, g_b, e_b, signer_a, g_a, e_a)
+        } else {
+            (signer_a, g_a, e_a, signer_b, g_b, e_b)
+        };
+    let node = Irokle::new(NodeConfig {
+        signer: loser_signer.clone(),
+        default_write_concern: WriteConcern::Local,
+        ..NodeConfig::default()
+    })
+    .unwrap();
+    node.receive_sync_data_from(
+        loser_signer.peer_id(),
+        sync::SyncData {
+            topic_id,
+            ops: vec![loser_genesis.clone(), loser_event.clone()],
+        },
+    )
+    .unwrap();
+
+    let (ack, evictions) = node
+        .receive_sync_data_from(
+            winner_signer.peer_id(),
+            sync::SyncData {
+                topic_id,
+                ops: vec![winner_genesis.clone(), winner_event],
+            },
+        )
+        .unwrap();
+
+    assert!(ack.accepted.contains(&winner_genesis.id));
+    assert_eq!(evictions.len(), 1);
+    assert_eq!(evictions[0].losing_genesis, loser_genesis.id);
+    assert_eq!(evictions[0].winning_genesis, winner_genesis.id);
+    assert_eq!(evictions[0].evicted[0].op_id, loser_event.id);
+}
+
+#[test]
 fn non_member_smaller_genesis_does_not_reset() {
     let topic_id = TopicId::hash(b"genesis-fork-topic");
     // Local chain with no other members, so its membership is exactly {local}.
@@ -280,7 +377,7 @@ fn reset_completeness_lets_acks_converge() {
     let loser_summary = sync_loser.summary(topic_id).unwrap();
     let data_for_loser = sync_winner.plan_data(loser_peer, &loser_summary).unwrap();
     assert!(data_for_loser.ops.is_empty());
-    let mut ack_from_loser = sync_loser
+    let (mut ack_from_loser, _) = sync_loser
         .receive_data(winner_peer, loser_peer, data_for_loser)
         .unwrap();
     ack_from_loser.sign(&fork.loser_signer).unwrap();
@@ -289,7 +386,7 @@ fn reset_completeness_lets_acks_converge() {
     let winner_summary = sync_winner.summary(topic_id).unwrap();
     let data_for_winner = sync_loser.plan_data(winner_peer, &winner_summary).unwrap();
     assert!(data_for_winner.ops.is_empty());
-    let mut ack_from_winner = sync_winner
+    let (mut ack_from_winner, _) = sync_winner
         .receive_data(loser_peer, winner_peer, data_for_winner)
         .unwrap();
     ack_from_winner.sign(&fork.winner_signer).unwrap();

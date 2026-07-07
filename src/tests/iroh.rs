@@ -811,7 +811,7 @@ async fn batched_resync_drains_topic_backlog_with_few_streams() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn genesis_tiebreak_eviction_reaches_sink_via_handle_messages() {
+async fn genesis_tiebreak_eviction_reaches_sink_via_builder_net() {
     use crate::TopicEviction;
 
     let topic_id = TopicId::hash(b"iroh-genesis-fork-topic");
@@ -888,8 +888,12 @@ async fn genesis_tiebreak_eviction_reaches_sink_via_handle_messages() {
         .bind()
         .await
         .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TopicEviction>();
     let alice = Irokle::builder()
         .with_iroh_secret_key(alice_endpoint.secret_key())
+        .with_net(alice_endpoint)
+        .with_eviction_sink(tx)
+        .without_auto_accept()
         .build()
         .unwrap();
     // Seed alice with the losing chain so the incoming winning genesis collides.
@@ -903,33 +907,26 @@ async fn genesis_tiebreak_eviction_reaches_sink_via_handle_messages() {
         )
         .unwrap();
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TopicEviction>();
-    let net = net::IrohNet::new_with_alpns_config_and_sink(
-        alice_endpoint,
-        alice.clone(),
-        Vec::new(),
-        net::IrohRuntimeConfig::default(),
-        Some(tx),
-    )
-    .unwrap();
-
     let peer_peer_id = PeerId::from_bytes(*peer_endpoint.id().as_bytes());
-    let responses = net
-        .handle_messages(
-            peer_endpoint.id(),
-            vec![
-                sync::SyncMessage::Open(sync::SyncEngine::<MemoryStorage>::open(
-                    topic_id,
-                    peer_peer_id,
-                    Some(Note::TYPE_ID.into()),
-                )),
-                sync::SyncMessage::Data(sync::SyncData {
-                    topic_id,
-                    ops: vec![winner_genesis.clone(), winner_event.clone()],
-                }),
-            ],
-        )
+    let peer = Irokle::builder()
+        .with_iroh_secret_key(peer_endpoint.secret_key())
+        .build()
         .unwrap();
+    let peer_net = net::IrohNet::new(peer_endpoint, peer).unwrap();
+    alice.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice.endpoint().unwrap()).await;
+    let messages = vec![
+        sync::SyncMessage::Open(sync::SyncEngine::<MemoryStorage>::open(
+            topic_id,
+            peer_peer_id,
+            Some(Note::TYPE_ID.into()),
+        )),
+        sync::SyncMessage::Data(sync::SyncData {
+            topic_id,
+            ops: vec![winner_genesis.clone(), winner_event.clone()],
+        }),
+    ];
+    let responses = peer_net.sync_with(alice_addr, &messages).await.unwrap();
 
     assert!(responses.iter().any(|response| {
         matches!(response, sync::SyncMessage::Ack(ack) if ack.topic_id == topic_id)
@@ -954,7 +951,8 @@ async fn genesis_tiebreak_eviction_reaches_sink_via_handle_messages() {
         winner_genesis.id
     );
 
-    net.shutdown().await;
+    peer_net.shutdown().await;
+    alice.shutdown_iroh().await;
 }
 
 #[cfg(feature = "iroh")]

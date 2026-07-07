@@ -42,7 +42,7 @@ fn main() -> irokle::Result<()> {
 
     let bob_summary = bob.sync_summary(alice_topic.id())?;
     let data_for_bob = alice.plan_sync_data(bob.peer_id(), &bob_summary)?;
-    let bob_ack = bob.receive_sync_data_from(alice.peer_id(), data_for_bob)?;
+    let (bob_ack, _) = bob.receive_sync_data_from(alice.peer_id(), data_for_bob)?;
     alice.apply_sync_ack(&bob_ack)?;
 
     let bob_topic = bob.open_topic::<ChatEvent>(alice_topic.id())?;

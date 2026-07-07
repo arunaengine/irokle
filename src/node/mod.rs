@@ -94,6 +94,8 @@ pub struct IrokleBuilder<S = MemoryStorage> {
     auto_accept: bool,
     #[cfg(feature = "iroh")]
     iroh_runtime: crate::net::IrohRuntimeConfig,
+    #[cfg(feature = "iroh")]
+    eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
 }
 
 impl<S: Storage> Irokle<S> {
@@ -442,21 +444,20 @@ impl<S: Storage> Irokle<S> {
         self.sync.plan_response_data(peer_id, request)
     }
 
+    /// Admit sync data from `source_peer_id` and return the signed ack payload
+    /// plus any topic evictions produced by genesis tie-break resolution.
     pub fn receive_sync_data_from(
         &self,
         source_peer_id: PeerId,
         data: SyncData,
-    ) -> Result<SyncAck> {
-        Ok(self
-            .receive_sync_data_from_evicting(source_peer_id, data)?
-            .0)
+    ) -> Result<(SyncAck, Vec<TopicEviction>)> {
+        self.receive_sync_data_from_evicting(source_peer_id, data)
     }
 
-    /// Like [`Self::receive_sync_data_from`], but also returns the topic
-    /// evictions produced when a genesis tie-break resets a local topic in
-    /// favour of a smaller foreign genesis. The embedder consumes these to
-    /// re-emit the discarded payloads under the winning genesis; re-emission
-    /// itself is out of scope for irokle.
+    /// Alias for [`Self::receive_sync_data_from`] with an explicit name for
+    /// callers handling genesis tie-break evictions. The embedder consumes
+    /// evictions to re-emit discarded payloads under the winning genesis;
+    /// re-emission itself is out of scope for irokle.
     pub fn receive_sync_data_from_evicting(
         &self,
         source_peer_id: PeerId,
@@ -499,12 +500,15 @@ impl<S: Storage> Irokle<S> {
         Ok((ack, evictions))
     }
 
-    pub fn receive_sync_data_as_local(&self, data: SyncData) -> Result<SyncAck> {
-        let mut ack = self
+    pub fn receive_sync_data_as_local(
+        &self,
+        data: SyncData,
+    ) -> Result<(SyncAck, Vec<TopicEviction>)> {
+        let (mut ack, evictions) = self
             .sync
             .receive_data(self.peer_id(), self.peer_id(), data)?;
         ack.sign(&self.config.signer)?;
-        Ok(ack)
+        Ok((ack, evictions))
     }
 
     pub fn apply_sync_ack(&self, ack: &SyncAck) -> Result<()> {
