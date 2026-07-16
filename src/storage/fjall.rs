@@ -93,6 +93,11 @@ impl FjallStorage {
         [prefix, id.as_ref()].concat()
     }
 
+    // An op id beginning with `b` makes its `o<id>` key match the `ob` scan prefix.
+    fn is_op_record_key(key: &[u8]) -> bool {
+        key.len() == b"o".len() + OpId::LEN && key.starts_with(b"o")
+    }
+
     fn put<T: Serialize>(&self, key: impl AsRef<[u8]>, value: &T) -> Result<()> {
         let key = key.as_ref().to_vec();
         let value = postcard::to_allocvec(value)?;
@@ -511,6 +516,9 @@ impl FjallStorage {
         let mut ob_keys = Vec::new();
         for item in fjall::Readable::prefix(tx, &self.records, b"ob".as_slice()) {
             let (key, value) = item.into_inner()?;
+            if Self::is_op_record_key(key.as_ref()) {
+                continue;
+            }
             let obligation: SyncObligation = postcard::from_bytes(value.as_ref())?;
             if obligation.topic_id == *topic_id {
                 ob_keys.push(key.to_vec());
@@ -796,7 +804,10 @@ impl Storage for FjallStorage {
         let mut out = Vec::new();
         let read_tx = self.db.read_tx();
         for item in fjall::Readable::prefix(&read_tx, &self.records, b"ob".as_slice()) {
-            let value = item.value()?;
+            let (key, value) = item.into_inner()?;
+            if Self::is_op_record_key(key.as_ref()) {
+                continue;
+            }
             out.push(postcard::from_bytes(value.as_ref())?);
         }
         Ok(out)
@@ -919,4 +930,35 @@ fn clear_satisfied_tx(
         tx.remove(records, key);
     }
     Ok(cleared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn obligation_scans_skip_op_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path()).unwrap();
+        let mut op_id = [0_u8; OpId::LEN];
+        op_id[0] = b'b';
+        storage
+            .put(FjallStorage::key_id(b"o", &OpId::from_bytes(op_id)), &())
+            .unwrap();
+
+        let obligation = SyncObligation {
+            peer_id: PeerId::hash(b"collision-peer"),
+            topic_id: TopicId::hash(b"collision-topic"),
+            op_ids: [OpId::hash(b"collision-op")].into(),
+            target_clock: ActorClock::new(),
+        };
+        storage.put_sync_obligation(obligation.clone()).unwrap();
+
+        assert_eq!(
+            storage.all_sync_obligations().unwrap(),
+            vec![obligation.clone()]
+        );
+        assert_eq!(storage.reset_topic(&obligation.topic_id).unwrap(), 0);
+        assert!(storage.all_sync_obligations().unwrap().is_empty());
+    }
 }
