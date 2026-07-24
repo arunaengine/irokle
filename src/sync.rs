@@ -381,20 +381,36 @@ impl<S: Storage> SyncEngine<S> {
         data: SyncData,
         verified: &BTreeSet<OpId>,
     ) -> Result<(SyncAck, Vec<TopicEviction>)> {
+        let mut data_op_ids = BTreeSet::new();
         for op in &data.ops {
             if op.signed.body.topic_id != data.topic_id {
                 return Err(Error::TopicMismatch);
             }
+            data_op_ids.insert(op.id);
         }
         let admitted = self.oplog.receive_ops_from_peer_preverified(
             Some(source_peer_id),
             data.ops,
             verified,
         )?;
+        // Admission also flushes buffered ops of other topics; an ack speaks
+        // for its own topic only, and its reader files obligations under it.
+        let mut accepted = BTreeSet::new();
+        for op_id in admitted.accepted {
+            if data_op_ids.contains(&op_id)
+                || self
+                    .oplog
+                    .storage()
+                    .get_meta(&op_id)?
+                    .is_some_and(|meta| meta.topic_id == data.topic_id)
+            {
+                accepted.insert(op_id);
+            }
+        }
         let ack = SyncAck {
             topic_id: data.topic_id,
             peer_id: ack_peer_id,
-            accepted: admitted.accepted,
+            accepted,
             heads: self.oplog.storage().heads(&data.topic_id)?,
             clock: self.oplog.storage().actor_clock(&data.topic_id)?,
             signature: None,
