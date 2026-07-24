@@ -10,7 +10,8 @@ use smallvec::SmallVec;
 use crate::oplog::{Oplog, TopicEviction, topological_subset};
 use crate::storage::{PeerAck, Storage, SyncObligation};
 use crate::{
-    ActorClock, ActorId, Error, Op, OpId, PeerId, Result, Signer, TopicId, canonical_bytes, verify,
+    ActorClock, ActorId, Error, Op, OpId, PeerId, Result, Signer, TopicId, actor_id_for,
+    canonical_bytes, verify,
 };
 
 const SYNC_ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/1";
@@ -146,11 +147,12 @@ pub enum SyncMessage {
 #[derive(Clone)]
 pub struct SyncEngine<S> {
     oplog: Oplog<S>,
+    peer_id: PeerId,
 }
 
 impl<S: Storage> SyncEngine<S> {
-    pub fn new(oplog: Oplog<S>) -> Self {
-        Self { oplog }
+    pub fn new(oplog: Oplog<S>, peer_id: PeerId) -> Self {
+        Self { oplog, peer_id }
     }
     pub fn open(topic_id: TopicId, peer_id: PeerId, event_type_id: Option<String>) -> SyncOpen {
         SyncOpen {
@@ -493,21 +495,26 @@ impl<S: Storage> SyncEngine<S> {
             return Err(Error::NotTopicMember);
         }
 
-        let local_clock = self.oplog.storage().actor_clock(&ack.topic_id)?;
-        for (actor_id, seq) in ack.clock.iter() {
-            let local_seq = local_clock.get(actor_id);
-            if *seq > local_seq {
-                return Err(Error::InvalidSyncAck(format!(
-                    "clock for actor {actor_id} claims seq {seq}, local seq is {local_seq}"
-                )));
-            }
+        // Only our own actor is locally bounded: we author all of its ops, so
+        // no peer can hold more. Other actors reach a peer through a third
+        // member before they reach us, so their entries stay unchecked.
+        let local_actor = actor_id_for(ack.topic_id, self.peer_id);
+        let local_seq = self
+            .oplog
+            .storage()
+            .actor_clock(&ack.topic_id)?
+            .get(&local_actor);
+        let claimed_seq = ack.clock.get(&local_actor);
+        if claimed_seq > local_seq {
+            return Err(Error::InvalidSyncAck(format!(
+                "clock for actor {local_actor} claims seq {claimed_seq}, local seq is {local_seq}"
+            )));
         }
 
         for op_id in ack.accepted.iter().chain(ack.heads.iter()) {
+            // History we have not learned yet makes no locally checkable claim.
             let Some(meta) = self.oplog.storage().get_meta(op_id)? else {
-                return Err(Error::InvalidSyncAck(format!(
-                    "ack references unknown op {op_id}"
-                )));
+                continue;
             };
             if meta.topic_id != ack.topic_id {
                 return Err(Error::TopicMismatch);
