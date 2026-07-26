@@ -190,7 +190,7 @@ fn sync_receive_data_returns_genesis_eviction() {
         )
     };
 
-    let engine = SyncEngine::new(loser_oplog);
+    let engine = SyncEngine::new(loser_oplog, loser_peer);
     let (ack, evictions) = engine
         .receive_data(
             winner_peer,
@@ -368,8 +368,8 @@ fn reset_completeness_lets_acks_converge() {
     let topic_id = fork.topic_id;
     let winner_peer = fork.winner_signer.peer_id();
     let loser_peer = fork.loser_signer.peer_id();
-    let sync_winner = SyncEngine::new(fork.winner_oplog.clone());
-    let sync_loser = SyncEngine::new(fork.loser_oplog.clone());
+    let sync_winner = SyncEngine::new(fork.winner_oplog.clone(), winner_peer);
+    let sync_loser = SyncEngine::new(fork.loser_oplog.clone(), loser_peer);
 
     // A normal sync round in both directions. Fingerprints already match after
     // resolution, so no ops move; the point is that the signed acks validate

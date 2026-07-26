@@ -102,7 +102,7 @@ impl<S: Storage> Irokle<S> {
     pub fn with_storage(storage: S, config: NodeConfig) -> Result<Self> {
         let oplog = Oplog::with_storage(storage);
         oplog.reconcile_pending_ops()?;
-        let sync = SyncEngine::new(oplog.clone());
+        let sync = SyncEngine::new(oplog.clone(), config.signer.peer_id());
         Ok(Self {
             oplog,
             sync,

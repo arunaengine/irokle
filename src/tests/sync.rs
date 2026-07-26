@@ -606,6 +606,86 @@ fn reports_status() {
 }
 
 #[test]
+fn scopes_accepted_ops() {
+    // Admission flushes ready ops of every topic; a buffered op of another
+    // topic must stay out of this ack, or its reader files an obligation
+    // under the wrong topic that no ack can ever satisfy.
+    let alice = node(80);
+    let bob = node(81);
+    let first = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let second = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    bob.receive_sync_data_from(
+        alice.peer_id(),
+        crate_sync::SyncData {
+            topic_id: second.id(),
+            ops: oplog::topological(alice.storage(), &second.id()).unwrap(),
+        },
+    )
+    .unwrap();
+
+    let buffered = second
+        .publish(Note {
+            text: "other topic".into(),
+        })
+        .unwrap();
+    let buffered_op = alice
+        .storage()
+        .get_op(&buffered.meta.op_id)
+        .unwrap()
+        .unwrap();
+    let buffered_meta = alice
+        .storage()
+        .get_meta(&buffered.meta.op_id)
+        .unwrap()
+        .unwrap();
+    bob.storage()
+        .put_pending_op(alice.peer_id(), buffered_op, buffered_meta)
+        .unwrap();
+
+    let record = first
+        .publish(Note {
+            text: "mine".into(),
+        })
+        .unwrap();
+    let ack = bob
+        .receive_sync_data_from(
+            alice.peer_id(),
+            crate_sync::SyncData {
+                topic_id: first.id(),
+                ops: oplog::topological(alice.storage(), &first.id()).unwrap(),
+            },
+        )
+        .unwrap()
+        .0;
+
+    assert!(ack.accepted.contains(&record.meta.op_id));
+    assert!(!ack.accepted.contains(&buffered.meta.op_id));
+    assert!(
+        bob.storage()
+            .get_op(&buffered.meta.op_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        bob.storage()
+            .all_sync_obligations()
+            .unwrap()
+            .iter()
+            .all(|obligation| !obligation.op_ids.contains(&buffered.meta.op_id))
+    );
+}
+
+#[test]
 fn omits_non_member_ops() {
     let a = node(8);
     let topic = a.create_topic::<Note>(TopicConfig::default()).unwrap();

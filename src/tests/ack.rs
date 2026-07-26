@@ -266,7 +266,8 @@ fn rejects_future_clock() {
 }
 
 #[test]
-fn rejects_unknown_heads() {
+fn accepts_unknown_heads() {
+    // A head we have not learned is the peer's own history, not a bad ack.
     let alice = node(96);
     let ack_signer = Ed25519Signer::from_bytes(&[97; 32]);
     let peer = ack_signer.peer_id();
@@ -286,13 +287,147 @@ fn rejects_unknown_heads() {
     };
     ack.sign(&ack_signer).unwrap();
 
+    alice.apply_sync_ack(&ack).unwrap();
+
+    assert!(
+        alice
+            .storage()
+            .peer_ack(&peer, &topic.id())
+            .unwrap()
+            .is_some()
+    );
+}
+
+fn mesh_ack() -> (Irokle, Irokle, TopicId, sync::SyncAck) {
+    // Bob buffers Charlie's op until Alice's data completes it, so Bob's ack
+    // carries a third actor's clock entry, head, and accepted op that Alice
+    // has never seen.
+    let alice = node(70);
+    let bob = node(71);
+    let charlie = node(72);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id(), charlie.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    topic
+        .publish(Note {
+            text: "first".into(),
+        })
+        .unwrap();
+    let history = oplog::topological(alice.storage(), &topic.id()).unwrap();
+    charlie
+        .receive_sync_data_from(
+            alice.peer_id(),
+            sync::SyncData {
+                topic_id: topic.id(),
+                ops: history.clone(),
+            },
+        )
+        .unwrap();
+    bob.receive_sync_data_from(
+        alice.peer_id(),
+        sync::SyncData {
+            topic_id: topic.id(),
+            ops: vec![history[0].clone()],
+        },
+    )
+    .unwrap();
+
+    let remote = charlie
+        .open_topic::<Note>(topic.id())
+        .unwrap()
+        .publish(Note {
+            text: "charlie".into(),
+        })
+        .unwrap();
+    let remote_op = charlie
+        .storage()
+        .get_op(&remote.meta.op_id)
+        .unwrap()
+        .unwrap();
+    bob.receive_sync_data_from(
+        charlie.peer_id(),
+        sync::SyncData {
+            topic_id: topic.id(),
+            ops: vec![remote_op],
+        },
+    )
+    .unwrap();
+    assert!(bob.storage().get_op(&remote.meta.op_id).unwrap().is_none());
+
+    let second = topic
+        .publish(Note {
+            text: "second".into(),
+        })
+        .unwrap();
+    let second_op = alice.storage().get_op(&second.meta.op_id).unwrap().unwrap();
+    let ack = bob
+        .receive_sync_data_from(
+            alice.peer_id(),
+            sync::SyncData {
+                topic_id: topic.id(),
+                ops: vec![history[1].clone(), second_op],
+            },
+        )
+        .unwrap()
+        .0;
+    (alice, bob, topic.id(), ack)
+}
+
+#[test]
+fn accepts_mesh_ack() {
+    let (alice, bob, topic_id, ack) = mesh_ack();
+    let local_clock = alice.storage().actor_clock(&topic_id).unwrap();
+    assert!(
+        ack.clock
+            .iter()
+            .any(|(actor_id, seq)| *seq > local_clock.get(actor_id))
+    );
+    assert!(
+        ack.heads
+            .iter()
+            .any(|op_id| alice.storage().get_meta(op_id).unwrap().is_none())
+    );
+    assert!(
+        ack.accepted
+            .iter()
+            .any(|op_id| alice.storage().get_meta(op_id).unwrap().is_none())
+    );
+
+    alice.apply_sync_ack(&ack).unwrap();
+
+    assert!(
+        alice
+            .storage()
+            .peer_ack(&bob.peer_id(), &topic_id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn rejects_local_overclaim() {
+    // Other actors may outrun us, our own actor never can.
+    let (alice, bob, topic_id, mut ack) = mesh_ack();
+    let local_actor = actor_id_for(topic_id, alice.peer_id());
+    let local_seq = alice
+        .storage()
+        .actor_clock(&topic_id)
+        .unwrap()
+        .get(&local_actor);
+    ack.clock.observe(local_actor, local_seq + 1);
+    ack.signature = None;
+    ack.sign(bob.signer()).unwrap();
+
     let err = alice.apply_sync_ack(&ack).unwrap_err();
 
     assert!(matches!(err, Error::InvalidSyncAck(_)));
     assert!(
         alice
             .storage()
-            .peer_ack(&peer, &topic.id())
+            .peer_ack(&bob.peer_id(), &topic_id)
             .unwrap()
             .is_none()
     );
