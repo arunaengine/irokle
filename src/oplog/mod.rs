@@ -158,6 +158,15 @@ impl<S: Storage> Oplog<S> {
         Ok(holes)
     }
 
+    /// Drop the record of which topics were found whole, so the next integrity
+    /// question audits the stored records again. Admission cannot introduce a
+    /// hole, but damage from outside irokle can, and nothing else would ever
+    /// ask a second time.
+    pub fn recheck_topics(&self) -> Result<()> {
+        self.whole_topics()?.clear();
+        Ok(())
+    }
+
     fn whole_topics(&self) -> Result<std::sync::MutexGuard<'_, BTreeSet<TopicId>>> {
         self.whole_topics
             .lock()

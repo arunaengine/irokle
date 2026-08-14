@@ -263,9 +263,7 @@ impl<S: Storage> SyncEngine<S> {
         // A hole moves neither heads nor the clock, so a matching fingerprint
         // does not prove we are whole; keep negotiating until it is repaired.
         let unresolved = self.oplog.topic_unresolved(&remote.topic_id)?;
-        if unresolved.is_empty()
-            && self.oplog.storage().topic_fingerprint(&remote.topic_id)? == remote.fingerprint
-        {
+        if unresolved.is_empty() && self.topic_digest(&remote.topic_id)? == remote.fingerprint {
             return Ok(SyncPlan {
                 topic_id: remote.topic_id,
                 common: local_heads.clone(),

@@ -834,6 +834,9 @@ impl<S: Storage> IrohNet<S> {
     }
 
     fn schedule_full_sweep_resync(&self) -> io::Result<usize> {
+        // The sweep is the one pass that revisits every topic, so let it audit
+        // stored records again rather than reuse an earlier whole verdict.
+        self.node.recheck_topics().map_err(invalid_data)?;
         let mut scheduled = self.schedule_persisted_obligations()?;
         for (peer_id, topic_id) in self.full_sweep_resync_targets()? {
             self.resync_scheduler.schedule_now(peer_id, topic_id, true);

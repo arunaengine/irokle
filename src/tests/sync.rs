@@ -1419,3 +1419,34 @@ fn repair_refetches_dangling_dep() {
         ops.len()
     );
 }
+
+#[test]
+fn recheck_finds_damage() {
+    // A topic verified whole is not re-scanned on every sync, so damage from
+    // outside irokle stays invisible until the audit is asked for again.
+    let storage = MemoryStorage::new();
+    let holder_signer = Ed25519Signer::from_bytes(&[132; 32]);
+    let (_, topic_id, ops) = chain_source(131, holder_signer.peer_id());
+    oplog::Oplog::with_storage(storage.clone())
+        .receive_ops(ops.clone())
+        .unwrap();
+    let holder = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: holder_signer,
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    assert!(holder.topic_unresolved(topic_id).unwrap().is_empty());
+
+    damage_op(&storage, &ops[1].id, Damage::Meta);
+    assert!(holder.topic_unresolved(topic_id).unwrap().is_empty());
+    holder.recheck_topics().unwrap();
+
+    assert_eq!(
+        holder.topic_unresolved(topic_id).unwrap(),
+        [ops[1].id].into()
+    );
+}

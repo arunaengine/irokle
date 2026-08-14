@@ -431,6 +431,13 @@ impl<S: Storage> Irokle<S> {
         self.oplog.topic_unresolved(&topic_id)
     }
 
+    /// Audit stored records again on the next integrity question instead of
+    /// trusting the earlier verdict. Admission keeps topics whole, so this only
+    /// matters for damage that happened outside irokle.
+    pub fn recheck_topics(&self) -> Result<()> {
+        self.oplog.recheck_topics()
+    }
+
     pub fn negotiate_sync(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
         self.sync.negotiate(peer_id, remote)
     }
