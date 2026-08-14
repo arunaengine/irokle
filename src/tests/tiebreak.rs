@@ -739,3 +739,186 @@ fn reset_ignores_tips() {
         [fork.winner_genesis.id, fork.winner_event.id, reemitted.id].into()
     );
 }
+
+/// Rebuild the store the pre-`reset_topic_and_admit` genesis reset could leave:
+/// the winning genesis installed while a descendant of the replaced chain stays
+/// admitted with its ancestry gone.
+fn assert_quarantines_orphan<S: Corrupt>(storage: S) {
+    let topic_id = TopicId::hash(b"legacy-reset-topic");
+    let keeper = Ed25519Signer::from_bytes(&[203; 32]);
+    let peer = |seed: u8| Ed25519Signer::from_bytes(&[seed; 32]).peer_id();
+    let (_, sign_a, g_a, e_a) = forked_side(
+        MemoryStorage::new(),
+        topic_id,
+        201,
+        [peer(202), keeper.peer_id()],
+        "a-branch",
+    );
+    let (_, sign_b, g_b, e_b) = forked_side(
+        MemoryStorage::new(),
+        topic_id,
+        202,
+        [peer(201), keeper.peer_id()],
+        "b-branch",
+    );
+    let a_won = g_a.id < g_b.id;
+    let (won_genesis, won_event) = if a_won {
+        (g_a.clone(), e_a.clone())
+    } else {
+        (g_b.clone(), e_b.clone())
+    };
+    let (lost_genesis, lost_event) = if a_won { (g_b, e_b) } else { (g_a, e_a) };
+    let (won_signer, lost_signer) = if a_won {
+        (sign_a, sign_b)
+    } else {
+        (sign_b, sign_a)
+    };
+
+    // A peer that never saw the collision still serves the replaced chain.
+    let keeper_store = MemoryStorage::new();
+    Oplog::with_storage(keeper_store.clone())
+        .receive_ops(vec![lost_genesis.clone(), lost_event.clone()])
+        .unwrap();
+    let keeper_node = Irokle::with_storage(
+        keeper_store.clone(),
+        NodeConfig {
+            signer: keeper,
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+
+    let holder_log = oplog::Oplog::with_storage(storage.clone());
+    holder_log
+        .receive_ops(vec![lost_genesis.clone(), lost_event.clone()])
+        .unwrap();
+    holder_log
+        .receive_ops_from_peer_evicting(
+            Some(won_signer.peer_id()),
+            vec![won_genesis.clone(), won_event.clone()],
+        )
+        .unwrap();
+    let orphan_meta = keeper_store.get_meta(&lost_event.id).unwrap().unwrap();
+    storage.orphan_op(&lost_event, &orphan_meta);
+
+    let holder = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: lost_signer.clone(),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let lost_actor = actor_id_for(topic_id, lost_signer.peer_id());
+    assert_eq!(
+        storage.actor_tip(&topic_id, &lost_actor).unwrap(),
+        Some((orphan_meta.actor_seq, lost_event.id))
+    );
+    assert_eq!(
+        holder.topic_unresolved(topic_id).unwrap(),
+        [lost_genesis.id].into()
+    );
+
+    // Ordinary anti-entropy against the peer that still holds the replaced
+    // chain must not merge its genesis back into the winner.
+    let plan = holder
+        .negotiate_sync(
+            keeper_node.peer_id(),
+            &keeper_node.sync_summary(topic_id).unwrap(),
+        )
+        .unwrap();
+    assert!(plan.need.contains(&lost_genesis.id));
+    let data = keeper_node
+        .plan_sync_response_data(
+            holder.peer_id(),
+            &crate::sync::SyncRequest {
+                topic_id,
+                known: plan.common,
+                wants: plan.need,
+                actor_range_hints: plan.actor_range_hints,
+            },
+        )
+        .unwrap();
+    holder
+        .receive_sync_data_from(keeper_node.peer_id(), data)
+        .unwrap();
+    assert_eq!(
+        storage.topic_state(&topic_id).unwrap().unwrap().genesis,
+        won_genesis.id
+    );
+    assert!(storage.get_op(&lost_genesis.id).unwrap().is_none());
+    assert_eq!(
+        holder.topic_unresolved(topic_id).unwrap(),
+        [lost_genesis.id].into()
+    );
+
+    // A hole the frontier does reach is repair work, not quarantine work.
+    damage_op(&storage, &won_event.id, Damage::Op);
+    assert!(holder.quarantine_orphans(topic_id).unwrap().is_none());
+    assert_eq!(
+        storage.get_op(&lost_event.id).unwrap(),
+        Some(lost_event.clone())
+    );
+    holder_log.receive_ops(vec![won_event.clone()]).unwrap();
+
+    let eviction = holder
+        .quarantine_orphans(topic_id)
+        .unwrap()
+        .expect("the orphan closure no peer can repair must be quarantined");
+    assert_eq!(eviction.topic_id, topic_id);
+    assert_eq!(eviction.losing_genesis, won_genesis.id);
+    assert_eq!(eviction.winning_genesis, won_genesis.id);
+    assert_eq!(
+        eviction
+            .evicted
+            .iter()
+            .map(|op| op.op_id)
+            .collect::<Vec<_>>(),
+        vec![lost_event.id]
+    );
+    assert_eq!(eviction.evicted[0].payload, lost_event.signed.body.payload);
+
+    assert!(holder.topic_unresolved(topic_id).unwrap().is_empty());
+    assert!(storage.get_op(&lost_event.id).unwrap().is_none());
+    assert!(storage.get_meta(&lost_event.id).unwrap().is_none());
+    assert_eq!(
+        storage.list_op_ids(&topic_id).unwrap(),
+        [won_genesis.id, won_event.id].into()
+    );
+    assert_eq!(storage.heads(&topic_id).unwrap(), [won_event.id].into());
+    let state = storage.topic_state(&topic_id).unwrap().unwrap();
+    assert_eq!(state.genesis, won_genesis.id);
+    assert_eq!(state.heads, [won_event.id].into());
+    assert_eq!(storage.actor_tip(&topic_id, &lost_actor).unwrap(), None);
+    assert_eq!(
+        storage
+            .actor_index(&topic_id, &lost_actor, orphan_meta.actor_seq)
+            .unwrap(),
+        None
+    );
+    assert_eq!(storage.actor_clock(&topic_id).unwrap().get(&lost_actor), 0);
+    assert!(storage.children(&lost_genesis.id).unwrap().is_empty());
+    assert_eq!(
+        oplog::topological(&storage, &topic_id)
+            .unwrap()
+            .iter()
+            .map(|op| op.id)
+            .collect::<Vec<_>>(),
+        vec![won_genesis.id, won_event.id]
+    );
+    assert!(holder.quarantine_orphans(topic_id).unwrap().is_none());
+}
+
+#[test]
+fn memory_quarantines_orphan() {
+    assert_quarantines_orphan(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_quarantines_orphan() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_quarantines_orphan(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}

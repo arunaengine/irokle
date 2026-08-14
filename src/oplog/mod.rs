@@ -51,6 +51,14 @@ type GenesisResolution = (
     Option<TopicState>,
 );
 
+/// The rebuild a quarantine is about to run: the topic state it must still
+/// find, the ops that stay, and the payloads the caller may re-emit.
+struct QuarantinePlan {
+    state: TopicState,
+    survivors: Vec<Op>,
+    evicted: Vec<EvictedOp>,
+}
+
 /// The batch-local view admission validates against: the entries this batch has
 /// already accepted, plus whether the topic is being reset. A reset removes the
 /// stored actor slots and tips of the topic in the same transaction, so they
@@ -74,10 +82,13 @@ pub struct EvictedOp {
     pub payload: TopicPayload,
 }
 
-/// Reports that a topic's local chain was discarded in favour of a foreign
-/// genesis with a smaller op id. `evicted` holds the reset chain's non-genesis
-/// payloads ordered by `(actor_id, actor_seq)`; re-emission is the embedder's
-/// responsibility.
+/// Reports ops discarded from a topic's local chain. A genesis tie-break sets
+/// `losing_genesis` to the replaced chain's genesis and `winning_genesis` to the
+/// foreign one that took its place; a quarantine of ops no head reaches has no
+/// second genesis to name, so both fields carry the surviving genesis and equal
+/// fields are what tells the two apart. `evicted` holds the discarded
+/// non-genesis payloads ordered by `(actor_id, actor_seq)`; re-emission is the
+/// embedder's responsibility.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopicEviction {
     pub topic_id: TopicId,
@@ -177,6 +188,122 @@ impl<S: Storage> Oplog<S> {
     pub fn recheck_topics(&self) -> Result<()> {
         self.whole_topics()?.clear();
         Ok(())
+    }
+
+    /// Ops the topic stores that no head reaches. Admission puts every new op
+    /// into `heads` and takes it out only when a later op names it as a
+    /// dependency, so the head closure covers exactly the ops the local chain
+    /// accounts for. Anything outside it was never part of this lineage's
+    /// frontier and its ancestry cannot be validated against the current
+    /// genesis: the pre-`reset_topic_and_admit` genesis reset could leave such
+    /// a descendant behind after removing the losing chain it stood on.
+    fn topic_orphans(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
+        let mut reachable = BTreeSet::new();
+        let mut frontier = self
+            .storage
+            .heads(topic_id)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        while let Some(id) = frontier.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            // A head-reachable id with no metadata is an ordinary hole to
+            // repair, not an orphan; it still counts as accounted for.
+            let Some(meta) = self.storage.get_meta(&id)? else {
+                continue;
+            };
+            frontier.extend(meta.deps);
+        }
+        let mut orphans = self.storage.list_op_ids(topic_id)?;
+        orphans.retain(|id| !reachable.contains(id));
+        Ok(orphans)
+    }
+
+    /// Discard the ops no head reaches and rebuild the topic from the ops that
+    /// remain, in the single transaction genesis adoption already uses. The
+    /// survivors are re-validated and re-admitted from the genesis up, so heads,
+    /// clock, actor indexes, generation and fingerprint come back agreeing with
+    /// one current-genesis DAG, and acks and obligations naming the old frontier
+    /// are dropped rather than carried over. Returns the discarded payloads for
+    /// re-emission, or `None` when there is nothing to quarantine.
+    pub fn quarantine_orphans(&self, topic_id: &TopicId) -> Result<Option<TopicEviction>> {
+        if self.topic_orphans(topic_id)?.is_empty() {
+            return Ok(None);
+        }
+        // The rebuild resets the topic, so it must not interleave with a
+        // genesis tie-break resolving the same topic.
+        let _guard = GENESIS_RESOLUTION_LOCK
+            .lock()
+            .map_err(|_| Error::Storage("genesis resolution lock poisoned".into()))?;
+        for _ in 0..MAX_ADMISSION_RETRIES {
+            let Some(plan) = self.plan_quarantine(topic_id)? else {
+                return Ok(None);
+            };
+            let QuarantinePlan {
+                state,
+                survivors,
+                evicted,
+            } = plan;
+            match self.admit_ops_batch(None, survivors, &BTreeSet::new(), Some(state.clone())) {
+                Err(Error::AdmissionConflict) => continue,
+                Err(err) => return Err(err),
+                Ok(_) => {}
+            }
+            self.whole_topics()?.remove(topic_id);
+            tracing::warn!(
+                %topic_id,
+                genesis = %state.genesis,
+                quarantined = evicted.len(),
+                "quarantined ops no head reaches and rebuilt the topic"
+            );
+            return Ok(Some(TopicEviction {
+                topic_id: *topic_id,
+                losing_genesis: state.genesis,
+                winning_genesis: state.genesis,
+                evicted,
+            }));
+        }
+        Err(Error::AdmissionConflict)
+    }
+
+    /// Split the topic's stored ops into the head closure and the orphans.
+    /// Refuses while the head closure itself has a hole: that is ordinary
+    /// repair work sync must finish first, and a rebuild would drop the whole
+    /// branch standing on it. Refuses too when the closure does not reach the
+    /// recorded genesis, since then there is no chain left to rebuild from.
+    fn plan_quarantine(&self, topic_id: &TopicId) -> Result<Option<QuarantinePlan>> {
+        let Some(state) = self.storage.topic_state(topic_id)? else {
+            return Ok(None);
+        };
+        let orphans = self.topic_orphans(topic_id)?;
+        if orphans.is_empty() {
+            return Ok(None);
+        }
+        let mut survivors = Vec::new();
+        for id in self.storage.list_op_ids(topic_id)? {
+            if orphans.contains(&id) {
+                continue;
+            }
+            let Some(op) = self.storage.get_op(&id)? else {
+                tracing::warn!(%topic_id, %id, "deferred quarantine: repair the frontier first");
+                return Ok(None);
+            };
+            survivors.push(op);
+        }
+        if !survivors.iter().any(|op| op.id == state.genesis) {
+            tracing::warn!(
+                %topic_id,
+                genesis = %state.genesis,
+                "refused quarantine: no head reaches the recorded genesis"
+            );
+            return Ok(None);
+        }
+        Ok(Some(QuarantinePlan {
+            evicted: self.evicted_ops(&orphans)?,
+            state,
+            survivors,
+        }))
     }
 
     fn whole_topics(&self) -> Result<std::sync::MutexGuard<'_, BTreeSet<TopicId>>> {
@@ -612,21 +739,35 @@ impl<S: Storage> Oplog<S> {
         local_state: &TopicState,
         winning_genesis: OpId,
     ) -> Result<TopicEviction> {
+        let mut discarded = self.storage.list_op_ids(&topic_id)?;
+        discarded.remove(&local_state.genesis);
+        Ok(TopicEviction {
+            topic_id,
+            losing_genesis: local_state.genesis,
+            winning_genesis,
+            evicted: self.evicted_ops(&discarded)?,
+        })
+    }
+
+    /// Payloads for the ops named by `ids`, ordered by actor then sequence so
+    /// re-emission preserves each actor's order. A half-stored id is reported
+    /// and skipped: its payload cannot be read, and failing here would strand
+    /// the whole topic instead of discarding one unreadable record.
+    fn evicted_ops(&self, ids: &BTreeSet<OpId>) -> Result<Vec<EvictedOp>> {
         let mut metas = Vec::new();
-        for op_id in self.storage.list_op_ids(&topic_id)? {
-            if let Some(meta) = self.storage.get_meta(&op_id)? {
-                metas.push(meta);
+        for id in ids {
+            match self.storage.get_meta(id)? {
+                Some(meta) => metas.push(meta),
+                None => tracing::warn!(%id, "discarded op has no metadata to re-emit"),
             }
         }
         metas.sort_by_key(|meta| (meta.actor_id, meta.actor_seq));
         let mut evicted = Vec::new();
         for meta in metas {
-            if meta.id == local_state.genesis {
+            let Some(op) = self.storage.get_op(&meta.id)? else {
+                tracing::warn!(id = %meta.id, "discarded op has no record to re-emit");
                 continue;
-            }
-            let op = self.storage.get_op(&meta.id)?.ok_or_else(|| {
-                Error::Storage(format!("missing op during eviction: {}", meta.id))
-            })?;
+            };
             evicted.push(EvictedOp {
                 op_id: meta.id,
                 actor_id: meta.actor_id,
@@ -635,12 +776,7 @@ impl<S: Storage> Oplog<S> {
                 payload: op.signed.body.payload.clone(),
             });
         }
-        Ok(TopicEviction {
-            topic_id,
-            losing_genesis: local_state.genesis,
-            winning_genesis,
-            evicted,
-        })
+        Ok(evicted)
     }
 
     fn admit_ops_batch(

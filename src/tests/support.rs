@@ -34,6 +34,10 @@ impl Event for Other {
 pub(crate) trait Corrupt: Storage {
     fn drop_op_record(&self, id: &OpId);
     fn drop_meta_record(&self, id: &OpId);
+    /// Leave an admitted op behind that no head reaches, the shape the pre-
+    /// `reset_topic_and_admit` reset left when it removed a descendant's
+    /// ancestry but not the descendant.
+    fn orphan_op(&self, op: &Op, meta: &crate::storage::OpMeta);
 }
 
 /// Which record halves a test erases. `Both` leaves the topic, actor and child
@@ -65,6 +69,9 @@ impl Corrupt for MemoryStorage {
     fn drop_meta_record(&self, id: &OpId) {
         MemoryStorage::drop_meta_record(self, id);
     }
+    fn orphan_op(&self, op: &Op, meta: &crate::storage::OpMeta) {
+        MemoryStorage::orphan_op(self, op, meta);
+    }
 }
 
 #[cfg(feature = "fjall")]
@@ -74,6 +81,9 @@ impl Corrupt for crate::storage::FjallStorage {
     }
     fn drop_meta_record(&self, id: &OpId) {
         crate::storage::FjallStorage::drop_meta_record(self, id);
+    }
+    fn orphan_op(&self, op: &Op, meta: &crate::storage::OpMeta) {
+        crate::storage::FjallStorage::orphan_op(self, op, meta);
     }
 }
 

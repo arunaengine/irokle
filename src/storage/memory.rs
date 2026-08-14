@@ -60,6 +60,28 @@ impl MemoryStorage {
     pub(crate) fn drop_meta_record(&self, id: &OpId) {
         self.inner.lock().expect("memory lock").meta.remove(id);
     }
+
+    /// Store both records and the topic/child indexes while leaving heads and
+    /// topic state alone, so the op is admitted yet reachable from no head.
+    pub(crate) fn orphan_op(&self, op: &Op, meta: &OpMeta) {
+        let mut inner = self.inner.lock().expect("memory lock");
+        inner
+            .topic_ops
+            .entry(meta.topic_id)
+            .or_default()
+            .insert(op.id);
+        for dep in &meta.deps {
+            inner.children.entry(*dep).or_default().insert(op.id);
+        }
+        inner
+            .actor_by_seq
+            .insert((meta.topic_id, meta.actor_id, meta.actor_seq), op.id);
+        inner
+            .actor_tip
+            .insert((meta.topic_id, meta.actor_id), (meta.actor_seq, op.id));
+        inner.meta.insert(op.id, meta.clone());
+        inner.ops.insert(op.id, op.clone());
+    }
 }
 
 impl Storage for MemoryStorage {
@@ -561,6 +583,21 @@ fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> usize {
     let op_ids = inner.topic_ops.remove(topic_id).unwrap_or_default();
     let removed = op_ids.len();
     for op_id in &op_ids {
+        // Edges pointing at this op go too, or a dependency the reset does not
+        // reach keeps naming a child the topic no longer holds.
+        let deps = inner
+            .meta
+            .get(op_id)
+            .map(|meta| meta.deps.clone())
+            .unwrap_or_default();
+        for dep in deps {
+            if let Some(children) = inner.children.get_mut(&dep) {
+                children.remove(op_id);
+                if children.is_empty() {
+                    inner.children.remove(&dep);
+                }
+            }
+        }
         inner.ops.remove(op_id);
         inner.meta.remove(op_id);
         inner.children.remove(op_id);

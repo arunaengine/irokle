@@ -438,6 +438,27 @@ impl<S: Storage> Irokle<S> {
         self.oplog.recheck_topics()
     }
 
+    /// Discard ops of `topic_id` that no head reaches and rebuild the topic from
+    /// the ops that remain. A store damaged by the pre-`reset_topic_and_admit`
+    /// genesis reset can hold a descendant whose ancestry belongs to the
+    /// replaced chain; no peer can supply that ancestry under the current
+    /// genesis, so the topic stays unresolved until the descendant goes. The
+    /// returned payloads are the embedder's to re-emit.
+    pub fn quarantine_orphans(&self, topic_id: TopicId) -> Result<Option<TopicEviction>> {
+        self.oplog.quarantine_orphans(&topic_id)
+    }
+
+    /// Run [`Irokle::quarantine_orphans`] over every local topic.
+    pub fn quarantine_topics(&self) -> Result<Vec<TopicEviction>> {
+        let mut quarantined = Vec::new();
+        for info in self.list_topics()? {
+            if let Some(eviction) = self.oplog.quarantine_orphans(&info.topic_id)? {
+                quarantined.push(eviction);
+            }
+        }
+        Ok(quarantined)
+    }
+
     pub fn negotiate_sync(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
         self.sync.negotiate(peer_id, remote)
     }

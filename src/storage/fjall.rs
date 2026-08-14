@@ -505,6 +505,55 @@ impl FjallStorage {
         .expect("fjall drop meta record");
     }
 
+    /// Store both records and the topic/child indexes while leaving heads and
+    /// topic state alone, so the op is admitted yet reachable from no head.
+    #[cfg(test)]
+    pub(crate) fn orphan_op(&self, op: &Op, meta: &OpMeta) {
+        self.transaction(|tx| {
+            Self::tx_put(tx, &self.records, Self::key_id(b"o", &op.id), op)?;
+            Self::tx_put(tx, &self.records, Self::key_id(b"m", &op.id), meta)?;
+            Self::tx_put(
+                tx,
+                &self.records,
+                [b"to".as_slice(), meta.topic_id.as_ref(), op.id.as_ref()].concat(),
+                &(),
+            )?;
+            for dep in &meta.deps {
+                Self::tx_put(
+                    tx,
+                    &self.records,
+                    [b"ch".as_slice(), dep.as_ref(), op.id.as_ref()].concat(),
+                    &(),
+                )?;
+            }
+            Self::tx_put(
+                tx,
+                &self.records,
+                [
+                    b"as".as_slice(),
+                    meta.topic_id.as_ref(),
+                    meta.actor_id.as_ref(),
+                    &meta.actor_seq.to_be_bytes(),
+                ]
+                .concat(),
+                &op.id,
+            )?;
+            Self::tx_put(
+                tx,
+                &self.records,
+                [
+                    b"at".as_slice(),
+                    meta.topic_id.as_ref(),
+                    meta.actor_id.as_ref(),
+                ]
+                .concat(),
+                &(meta.actor_seq, op.id),
+            )?;
+            Ok(())
+        })
+        .expect("fjall orphan op");
+    }
+
     fn tx_reset_topic(
         &self,
         tx: &mut fjall::OptimisticWriteTx,
@@ -520,6 +569,18 @@ impl FjallStorage {
         }
         let removed = op_ids.len();
         for op_id in &op_ids {
+            // Edges pointing at this op go too, or a dependency the reset does
+            // not reach keeps naming a child the topic no longer holds.
+            if let Some(meta) =
+                Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", op_id))?
+            {
+                for dep in &meta.deps {
+                    tx.remove(
+                        &self.records,
+                        [b"ch".as_slice(), dep.as_ref(), op_id.as_ref()].concat(),
+                    );
+                }
+            }
             tx.remove(&self.records, Self::key_id(b"o", op_id));
             tx.remove(&self.records, Self::key_id(b"m", op_id));
             let ch_prefix = [b"ch".as_slice(), op_id.as_ref()].concat();
