@@ -134,6 +134,27 @@ pub struct SyncReport {
     pub obligations: Vec<SyncObligation>,
 }
 
+/// Which part of a topic exchange failed. Bounded on purpose: it names the
+/// message the responder could not handle, never the underlying error text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SyncFailureCode {
+    Open,
+    Fingerprint,
+    Summary,
+    Request,
+    Data,
+    Ack,
+}
+
+/// The terminal result of one topic's exchange when it could not be completed.
+/// Without it a responder that swallowed a per-topic error is indistinguishable
+/// from one that had nothing to say, and the requester marks the topic clean.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncFailure {
+    pub topic_id: TopicId,
+    pub code: SyncFailureCode,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SyncMessage {
     Open(SyncOpen),
@@ -142,6 +163,7 @@ pub enum SyncMessage {
     Request(SyncRequest),
     Data(SyncData),
     Ack(SyncAck),
+    Failure(SyncFailure),
 }
 
 #[derive(Clone)]

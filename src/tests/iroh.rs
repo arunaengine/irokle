@@ -1160,3 +1160,197 @@ async fn equal_fingerprint_repairs() {
     );
     alice.shutdown_iroh().await;
 }
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_topic_retries() {
+    // A topic whose data the peer could not admit must come back as an explicit
+    // failure, never as silence the requester reads as success, and must not
+    // take the topics batched alongside it down with it.
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_signer = Ed25519Signer::from_iroh_secret_key(bob_endpoint.secret_key());
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_iroh_secret_key(alice_endpoint.secret_key()),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let bob = Irokle::with_storage(
+        MemoryStorage::new(),
+        NodeConfig {
+            signer: bob_signer.clone(),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+
+    let mut topic_ids = Vec::new();
+    for text in ["broken", "healthy"] {
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob_signer.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        topic.publish(Note { text: text.into() }).unwrap();
+        let ops = oplog::topological(alice.storage(), &topic.id()).unwrap();
+        bob.receive_sync_data_from(
+            alice.peer_id(),
+            sync::SyncData {
+                topic_id: topic.id(),
+                ops,
+            },
+        )
+        .unwrap();
+        bob.open_topic::<Note>(topic.id())
+            .unwrap()
+            .publish(Note {
+                text: "reply".into(),
+            })
+            .unwrap();
+        topic_ids.push(topic.id());
+    }
+    let (broken, healthy) = (topic_ids[0], topic_ids[1]);
+    storage.fail_writes(broken);
+
+    let alice_net = Arc::new(net::IrohNet::new(alice_endpoint, alice.clone()).unwrap());
+    alice_net.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice_net.endpoint()).await;
+    let bob_net = net::IrohNet::new(bob_endpoint, bob.clone()).unwrap();
+
+    // One stream carrying both topics: the broken one is reported, the healthy
+    // one still gets its ack.
+    let mut messages = Vec::new();
+    for topic_id in [broken, healthy] {
+        let plan = bob
+            .negotiate_sync(alice.peer_id(), &alice.sync_summary(topic_id).unwrap())
+            .unwrap();
+        messages.push(sync::SyncMessage::Open(bob.sync_open(topic_id)));
+        messages.push(sync::SyncMessage::Data(sync::SyncData {
+            topic_id,
+            ops: plan.send,
+        }));
+    }
+    let responses = bob_net
+        .sync_with(alice_addr.clone(), &messages)
+        .await
+        .unwrap();
+    assert!(responses.iter().any(|message| matches!(
+        message,
+        sync::SyncMessage::Failure(failure) if failure.topic_id == broken
+    )));
+    assert!(responses.iter().any(|message| matches!(
+        message,
+        sync::SyncMessage::Ack(ack) if ack.topic_id == healthy
+    )));
+
+    assert!(bob_net.sync_now(alice_addr.clone(), broken).await.is_err());
+    bob_net.sync_now(alice_addr, healthy).await.unwrap();
+    assert_eq!(alice.storage().list_op_ids(&broken).unwrap().len(), 2);
+    assert_eq!(alice.storage().list_op_ids(&healthy).unwrap().len(), 3);
+    alice.shutdown_iroh().await;
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrong_peer_ack() {
+    // An ack bound to another peer must fail its own topic only; the valid ack
+    // batched behind it still has to clear its obligations.
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(bob_endpoint.secret_key())
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let carol = node(77);
+    let net = net::IrohNet::new(alice_endpoint, alice.clone()).unwrap();
+
+    let mut topics = Vec::new();
+    for text in ["unbound", "healthy"] {
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id(), carol.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        topic.publish(Note { text: text.into() }).unwrap();
+        topics.push(topic.id());
+    }
+    let (unbound, healthy) = (topics[0], topics[1]);
+
+    // Signed by carol, so only the session's peer binding can reject it.
+    let mut stray = sync::SyncAck {
+        topic_id: unbound,
+        peer_id: carol.peer_id(),
+        accepted: BTreeSet::new(),
+        heads: alice.storage().heads(&unbound).unwrap(),
+        clock: alice.storage().actor_clock(&unbound).unwrap(),
+        signature: None,
+    };
+    stray.sign(carol.signer()).unwrap();
+    let mut good = sync::SyncAck {
+        topic_id: healthy,
+        peer_id: bob.peer_id(),
+        accepted: BTreeSet::new(),
+        heads: alice.storage().heads(&healthy).unwrap(),
+        clock: alice.storage().actor_clock(&healthy).unwrap(),
+        signature: None,
+    };
+    good.sign(bob.signer()).unwrap();
+
+    let responses = net
+        .handle_messages(
+            bob_endpoint.id(),
+            vec![
+                sync::SyncMessage::Open(bob.sync_open(unbound)),
+                sync::SyncMessage::Ack(stray),
+                sync::SyncMessage::Open(bob.sync_open(healthy)),
+                sync::SyncMessage::Ack(good),
+            ],
+        )
+        .expect("an unbound ack must not fail the stream");
+
+    assert!(responses.iter().any(|message| matches!(
+        message,
+        sync::SyncMessage::Failure(failure) if failure.topic_id == unbound
+    )));
+    assert!(
+        alice
+            .storage()
+            .peer_ack(&bob.peer_id(), &healthy)
+            .unwrap()
+            .is_some(),
+        "the validly bound ack must still be applied"
+    );
+    assert!(
+        alice
+            .storage()
+            .peer_ack(&carol.peer_id(), &unbound)
+            .unwrap()
+            .is_none()
+    );
+}

@@ -1092,6 +1092,10 @@ impl<S: Storage> IrohNet<S> {
                 SyncMessage::Summary(summary) if fingerprints.contains_key(&summary.topic_id) => {
                     summaries.insert(summary.topic_id, summary);
                 }
+                SyncMessage::Failure(failure) if fingerprints.contains_key(&failure.topic_id) => {
+                    outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
+                    summaries.remove(&failure.topic_id);
+                }
                 other => {
                     let error = invalid_data(format!(
                         "unexpected sync response {}",
@@ -1128,10 +1132,9 @@ impl<S: Storage> IrohNet<S> {
                 && !incomplete.contains(topic_id)
                 && !summaries.contains_key(topic_id)
             {
-                outcomes.insert(
-                    *topic_id,
-                    Err(invalid_data("peer did not return a sync summary")),
-                );
+                outcomes
+                    .entry(*topic_id)
+                    .or_insert_with(|| Err(invalid_data("peer did not return a sync summary")));
             }
         }
 
@@ -1259,12 +1262,23 @@ impl<S: Storage> IrohNet<S> {
         for response in responses {
             match response {
                 SyncMessage::Ack(ack) => {
-                    if ack.peer_id != remote_peer_id || !group_topics.contains(&ack.topic_id) {
-                        let error = invalid_data("sync ack does not match remote peer/topic");
-                        fail_group(outcomes, &error);
-                        return;
+                    // An ack that is not validly bound fails its own topic; the
+                    // other topics in the stream keep their valid work.
+                    if ack.peer_id != remote_peer_id {
+                        let error = invalid_data("sync ack does not match remote peer");
+                        if group_topics.contains(&ack.topic_id) {
+                            outcomes.insert(ack.topic_id, Err(error));
+                        }
+                        continue;
+                    }
+                    if !group_topics.contains(&ack.topic_id) {
+                        tracing::warn!(topic_id = %ack.topic_id, "ignoring ack outside the exchange");
+                        continue;
                     }
                     acks.push(ack);
+                }
+                SyncMessage::Failure(failure) if group_topics.contains(&failure.topic_id) => {
+                    outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
                 }
                 SyncMessage::Summary(summary) if group_topics.contains(&summary.topic_id) => {}
                 SyncMessage::Data(data) if group_topics.contains(&data.topic_id) => {
@@ -1333,6 +1347,9 @@ impl<S: Storage> IrohNet<S> {
                     for response in responses {
                         match response {
                             SyncMessage::Summary(summary) if topics.contains(&summary.topic_id) => {
+                            }
+                            SyncMessage::Failure(failure) if topics.contains(&failure.topic_id) => {
+                                outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
                             }
                             other => {
                                 let error = invalid_data(format!(
@@ -1556,19 +1573,28 @@ impl<S: Storage> IrohNet<S> {
             // `SyncSession::finish`, so one rejected ack cannot discard the
             // rest; there is deliberately no second path that applies one.
             SyncMessage::Ack(_) => Err(invalid_data("sync ack must be applied by the session")),
+            SyncMessage::Failure(_) => Err(invalid_data("sync failure is a response-only message")),
         }
     }
 }
 
-/// The topic a sync message speaks for when its handling failure should be
-/// contained to that topic instead of aborting the stream.
-fn per_topic_failure_scope(message: &SyncMessage) -> Option<crate::TopicId> {
-    match message {
-        SyncMessage::Summary(summary) => Some(summary.topic_id),
-        SyncMessage::Request(request) => Some(request.topic_id),
-        SyncMessage::Data(data) => Some(data.topic_id),
-        SyncMessage::Open(_) | SyncMessage::Fingerprint(_) | SyncMessage::Ack(_) => None,
-    }
+/// The failure a sync message reports when its handling must be contained to
+/// one topic instead of aborting the stream. Every message that names a topic
+/// and does real work belongs here; the session validates the protocol and the
+/// peer binding before this point, so those failures still indict the peer.
+fn per_topic_failure_scope(message: &SyncMessage) -> Option<crate::sync::SyncFailure> {
+    let (topic_id, code) = match message {
+        SyncMessage::Open(open) => (open.topic_id, crate::sync::SyncFailureCode::Open),
+        SyncMessage::Fingerprint(fingerprint) => (
+            fingerprint.topic_id,
+            crate::sync::SyncFailureCode::Fingerprint,
+        ),
+        SyncMessage::Summary(summary) => (summary.topic_id, crate::sync::SyncFailureCode::Summary),
+        SyncMessage::Request(request) => (request.topic_id, crate::sync::SyncFailureCode::Request),
+        SyncMessage::Data(data) => (data.topic_id, crate::sync::SyncFailureCode::Data),
+        SyncMessage::Ack(_) | SyncMessage::Failure(_) => return None,
+    };
+    Some(crate::sync::SyncFailure { topic_id, code })
 }
 
 struct PlannedTopicSync {
@@ -1610,20 +1636,22 @@ impl SyncSession {
             }
             self.remote_peer_id = Some(open.peer_id);
             self.open_topic_id = Some(open.topic_id);
-        } else if let Some(topic_id) = message_topic_id(&message)
-            && self.open_topic_id != Some(topic_id)
-        {
-            return Err(invalid_data(
-                "sync message topic does not match SyncOpen topic",
-            ));
+        } else {
+            if self.remote_peer_id.is_none() {
+                return Err(invalid_data(
+                    "sync message requires a preceding SyncOpen with peer_id",
+                ));
+            }
+            if let Some(topic_id) = message_topic_id(&message)
+                && self.open_topic_id != Some(topic_id)
+            {
+                return Err(invalid_data(
+                    "sync message topic does not match SyncOpen topic",
+                ));
+            }
         }
 
         if let SyncMessage::Ack(ack) = message {
-            if self.remote_peer_id.is_none() {
-                return Err(invalid_data(
-                    "sync ack requires a preceding SyncOpen with peer_id",
-                ));
-            }
             self.acks.push(ack);
             return Ok(Vec::new());
         }
@@ -1631,14 +1659,16 @@ impl SyncSession {
         // A data-plane failure for one topic must not abort the whole stream:
         // the other topics batched into it would lose their summaries, data and
         // acks, the caller marks every one of them failed, and the sender
-        // resends the identical ranges forever. Framing and authentication
-        // failures above stay fatal - those indict the peer, not one topic.
-        if let Some(topic_id) = per_topic_failure_scope(&message) {
+        // resends the identical ranges forever. It must not read as success
+        // either, so the topic gets an explicit terminal failure. Framing and
+        // authentication failures above stay fatal - those indict the peer.
+        if let Some(failure) = per_topic_failure_scope(&message) {
             return match net.handle_message(message, self.remote_peer_id) {
                 Ok(responses) => Ok(responses),
                 Err(error) => {
-                    tracing::warn!(%topic_id, %error, "skipping sync message after topic failure");
-                    Ok(Vec::new())
+                    let topic_id = failure.topic_id;
+                    tracing::warn!(%topic_id, %error, "failing one sync topic");
+                    Ok(vec![SyncMessage::Failure(failure)])
                 }
             };
         }
@@ -1647,8 +1677,9 @@ impl SyncSession {
     }
 
     /// Apply the stream's acks independently. One rejected ack - a stale clock
-    /// after a topic reset, say - must not discard the others, or their
-    /// obligations never clear and the peer resends the same ranges forever.
+    /// after a topic reset, or one bound to another peer - must not discard the
+    /// others, or their obligations never clear and the peer resends the same
+    /// ranges forever. Each rejection is reported against its own topic.
     fn finish<S: Storage>(&mut self, net: &IrohNet<S>) -> io::Result<Vec<SyncMessage>> {
         let acks = std::mem::take(&mut self.acks);
         if acks.is_empty() {
@@ -1657,23 +1688,34 @@ impl SyncSession {
         let peer_id = self
             .remote_peer_id
             .ok_or_else(|| invalid_data("sync ack requires a preceding SyncOpen with peer_id"))?;
-        for ack in &acks {
-            if ack.peer_id != peer_id {
-                return Err(invalid_data(
-                    "sync ack peer_id does not match SyncOpen peer_id",
-                ));
+        let mut responses = Vec::new();
+        let mut bound = Vec::new();
+        for ack in acks {
+            if ack.peer_id == peer_id {
+                bound.push(ack);
+                continue;
             }
+            let topic_id = ack.topic_id;
+            tracing::warn!(%topic_id, "dropping sync ack bound to another peer");
+            responses.push(SyncMessage::Failure(crate::sync::SyncFailure {
+                topic_id,
+                code: crate::sync::SyncFailureCode::Ack,
+            }));
         }
-        for (ack, result) in acks.iter().zip(net.node.apply_sync_acks(&acks)) {
+        for (ack, result) in bound.iter().zip(net.node.apply_sync_acks(&bound)) {
             match result {
                 Ok(()) => net.finish_resync_attempt(peer_id, ack.topic_id, Ok(()), net.runtime),
                 Err(error) => {
                     let topic_id = ack.topic_id;
                     tracing::warn!(%topic_id, %error, "skipping rejected sync ack");
+                    responses.push(SyncMessage::Failure(crate::sync::SyncFailure {
+                        topic_id,
+                        code: crate::sync::SyncFailureCode::Ack,
+                    }));
                 }
             }
         }
-        Ok(Vec::new())
+        Ok(responses)
     }
 }
 
@@ -1963,7 +2005,12 @@ fn message_topic_id(message: &SyncMessage) -> Option<crate::TopicId> {
         SyncMessage::Request(request) => Some(request.topic_id),
         SyncMessage::Data(data) => Some(data.topic_id),
         SyncMessage::Ack(ack) => Some(ack.topic_id),
+        SyncMessage::Failure(failure) => Some(failure.topic_id),
     }
+}
+
+fn topic_failed(failure: &crate::sync::SyncFailure) -> io::Error {
+    invalid_data(format!("peer failed this topic at {:?}", failure.code))
 }
 
 fn timed_out(message: &'static str) -> io::Error {

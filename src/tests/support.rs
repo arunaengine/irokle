@@ -77,6 +77,169 @@ impl Corrupt for crate::storage::FjallStorage {
     }
 }
 
+/// Storage wrapper that simulates the stale reads of a concurrent admission:
+/// `get_op`/`actor_index` report "unknown" exactly once for ops in the
+/// one-shot sets, so a duplicate slips past the batch dedup check and reaches
+/// seq validation while the actor tip already covers it. Ops in
+/// `mid_commit_ops` stay invisible to `get_op` permanently, modelling a
+/// commit whose actor index/tip keys are visible before the op record. Writes
+/// for a topic in `failed_writes` are rejected, standing in for a storage fault
+/// that only affects one topic.
+#[derive(Clone)]
+pub(crate) struct StaleReadStorage {
+    pub(crate) inner: MemoryStorage,
+    pub(crate) hidden_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
+    pub(crate) hidden_index: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
+    pub(crate) mid_commit_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
+    pub(crate) failed_writes: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
+}
+
+impl StaleReadStorage {
+    pub(crate) fn new(inner: MemoryStorage) -> Self {
+        Self {
+            inner,
+            hidden_ops: Arc::default(),
+            hidden_index: Arc::default(),
+            mid_commit_ops: Arc::default(),
+            failed_writes: Arc::default(),
+        }
+    }
+
+    pub(crate) fn fail_writes(&self, topic_id: TopicId) {
+        self.failed_writes.lock().unwrap().insert(topic_id);
+    }
+}
+
+impl Storage for StaleReadStorage {
+    fn put_admitted_batch(&self, batch: crate::storage::AdmittedBatch) -> Result<(), Error> {
+        if self.failed_writes.lock().unwrap().contains(&batch.topic_id) {
+            return Err(Error::Storage("injected admission write failure".into()));
+        }
+        self.inner.put_admitted_batch(batch)
+    }
+    fn get_op(&self, id: &OpId) -> Result<Option<Op>, Error> {
+        if self.mid_commit_ops.lock().unwrap().contains(id) {
+            return Ok(None);
+        }
+        if self.hidden_ops.lock().unwrap().remove(id) {
+            return Ok(None);
+        }
+        self.inner.get_op(id)
+    }
+    fn get_meta(&self, id: &OpId) -> Result<Option<crate::storage::OpMeta>, Error> {
+        self.inner.get_meta(id)
+    }
+    fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>, Error> {
+        self.inner.list_ops(topic_id)
+    }
+    fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.list_op_ids(topic_id)
+    }
+    fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.heads(topic_id)
+    }
+    fn children(&self, op_id: &OpId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.children(op_id)
+    }
+    fn actor_tip(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+    ) -> Result<Option<(u64, OpId)>, Error> {
+        self.inner.actor_tip(topic_id, actor_id)
+    }
+    fn actor_index(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+        seq: u64,
+    ) -> Result<Option<OpId>, Error> {
+        let existing = self.inner.actor_index(topic_id, actor_id, seq)?;
+        if let Some(id) = existing
+            && self.hidden_index.lock().unwrap().remove(&id)
+        {
+            return Ok(None);
+        }
+        Ok(existing)
+    }
+    fn actor_clock(&self, topic_id: &TopicId) -> Result<ActorClock, Error> {
+        self.inner.actor_clock(topic_id)
+    }
+    fn topic_fingerprint(&self, topic_id: &TopicId) -> Result<[u8; 32], Error> {
+        self.inner.topic_fingerprint(topic_id)
+    }
+    fn max_generation(&self, topic_id: &TopicId) -> Result<u64, Error> {
+        self.inner.max_generation(topic_id)
+    }
+    fn topic_state(&self, topic_id: &TopicId) -> Result<Option<crate::storage::TopicState>, Error> {
+        self.inner.topic_state(topic_id)
+    }
+    fn list_topics(&self) -> Result<Vec<crate::TopicInfo>, Error> {
+        self.inner.list_topics()
+    }
+    fn put_pending_op(
+        &self,
+        source_peer: PeerId,
+        op: Op,
+        meta: crate::storage::OpMeta,
+    ) -> Result<(), Error> {
+        self.inner.put_pending_op(source_peer, op, meta)
+    }
+    fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>, Error> {
+        self.inner.pending_waiters(dep_id)
+    }
+    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>, Error> {
+        self.inner.ready_pending_ops()
+    }
+    fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.pending_missing_deps(topic_id)
+    }
+    fn remove_pending_op(&self, op_id: &OpId) -> Result<(), Error> {
+        self.inner.remove_pending_op(op_id)
+    }
+    fn peer_ack(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+    ) -> Result<Option<crate::storage::PeerAck>, Error> {
+        self.inner.peer_ack(peer_id, topic_id)
+    }
+    fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<crate::storage::PeerAck>, Error> {
+        self.inner.peer_acks(topic_id)
+    }
+    fn put_sync_obligation(&self, obligation: crate::storage::SyncObligation) -> Result<(), Error> {
+        self.inner.put_sync_obligation(obligation)
+    }
+    fn all_sync_obligations(&self) -> Result<Vec<crate::storage::SyncObligation>, Error> {
+        self.inner.all_sync_obligations()
+    }
+    fn apply_peer_ack(&self, ack: crate::storage::PeerAck) -> Result<usize, Error> {
+        self.inner.apply_peer_ack(ack)
+    }
+    fn sync_obligations(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+    ) -> Result<Vec<crate::storage::SyncObligation>, Error> {
+        self.inner.sync_obligations(peer_id, topic_id)
+    }
+    fn put_sync_status(&self, status: crate::storage::SyncPeerStatus) -> Result<(), Error> {
+        self.inner.put_sync_status(status)
+    }
+    fn sync_statuses(
+        &self,
+        topic_id: &TopicId,
+    ) -> Result<Vec<crate::storage::SyncPeerStatus>, Error> {
+        self.inner.sync_statuses(topic_id)
+    }
+    fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize, Error> {
+        self.inner.clear_peer_sync_state(peer_id, topic_id)
+    }
+    fn reset_topic(&self, topic_id: &TopicId) -> Result<usize, Error> {
+        self.inner.reset_topic(topic_id)
+    }
+}
+
 /// A source node holding a three-op chain that `holder_peer` may sync with.
 pub(crate) fn chain_source(seed: u8, holder_peer: PeerId) -> (Irokle, TopicId, Vec<Op>) {
     let source = node(seed);
