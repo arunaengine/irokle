@@ -880,6 +880,12 @@ fn assert_quarantines_orphan<S: Corrupt>(storage: S) {
     );
     assert_eq!(eviction.evicted[0].payload, lost_event.signed.body.payload);
 
+    // The rebuild journalled its payloads in the transaction that discarded
+    // them, so losing the returned copy is not losing the payloads.
+    assert!(storage.pending_evictions().unwrap().contains(&eviction));
+    storage.clear_eviction(&eviction.key()).unwrap();
+    assert!(!storage.pending_evictions().unwrap().contains(&eviction));
+
     assert!(holder.topic_unresolved(topic_id).unwrap().is_empty());
     assert!(storage.get_op(&lost_event.id).unwrap().is_none());
     assert!(storage.get_meta(&lost_event.id).unwrap().is_none());

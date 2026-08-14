@@ -552,6 +552,230 @@ fn fjall_reset_topic_and_admit_rejects_stale_state() {
     assert_reset_topic_and_admit_rejects_stale_state(storage);
 }
 
+/// What a lost eviction must still be recoverable from: the topic, the chain it
+/// replaced, and the one op whose payload the reset discarded.
+struct LostEviction {
+    topic_id: TopicId,
+    losing_genesis: OpId,
+    winning_genesis: OpId,
+    evicted: Op,
+}
+
+/// Resolve a real genesis tie-break against `storage` and drop the returned
+/// eviction without delivering it anywhere: the crash window between the reset
+/// commit and the consumer's receipt.
+fn evict_undelivered<S: Storage>(storage: &S) -> LostEviction {
+    let topic_id = TopicId::hash(b"eviction-journal-topic");
+    let local_peer = Ed25519Signer::from_bytes(&[91; 32]).peer_id();
+    let foreign_peer = Ed25519Signer::from_bytes(&[92; 32]).peer_id();
+    let (local, _, local_genesis, local_event) = forked_side(
+        storage.clone(),
+        topic_id,
+        91,
+        [foreign_peer],
+        "acknowledged",
+    );
+    let (_, _, foreign_genesis, foreign_event) =
+        forked_side(MemoryStorage::new(), topic_id, 92, [local_peer], "winner");
+    assert!(
+        foreign_genesis.id < local_genesis.id,
+        "these seeds must make the local side lose the tie-break"
+    );
+
+    let admitted = local
+        .receive_ops_from_peer_evicting(
+            Some(foreign_peer),
+            vec![foreign_genesis.clone(), foreign_event],
+        )
+        .unwrap();
+    assert_eq!(admitted.evictions.len(), 1);
+    // The crash: the only in-memory copy of the payload goes nowhere.
+    drop(admitted);
+    drop(local);
+
+    LostEviction {
+        topic_id,
+        losing_genesis: local_genesis.id,
+        winning_genesis: foreign_genesis.id,
+        evicted: local_event,
+    }
+}
+
+/// The journal a restart finds must describe exactly the payloads the reset
+/// removed, and release them only when the consumer acknowledges.
+fn assert_journal_recovers<S: Storage>(storage: &S, lost: LostEviction) {
+    let pending = storage.pending_evictions().unwrap();
+    assert_eq!(pending.len(), 1);
+    let record = &pending[0];
+    assert_eq!(record.topic_id, lost.topic_id);
+    assert_eq!(record.losing_genesis, lost.losing_genesis);
+    assert_eq!(record.winning_genesis, lost.winning_genesis);
+    assert_eq!(record.evicted.len(), 1);
+    assert_eq!(record.evicted[0].op_id, lost.evicted.id);
+    assert_eq!(record.evicted[0].payload, lost.evicted.signed.body.payload);
+
+    // The reset really committed: the journal is the only copy left.
+    assert!(storage.get_op(&lost.evicted.id).unwrap().is_none());
+    assert_eq!(
+        storage
+            .topic_state(&lost.topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis,
+        lost.winning_genesis
+    );
+
+    storage.clear_eviction(&record.key()).unwrap();
+    assert!(storage.pending_evictions().unwrap().is_empty());
+    // Acknowledging a record that is already released is not an error.
+    storage.clear_eviction(&record.key()).unwrap();
+}
+
+#[test]
+fn memory_journals_eviction() {
+    let storage = MemoryStorage::new();
+    let lost = evict_undelivered(&storage);
+    // A facade built after the fact: the record lives in the store, not in the
+    // node that produced it.
+    assert_journal_recovers(&storage.clone(), lost);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_journals_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    let lost = evict_undelivered(&storage);
+    drop(storage);
+    // Reopened from disk: only what the reset transaction committed is left.
+    let reopened = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    assert_journal_recovers(&reopened, lost);
+}
+
+/// One reset's worth of journal input, with a key that differs per `nonce`.
+fn filler_eviction(topic_id: TopicId, winning_genesis: OpId, nonce: usize) -> crate::TopicEviction {
+    crate::TopicEviction {
+        topic_id,
+        losing_genesis: OpId::hash(nonce.to_le_bytes()),
+        winning_genesis,
+        evicted: vec![crate::EvictedOp {
+            op_id: OpId::hash(nonce.to_le_bytes()),
+            actor_id: ActorId::default(),
+            author: PeerId::default(),
+            actor_seq: 1,
+            payload: TopicPayload::Event(
+                EventEnvelope::encode_event(&Note {
+                    text: String::new(),
+                })
+                .unwrap(),
+            ),
+        }],
+    }
+}
+
+/// A winner genesis for `topic_id` that no earlier `nonce` produced, with the
+/// metadata and state a reset needs to install it.
+fn filler_winner(
+    topic_id: TopicId,
+    nonce: usize,
+) -> (Op, crate_storage::OpMeta, crate_storage::TopicState) {
+    let signer = Ed25519Signer::from_bytes(&[96; 32]);
+    let source = oplog::Oplog::with_storage(MemoryStorage::new());
+    let genesis = source
+        .create_topic_genesis(
+            topic_id,
+            actor_id_for(topic_id, signer.peer_id()),
+            TopicGenesis {
+                event_type_id: Note::TYPE_ID.into(),
+                initial_peers: [PeerId::hash(nonce.to_le_bytes())].into(),
+                replication_policy: ReplicationPolicy::default(),
+            },
+            &signer,
+        )
+        .unwrap();
+    let meta = source.storage().get_meta(&genesis.id).unwrap().unwrap();
+    let state = source.storage().topic_state(&topic_id).unwrap().unwrap();
+    (genesis, meta, state)
+}
+
+/// The journal is bounded: once it holds `MAX_PENDING_EVICTIONS`
+/// unacknowledged records the next reset is refused, rather than growing
+/// without limit or dropping a payload nothing else holds.
+fn assert_journal_bound<S: Storage>(storage: S) {
+    let topic_id = TopicId::hash(b"eviction-bound-topic");
+    seed_chain(&storage, topic_id, 95, &["one"]);
+
+    for nonce in 0..crate_storage::MAX_PENDING_EVICTIONS {
+        let expected_state = storage.topic_state(&topic_id).unwrap().unwrap();
+        let (genesis, meta, state) = filler_winner(topic_id, nonce);
+        storage
+            .reset_topic_and_admit(
+                &topic_id,
+                &expected_state,
+                crate_storage::AdmittedBatch {
+                    topic_id,
+                    expected_heads: BTreeSet::new(),
+                    expected_topic_state: None,
+                    entries: vec![(genesis.clone(), meta)],
+                    heads: [genesis.id].into(),
+                    topic_state: Some(state),
+                    effects: crate_storage::AdmissionEffects::default(),
+                },
+                Some(&filler_eviction(topic_id, genesis.id, nonce)),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        storage.pending_evictions().unwrap().len(),
+        crate_storage::MAX_PENDING_EVICTIONS
+    );
+
+    let before = topic_snapshot(&storage, &topic_id);
+    let expected_state = storage.topic_state(&topic_id).unwrap().unwrap();
+    let (genesis, meta, state) = filler_winner(topic_id, crate_storage::MAX_PENDING_EVICTIONS);
+    let refused = storage.reset_topic_and_admit(
+        &topic_id,
+        &expected_state,
+        crate_storage::AdmittedBatch {
+            topic_id,
+            expected_heads: BTreeSet::new(),
+            expected_topic_state: None,
+            entries: vec![(genesis.clone(), meta)],
+            heads: [genesis.id].into(),
+            topic_state: Some(state),
+            effects: crate_storage::AdmissionEffects::default(),
+        },
+        Some(&filler_eviction(
+            topic_id,
+            genesis.id,
+            crate_storage::MAX_PENDING_EVICTIONS,
+        )),
+    );
+
+    // Refused whole: the chain the reset would have discarded is still here.
+    assert!(matches!(refused, Err(Error::EvictionJournalFull)));
+    assert_eq!(topic_snapshot(&storage, &topic_id), before);
+    assert_eq!(
+        storage.pending_evictions().unwrap().len(),
+        crate_storage::MAX_PENDING_EVICTIONS
+    );
+}
+
+#[test]
+fn memory_bounds_journal() {
+    assert_journal_bound(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_bounds_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        crate_storage::FjallStorage::open_with_persist_mode(dir.path(), fjall::PersistMode::Buffer)
+            .unwrap();
+    assert_journal_bound(storage);
+}
+
 #[test]
 fn rejects_too_many_pending_deps() {
     let signer = Ed25519Signer::from_bytes(&[49; 32]);
@@ -914,13 +1138,15 @@ fn assert_reset_rollback<S: Storage>(storage: S) {
             topic_state: None,
             effects: crate_storage::AdmissionEffects::default(),
         },
-        None,
+        Some(&filler_eviction(topic_id, genesis.id, 0)),
     );
 
     assert!(matches!(result, Err(Error::MissingDependency(id)) if id == genesis.id));
     assert_eq!(topic_snapshot(&storage, &topic_id), before);
     assert_eq!(topic_snapshot(&storage, &survivor_id), survivor_before);
     assert!(storage.get_op(&event.id).unwrap().is_none());
+    // The record belongs to the reset: no reset, no record to acknowledge.
+    assert!(storage.pending_evictions().unwrap().is_empty());
 }
 
 #[test]
