@@ -105,6 +105,7 @@ impl StaleReadStorage {
         }
     }
 
+    #[cfg(feature = "iroh")]
     pub(crate) fn fail_writes(&self, topic_id: TopicId) {
         self.failed_writes.lock().unwrap().insert(topic_id);
     }
