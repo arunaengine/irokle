@@ -441,20 +441,12 @@ impl<S: Storage> Oplog<S> {
     /// Drain pending ops that transitively wait on a genesis that lost (or was
     /// rejected by) a collision resolution: the local topic keeps a different
     /// genesis, so that id will never be admitted here and nothing depending on
-    /// it can ever become ready. Walks the waiter index breadth-first;
-    /// `remove_pending_op` keeps the pending counters consistent.
+    /// it can ever become ready. The storage layer walks the waiter closure in
+    /// one transaction so a crash cannot strand half of it.
     fn purge_losing_pending(&self, losing_genesis: OpId) -> Result<()> {
-        let mut frontier = vec![losing_genesis];
-        let mut seen = BTreeSet::new();
-        while let Some(dep) = frontier.pop() {
-            for (_, op) in self.storage.pending_waiters(&dep)? {
-                if seen.insert(op.id) {
-                    self.storage.remove_pending_op(&op.id)?;
-                    frontier.push(op.id);
-                }
-            }
-        }
-        Ok(())
+        self.storage
+            .purge_pending_waiters(&losing_genesis)
+            .map(drop)
     }
 
     /// Resolve a genesis tie-break for a batch that carries a structurally
@@ -615,11 +607,11 @@ impl<S: Storage> Oplog<S> {
             if !verified.contains(&op.id) {
                 op.validate()?;
             }
-            if self.storage.get_op(&op.id)?.is_some() {
+            if !reset && self.storage.get_op(&op.id)?.is_some() {
                 continue;
             }
 
-            let missing_deps = self.missing_deps_projected(&op, &overlay_ops)?;
+            let missing_deps = self.missing_deps_projected(&op, &overlay_ops, reset)?;
             if !missing_deps.is_empty() {
                 match self.validate_pending_op_projected(
                     &op,
@@ -1071,14 +1063,24 @@ impl<S: Storage> Oplog<S> {
         })
     }
 
+    /// Dependencies this op cannot resolve yet. A dependency counts as present
+    /// only when both its op record and its metadata are stored: the DAG is
+    /// traversed through metadata, so either record alone is a hole to refill,
+    /// never a satisfied edge. On the reset path storage is about to be wiped,
+    /// so only the batch overlay counts.
     fn missing_deps_projected(
         &self,
         op: &Op,
         overlay_ops: &BTreeMap<crate::OpId, Op>,
+        reset: bool,
     ) -> Result<BTreeSet<crate::OpId>> {
         let mut missing = BTreeSet::new();
         for dep in &op.signed.body.deps {
-            if !overlay_ops.contains_key(dep) && self.storage.get_op(dep)?.is_none() {
+            if overlay_ops.contains_key(dep) {
+                continue;
+            }
+            if reset || self.storage.get_op(dep)?.is_none() || self.storage.get_meta(dep)?.is_none()
+            {
                 missing.insert(*dep);
             }
         }

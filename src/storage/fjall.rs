@@ -10,7 +10,8 @@ use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, Topic
 use super::{
     AdmittedBatch, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL,
     MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation, SyncPeerStatus,
-    TopicState, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
+    TopicState, ensure_deps_resolvable, stored_ack_dominates, sync_obligation_satisfied,
+    topic_fingerprint_for,
 };
 
 #[cfg(feature = "fjall")]
@@ -324,6 +325,10 @@ impl FjallStorage {
                 actor_tips.insert((meta.topic_id, meta.actor_id), (meta.actor_seq, op.id));
                 new_entries.push((op.clone(), meta.clone()));
             }
+
+            ensure_deps_resolvable(&new_entries, |dep| {
+                Ok(Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", dep))?.is_some())
+            })?;
 
             let mut clock: ActorClock =
                 Self::tx_get(tx, &self.records, Self::key_id(b"ac", &topic_id))?
@@ -682,7 +687,9 @@ impl Storage for FjallStorage {
                 Self::tx_remove_pending_op(tx, &self.records, &op.id)?;
             }
             for dep in &meta.missing_deps {
-                if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", dep))?.is_some() {
+                if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", dep))?.is_some()
+                    && Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", dep))?.is_some()
+                {
                     return Err(Error::AdmissionConflict);
                 }
             }
@@ -767,6 +774,8 @@ impl Storage for FjallStorage {
             let mut ready = true;
             for dep in &meta.missing_deps {
                 if fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", dep))?.is_none()
+                    || fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"m", dep))?
+                        .is_none()
                 {
                     ready = false;
                     break;
@@ -780,6 +789,27 @@ impl Storage for FjallStorage {
     }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         self.transaction(|tx| Self::tx_remove_pending_op(tx, &self.records, op_id))
+    }
+    fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
+        self.transaction(|tx| {
+            let mut frontier = vec![*dep_id];
+            let mut seen = BTreeSet::new();
+            while let Some(dep) = frontier.pop() {
+                let prefix = [b"pw".as_slice(), dep.as_ref()].concat();
+                let mut waiters = Vec::new();
+                for item in fjall::Readable::prefix(tx, &self.records, prefix) {
+                    let (key, _) = item.into_inner()?;
+                    waiters.push(Self::op_id_from_key(key.as_ref(), 2 + OpId::LEN)?);
+                }
+                for op_id in waiters {
+                    if seen.insert(op_id) {
+                        Self::tx_remove_pending_op(tx, &self.records, &op_id)?;
+                        frontier.push(op_id);
+                    }
+                }
+            }
+            Ok(seen.len())
+        })
     }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
         self.get([b"ak".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat())

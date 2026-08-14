@@ -107,6 +107,10 @@ pub struct SyncPeerStatus {
 }
 
 pub trait Storage: Clone + Send + Sync + 'static {
+    /// Durably admit `batch`. Backends must write each entry's op record and
+    /// its [`OpMeta`] in one atomic unit and must reject a batch whose entry
+    /// depends on an op with no metadata, so a committed op can never reference
+    /// a dependency the DAG cannot resolve.
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()>;
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
@@ -126,6 +130,25 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>>;
     fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>>;
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
+    /// Atomically drop every pending op that transitively waits on `dep_id`.
+    /// Genesis tie-break resolution uses this for a genesis that will never be
+    /// admitted here; a partial walk would strand waiters holding pending quota
+    /// against a dependency that can never arrive. Returns the number removed.
+    /// The default composition is correct but not atomic; durable backends
+    /// override it with a single transaction.
+    fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
+        let mut frontier = vec![*dep_id];
+        let mut seen = BTreeSet::new();
+        while let Some(dep) = frontier.pop() {
+            for (_, op) in self.pending_waiters(&dep)? {
+                if seen.insert(op.id) {
+                    self.remove_pending_op(&op.id)?;
+                    frontier.push(op.id);
+                }
+            }
+        }
+        Ok(seen.len())
+    }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>>;
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()>;
@@ -240,6 +263,25 @@ pub(super) fn sync_obligation_satisfied(obligation: &SyncObligation, ack: &PeerA
         return true;
     }
     !obligation.target_clock.is_empty() && ack.clock.dominates(&obligation.target_clock)
+}
+
+/// Reject a batch whose entry depends on an op with no metadata, checked
+/// against the same transaction that will write it. Enforcing this at the
+/// durability boundary is what keeps every admission path (batch admission,
+/// admission retry, genesis reset) from committing a dangling DAG edge.
+pub(super) fn ensure_deps_resolvable(
+    entries: &[(Op, OpMeta)],
+    mut stored_meta: impl FnMut(&OpId) -> Result<bool>,
+) -> Result<()> {
+    let batch = entries.iter().map(|(op, _)| op.id).collect::<BTreeSet<_>>();
+    for (_, meta) in entries {
+        for dep in &meta.deps {
+            if !batch.contains(dep) && !stored_meta(dep)? {
+                return Err(crate::Error::MissingDependency(*dep));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn stored_ack_dominates(existing: &PeerAck, incoming: &PeerAck) -> bool {

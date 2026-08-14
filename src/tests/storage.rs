@@ -685,3 +685,117 @@ fn fjall_reconciles_pending() {
     let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
     assert_pending_reconciles(storage);
 }
+
+/// A genesis from one peer plus a second peer's first event on top of it, both
+/// with meta. The event opens its own actor chain, so admitting it alone leaves
+/// its dependency as the only thing standing in the way.
+fn seed_pair(topic_id: TopicId, seed: u8) -> [(Op, crate_storage::OpMeta); 2] {
+    let founder = Ed25519Signer::from_bytes(&[seed; 32]);
+    let joiner = Ed25519Signer::from_bytes(&[seed.wrapping_add(1); 32]);
+    let source = oplog::Oplog::with_storage(MemoryStorage::new());
+    let genesis = source
+        .create_topic_genesis(
+            topic_id,
+            actor_id_for(topic_id, founder.peer_id()),
+            TopicGenesis {
+                event_type_id: Note::TYPE_ID.into(),
+                initial_peers: [joiner.peer_id()].into(),
+                replication_policy: ReplicationPolicy::default(),
+            },
+            &founder,
+        )
+        .unwrap();
+    let event = source
+        .create_event_op(
+            topic_id,
+            actor_id_for(topic_id, joiner.peer_id()),
+            EventEnvelope::encode_event(&Note {
+                text: "chained".into(),
+            })
+            .unwrap(),
+            &joiner,
+        )
+        .unwrap();
+    [genesis, event].map(|op| {
+        let meta = source.storage().get_meta(&op.id).unwrap().unwrap();
+        (op, meta)
+    })
+}
+
+fn assert_rejects_dangling_entry<S: Storage>(storage: S) {
+    // The durability boundary must refuse an op whose dependency has no meta,
+    // however the caller's pre-transaction reads decided the dep was there.
+    let topic_id = TopicId::hash(b"dangling-entry-topic");
+    let [(genesis, _), (event, event_meta)] = seed_pair(topic_id, 71);
+
+    let result = storage.put_admitted_batch(crate_storage::AdmittedBatch {
+        topic_id,
+        expected_heads: BTreeSet::new(),
+        expected_topic_state: None,
+        entries: vec![(event.clone(), event_meta)],
+        heads: [event.id].into(),
+        topic_state: None,
+        effects: crate_storage::AdmissionEffects::default(),
+    });
+
+    assert!(matches!(result, Err(Error::MissingDependency(id)) if id == genesis.id));
+    assert!(storage.get_op(&event.id).unwrap().is_none());
+    assert!(storage.get_meta(&event.id).unwrap().is_none());
+    assert!(storage.list_op_ids(&topic_id).unwrap().is_empty());
+}
+
+#[test]
+fn memory_rejects_dangling_entry() {
+    assert_rejects_dangling_entry(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_rejects_dangling_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_rejects_dangling_entry(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+fn assert_purges_waiter_closure<S: Storage>(storage: S) {
+    // Dropping a dependency that can never arrive must take its whole waiter
+    // chain with it in one durable step.
+    let topic_id = TopicId::hash(b"waiter-closure-topic");
+    let source = node(73);
+    let chain = source
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: BTreeSet::new(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    chain.publish(Note { text: "one".into() }).unwrap();
+    chain.publish(Note { text: "two".into() }).unwrap();
+    let ops = oplog::topological(source.storage(), &chain.id()).unwrap();
+    let log = oplog::Oplog::with_storage(storage.clone());
+
+    // Withhold the genesis so both events buffer, the second behind the first.
+    log.receive_ops_from_peer(Some(source.peer_id()), vec![ops[2].clone()])
+        .unwrap();
+    log.receive_ops_from_peer(Some(source.peer_id()), vec![ops[1].clone()])
+        .unwrap();
+    assert_eq!(storage.pending_waiters(&ops[0].id).unwrap().len(), 1);
+
+    let purged = storage.purge_pending_waiters(&ops[0].id).unwrap();
+
+    assert_eq!(purged, 2);
+    assert!(storage.pending_waiters(&ops[0].id).unwrap().is_empty());
+    assert!(storage.pending_waiters(&ops[1].id).unwrap().is_empty());
+    assert!(storage.ready_pending_ops().unwrap().is_empty());
+    assert!(storage.list_op_ids(&topic_id).unwrap().is_empty());
+}
+
+#[test]
+fn memory_purges_waiter_closure() {
+    assert_purges_waiter_closure(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_purges_waiter_closure() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_purges_waiter_closure(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}

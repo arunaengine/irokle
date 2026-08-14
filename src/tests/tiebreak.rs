@@ -648,3 +648,67 @@ fn structurally_invalid_genesis_is_rejected_without_reset() {
         winner_genesis
     );
 }
+
+/// Every admitted op in `topic_id` must be able to resolve its dependencies.
+fn assert_dag_whole(oplog: &Oplog, topic_id: &TopicId) {
+    for op_id in oplog.storage().list_op_ids(topic_id).unwrap() {
+        let meta = oplog.storage().get_meta(&op_id).unwrap().unwrap();
+        for dep in &meta.deps {
+            assert!(
+                oplog.storage().get_meta(dep).unwrap().is_some(),
+                "admitted {op_id} references dependency {dep} with no meta"
+            );
+        }
+    }
+}
+
+#[test]
+fn reset_defers_stale_dependents() {
+    // The reset path reads dep presence before it wipes the topic. An op whose
+    // dependency only exists in the chain about to be discarded must be
+    // buffered, never admitted against storage that is one step from empty.
+    let fork = build_fork(11, 12);
+    let (loser_seed, winner_seed) = if fork.a_won { (12, 11) } else { (11, 12) };
+    let (loser, _, _, loser_event) = seed_side(fork.topic_id, loser_seed, winner_seed, "replay");
+    let stale_dependent = Op::sign(
+        OpBody {
+            topic_id: fork.topic_id,
+            author: fork.winner_signer.peer_id(),
+            actor_id: actor_id_for(fork.topic_id, fork.winner_signer.peer_id()),
+            actor_seq: 3,
+            actor_prev: Some(fork.winner_event.id),
+            deps: [fork.winner_event.id, loser_event.id].into(),
+            generation: 2,
+            payload: TopicPayload::Event(
+                EventEnvelope::encode_event(&Note {
+                    text: "straddles both chains".into(),
+                })
+                .unwrap(),
+            ),
+        },
+        &fork.winner_signer,
+    )
+    .unwrap();
+
+    loser
+        .receive_ops_from_peer_evicting(
+            Some(fork.winner_signer.peer_id()),
+            vec![
+                fork.winner_genesis.clone(),
+                fork.winner_event.clone(),
+                stale_dependent.clone(),
+            ],
+        )
+        .unwrap();
+
+    let admitted = admitted_ids(&loser, &fork.topic_id);
+    assert!(!admitted.contains(&stale_dependent.id));
+    assert_dag_whole(&loser, &fork.topic_id);
+}
+
+#[test]
+fn reset_keeps_dag_whole() {
+    let fork = build_fork(13, 14);
+    assert_dag_whole(&fork.winner_oplog, &fork.topic_id);
+    assert_dag_whole(&fork.loser_oplog, &fork.topic_id);
+}

@@ -8,7 +8,8 @@ use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, Topic
 use super::{
     AdmittedBatch, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL,
     MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation, SyncPeerStatus,
-    TopicState, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
+    TopicState, ensure_deps_resolvable, stored_ack_dominates, sync_obligation_satisfied,
+    topic_fingerprint_for,
 };
 
 #[derive(Clone, Default)]
@@ -187,7 +188,7 @@ impl Storage for MemoryStorage {
         if meta
             .missing_deps
             .iter()
-            .any(|dep| inner.ops.contains_key(dep))
+            .any(|dep| dep_resolvable_locked(&inner, dep))
         {
             return Err(Error::AdmissionConflict);
         }
@@ -250,7 +251,7 @@ impl Storage for MemoryStorage {
             .filter(|(_, _, meta)| {
                 meta.missing_deps
                     .iter()
-                    .all(|dep| inner.ops.contains_key(dep))
+                    .all(|dep| dep_resolvable_locked(&inner, dep))
             })
             .map(|(source, op, _)| (*source, op.clone()))
             .collect())
@@ -259,6 +260,10 @@ impl Storage for MemoryStorage {
         let mut inner = self.lock()?;
         remove_pending_locked(&mut inner, op_id);
         Ok(())
+    }
+    fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
+        let mut inner = self.lock()?;
+        Ok(purge_waiters_locked(&mut inner, dep_id))
     }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
         Ok(self.lock()?.peer_acks.get(&(*peer_id, *topic_id)).cloned())
@@ -441,6 +446,8 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
         new_entries.push((op, meta));
     }
 
+    ensure_deps_resolvable(&new_entries, |dep| Ok(inner.meta.contains_key(dep)))?;
+
     let topic_id = topic_state
         .as_ref()
         .map(|state| state.topic_id)
@@ -559,6 +566,27 @@ fn clear_satisfied_locked(inner: &mut MemoryInner, ack: &PeerAck) -> usize {
         })
         .collect();
     before - inner.obligations.len()
+}
+
+/// A dependency is only satisfied once both of its records are stored; either
+/// one alone leaves the DAG unable to traverse the edge.
+fn dep_resolvable_locked(inner: &MemoryInner, dep: &OpId) -> bool {
+    inner.ops.contains_key(dep) && inner.meta.contains_key(dep)
+}
+
+fn purge_waiters_locked(inner: &mut MemoryInner, dep_id: &OpId) -> usize {
+    let mut frontier = vec![*dep_id];
+    let mut seen = BTreeSet::new();
+    while let Some(dep) = frontier.pop() {
+        let waiters = inner.pending_waiters.get(&dep).cloned().unwrap_or_default();
+        for op_id in waiters {
+            if seen.insert(op_id) {
+                remove_pending_locked(inner, &op_id);
+                frontier.push(op_id);
+            }
+        }
+    }
+    seen.len()
 }
 
 fn remove_pending_locked(inner: &mut MemoryInner, op_id: &OpId) {
