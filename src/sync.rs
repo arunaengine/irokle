@@ -223,7 +223,15 @@ impl<S: Storage> SyncEngine<S> {
         }
 
         let local_heads = self.oplog.storage().heads(&remote.topic_id)?;
-        if self.oplog.storage().topic_fingerprint(&remote.topic_id)? == remote.fingerprint {
+        // Buffered ops do not move heads or the clock, so a matching fingerprint
+        // does not prove we are whole; keep negotiating while a hole is waiting.
+        let buffered = self
+            .oplog
+            .storage()
+            .pending_missing_deps(&remote.topic_id)?;
+        if buffered.is_empty()
+            && self.oplog.storage().topic_fingerprint(&remote.topic_id)? == remote.fingerprint
+        {
             return Ok(SyncPlan {
                 topic_id: remote.topic_id,
                 common: local_heads.clone(),
@@ -234,13 +242,30 @@ impl<S: Storage> SyncEngine<S> {
             });
         }
 
-        let common = self.find_common_ancestors(remote)?;
+        let (common, dangling) = self.survey_local(remote)?;
         let send = self.missing_closure(remote)?;
         let mut need = BTreeSet::new();
         for id in &remote.heads {
             if self.oplog.storage().get_meta(id)?.is_none() {
                 need.insert(*id);
             }
+        }
+        // Anti-entropy: a dependency we reference but cannot resolve - whether a
+        // head the walk could not follow or a hole a buffered op waits on - is
+        // requested from this peer like any other missing op, so a store already
+        // holding a dangling edge heals over normal sync instead of deferring
+        // its dependents forever.
+        let repair = dangling
+            .into_iter()
+            .chain(buffered)
+            .collect::<BTreeSet<_>>();
+        if !repair.is_empty() {
+            tracing::debug!(
+                topic_id = %remote.topic_id,
+                dangling = repair.len(),
+                "requesting unresolved dependencies from peer"
+            );
+            need.extend(repair);
         }
         Ok(SyncPlan {
             topic_id: remote.topic_id,
@@ -253,7 +278,16 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     pub fn find_common_ancestors(&self, remote: &SyncSummary) -> Result<BTreeSet<OpId>> {
+        Ok(self.survey_local(remote)?.0)
+    }
+
+    /// Walk local heads down to the frontier the remote already has, reporting
+    /// the common ancestors found there and every id the walk could not resolve
+    /// because its metadata is absent. The second set is what anti-entropy
+    /// repair asks the peer for; collecting it here costs no extra traversal.
+    fn survey_local(&self, remote: &SyncSummary) -> Result<(BTreeSet<OpId>, BTreeSet<OpId>)> {
         let mut common = BTreeSet::new();
+        let mut dangling = BTreeSet::new();
         let mut queue: VecDeque<_> = self
             .oplog
             .storage()
@@ -267,6 +301,7 @@ impl<S: Storage> SyncEngine<S> {
                 continue;
             }
             let Some(meta) = self.oplog.storage().get_meta(&id)? else {
+                dangling.insert(id);
                 continue;
             };
             if meta.topic_id != remote.topic_id {
@@ -279,7 +314,7 @@ impl<S: Storage> SyncEngine<S> {
             queue.extend(meta.deps.iter().copied());
         }
 
-        Ok(common)
+        Ok((common, dangling))
     }
 
     pub fn missing_closure(&self, remote: &SyncSummary) -> Result<Vec<Op>> {

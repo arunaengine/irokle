@@ -256,6 +256,16 @@ impl Storage for MemoryStorage {
             .map(|(source, op, _)| (*source, op.clone()))
             .collect())
     }
+    fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
+        let inner = self.lock()?;
+        Ok(inner
+            .pending_ops
+            .values()
+            .filter(|(_, _, meta)| meta.topic_id == *topic_id)
+            .flat_map(|(_, _, meta)| meta.missing_deps.iter().copied())
+            .filter(|dep| !dep_resolvable_locked(&inner, dep))
+            .collect())
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         let mut inner = self.lock()?;
         remove_pending_locked(&mut inner, op_id);

@@ -787,6 +787,24 @@ impl Storage for FjallStorage {
         }
         Ok(out)
     }
+    fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
+        let mut out = BTreeSet::new();
+        let read_tx = self.db.read_tx();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, b"po".as_slice()) {
+            let value = item.value()?;
+            let (_, _, meta): (PeerId, Op, OpMeta) = postcard::from_bytes(value.as_ref())?;
+            if meta.topic_id != *topic_id {
+                continue;
+            }
+            for dep in &meta.missing_deps {
+                if fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"m", dep))?.is_none()
+                {
+                    out.insert(*dep);
+                }
+            }
+        }
+        Ok(out)
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         self.transaction(|tx| Self::tx_remove_pending_op(tx, &self.records, op_id))
     }

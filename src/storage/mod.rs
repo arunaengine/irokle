@@ -129,6 +129,10 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()>;
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>>;
     fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>>;
+    /// Dependencies that buffered ops of `topic_id` are still waiting for.
+    /// Sync planning turns these into wants, so a hole a peer never pushes is
+    /// actively pulled instead of stranding its dependents forever.
+    fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
     /// Atomically drop every pending op that transitively waits on `dep_id`.
     /// Genesis tie-break resolution uses this for a genesis that will never be

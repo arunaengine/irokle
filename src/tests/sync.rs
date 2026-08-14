@@ -1219,6 +1219,9 @@ impl Storage for StaleReadStorage {
     fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>, Error> {
         self.inner.ready_pending_ops()
     }
+    fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.pending_missing_deps(topic_id)
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<(), Error> {
         self.inner.remove_pending_op(op_id)
     }
@@ -1392,6 +1395,9 @@ impl Storage for HoleStorage {
     fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>, Error> {
         self.inner.ready_pending_ops()
     }
+    fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.pending_missing_deps(topic_id)
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<(), Error> {
         self.inner.remove_pending_op(op_id)
     }
@@ -1522,4 +1528,95 @@ fn dangling_dep_keeps_dag_query() {
     let ids = newest.iter().map(|op| op.id).collect::<BTreeSet<_>>();
     assert!(ids.contains(&ops[2].id));
     assert!(!ids.contains(&ops[1].id));
+}
+
+#[test]
+fn repair_refetches_dangling_dep() {
+    // A store holding a hole must pull it from a peer over the ordinary
+    // negotiate/request path and end up whole, even though its heads and clock
+    // never revealed the gap.
+    let source_signer = Ed25519Signer::from_bytes(&[96; 32]);
+    let holder_signer = Ed25519Signer::from_bytes(&[97; 32]);
+    let source = Irokle::new(NodeConfig {
+        signer: source_signer.clone(),
+        default_write_concern: WriteConcern::Local,
+        ..NodeConfig::default()
+    })
+    .unwrap();
+    let topic = source
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [holder_signer.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    topic.publish(Note { text: "one".into() }).unwrap();
+    topic.publish(Note { text: "two".into() }).unwrap();
+    let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+    let topic_id = topic.id();
+
+    // Withhold the middle op: the newest buffers with that id as a hole.
+    let holder = Irokle::new(NodeConfig {
+        signer: holder_signer.clone(),
+        default_write_concern: WriteConcern::Local,
+        ..NodeConfig::default()
+    })
+    .unwrap();
+    holder
+        .receive_sync_data_from(
+            source.peer_id(),
+            crate_sync::SyncData {
+                topic_id,
+                ops: vec![ops[0].clone(), ops[2].clone()],
+            },
+        )
+        .unwrap();
+    assert!(holder.storage().get_meta(&ops[2].id).unwrap().is_none());
+    assert_eq!(
+        holder.storage().pending_missing_deps(&topic_id).unwrap(),
+        [ops[1].id].into()
+    );
+
+    let plan = holder
+        .negotiate_sync(source.peer_id(), &source.sync_summary(topic_id).unwrap())
+        .unwrap();
+    assert!(plan.need.contains(&ops[1].id));
+
+    let data = source
+        .plan_sync_response_data(
+            holder_signer.peer_id(),
+            &crate_sync::SyncRequest {
+                topic_id,
+                known: plan.common,
+                wants: plan.need,
+                actor_range_hints: plan.actor_range_hints,
+            },
+        )
+        .unwrap();
+    assert!(data.ops.iter().any(|op| op.id == ops[1].id));
+
+    holder
+        .receive_sync_data_from(source.peer_id(), data)
+        .unwrap();
+
+    // The hole is closed, the buffered dependent is admitted, and every
+    // admitted op resolves its dependencies again.
+    assert!(
+        holder
+            .storage()
+            .pending_missing_deps(&topic_id)
+            .unwrap()
+            .is_empty()
+    );
+    for op_id in holder.storage().list_op_ids(&topic_id).unwrap() {
+        let meta = holder.storage().get_meta(&op_id).unwrap().unwrap();
+        for dep in &meta.deps {
+            assert!(holder.storage().get_meta(dep).unwrap().is_some());
+        }
+    }
+    assert_eq!(
+        oplog::topological(holder.storage(), &topic_id)
+            .unwrap()
+            .len(),
+        ops.len()
+    );
 }
