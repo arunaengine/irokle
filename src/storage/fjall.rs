@@ -5,13 +5,16 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, TopicInfo};
+use crate::{
+    ActorClock, ActorId, Error, EvictionKey, Op, OpId, PeerId, Result, TopicEviction, TopicId,
+    TopicInfo,
+};
 
 use super::{
-    AdmittedBatch, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL,
-    MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation, SyncPeerStatus,
-    TopicState, ensure_deps_resolvable, stored_ack_dominates, sync_obligation_satisfied,
-    topic_fingerprint_for,
+    AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
+    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
+    SyncPeerStatus, TopicState, ensure_deps_resolvable, journalled_eviction, stored_ack_dominates,
+    sync_obligation_satisfied, topic_fingerprint_for,
 };
 
 #[cfg(feature = "fjall")]
@@ -24,6 +27,10 @@ pub struct FjallStorage {
 
 #[cfg(feature = "fjall")]
 const FJALL_SCHEMA_VERSION: u32 = 1;
+/// Eviction journal records. No other keyspace begins with `e`, so this is the
+/// whole prefix: unlike `ob`, it cannot be shadowed by a single-letter prefix.
+#[cfg(feature = "fjall")]
+const EVICTION_PREFIX: &[u8] = b"ev";
 #[cfg(feature = "fjall")]
 const FJALL_SCHEMA_VERSION_KEY: &[u8] = b"sv";
 
@@ -130,6 +137,17 @@ impl FjallStorage {
         Ok(fjall::Readable::get(tx, records, key.as_ref())?
             .map(|v| postcard::from_bytes(v.as_ref()))
             .transpose()?)
+    }
+
+    /// Outstanding journal records, counted no further than the cap the caller
+    /// compares against.
+    fn tx_eviction_count(
+        tx: &fjall::OptimisticWriteTx,
+        records: &fjall::OptimisticTxKeyspace,
+    ) -> usize {
+        fjall::Readable::prefix(tx, records, EVICTION_PREFIX)
+            .take(MAX_PENDING_EVICTIONS)
+            .count()
     }
 
     fn tx_remove_pending_op(
@@ -673,6 +691,7 @@ impl Storage for FjallStorage {
         topic_id: &TopicId,
         expected_topic_state: &TopicState,
         batch: AdmittedBatch,
+        eviction: Option<&TopicEviction>,
     ) -> Result<usize> {
         self.transaction(|tx| {
             let current_heads: BTreeSet<OpId> =
@@ -689,7 +708,34 @@ impl Storage for FjallStorage {
             }
             let removed = self.tx_reset_topic(tx, topic_id)?;
             self.tx_put_admitted_batch(tx, &batch)?;
+            // The journal entry commits with the reset that made it the only
+            // copy, so no crash point can leave the payloads unrecorded.
+            if let Some((key, eviction)) = journalled_eviction(eviction) {
+                let key = Self::key_id(EVICTION_PREFIX, &key);
+                if Self::tx_get::<TopicEviction>(tx, &self.records, key.as_slice())?.is_none()
+                    && Self::tx_eviction_count(tx, &self.records) >= MAX_PENDING_EVICTIONS
+                {
+                    return Err(Error::EvictionJournalFull);
+                }
+                Self::tx_put(tx, &self.records, key, eviction)?;
+            }
             Ok(removed)
+        })
+    }
+
+    fn pending_evictions(&self) -> Result<Vec<TopicEviction>> {
+        let mut out = Vec::new();
+        for item in self.records.inner().prefix(EVICTION_PREFIX) {
+            let (_, value) = item.into_inner()?;
+            out.push(postcard::from_bytes(value.as_ref())?);
+        }
+        Ok(out)
+    }
+
+    fn clear_eviction(&self, key: &EvictionKey) -> Result<()> {
+        self.transaction(|tx| {
+            tx.remove(&self.records, Self::key_id(EVICTION_PREFIX, key));
+            Ok(())
         })
     }
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {

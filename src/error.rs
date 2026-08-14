@@ -70,6 +70,9 @@ pub enum Error {
     #[error("storage error: {0}")]
     Storage(String),
 
+    #[error("eviction journal is full")]
+    EvictionJournalFull,
+
     #[cfg(feature = "fjall")]
     #[error("fjall error: {0}")]
     Fjall(#[from] fjall::Error),

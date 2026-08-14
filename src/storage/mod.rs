@@ -7,12 +7,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::canonical_bytes;
 use crate::topic::ReplicationPolicy;
-use crate::{ActorClock, ActorId, Op, OpId, PeerId, Result, TopicId, TopicInfo};
+use crate::{
+    ActorClock, ActorId, EvictionKey, Op, OpId, PeerId, Result, TopicEviction, TopicId, TopicInfo,
+};
 
 pub const MAX_PENDING_OPS_TOTAL: usize = 4096;
 pub const MAX_PENDING_OPS_PER_SOURCE: usize = 1024;
 pub const MAX_PENDING_WAITERS_PER_DEP: usize = 1024;
 pub const MAX_PENDING_MISSING_DEPS: usize = 128;
+/// Eviction records a store may hold unacknowledged. A healthy consumer
+/// acknowledges each record as soon as it owns the payloads durably, so this
+/// only bounds a store whose consumer stopped draining; the reset that would
+/// exceed it is refused rather than discarding a payload nothing else holds.
+pub const MAX_PENDING_EVICTIONS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpMeta {
@@ -203,12 +210,34 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// the local chain exactly as it was. Required rather than defaulted: a
     /// reset followed by a separate admission is not atomic, and a backend must
     /// not inherit that silently.
+    ///
+    /// `eviction` describes the payloads this reset discards. When it carries
+    /// any, backends must journal it under [`TopicEviction::key`] in this same
+    /// transaction: the reset is the moment those payloads stop existing
+    /// anywhere else, so a record written afterwards would leave a crash window
+    /// that loses acknowledged writes. The record is released by
+    /// [`Storage::clear_eviction`], never by the reset itself. A reset that
+    /// would push the store past [`MAX_PENDING_EVICTIONS`] outstanding records
+    /// must be refused with [`crate::Error::EvictionJournalFull`], leaving the
+    /// local chain in place.
     fn reset_topic_and_admit(
         &self,
         topic_id: &TopicId,
         expected_topic_state: &TopicState,
         batch: AdmittedBatch,
+        eviction: Option<&TopicEviction>,
     ) -> Result<usize>;
+
+    /// Journalled evictions no consumer has acknowledged yet. A restart drains
+    /// these before eviction recovery can be considered complete; each is the
+    /// only remaining copy of the payloads its reset removed.
+    fn pending_evictions(&self) -> Result<Vec<TopicEviction>>;
+
+    /// Release the journalled eviction named by `key`. The consumer calls this
+    /// only once it durably owns the payloads, so a crash before that point
+    /// leaves the record for the next restart. Releasing an absent key is not
+    /// an error: acknowledgement is idempotent.
+    fn clear_eviction(&self, key: &EvictionKey) -> Result<()>;
 
     fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
         let Some(meta) = self.get_meta(op_id)? else {
@@ -278,6 +307,17 @@ pub(super) fn ensure_deps_resolvable(
         }
     }
     Ok(())
+}
+
+/// The eviction a reset must journal, with the key it takes. An eviction with
+/// no payloads leaves nothing to recover, so it takes no record and no
+/// acknowledgement.
+pub(super) fn journalled_eviction(
+    eviction: Option<&TopicEviction>,
+) -> Option<(EvictionKey, &TopicEviction)> {
+    eviction
+        .filter(|eviction| !eviction.evicted.is_empty())
+        .map(|eviction| (eviction.key(), eviction))
 }
 
 pub(super) fn stored_ack_dominates(existing: &PeerAck, incoming: &PeerAck) -> bool {

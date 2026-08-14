@@ -3,13 +3,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, TopicInfo};
+use crate::{
+    ActorClock, ActorId, Error, EvictionKey, Op, OpId, PeerId, Result, TopicEviction, TopicId,
+    TopicInfo,
+};
 
 use super::{
-    AdmittedBatch, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL,
-    MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation, SyncPeerStatus,
-    TopicState, ensure_deps_resolvable, stored_ack_dominates, sync_obligation_satisfied,
-    topic_fingerprint_for,
+    AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
+    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
+    SyncPeerStatus, TopicState, ensure_deps_resolvable, journalled_eviction, stored_ack_dominates,
+    sync_obligation_satisfied, topic_fingerprint_for,
 };
 
 #[derive(Clone, Default)]
@@ -36,6 +39,7 @@ struct MemoryInner {
     peer_acks: HashMap<(PeerId, TopicId), PeerAck>,
     obligations: Vec<SyncObligation>,
     sync_statuses: BTreeMap<(TopicId, PeerId), SyncPeerStatus>,
+    evictions: BTreeMap<EvictionKey, TopicEviction>,
 }
 
 impl MemoryStorage {
@@ -416,6 +420,7 @@ impl Storage for MemoryStorage {
         topic_id: &TopicId,
         expected_topic_state: &TopicState,
         batch: AdmittedBatch,
+        eviction: Option<&TopicEviction>,
     ) -> Result<usize> {
         let mut inner = self.lock()?;
         if memory_topic_state_locked(&inner, topic_id).as_ref() != Some(expected_topic_state) {
@@ -427,8 +432,27 @@ impl Storage for MemoryStorage {
         let mut staged = inner.clone();
         let removed = reset_topic_locked(&mut staged, topic_id);
         put_admitted_batch_locked(&mut staged, batch)?;
+        // The journal entry is part of the same swap: after it the discarded
+        // payloads exist nowhere else, so no ordering here can lose them.
+        if let Some((key, eviction)) = journalled_eviction(eviction) {
+            if !staged.evictions.contains_key(&key)
+                && staged.evictions.len() >= MAX_PENDING_EVICTIONS
+            {
+                return Err(Error::EvictionJournalFull);
+            }
+            staged.evictions.insert(key, eviction.clone());
+        }
         *inner = staged;
         Ok(removed)
+    }
+
+    fn pending_evictions(&self) -> Result<Vec<TopicEviction>> {
+        Ok(self.lock()?.evictions.values().cloned().collect())
+    }
+
+    fn clear_eviction(&self, key: &EvictionKey) -> Result<()> {
+        self.lock()?.evictions.remove(key);
+        Ok(())
     }
 }
 

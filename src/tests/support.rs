@@ -254,9 +254,16 @@ impl Storage for StaleReadStorage {
         topic_id: &TopicId,
         expected_topic_state: &crate::storage::TopicState,
         batch: crate::storage::AdmittedBatch,
+        eviction: Option<&crate::TopicEviction>,
     ) -> Result<usize, Error> {
         self.inner
-            .reset_topic_and_admit(topic_id, expected_topic_state, batch)
+            .reset_topic_and_admit(topic_id, expected_topic_state, batch, eviction)
+    }
+    fn pending_evictions(&self) -> Result<Vec<crate::TopicEviction>, Error> {
+        self.inner.pending_evictions()
+    }
+    fn clear_eviction(&self, key: &crate::EvictionKey) -> Result<(), Error> {
+        self.inner.clear_eviction(key)
     }
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize, Error> {
         self.inner.purge_pending_waiters(dep_id)

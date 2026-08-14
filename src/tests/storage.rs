@@ -425,6 +425,7 @@ fn assert_reset_topic_and_admit_is_atomic<S: Storage>(storage: S) {
                 topic_state: Some(winner_state),
                 effects: crate_storage::AdmissionEffects::default(),
             },
+            None,
         )
         .unwrap();
 
@@ -517,6 +518,7 @@ fn assert_reset_topic_and_admit_rejects_stale_state<S: Storage>(storage: S) {
                 topic_state: Some(winner_state),
                 effects: crate_storage::AdmissionEffects::default(),
             },
+            None,
         )
         .unwrap_err();
     assert!(matches!(err, Error::AdmissionConflict));
@@ -912,6 +914,7 @@ fn assert_reset_rollback<S: Storage>(storage: S) {
             topic_state: None,
             effects: crate_storage::AdmissionEffects::default(),
         },
+        None,
     );
 
     assert!(matches!(result, Err(Error::MissingDependency(id)) if id == genesis.id));
