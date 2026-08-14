@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
 
 use crate::history::{DagQuery, HistoryOrder, limited};
@@ -186,14 +186,22 @@ pub(super) fn dag_ops<S: Storage>(
                 queue.push_back((dep, false));
             }
         }
+        let subset = ids.iter().copied().collect::<BTreeSet<_>>();
+        let usable = topological_subset(storage, &subset)?;
         if query.order == HistoryOrder::OldestFirst {
-            let subset = ids.into_iter().collect::<BTreeSet<_>>();
-            topological_subset(storage, &subset)
-        } else {
-            ids.into_iter()
-                .filter_map(|id| storage.get_op(&id).transpose())
-                .collect()
+            return Ok(usable);
         }
+        // Both orders must agree on membership: an op whose dependencies cannot
+        // be resolved is withheld here exactly as the oldest-first walk withholds
+        // it, so a caller never receives an op whose parents it cannot fetch.
+        let mut usable = usable
+            .into_iter()
+            .map(|op| (op.id, op))
+            .collect::<BTreeMap<_, _>>();
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| usable.remove(&id))
+            .collect())
     } else {
         Ok(limited(topological(storage, &topic_id)?, query.limit))
     }

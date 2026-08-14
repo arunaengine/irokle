@@ -1212,7 +1212,10 @@ fn dangling_dep_defers_dependents() {
 }
 
 #[test]
-fn dangling_dep_keeps_dag_query() {
+fn newest_defers_child() {
+    // Newest-first must withhold a child whose dependency is unresolved, or it
+    // hands back history whose parents cannot be fetched while oldest-first
+    // reports a different membership for the same query.
     let storage = MemoryStorage::new();
     let (_, topic_id, ops) = holed_store(&storage, 95, Damage::Meta);
     let holder = Irokle::with_storage(
@@ -1225,20 +1228,26 @@ fn dangling_dep_keeps_dag_query() {
     )
     .unwrap();
 
-    let newest = holder
-        .raw_topic(topic_id)
-        .unwrap()
-        .dag(history::DagQuery {
-            heads: Vec::new(),
-            include_heads: true,
-            limit: None,
-            order: history::HistoryOrder::NewestFirst,
-        })
-        .unwrap();
+    let walk = |order| {
+        holder
+            .raw_topic(topic_id)
+            .unwrap()
+            .dag(history::DagQuery {
+                heads: vec![ops[2].id],
+                include_heads: true,
+                limit: None,
+                order,
+            })
+            .unwrap()
+            .iter()
+            .map(|op| op.id)
+            .collect::<BTreeSet<_>>()
+    };
 
-    let ids = newest.iter().map(|op| op.id).collect::<BTreeSet<_>>();
-    assert!(ids.contains(&ops[2].id));
-    assert!(!ids.contains(&ops[1].id));
+    let newest = walk(history::HistoryOrder::NewestFirst);
+
+    assert!(!newest.contains(&ops[2].id));
+    assert_eq!(newest, walk(history::HistoryOrder::OldestFirst));
 }
 
 fn assert_repairs_hole<S: Corrupt>(storage: S, seed: u8, damage: Damage) {
