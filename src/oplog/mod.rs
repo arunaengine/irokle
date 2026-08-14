@@ -2,7 +2,7 @@
 //! Operation-log admission, DAG validation, and topic-state materialization.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::storage::{
     AdmissionEffects, AdmittedBatch, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage,
@@ -32,6 +32,16 @@ static GENESIS_RESOLUTION_LOCK: Mutex<()> = Mutex::new(());
 enum OpAdmission {
     Admit,
     Duplicate,
+}
+
+/// How much of an op the local store already holds. `Repair` is an id the local
+/// chain already accounts for while its records are missing or half written:
+/// refilling it is not an append, so the actor-position checks that guard a new
+/// op do not apply to it.
+enum StoredOp {
+    Absent,
+    Repair,
+    Complete,
 }
 
 type GenesisResolution = (
@@ -83,6 +93,10 @@ fn is_structural_genesis(op: &Op) -> bool {
 #[derive(Clone)]
 pub struct Oplog<S = MemoryStorage> {
     storage: S,
+    // Topics whose stored records were scanned and found whole. Admission keeps
+    // that invariant, so only damage from outside irokle can reintroduce a
+    // hole; scanning once per topic keeps the sync fast path off a full scan.
+    whole_topics: Arc<Mutex<BTreeSet<TopicId>>>,
 }
 
 impl Default for Oplog<MemoryStorage> {
@@ -93,18 +107,61 @@ impl Default for Oplog<MemoryStorage> {
 
 impl Oplog<MemoryStorage> {
     pub fn new() -> Self {
-        Self {
-            storage: MemoryStorage::new(),
-        }
+        Self::with_storage(MemoryStorage::new())
     }
 }
 
 impl<S: Storage> Oplog<S> {
     pub fn with_storage(storage: S) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            whole_topics: Arc::new(Mutex::new(BTreeSet::new())),
+        }
     }
     pub fn storage(&self) -> &S {
         &self.storage
+    }
+
+    /// Ids this topic references but cannot resolve: admitted ops whose own
+    /// records are incomplete, dependencies of admitted ops that are not fully
+    /// stored, and the holes buffered ops are still waiting for. An empty set
+    /// means every admitted op is locally usable, which is what lets sync
+    /// certify the topic; anything else is turned into concrete repair wants.
+    pub fn topic_unresolved(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
+        let mut unresolved = self.storage.pending_missing_deps(topic_id)?;
+        unresolved.extend(self.scan_stored_holes(topic_id)?);
+        Ok(unresolved)
+    }
+
+    fn scan_stored_holes(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
+        if self.whole_topics()?.contains(topic_id) {
+            return Ok(BTreeSet::new());
+        }
+        let mut holes = BTreeSet::new();
+        for id in self.storage.list_op_ids(topic_id)? {
+            let Some(meta) = self.storage.get_meta(&id)? else {
+                holes.insert(id);
+                continue;
+            };
+            if self.storage.get_op(&id)?.is_none() {
+                holes.insert(id);
+            }
+            for dep in &meta.deps {
+                if !self.storage.dep_resolvable(dep)? {
+                    holes.insert(*dep);
+                }
+            }
+        }
+        if holes.is_empty() {
+            self.whole_topics()?.insert(*topic_id);
+        }
+        Ok(holes)
+    }
+
+    fn whole_topics(&self) -> Result<std::sync::MutexGuard<'_, BTreeSet<TopicId>>> {
+        self.whole_topics
+            .lock()
+            .map_err(|_| Error::Storage("topic integrity cache lock poisoned".into()))
     }
 
     pub fn create_topic_genesis(
@@ -607,11 +664,31 @@ impl<S: Storage> Oplog<S> {
             if !verified.contains(&op.id) {
                 op.validate()?;
             }
-            if !reset && self.storage.get_op(&op.id)?.is_some() {
+            let stored = if reset {
+                StoredOp::Absent
+            } else {
+                self.stored_op_state(&op)?
+            };
+            if matches!(stored, StoredOp::Complete) {
                 continue;
             }
 
             let missing_deps = self.missing_deps_projected(&op, &overlay_ops, reset)?;
+            // Refilling an already-accounted id changes no head, clock entry or
+            // topic state: only the records themselves are rewritten, once its
+            // dependencies can be resolved again.
+            if matches!(stored, StoredOp::Repair) {
+                if missing_deps.is_empty() {
+                    let meta = self.meta_for_projected(&op, &overlay_meta)?;
+                    overlay_meta.insert(op.id, meta.clone());
+                    overlay_ops.insert(op.id, op.clone());
+                    accepted.insert(op.id);
+                    entries.push((op, meta));
+                } else {
+                    pending.push((op, missing_deps));
+                }
+                continue;
+            }
             if !missing_deps.is_empty() {
                 match self.validate_pending_op_projected(
                     &op,
@@ -1331,19 +1408,36 @@ impl<S: Storage> Oplog<S> {
 
     /// Re-reads storage after a tip/seq mismatch: a concurrent admission may
     /// have committed this exact op between the batch dedup check and the
-    /// validation reads. Such ops are duplicates, not gaps or forks. Op ids
-    /// are content-addressed, so an actor-index entry mapping the op's seq to
-    /// its exact id also proves admission even while the op record itself is
-    /// not yet visible mid-commit.
+    /// validation reads. Only a completely stored op is such a duplicate; a
+    /// half-stored one is damage that [`Self::stored_op_state`] routes into
+    /// repair, and calling it a duplicate is what left it broken forever.
     fn is_admitted_duplicate(&self, op: &Op) -> Result<bool> {
-        if self.storage.get_op(&op.id)?.is_some() {
-            return Ok(true);
+        self.storage.dep_resolvable(&op.id)
+    }
+
+    /// Classify what the store already holds for `op`. Both records present is
+    /// a duplicate; either record alone, or an actor slot or child edge naming
+    /// this exact id while the records are gone, is damage the local chain
+    /// already accounts for and must repair in place.
+    fn stored_op_state(&self, op: &Op) -> Result<StoredOp> {
+        let has_op = self.storage.get_op(&op.id)?.is_some();
+        let has_meta = self.storage.get_meta(&op.id)?.is_some();
+        if has_op && has_meta {
+            return Ok(StoredOp::Complete);
+        }
+        if has_op || has_meta {
+            return Ok(StoredOp::Repair);
         }
         let body = &op.signed.body;
-        Ok(self
+        if self
             .storage
             .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            == Some(op.id))
+            == Some(op.id)
+            || !self.storage.children(&op.id)?.is_empty()
+        {
+            return Ok(StoredOp::Repair);
+        }
+        Ok(StoredOp::Absent)
     }
 
     fn projected_state_for_deps(

@@ -36,6 +36,28 @@ pub(crate) trait Corrupt: Storage {
     fn drop_meta_record(&self, id: &OpId);
 }
 
+/// Which record halves a test erases. `Both` leaves the topic, actor and child
+/// indexes pointing at an op with no records at all, the shape an admitted
+/// descendant with a lost dependency has.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Damage {
+    Op,
+    Meta,
+    Both,
+}
+
+pub(crate) fn damage_op<S: Corrupt>(storage: &S, id: &OpId, damage: Damage) {
+    match damage {
+        Damage::Op => storage.drop_op_record(id),
+        Damage::Meta => storage.drop_meta_record(id),
+        Damage::Both => {
+            storage.drop_op_record(id);
+            storage.drop_meta_record(id);
+        }
+    }
+    assert!(!storage.dep_resolvable(id).unwrap());
+}
+
 impl Corrupt for MemoryStorage {
     fn drop_op_record(&self, id: &OpId) {
         MemoryStorage::drop_op_record(self, id);

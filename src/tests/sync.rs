@@ -1269,7 +1269,10 @@ impl Storage for StaleReadStorage {
 }
 
 #[test]
-fn duplicate_op_with_stale_dedup_read_is_skipped_not_a_gap() {
+fn stale_dedup_read() {
+    // A stale dedup read must not turn a resend into an actor gap or fork. An
+    // op whose record reads as absent while its index names it is treated as
+    // damage and rewritten in place, so the chain still ends up intact.
     let alice = node(87);
     let bob_signer = Ed25519Signer::from_bytes(&[88; 32]);
     let topic = alice
@@ -1305,7 +1308,7 @@ fn duplicate_op_with_stale_dedup_read_is_skipped_not_a_gap() {
     let accepted = receiver
         .receive_ops_from_peer(Some(alice.peer_id()), resend)
         .unwrap();
-    assert_eq!(accepted, [newest.id].into());
+    assert!(accepted.contains(&newest.id));
     assert_eq!(
         storage
             .actor_clock(&topic.id())
@@ -1313,157 +1316,43 @@ fn duplicate_op_with_stale_dedup_read_is_skipped_not_a_gap() {
             .get(&actor_id_for(topic.id(), alice.peer_id())),
         3
     );
+    assert_eq!(
+        storage.inner.list_op_ids(&topic.id()).unwrap().len(),
+        ops.len() + 1
+    );
 }
 
-/// Wraps storage so a chosen op's metadata reads as absent, modelling a store
-/// that already contains a dangling DAG edge.
-#[derive(Clone)]
-struct HoleStorage {
-    inner: MemoryStorage,
-    hole: OpId,
-}
-
-impl Storage for HoleStorage {
-    fn put_admitted_batch(&self, batch: crate_storage::AdmittedBatch) -> Result<(), Error> {
-        self.inner.put_admitted_batch(batch)
-    }
-    fn get_op(&self, id: &OpId) -> Result<Option<Op>, Error> {
-        if *id == self.hole {
-            return Ok(None);
-        }
-        self.inner.get_op(id)
-    }
-    fn get_meta(&self, id: &OpId) -> Result<Option<crate_storage::OpMeta>, Error> {
-        if *id == self.hole {
-            return Ok(None);
-        }
-        self.inner.get_meta(id)
-    }
-    fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>, Error> {
-        self.inner.list_ops(topic_id)
-    }
-    fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
-        self.inner.list_op_ids(topic_id)
-    }
-    fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
-        self.inner.heads(topic_id)
-    }
-    fn children(&self, op_id: &OpId) -> Result<BTreeSet<OpId>, Error> {
-        self.inner.children(op_id)
-    }
-    fn actor_tip(
-        &self,
-        topic_id: &TopicId,
-        actor_id: &ActorId,
-    ) -> Result<Option<(u64, OpId)>, Error> {
-        self.inner.actor_tip(topic_id, actor_id)
-    }
-    fn actor_index(
-        &self,
-        topic_id: &TopicId,
-        actor_id: &ActorId,
-        seq: u64,
-    ) -> Result<Option<OpId>, Error> {
-        self.inner.actor_index(topic_id, actor_id, seq)
-    }
-    fn actor_clock(&self, topic_id: &TopicId) -> Result<ActorClock, Error> {
-        self.inner.actor_clock(topic_id)
-    }
-    fn topic_fingerprint(&self, topic_id: &TopicId) -> Result<[u8; 32], Error> {
-        self.inner.topic_fingerprint(topic_id)
-    }
-    fn max_generation(&self, topic_id: &TopicId) -> Result<u64, Error> {
-        self.inner.max_generation(topic_id)
-    }
-    fn topic_state(&self, topic_id: &TopicId) -> Result<Option<crate_storage::TopicState>, Error> {
-        self.inner.topic_state(topic_id)
-    }
-    fn list_topics(&self) -> Result<Vec<crate::TopicInfo>, Error> {
-        self.inner.list_topics()
-    }
-    fn put_pending_op(
-        &self,
-        source_peer: PeerId,
-        op: Op,
-        meta: crate_storage::OpMeta,
-    ) -> Result<(), Error> {
-        self.inner.put_pending_op(source_peer, op, meta)
-    }
-    fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>, Error> {
-        self.inner.pending_waiters(dep_id)
-    }
-    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>, Error> {
-        self.inner.ready_pending_ops()
-    }
-    fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
-        self.inner.pending_missing_deps(topic_id)
-    }
-    fn remove_pending_op(&self, op_id: &OpId) -> Result<(), Error> {
-        self.inner.remove_pending_op(op_id)
-    }
-    fn peer_ack(
-        &self,
-        peer_id: &PeerId,
-        topic_id: &TopicId,
-    ) -> Result<Option<crate_storage::PeerAck>, Error> {
-        self.inner.peer_ack(peer_id, topic_id)
-    }
-    fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<crate_storage::PeerAck>, Error> {
-        self.inner.peer_acks(topic_id)
-    }
-    fn put_sync_obligation(&self, obligation: crate_storage::SyncObligation) -> Result<(), Error> {
-        self.inner.put_sync_obligation(obligation)
-    }
-    fn all_sync_obligations(&self) -> Result<Vec<crate_storage::SyncObligation>, Error> {
-        self.inner.all_sync_obligations()
-    }
-    fn apply_peer_ack(&self, ack: crate_storage::PeerAck) -> Result<usize, Error> {
-        self.inner.apply_peer_ack(ack)
-    }
-    fn sync_obligations(
-        &self,
-        peer_id: &PeerId,
-        topic_id: &TopicId,
-    ) -> Result<Vec<crate_storage::SyncObligation>, Error> {
-        self.inner.sync_obligations(peer_id, topic_id)
-    }
-    fn put_sync_status(&self, status: crate_storage::SyncPeerStatus) -> Result<(), Error> {
-        self.inner.put_sync_status(status)
-    }
-    fn sync_statuses(
-        &self,
-        topic_id: &TopicId,
-    ) -> Result<Vec<crate_storage::SyncPeerStatus>, Error> {
-        self.inner.sync_statuses(topic_id)
-    }
-    fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize, Error> {
-        self.inner.clear_peer_sync_state(peer_id, topic_id)
-    }
-    fn reset_topic(&self, topic_id: &TopicId) -> Result<usize, Error> {
-        self.inner.reset_topic(topic_id)
-    }
-}
-
-/// A three-op chain plus one independent event, with the second chain op turned
-/// into a hole. Returns the holed storage and the ops in order.
-fn dangling_chain(seed: u8) -> (HoleStorage, Vec<Op>) {
+/// A source node holding a three-op chain that `holder_peer` may sync with.
+fn chain_source(seed: u8, holder_peer: PeerId) -> (Irokle, TopicId, Vec<Op>) {
     let source = node(seed);
-    let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
+    let topic = source
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [holder_peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
     topic.publish(Note { text: "one".into() }).unwrap();
     topic.publish(Note { text: "two".into() }).unwrap();
     let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
-    let inner = MemoryStorage::new();
-    let seeded = oplog::Oplog::with_storage(inner.clone());
-    seeded.receive_ops(ops.clone()).unwrap();
-    let hole = ops[1].id;
-    (HoleStorage { inner, hole }, ops)
+    (source, topic.id(), ops)
+}
+
+/// A three-op chain seeded into `storage` with the middle op really damaged.
+fn holed_store<S: Corrupt>(storage: &S, seed: u8, damage: Damage) -> (Irokle, TopicId, Vec<Op>) {
+    let holder_peer = Ed25519Signer::from_bytes(&[seed.wrapping_add(1); 32]).peer_id();
+    let (source, topic_id, ops) = chain_source(seed, holder_peer);
+    oplog::Oplog::with_storage(storage.clone())
+        .receive_ops(ops.clone())
+        .unwrap();
+    damage_op(storage, &ops[1].id, damage);
+    (source, topic_id, ops)
 }
 
 #[test]
 fn unknown_want_serves_the_rest() {
     // A want we cannot resolve must not abort a whole batched exchange.
-    let (storage, ops) = dangling_chain(93);
-    let topic_id = ops[0].signed.body.topic_id;
+    let storage = MemoryStorage::new();
+    let (_, topic_id, ops) = holed_store(&storage, 93, Damage::Meta);
     let engine = crate_sync::SyncEngine::new(
         oplog::Oplog::with_storage(storage),
         Ed25519Signer::from_bytes(&[93; 32]).peer_id(),
@@ -1488,22 +1377,22 @@ fn unknown_want_serves_the_rest() {
 #[test]
 fn dangling_dep_defers_dependents() {
     // The hole and the op standing on it are deferred; the genesis still ships.
-    let (storage, ops) = dangling_chain(94);
-    let topic_id = ops[0].signed.body.topic_id;
-    let all = storage.inner.list_op_ids(&topic_id).unwrap();
+    let storage = MemoryStorage::new();
+    let (_, topic_id, ops) = holed_store(&storage, 94, Damage::Meta);
+    let all = storage.list_op_ids(&topic_id).unwrap();
 
     let ordered = oplog::topological_subset(&storage, &all).unwrap();
 
     let served = ordered.iter().map(|op| op.id).collect::<BTreeSet<_>>();
     assert_eq!(served, [ops[0].id].into());
     // Nothing was dropped from storage: the deferred ops are still admitted.
-    assert_eq!(storage.inner.list_op_ids(&topic_id).unwrap(), all);
+    assert_eq!(storage.list_op_ids(&topic_id).unwrap(), all);
 }
 
 #[test]
 fn dangling_dep_keeps_dag_query() {
-    let (storage, ops) = dangling_chain(95);
-    let topic_id = ops[0].signed.body.topic_id;
+    let storage = MemoryStorage::new();
+    let (_, topic_id, ops) = holed_store(&storage, 95, Damage::Meta);
     let holder = Irokle::with_storage(
         storage,
         NodeConfig {
@@ -1528,6 +1417,85 @@ fn dangling_dep_keeps_dag_query() {
     let ids = newest.iter().map(|op| op.id).collect::<BTreeSet<_>>();
     assert!(ids.contains(&ops[2].id));
     assert!(!ids.contains(&ops[1].id));
+}
+
+fn assert_repairs_hole<S: Corrupt>(storage: S, seed: u8, damage: Damage) {
+    // Start from a store that really lost records for an admitted, non-head op
+    // and prove ordinary sync puts them back exactly as they were.
+    let holder_signer = Ed25519Signer::from_bytes(&[seed.wrapping_add(1); 32]);
+    let (source, topic_id, ops) = chain_source(seed, holder_signer.peer_id());
+    oplog::Oplog::with_storage(storage.clone())
+        .receive_ops(ops.clone())
+        .unwrap();
+    let intact = storage.get_meta(&ops[1].id).unwrap().unwrap();
+    damage_op(&storage, &ops[1].id, damage);
+
+    let holder = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: holder_signer,
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    // The damage moved neither heads nor the clock, so only an integrity check
+    // tells the damaged store apart from the whole one.
+    assert_eq!(
+        storage.topic_fingerprint(&topic_id).unwrap(),
+        source.storage().topic_fingerprint(&topic_id).unwrap()
+    );
+    assert_eq!(
+        holder.topic_unresolved(topic_id).unwrap(),
+        [ops[1].id].into()
+    );
+
+    let plan = holder
+        .negotiate_sync(source.peer_id(), &source.sync_summary(topic_id).unwrap())
+        .unwrap();
+    assert!(plan.need.contains(&ops[1].id));
+    let data = source
+        .plan_sync_response_data(
+            holder.peer_id(),
+            &crate_sync::SyncRequest {
+                topic_id,
+                known: plan.common,
+                wants: plan.need,
+                actor_range_hints: plan.actor_range_hints,
+            },
+        )
+        .unwrap();
+    holder
+        .receive_sync_data_from(source.peer_id(), data)
+        .unwrap();
+
+    assert_eq!(storage.get_op(&ops[1].id).unwrap().as_ref(), Some(&ops[1]));
+    assert_eq!(storage.get_meta(&ops[1].id).unwrap(), Some(intact));
+    assert!(holder.topic_unresolved(topic_id).unwrap().is_empty());
+    assert_eq!(
+        oplog::topological(&storage, &topic_id).unwrap().len(),
+        ops.len()
+    );
+}
+
+#[test]
+fn memory_repairs_hole() {
+    for (seed, damage) in [(101, Damage::Meta), (103, Damage::Op), (105, Damage::Both)] {
+        assert_repairs_hole(MemoryStorage::new(), seed, damage);
+    }
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_repairs_hole() {
+    for (seed, damage) in [(111, Damage::Meta), (113, Damage::Op), (115, Damage::Both)] {
+        let dir = tempfile::tempdir().unwrap();
+        assert_repairs_hole(
+            crate_storage::FjallStorage::open(dir.path()).unwrap(),
+            seed,
+            damage,
+        );
+    }
 }
 
 #[test]

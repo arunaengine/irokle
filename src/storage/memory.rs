@@ -190,7 +190,9 @@ impl Storage for MemoryStorage {
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         let mut inner = self.lock()?;
-        if inner.ops.contains_key(&op.id) {
+        // Only a completely stored op is already admitted; a half stored one
+        // still has to buffer so its repair runs once its deps resolve.
+        if dep_resolvable_locked(&inner, &op.id) {
             return Ok(());
         }
         let replace_pending = if let Some((_, existing, _)) = inner.pending_ops.get(&op.id) {
@@ -422,19 +424,34 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
     let mut actor_tips = BTreeMap::new();
     let mut new_entries = Vec::new();
     for (op, meta) in entries {
-        if let Some(existing) = inner.ops.get(&op.id) {
-            if existing != &op {
+        if meta.topic_id != topic_id {
+            return Err(Error::TopicMismatch);
+        }
+        let has_op = match inner.ops.get(&op.id) {
+            Some(existing) if existing != &op => {
                 return Err(Error::Storage("op id collision with different op".into()));
             }
+            Some(_) => true,
+            None => false,
+        };
+        let has_meta = inner.meta.contains_key(&op.id);
+        if has_op && has_meta {
             continue;
         }
-        if let Some(existing) =
-            inner
-                .actor_by_seq
-                .get(&(meta.topic_id, meta.actor_id, meta.actor_seq))
-            && *existing != op.id
+        let indexed = inner
+            .actor_by_seq
+            .get(&(meta.topic_id, meta.actor_id, meta.actor_seq))
+            .copied();
+        if let Some(existing) = indexed
+            && existing != op.id
         {
             return Err(Error::ActorFork);
+        }
+        // Refilling an id the chain already accounts for is not an append: its
+        // actor position is already recorded, so the checks below cannot apply.
+        if has_op || has_meta || indexed == Some(op.id) || inner.children.contains_key(&op.id) {
+            new_entries.push((op, meta));
+            continue;
         }
         let tip = actor_tips
             .get(&(meta.topic_id, meta.actor_id))
@@ -476,18 +493,6 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
 
     ensure_deps_resolvable(&new_entries, |dep| Ok(dep_resolvable_locked(inner, dep)))?;
 
-    let topic_id = topic_state
-        .as_ref()
-        .map(|state| state.topic_id)
-        .or_else(|| new_entries.first().map(|(_, meta)| meta.topic_id));
-    if let Some(topic_id) = topic_id
-        && new_entries
-            .iter()
-            .any(|(_, meta)| meta.topic_id != topic_id)
-    {
-        return Err(Error::TopicMismatch);
-    }
-
     for (op, meta) in new_entries {
         inner
             .topic_ops
@@ -500,9 +505,18 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
         inner
             .actor_by_seq
             .insert((meta.topic_id, meta.actor_id, meta.actor_seq), op.id);
-        inner
-            .actor_tip
-            .insert((meta.topic_id, meta.actor_id), (meta.actor_seq, op.id));
+        // A refilled op sits behind the tip, so the tip only ever advances.
+        let tip = inner.actor_tip.entry((meta.topic_id, meta.actor_id));
+        match tip {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 < meta.actor_seq {
+                    entry.insert((meta.actor_seq, op.id));
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((meta.actor_seq, op.id));
+            }
+        }
         inner
             .actor_clock
             .entry(meta.topic_id)
@@ -518,17 +532,15 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
         inner.ops.insert(op.id, op);
     }
 
-    if let Some(topic_id) = topic_id {
-        inner.heads.insert(topic_id, heads.clone());
-        let clock = inner
-            .actor_clock
-            .get(&topic_id)
-            .cloned()
-            .unwrap_or_default();
-        inner
-            .topic_fingerprint
-            .insert(topic_id, topic_fingerprint_for(&heads, &clock)?);
-    }
+    inner.heads.insert(topic_id, heads.clone());
+    let clock = inner
+        .actor_clock
+        .get(&topic_id)
+        .cloned()
+        .unwrap_or_default();
+    inner
+        .topic_fingerprint
+        .insert(topic_id, topic_fingerprint_for(&heads, &clock)?);
     if let Some(state) = topic_state {
         inner.topics.insert(state.topic_id, state);
     }

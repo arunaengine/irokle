@@ -261,15 +261,21 @@ impl FjallStorage {
                 if meta.topic_id != topic_id {
                     return Err(Error::TopicMismatch);
                 }
-                if let Some(existing) =
-                    Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))?
-                {
-                    if existing != *op {
-                        return Err(Error::Storage("op id collision with different op".into()));
-                    }
+                let has_op =
+                    match Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))? {
+                        Some(existing) if existing != *op => {
+                            return Err(Error::Storage("op id collision with different op".into()));
+                        }
+                        Some(_) => true,
+                        None => false,
+                    };
+                let has_meta =
+                    Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", &op.id))?
+                        .is_some();
+                if has_op && has_meta {
                     continue;
                 }
-                if let Some(existing) = Self::tx_get::<OpId>(
+                let indexed = Self::tx_get::<OpId>(
                     tx,
                     &self.records,
                     [
@@ -279,9 +285,25 @@ impl FjallStorage {
                         &meta.actor_seq.to_be_bytes(),
                     ]
                     .concat(),
-                )? && existing != op.id
+                )?;
+                if let Some(existing) = indexed
+                    && existing != op.id
                 {
                     return Err(Error::ActorFork);
+                }
+                let has_children = fjall::Readable::prefix(
+                    tx,
+                    &self.records,
+                    [b"ch".as_slice(), op.id.as_ref()].concat(),
+                )
+                .next()
+                .is_some();
+                // Refilling an id the chain already accounts for is not an
+                // append: its actor position is already recorded, so the checks
+                // below cannot apply.
+                if has_op || has_meta || indexed == Some(op.id) || has_children {
+                    new_entries.push((op.clone(), meta.clone()));
+                    continue;
                 }
                 let tip =
                     actor_tips
@@ -369,17 +391,23 @@ impl FjallStorage {
                     .concat(),
                     &op.id,
                 )?;
-                Self::tx_put(
-                    tx,
-                    &self.records,
-                    [
-                        b"at".as_slice(),
-                        meta.topic_id.as_ref(),
-                        meta.actor_id.as_ref(),
-                    ]
-                    .concat(),
-                    &(meta.actor_seq, op.id),
-                )?;
+                // A refilled op sits behind the tip, so the tip only advances.
+                let tip_key = [
+                    b"at".as_slice(),
+                    meta.topic_id.as_ref(),
+                    meta.actor_id.as_ref(),
+                ]
+                .concat();
+                let stored_tip: Option<(u64, OpId)> =
+                    Self::tx_get(tx, &self.records, tip_key.as_slice())?;
+                if stored_tip.is_none_or(|(seq, _)| seq < meta.actor_seq) {
+                    Self::tx_put(
+                        tx,
+                        &self.records,
+                        tip_key.as_slice(),
+                        &(meta.actor_seq, op.id),
+                    )?;
+                }
                 if let Some((source_peer, _, pending_meta)) = Self::tx_get::<(PeerId, Op, OpMeta)>(
                     tx,
                     &self.records,
@@ -703,7 +731,11 @@ impl Storage for FjallStorage {
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         self.transaction(|tx| {
-            if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))?.is_some() {
+            // Only a completely stored op is already admitted; a half stored
+            // one still has to buffer so its repair runs once its deps resolve.
+            if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))?.is_some()
+                && Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", &op.id))?.is_some()
+            {
                 return Ok(());
             }
             if let Some((_, existing, _)) = Self::tx_get::<(PeerId, Op, OpMeta)>(

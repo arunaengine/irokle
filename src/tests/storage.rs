@@ -799,7 +799,10 @@ fn fjall_rejects_partial_dep() {
     let dir = tempfile::tempdir().unwrap();
     assert_rejects_partial_dep(crate_storage::FjallStorage::open(dir.path()).unwrap(), true);
     let dir = tempfile::tempdir().unwrap();
-    assert_rejects_partial_dep(crate_storage::FjallStorage::open(dir.path()).unwrap(), false);
+    assert_rejects_partial_dep(
+        crate_storage::FjallStorage::open(dir.path()).unwrap(),
+        false,
+    );
 }
 
 #[cfg(feature = "fjall")]

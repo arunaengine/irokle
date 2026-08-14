@@ -424,6 +424,13 @@ impl<S: Storage> Irokle<S> {
         self.sync.fingerprint(topic_id)
     }
 
+    /// Ids this node references in `topic_id` but cannot resolve locally. An
+    /// empty set means the topic is causally whole here; anything else is a
+    /// hole sync must repair before the topic can be certified to a peer.
+    pub fn topic_unresolved(&self, topic_id: TopicId) -> Result<BTreeSet<OpId>> {
+        self.oplog.topic_unresolved(&topic_id)
+    }
+
     pub fn negotiate_sync(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
         self.sync.negotiate(peer_id, remote)
     }

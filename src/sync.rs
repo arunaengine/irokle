@@ -223,13 +223,10 @@ impl<S: Storage> SyncEngine<S> {
         }
 
         let local_heads = self.oplog.storage().heads(&remote.topic_id)?;
-        // Buffered ops do not move heads or the clock, so a matching fingerprint
-        // does not prove we are whole; keep negotiating while a hole is waiting.
-        let buffered = self
-            .oplog
-            .storage()
-            .pending_missing_deps(&remote.topic_id)?;
-        if buffered.is_empty()
+        // A hole moves neither heads nor the clock, so a matching fingerprint
+        // does not prove we are whole; keep negotiating until it is repaired.
+        let unresolved = self.oplog.topic_unresolved(&remote.topic_id)?;
+        if unresolved.is_empty()
             && self.oplog.storage().topic_fingerprint(&remote.topic_id)? == remote.fingerprint
         {
             return Ok(SyncPlan {
@@ -250,14 +247,14 @@ impl<S: Storage> SyncEngine<S> {
                 need.insert(*id);
             }
         }
-        // Anti-entropy: a dependency we reference but cannot resolve - whether a
-        // head the walk could not follow or a hole a buffered op waits on - is
-        // requested from this peer like any other missing op, so a store already
-        // holding a dangling edge heals over normal sync instead of deferring
-        // its dependents forever.
+        // Anti-entropy: an id we reference but cannot resolve - a head the walk
+        // could not follow, an admitted record that is half stored, or a hole a
+        // buffered op waits on - is requested from this peer like any other
+        // missing op, so a store already holding a dangling edge heals over
+        // normal sync instead of deferring its dependents forever.
         let repair = dangling
             .into_iter()
-            .chain(buffered)
+            .chain(unresolved)
             .collect::<BTreeSet<_>>();
         if !repair.is_empty() {
             tracing::debug!(
