@@ -31,7 +31,7 @@ pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) 
         for dep in &meta.deps {
             if ids.contains(dep) {
                 deps_in_set += 1;
-            } else if storage.get_meta(dep)?.is_none() {
+            } else if !storage.dep_resolvable(dep)? {
                 dangling = true;
             }
         }

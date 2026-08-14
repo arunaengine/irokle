@@ -655,8 +655,8 @@ fn assert_dag_whole(oplog: &Oplog, topic_id: &TopicId) {
         let meta = oplog.storage().get_meta(&op_id).unwrap().unwrap();
         for dep in &meta.deps {
             assert!(
-                oplog.storage().get_meta(dep).unwrap().is_some(),
-                "admitted {op_id} references dependency {dep} with no meta"
+                oplog.storage().dep_resolvable(dep).unwrap(),
+                "admitted {op_id} references dependency {dep} that is not fully stored"
             );
         }
     }

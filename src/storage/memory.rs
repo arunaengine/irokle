@@ -48,6 +48,20 @@ impl MemoryStorage {
     }
 }
 
+#[cfg(test)]
+impl MemoryStorage {
+    /// Erase a stored op record, leaving its metadata and indexes behind. Tests
+    /// use this to build a store that is already durably inconsistent.
+    pub(crate) fn drop_op_record(&self, id: &OpId) {
+        self.inner.lock().expect("memory lock").ops.remove(id);
+    }
+
+    /// Erase a stored metadata record, leaving the op and indexes behind.
+    pub(crate) fn drop_meta_record(&self, id: &OpId) {
+        self.inner.lock().expect("memory lock").meta.remove(id);
+    }
+}
+
 impl Storage for MemoryStorage {
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
         let mut inner = self.lock()?;
@@ -59,6 +73,10 @@ impl Storage for MemoryStorage {
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
         Ok(self.lock()?.meta.get(id).cloned())
+    }
+    fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
+        let inner = self.lock()?;
+        Ok(dep_resolvable_locked(&inner, id))
     }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>> {
         let inner = self.lock()?;
@@ -456,7 +474,7 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
         new_entries.push((op, meta));
     }
 
-    ensure_deps_resolvable(&new_entries, |dep| Ok(inner.meta.contains_key(dep)))?;
+    ensure_deps_resolvable(&new_entries, |dep| Ok(dep_resolvable_locked(inner, dep)))?;
 
     let topic_id = topic_state
         .as_ref()

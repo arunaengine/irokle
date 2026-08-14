@@ -327,7 +327,11 @@ impl FjallStorage {
             }
 
             ensure_deps_resolvable(&new_entries, |dep| {
-                Ok(Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", dep))?.is_some())
+                Ok(
+                    Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", dep))?.is_some()
+                        && Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", dep))?
+                            .is_some(),
+                )
             })?;
 
             let mut clock: ActorClock =
@@ -450,6 +454,27 @@ impl FjallStorage {
             }
             Ok(())
         }
+    }
+
+    /// Erase a stored op record, leaving its metadata and indexes behind. Tests
+    /// use this to build a store that is already durably inconsistent.
+    #[cfg(test)]
+    pub(crate) fn drop_op_record(&self, id: &OpId) {
+        self.transaction(|tx| {
+            tx.remove(&self.records, Self::key_id(b"o", id));
+            Ok(())
+        })
+        .expect("fjall drop op record");
+    }
+
+    /// Erase a stored metadata record, leaving the op and indexes behind.
+    #[cfg(test)]
+    pub(crate) fn drop_meta_record(&self, id: &OpId) {
+        self.transaction(|tx| {
+            tx.remove(&self.records, Self::key_id(b"m", id));
+            Ok(())
+        })
+        .expect("fjall drop meta record");
     }
 
     fn tx_reset_topic(
@@ -583,6 +608,13 @@ impl Storage for FjallStorage {
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
         self.get(Self::key_id(b"m", id))
+    }
+    fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
+        let read_tx = self.db.read_tx();
+        Ok(
+            fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", id))?.is_some()
+                && fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"m", id))?.is_some(),
+        )
     }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>> {
         self.list_op_ids(topic_id)?
@@ -797,7 +829,9 @@ impl Storage for FjallStorage {
                 continue;
             }
             for dep in &meta.missing_deps {
-                if fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"m", dep))?.is_none()
+                if fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", dep))?.is_none()
+                    || fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"m", dep))?
+                        .is_none()
                 {
                     out.insert(*dep);
                 }

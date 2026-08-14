@@ -114,6 +114,14 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()>;
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
+    /// Whether `id` is stored completely enough to stand as a dependency. The
+    /// DAG is traversed through metadata and served from op records, so either
+    /// half alone is a hole to refill, never a resolved edge. This is the one
+    /// predicate every caller must use; backends override it to read both keys
+    /// from a single snapshot.
+    fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
+        Ok(self.get_op(id)?.is_some() && self.get_meta(id)?.is_some())
+    }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>>;
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
     fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
@@ -269,18 +277,20 @@ pub(super) fn sync_obligation_satisfied(obligation: &SyncObligation, ack: &PeerA
     !obligation.target_clock.is_empty() && ack.clock.dominates(&obligation.target_clock)
 }
 
-/// Reject a batch whose entry depends on an op with no metadata, checked
-/// against the same transaction that will write it. Enforcing this at the
-/// durability boundary is what keeps every admission path (batch admission,
-/// admission retry, genesis reset) from committing a dangling DAG edge.
+/// Reject a batch whose entry depends on an op that is not stored completely,
+/// checked against the same transaction that will write it. `stored_dep` must
+/// apply the [`Storage::dep_resolvable`] predicate inside that transaction.
+/// Enforcing this at the durability boundary is what keeps every admission path
+/// (batch admission, admission retry, genesis reset) from committing a dangling
+/// DAG edge.
 pub(super) fn ensure_deps_resolvable(
     entries: &[(Op, OpMeta)],
-    mut stored_meta: impl FnMut(&OpId) -> Result<bool>,
+    mut stored_dep: impl FnMut(&OpId) -> Result<bool>,
 ) -> Result<()> {
     let batch = entries.iter().map(|(op, _)| op.id).collect::<BTreeSet<_>>();
     for (_, meta) in entries {
         for dep in &meta.deps {
-            if !batch.contains(dep) && !stored_meta(dep)? {
+            if !batch.contains(dep) && !stored_dep(dep)? {
                 return Err(crate::Error::MissingDependency(*dep));
             }
         }

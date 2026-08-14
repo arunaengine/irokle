@@ -749,6 +749,59 @@ fn memory_rejects_dangling_entry() {
     assert_rejects_dangling_entry(MemoryStorage::new());
 }
 
+fn assert_rejects_partial_dep<S: Corrupt>(storage: S, drop_op: bool) {
+    // Half a dependency is a hole, not a resolved edge: neither an op record
+    // without metadata nor metadata without its op may let a descendant commit.
+    let topic_id = TopicId::hash(b"partial-dep-topic");
+    let [(genesis, genesis_meta), (event, event_meta)] = seed_pair(topic_id, 75);
+    storage
+        .put_admitted_batch(crate_storage::AdmittedBatch {
+            topic_id,
+            expected_heads: BTreeSet::new(),
+            expected_topic_state: None,
+            entries: vec![(genesis.clone(), genesis_meta)],
+            heads: [genesis.id].into(),
+            topic_state: None,
+            effects: crate_storage::AdmissionEffects::default(),
+        })
+        .unwrap();
+    if drop_op {
+        storage.drop_op_record(&genesis.id);
+    } else {
+        storage.drop_meta_record(&genesis.id);
+    }
+    assert!(!storage.dep_resolvable(&genesis.id).unwrap());
+
+    let result = storage.put_admitted_batch(crate_storage::AdmittedBatch {
+        topic_id,
+        expected_heads: [genesis.id].into(),
+        expected_topic_state: None,
+        entries: vec![(event.clone(), event_meta)],
+        heads: [event.id].into(),
+        topic_state: None,
+        effects: crate_storage::AdmissionEffects::default(),
+    });
+
+    assert!(matches!(result, Err(Error::MissingDependency(id)) if id == genesis.id));
+    assert!(storage.get_op(&event.id).unwrap().is_none());
+    assert!(storage.get_meta(&event.id).unwrap().is_none());
+}
+
+#[test]
+fn memory_rejects_partial_dep() {
+    assert_rejects_partial_dep(MemoryStorage::new(), true);
+    assert_rejects_partial_dep(MemoryStorage::new(), false);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_rejects_partial_dep() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_rejects_partial_dep(crate_storage::FjallStorage::open(dir.path()).unwrap(), true);
+    let dir = tempfile::tempdir().unwrap();
+    assert_rejects_partial_dep(crate_storage::FjallStorage::open(dir.path()).unwrap(), false);
+}
+
 #[cfg(feature = "fjall")]
 #[test]
 fn fjall_rejects_dangling_entry() {

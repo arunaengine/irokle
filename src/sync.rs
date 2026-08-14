@@ -246,7 +246,7 @@ impl<S: Storage> SyncEngine<S> {
         let send = self.missing_closure(remote)?;
         let mut need = BTreeSet::new();
         for id in &remote.heads {
-            if self.oplog.storage().get_meta(id)?.is_none() {
+            if !self.oplog.storage().dep_resolvable(id)? {
                 need.insert(*id);
             }
         }
@@ -282,9 +282,9 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     /// Walk local heads down to the frontier the remote already has, reporting
-    /// the common ancestors found there and every id the walk could not resolve
-    /// because its metadata is absent. The second set is what anti-entropy
-    /// repair asks the peer for; collecting it here costs no extra traversal.
+    /// the common ancestors found there and every id the walk found stored
+    /// incompletely. The second set is what anti-entropy repair asks the peer
+    /// for; collecting it here costs no extra traversal.
     fn survey_local(&self, remote: &SyncSummary) -> Result<(BTreeSet<OpId>, BTreeSet<OpId>)> {
         let mut common = BTreeSet::new();
         let mut dangling = BTreeSet::new();
@@ -306,6 +306,11 @@ impl<S: Storage> SyncEngine<S> {
             };
             if meta.topic_id != remote.topic_id {
                 continue;
+            }
+            // Metadata alone lets the walk continue but cannot be served, so the
+            // op record is requested while the traversal still uses the meta.
+            if self.oplog.storage().get_op(&id)?.is_none() {
+                dangling.insert(id);
             }
             if remote_contains(remote, &meta) {
                 common.insert(id);
