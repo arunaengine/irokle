@@ -855,3 +855,79 @@ fn fjall_purges_waiter_closure() {
     let dir = tempfile::tempdir().unwrap();
     assert_purges_waiter_closure(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
+
+/// Everything a caller can observe about one topic, so a failed reset can be
+/// proved unchanged rather than merely still present.
+#[derive(Debug, PartialEq)]
+struct TopicSnapshot {
+    op_ids: BTreeSet<OpId>,
+    records: Vec<(Option<Op>, Option<crate_storage::OpMeta>)>,
+    heads: BTreeSet<OpId>,
+    clock: ActorClock,
+    state: Option<crate_storage::TopicState>,
+    fingerprint: [u8; 32],
+    max_generation: u64,
+}
+
+fn topic_snapshot<S: Storage>(storage: &S, topic_id: &TopicId) -> TopicSnapshot {
+    let op_ids = storage.list_op_ids(topic_id).unwrap();
+    TopicSnapshot {
+        records: op_ids
+            .iter()
+            .map(|id| (storage.get_op(id).unwrap(), storage.get_meta(id).unwrap()))
+            .collect(),
+        op_ids,
+        heads: storage.heads(topic_id).unwrap(),
+        clock: storage.actor_clock(topic_id).unwrap(),
+        state: storage.topic_state(topic_id).unwrap(),
+        fingerprint: storage.topic_fingerprint(topic_id).unwrap(),
+        max_generation: storage.max_generation(topic_id).unwrap(),
+    }
+}
+
+fn assert_reset_rollback<S: Storage>(storage: S) {
+    // A winner batch the durability boundary rejects must leave the local chain
+    // in place: an empty topic is worse than the chain the reset was meant to
+    // replace, and the caller has no way back to it.
+    let topic_id = TopicId::hash(b"reset-rollback-topic");
+    seed_chain(&storage, topic_id, 81, &["one", "two"]);
+    let survivor_id = TopicId::hash(b"reset-rollback-survivor");
+    seed_chain(&storage, survivor_id, 83, &["keep"]);
+    let before = topic_snapshot(&storage, &topic_id);
+    let survivor_before = topic_snapshot(&storage, &survivor_id);
+    let expected_state = storage.topic_state(&topic_id).unwrap().unwrap();
+
+    // A winner whose own genesis is withheld: it passes every precondition and
+    // is only rejected once the reset has already been staged.
+    let [(genesis, _), (event, event_meta)] = seed_pair(topic_id, 85);
+    let result = storage.reset_topic_and_admit(
+        &topic_id,
+        &expected_state,
+        crate_storage::AdmittedBatch {
+            topic_id,
+            expected_heads: BTreeSet::new(),
+            expected_topic_state: None,
+            entries: vec![(event.clone(), event_meta)],
+            heads: [event.id].into(),
+            topic_state: None,
+            effects: crate_storage::AdmissionEffects::default(),
+        },
+    );
+
+    assert!(matches!(result, Err(Error::MissingDependency(id)) if id == genesis.id));
+    assert_eq!(topic_snapshot(&storage, &topic_id), before);
+    assert_eq!(topic_snapshot(&storage, &survivor_id), survivor_before);
+    assert!(storage.get_op(&event.id).unwrap().is_none());
+}
+
+#[test]
+fn memory_reset_rollback() {
+    assert_reset_rollback(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reset_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_reset_rollback(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}

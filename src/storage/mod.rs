@@ -146,21 +146,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// Genesis tie-break resolution uses this for a genesis that will never be
     /// admitted here; a partial walk would strand waiters holding pending quota
     /// against a dependency that can never arrive. Returns the number removed.
-    /// The default composition is correct but not atomic; durable backends
-    /// override it with a single transaction.
-    fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
-        let mut frontier = vec![*dep_id];
-        let mut seen = BTreeSet::new();
-        while let Some(dep) = frontier.pop() {
-            for (_, op) in self.pending_waiters(&dep)? {
-                if seen.insert(op.id) {
-                    self.remove_pending_op(&op.id)?;
-                    frontier.push(op.id);
-                }
-            }
-        }
-        Ok(seen.len())
-    }
+    /// Required rather than defaulted: a composition of single removals is
+    /// correct but not atomic, and a backend must not inherit that silently.
+    fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>>;
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()>;
@@ -211,22 +199,16 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// state check prevents a stale resolver from overwriting a smaller genesis
     /// admitted by another facade. `batch` must be built against a fresh topic
     /// (empty `expected_heads`, `None` `expected_topic_state`). Returns the
-    /// number of admitted ops the reset removed. The default composition is
-    /// correct but not atomic; durable backends override it with a single
-    /// transaction.
+    /// number of admitted ops the reset removed. A rejected `batch` must leave
+    /// the local chain exactly as it was. Required rather than defaulted: a
+    /// reset followed by a separate admission is not atomic, and a backend must
+    /// not inherit that silently.
     fn reset_topic_and_admit(
         &self,
         topic_id: &TopicId,
         expected_topic_state: &TopicState,
         batch: AdmittedBatch,
-    ) -> Result<usize> {
-        if self.topic_state(topic_id)?.as_ref() != Some(expected_topic_state) {
-            return Err(crate::Error::AdmissionConflict);
-        }
-        let removed = self.reset_topic(topic_id)?;
-        self.put_admitted_batch(batch)?;
-        Ok(removed)
-    }
+    ) -> Result<usize>;
 
     fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
         let Some(meta) = self.get_meta(op_id)? else {

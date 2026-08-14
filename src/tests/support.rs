@@ -238,6 +238,18 @@ impl Storage for StaleReadStorage {
     fn reset_topic(&self, topic_id: &TopicId) -> Result<usize, Error> {
         self.inner.reset_topic(topic_id)
     }
+    fn reset_topic_and_admit(
+        &self,
+        topic_id: &TopicId,
+        expected_topic_state: &crate::storage::TopicState,
+        batch: crate::storage::AdmittedBatch,
+    ) -> Result<usize, Error> {
+        self.inner
+            .reset_topic_and_admit(topic_id, expected_topic_state, batch)
+    }
+    fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize, Error> {
+        self.inner.purge_pending_waiters(dep_id)
+    }
 }
 
 /// A source node holding a three-op chain that `holder_peer` may sync with.

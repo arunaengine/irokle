@@ -17,7 +17,7 @@ pub struct MemoryStorage {
     inner: Arc<Mutex<MemoryInner>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MemoryInner {
     ops: BTreeMap<OpId, Op>,
     meta: BTreeMap<OpId, OpMeta>,
@@ -399,8 +399,13 @@ impl Storage for MemoryStorage {
         if memory_topic_state_locked(&inner, topic_id).as_ref() != Some(expected_topic_state) {
             return Err(Error::AdmissionConflict);
         }
-        let removed = reset_topic_locked(&mut inner, topic_id);
-        put_admitted_batch_locked(&mut inner, batch)?;
+        // Stage both steps on a copy and swap only once the winner is admitted:
+        // a rejected winner must leave the local chain exactly as it was, never
+        // an empty topic with nothing installed in its place.
+        let mut staged = inner.clone();
+        let removed = reset_topic_locked(&mut staged, topic_id);
+        put_admitted_batch_locked(&mut staged, batch)?;
+        *inner = staged;
         Ok(removed)
     }
 }
