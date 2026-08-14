@@ -661,3 +661,81 @@ fn fjall_clear_persists() {
     assert_eq!(obligations.len(), 1);
     assert_eq!(obligations[0].op_ids, [unsatisfied_id].into());
 }
+
+#[test]
+fn ack_needs_closure() {
+    // A receiver holding a hole must not clear the source's retry obligation:
+    // its ack would certify a frontier it cannot replay.
+    let storage = MemoryStorage::new();
+    let holder_signer = Ed25519Signer::from_bytes(&[122; 32]);
+    let (source, topic_id, ops) = chain_source(121, holder_signer.peer_id());
+    oplog::Oplog::with_storage(storage.clone())
+        .receive_ops(ops.clone())
+        .unwrap();
+    damage_op(&storage, &ops[1].id, Damage::Meta);
+    let holder = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: holder_signer,
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    source
+        .storage()
+        .put_sync_obligation(crate::storage::SyncObligation {
+            peer_id: holder.peer_id(),
+            topic_id,
+            op_ids: [ops[2].id].into(),
+            target_clock: source.storage().actor_clock(&topic_id).unwrap(),
+        })
+        .unwrap();
+
+    let (damaged_ack, _) = holder
+        .receive_sync_data_from(
+            source.peer_id(),
+            sync::SyncData {
+                topic_id,
+                ops: vec![ops[0].clone()],
+            },
+        )
+        .unwrap();
+    source.apply_sync_ack(&damaged_ack).unwrap();
+
+    assert!(damaged_ack.heads.is_empty());
+    assert!(damaged_ack.clock.is_empty());
+    assert!(
+        source
+            .storage()
+            .has_sync_obligations(&holder.peer_id(), &topic_id)
+            .unwrap()
+    );
+
+    let plan = holder
+        .negotiate_sync(source.peer_id(), &source.sync_summary(topic_id).unwrap())
+        .unwrap();
+    let repair = source
+        .plan_sync_response_data(
+            holder.peer_id(),
+            &sync::SyncRequest {
+                topic_id,
+                known: plan.common,
+                wants: plan.need,
+                actor_range_hints: plan.actor_range_hints,
+            },
+        )
+        .unwrap();
+    let (whole_ack, _) = holder
+        .receive_sync_data_from(source.peer_id(), repair)
+        .unwrap();
+    source.apply_sync_ack(&whole_ack).unwrap();
+
+    assert_eq!(whole_ack.heads, [ops[2].id].into());
+    assert!(
+        !source
+            .storage()
+            .has_sync_obligations(&holder.peer_id(), &topic_id)
+            .unwrap()
+    );
+}

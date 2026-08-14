@@ -77,6 +77,36 @@ impl Corrupt for crate::storage::FjallStorage {
     }
 }
 
+/// A source node holding a three-op chain that `holder_peer` may sync with.
+pub(crate) fn chain_source(seed: u8, holder_peer: PeerId) -> (Irokle, TopicId, Vec<Op>) {
+    let source = node(seed);
+    let topic = source
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [holder_peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    topic.publish(Note { text: "one".into() }).unwrap();
+    topic.publish(Note { text: "two".into() }).unwrap();
+    let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+    (source, topic.id(), ops)
+}
+
+/// A three-op chain seeded into `storage` with the middle op really damaged.
+pub(crate) fn holed_store<S: Corrupt>(
+    storage: &S,
+    seed: u8,
+    damage: Damage,
+) -> (Irokle, TopicId, Vec<Op>) {
+    let holder_peer = Ed25519Signer::from_bytes(&[seed.wrapping_add(1); 32]).peer_id();
+    let (source, topic_id, ops) = chain_source(seed, holder_peer);
+    oplog::Oplog::with_storage(storage.clone())
+        .receive_ops(ops.clone())
+        .unwrap();
+    damage_op(storage, &ops[1].id, damage);
+    (source, topic_id, ops)
+}
+
 pub(crate) fn node(seed: u8) -> Irokle {
     Irokle::new(NodeConfig {
         signer: Ed25519Signer::from_bytes(&[seed; 32]),

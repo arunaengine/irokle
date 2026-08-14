@@ -446,15 +446,31 @@ impl<S: Storage> SyncEngine<S> {
                 accepted.insert(op_id);
             }
         }
+        let (heads, clock) = self.ack_frontier(&data.topic_id)?;
         let ack = SyncAck {
             topic_id: data.topic_id,
             peer_id: ack_peer_id,
             accepted,
-            heads: self.oplog.storage().heads(&data.topic_id)?,
-            clock: self.oplog.storage().actor_clock(&data.topic_id)?,
+            heads,
+            clock,
             signature: None,
         };
         Ok((ack, admitted.evictions))
+    }
+
+    /// Heads and clock an acknowledgement may certify. A topic holding an id it
+    /// cannot resolve is unable to replay the history those values name, so it
+    /// certifies nothing until repair completes: the source keeps its retry
+    /// obligation and this node stays visibly behind instead of going quiet.
+    fn ack_frontier(&self, topic_id: &TopicId) -> Result<(BTreeSet<OpId>, ActorClock)> {
+        if !self.oplog.topic_unresolved(topic_id)?.is_empty() {
+            tracing::debug!(%topic_id, "withholding ack frontier for an incomplete topic");
+            return Ok((BTreeSet::new(), ActorClock::new()));
+        }
+        Ok((
+            self.oplog.storage().heads(topic_id)?,
+            self.oplog.storage().actor_clock(topic_id)?,
+        ))
     }
 
     pub fn apply_ack(&self, ack: &SyncAck) -> Result<()> {
@@ -512,11 +528,12 @@ impl<S: Storage> SyncEngine<S> {
         if !state.members.contains(&peer_id) {
             return Err(Error::NotTopicMember);
         }
+        let (heads, clock) = self.ack_frontier(&topic_id)?;
         let peer_ack = PeerAck {
             peer_id,
             topic_id,
-            heads: self.oplog.storage().heads(&topic_id)?,
-            clock: self.oplog.storage().actor_clock(&topic_id)?,
+            heads,
+            clock,
         };
         self.oplog.storage().apply_peer_ack(peer_ack)?;
         Ok(())
