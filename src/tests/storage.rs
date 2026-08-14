@@ -425,6 +425,7 @@ fn assert_reset_topic_and_admit_is_atomic<S: Storage>(storage: S) {
                 topic_state: Some(winner_state),
                 effects: crate_storage::AdmissionEffects::default(),
             },
+            None,
         )
         .unwrap();
 
@@ -517,6 +518,7 @@ fn assert_reset_topic_and_admit_rejects_stale_state<S: Storage>(storage: S) {
                 topic_state: Some(winner_state),
                 effects: crate_storage::AdmissionEffects::default(),
             },
+            None,
         )
         .unwrap_err();
     assert!(matches!(err, Error::AdmissionConflict));
@@ -548,6 +550,230 @@ fn fjall_reset_topic_and_admit_rejects_stale_state() {
     let dir = tempfile::tempdir().unwrap();
     let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
     assert_reset_topic_and_admit_rejects_stale_state(storage);
+}
+
+/// What a lost eviction must still be recoverable from: the topic, the chain it
+/// replaced, and the one op whose payload the reset discarded.
+struct LostEviction {
+    topic_id: TopicId,
+    losing_genesis: OpId,
+    winning_genesis: OpId,
+    evicted: Op,
+}
+
+/// Resolve a real genesis tie-break against `storage` and drop the returned
+/// eviction without delivering it anywhere: the crash window between the reset
+/// commit and the consumer's receipt.
+fn evict_undelivered<S: Storage>(storage: &S) -> LostEviction {
+    let topic_id = TopicId::hash(b"eviction-journal-topic");
+    let local_peer = Ed25519Signer::from_bytes(&[91; 32]).peer_id();
+    let foreign_peer = Ed25519Signer::from_bytes(&[92; 32]).peer_id();
+    let (local, _, local_genesis, local_event) = forked_side(
+        storage.clone(),
+        topic_id,
+        91,
+        [foreign_peer],
+        "acknowledged",
+    );
+    let (_, _, foreign_genesis, foreign_event) =
+        forked_side(MemoryStorage::new(), topic_id, 92, [local_peer], "winner");
+    assert!(
+        foreign_genesis.id < local_genesis.id,
+        "these seeds must make the local side lose the tie-break"
+    );
+
+    let admitted = local
+        .receive_ops_from_peer_evicting(
+            Some(foreign_peer),
+            vec![foreign_genesis.clone(), foreign_event],
+        )
+        .unwrap();
+    assert_eq!(admitted.evictions.len(), 1);
+    // The crash: the only in-memory copy of the payload goes nowhere.
+    drop(admitted);
+    drop(local);
+
+    LostEviction {
+        topic_id,
+        losing_genesis: local_genesis.id,
+        winning_genesis: foreign_genesis.id,
+        evicted: local_event,
+    }
+}
+
+/// The journal a restart finds must describe exactly the payloads the reset
+/// removed, and release them only when the consumer acknowledges.
+fn assert_journal_recovers<S: Storage>(storage: &S, lost: LostEviction) {
+    let pending = storage.pending_evictions().unwrap();
+    assert_eq!(pending.len(), 1);
+    let record = &pending[0];
+    assert_eq!(record.topic_id, lost.topic_id);
+    assert_eq!(record.losing_genesis, lost.losing_genesis);
+    assert_eq!(record.winning_genesis, lost.winning_genesis);
+    assert_eq!(record.evicted.len(), 1);
+    assert_eq!(record.evicted[0].op_id, lost.evicted.id);
+    assert_eq!(record.evicted[0].payload, lost.evicted.signed.body.payload);
+
+    // The reset really committed: the journal is the only copy left.
+    assert!(storage.get_op(&lost.evicted.id).unwrap().is_none());
+    assert_eq!(
+        storage
+            .topic_state(&lost.topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis,
+        lost.winning_genesis
+    );
+
+    storage.clear_eviction(&record.key()).unwrap();
+    assert!(storage.pending_evictions().unwrap().is_empty());
+    // Acknowledging a record that is already released is not an error.
+    storage.clear_eviction(&record.key()).unwrap();
+}
+
+#[test]
+fn memory_journals_eviction() {
+    let storage = MemoryStorage::new();
+    let lost = evict_undelivered(&storage);
+    // A facade built after the fact: the record lives in the store, not in the
+    // node that produced it.
+    assert_journal_recovers(&storage.clone(), lost);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_journals_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    let lost = evict_undelivered(&storage);
+    drop(storage);
+    // Reopened from disk: only what the reset transaction committed is left.
+    let reopened = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    assert_journal_recovers(&reopened, lost);
+}
+
+/// One reset's worth of journal input, with a key that differs per `nonce`.
+fn filler_eviction(topic_id: TopicId, winning_genesis: OpId, nonce: usize) -> crate::TopicEviction {
+    crate::TopicEviction {
+        topic_id,
+        losing_genesis: OpId::hash(nonce.to_le_bytes()),
+        winning_genesis,
+        evicted: vec![crate::EvictedOp {
+            op_id: OpId::hash(nonce.to_le_bytes()),
+            actor_id: ActorId::default(),
+            author: PeerId::default(),
+            actor_seq: 1,
+            payload: TopicPayload::Event(
+                EventEnvelope::encode_event(&Note {
+                    text: String::new(),
+                })
+                .unwrap(),
+            ),
+        }],
+    }
+}
+
+/// A winner genesis for `topic_id` that no earlier `nonce` produced, with the
+/// metadata and state a reset needs to install it.
+fn filler_winner(
+    topic_id: TopicId,
+    nonce: usize,
+) -> (Op, crate_storage::OpMeta, crate_storage::TopicState) {
+    let signer = Ed25519Signer::from_bytes(&[96; 32]);
+    let source = oplog::Oplog::with_storage(MemoryStorage::new());
+    let genesis = source
+        .create_topic_genesis(
+            topic_id,
+            actor_id_for(topic_id, signer.peer_id()),
+            TopicGenesis {
+                event_type_id: Note::TYPE_ID.into(),
+                initial_peers: [PeerId::hash(nonce.to_le_bytes())].into(),
+                replication_policy: ReplicationPolicy::default(),
+            },
+            &signer,
+        )
+        .unwrap();
+    let meta = source.storage().get_meta(&genesis.id).unwrap().unwrap();
+    let state = source.storage().topic_state(&topic_id).unwrap().unwrap();
+    (genesis, meta, state)
+}
+
+/// The journal is bounded: once it holds `MAX_PENDING_EVICTIONS`
+/// unacknowledged records the next reset is refused, rather than growing
+/// without limit or dropping a payload nothing else holds.
+fn assert_journal_bound<S: Storage>(storage: S) {
+    let topic_id = TopicId::hash(b"eviction-bound-topic");
+    seed_chain(&storage, topic_id, 95, &["one"]);
+
+    for nonce in 0..crate_storage::MAX_PENDING_EVICTIONS {
+        let expected_state = storage.topic_state(&topic_id).unwrap().unwrap();
+        let (genesis, meta, state) = filler_winner(topic_id, nonce);
+        storage
+            .reset_topic_and_admit(
+                &topic_id,
+                &expected_state,
+                crate_storage::AdmittedBatch {
+                    topic_id,
+                    expected_heads: BTreeSet::new(),
+                    expected_topic_state: None,
+                    entries: vec![(genesis.clone(), meta)],
+                    heads: [genesis.id].into(),
+                    topic_state: Some(state),
+                    effects: crate_storage::AdmissionEffects::default(),
+                },
+                Some(&filler_eviction(topic_id, genesis.id, nonce)),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        storage.pending_evictions().unwrap().len(),
+        crate_storage::MAX_PENDING_EVICTIONS
+    );
+
+    let before = topic_snapshot(&storage, &topic_id);
+    let expected_state = storage.topic_state(&topic_id).unwrap().unwrap();
+    let (genesis, meta, state) = filler_winner(topic_id, crate_storage::MAX_PENDING_EVICTIONS);
+    let refused = storage.reset_topic_and_admit(
+        &topic_id,
+        &expected_state,
+        crate_storage::AdmittedBatch {
+            topic_id,
+            expected_heads: BTreeSet::new(),
+            expected_topic_state: None,
+            entries: vec![(genesis.clone(), meta)],
+            heads: [genesis.id].into(),
+            topic_state: Some(state),
+            effects: crate_storage::AdmissionEffects::default(),
+        },
+        Some(&filler_eviction(
+            topic_id,
+            genesis.id,
+            crate_storage::MAX_PENDING_EVICTIONS,
+        )),
+    );
+
+    // Refused whole: the chain the reset would have discarded is still here.
+    assert!(matches!(refused, Err(Error::EvictionJournalFull)));
+    assert_eq!(topic_snapshot(&storage, &topic_id), before);
+    assert_eq!(
+        storage.pending_evictions().unwrap().len(),
+        crate_storage::MAX_PENDING_EVICTIONS
+    );
+}
+
+#[test]
+fn memory_bounds_journal() {
+    assert_journal_bound(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_bounds_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage =
+        crate_storage::FjallStorage::open_with_persist_mode(dir.path(), fjall::PersistMode::Buffer)
+            .unwrap();
+    assert_journal_bound(storage);
 }
 
 #[test]
@@ -684,4 +910,253 @@ fn fjall_reconciles_pending() {
     let dir = tempfile::tempdir().unwrap();
     let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
     assert_pending_reconciles(storage);
+}
+
+/// A genesis from one peer plus a second peer's first event on top of it, both
+/// with meta. The event opens its own actor chain, so admitting it alone leaves
+/// its dependency as the only thing standing in the way.
+fn seed_pair(topic_id: TopicId, seed: u8) -> [(Op, crate_storage::OpMeta); 2] {
+    let founder = Ed25519Signer::from_bytes(&[seed; 32]);
+    let joiner = Ed25519Signer::from_bytes(&[seed.wrapping_add(1); 32]);
+    let source = oplog::Oplog::with_storage(MemoryStorage::new());
+    let genesis = source
+        .create_topic_genesis(
+            topic_id,
+            actor_id_for(topic_id, founder.peer_id()),
+            TopicGenesis {
+                event_type_id: Note::TYPE_ID.into(),
+                initial_peers: [joiner.peer_id()].into(),
+                replication_policy: ReplicationPolicy::default(),
+            },
+            &founder,
+        )
+        .unwrap();
+    let event = source
+        .create_event_op(
+            topic_id,
+            actor_id_for(topic_id, joiner.peer_id()),
+            EventEnvelope::encode_event(&Note {
+                text: "chained".into(),
+            })
+            .unwrap(),
+            &joiner,
+        )
+        .unwrap();
+    [genesis, event].map(|op| {
+        let meta = source.storage().get_meta(&op.id).unwrap().unwrap();
+        (op, meta)
+    })
+}
+
+fn assert_rejects_dangling_entry<S: Storage>(storage: S) {
+    // The durability boundary must refuse an op whose dependency has no meta,
+    // however the caller's pre-transaction reads decided the dep was there.
+    let topic_id = TopicId::hash(b"dangling-entry-topic");
+    let [(genesis, _), (event, event_meta)] = seed_pair(topic_id, 71);
+
+    let result = storage.put_admitted_batch(crate_storage::AdmittedBatch {
+        topic_id,
+        expected_heads: BTreeSet::new(),
+        expected_topic_state: None,
+        entries: vec![(event.clone(), event_meta)],
+        heads: [event.id].into(),
+        topic_state: None,
+        effects: crate_storage::AdmissionEffects::default(),
+    });
+
+    assert!(matches!(result, Err(Error::MissingDependency(id)) if id == genesis.id));
+    assert!(storage.get_op(&event.id).unwrap().is_none());
+    assert!(storage.get_meta(&event.id).unwrap().is_none());
+    assert!(storage.list_op_ids(&topic_id).unwrap().is_empty());
+}
+
+#[test]
+fn memory_rejects_dangling_entry() {
+    assert_rejects_dangling_entry(MemoryStorage::new());
+}
+
+fn assert_rejects_partial_dep<S: Corrupt>(storage: S, drop_op: bool) {
+    // Half a dependency is a hole, not a resolved edge: neither an op record
+    // without metadata nor metadata without its op may let a descendant commit.
+    let topic_id = TopicId::hash(b"partial-dep-topic");
+    let [(genesis, genesis_meta), (event, event_meta)] = seed_pair(topic_id, 75);
+    storage
+        .put_admitted_batch(crate_storage::AdmittedBatch {
+            topic_id,
+            expected_heads: BTreeSet::new(),
+            expected_topic_state: None,
+            entries: vec![(genesis.clone(), genesis_meta)],
+            heads: [genesis.id].into(),
+            topic_state: None,
+            effects: crate_storage::AdmissionEffects::default(),
+        })
+        .unwrap();
+    if drop_op {
+        storage.drop_op_record(&genesis.id);
+    } else {
+        storage.drop_meta_record(&genesis.id);
+    }
+    assert!(!storage.dep_resolvable(&genesis.id).unwrap());
+
+    let result = storage.put_admitted_batch(crate_storage::AdmittedBatch {
+        topic_id,
+        expected_heads: [genesis.id].into(),
+        expected_topic_state: None,
+        entries: vec![(event.clone(), event_meta)],
+        heads: [event.id].into(),
+        topic_state: None,
+        effects: crate_storage::AdmissionEffects::default(),
+    });
+
+    assert!(matches!(result, Err(Error::MissingDependency(id)) if id == genesis.id));
+    assert!(storage.get_op(&event.id).unwrap().is_none());
+    assert!(storage.get_meta(&event.id).unwrap().is_none());
+}
+
+#[test]
+fn memory_rejects_partial_dep() {
+    assert_rejects_partial_dep(MemoryStorage::new(), true);
+    assert_rejects_partial_dep(MemoryStorage::new(), false);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_rejects_partial_dep() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_rejects_partial_dep(crate_storage::FjallStorage::open(dir.path()).unwrap(), true);
+    let dir = tempfile::tempdir().unwrap();
+    assert_rejects_partial_dep(
+        crate_storage::FjallStorage::open(dir.path()).unwrap(),
+        false,
+    );
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_rejects_dangling_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_rejects_dangling_entry(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+fn assert_purges_waiter_closure<S: Storage>(storage: S) {
+    // Dropping a dependency that can never arrive must take its whole waiter
+    // chain with it in one durable step.
+    let topic_id = TopicId::hash(b"waiter-closure-topic");
+    let source = node(73);
+    let chain = source
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: BTreeSet::new(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    chain.publish(Note { text: "one".into() }).unwrap();
+    chain.publish(Note { text: "two".into() }).unwrap();
+    let ops = oplog::topological(source.storage(), &chain.id()).unwrap();
+    let log = oplog::Oplog::with_storage(storage.clone());
+
+    // Withhold the genesis so both events buffer, the second behind the first.
+    log.receive_ops_from_peer(Some(source.peer_id()), vec![ops[2].clone()])
+        .unwrap();
+    log.receive_ops_from_peer(Some(source.peer_id()), vec![ops[1].clone()])
+        .unwrap();
+    assert_eq!(storage.pending_waiters(&ops[0].id).unwrap().len(), 1);
+
+    let purged = storage.purge_pending_waiters(&ops[0].id).unwrap();
+
+    assert_eq!(purged, 2);
+    assert!(storage.pending_waiters(&ops[0].id).unwrap().is_empty());
+    assert!(storage.pending_waiters(&ops[1].id).unwrap().is_empty());
+    assert!(storage.ready_pending_ops().unwrap().is_empty());
+    assert!(storage.list_op_ids(&topic_id).unwrap().is_empty());
+}
+
+#[test]
+fn memory_purges_waiter_closure() {
+    assert_purges_waiter_closure(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_purges_waiter_closure() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_purges_waiter_closure(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// Everything a caller can observe about one topic, so a failed reset can be
+/// proved unchanged rather than merely still present.
+#[derive(Debug, PartialEq)]
+struct TopicSnapshot {
+    op_ids: BTreeSet<OpId>,
+    records: Vec<(Option<Op>, Option<crate_storage::OpMeta>)>,
+    heads: BTreeSet<OpId>,
+    clock: ActorClock,
+    state: Option<crate_storage::TopicState>,
+    fingerprint: [u8; 32],
+    max_generation: u64,
+}
+
+fn topic_snapshot<S: Storage>(storage: &S, topic_id: &TopicId) -> TopicSnapshot {
+    let op_ids = storage.list_op_ids(topic_id).unwrap();
+    TopicSnapshot {
+        records: op_ids
+            .iter()
+            .map(|id| (storage.get_op(id).unwrap(), storage.get_meta(id).unwrap()))
+            .collect(),
+        op_ids,
+        heads: storage.heads(topic_id).unwrap(),
+        clock: storage.actor_clock(topic_id).unwrap(),
+        state: storage.topic_state(topic_id).unwrap(),
+        fingerprint: storage.topic_fingerprint(topic_id).unwrap(),
+        max_generation: storage.max_generation(topic_id).unwrap(),
+    }
+}
+
+fn assert_reset_rollback<S: Storage>(storage: S) {
+    // A winner batch the durability boundary rejects must leave the local chain
+    // in place: an empty topic is worse than the chain the reset was meant to
+    // replace, and the caller has no way back to it.
+    let topic_id = TopicId::hash(b"reset-rollback-topic");
+    seed_chain(&storage, topic_id, 81, &["one", "two"]);
+    let survivor_id = TopicId::hash(b"reset-rollback-survivor");
+    seed_chain(&storage, survivor_id, 83, &["keep"]);
+    let before = topic_snapshot(&storage, &topic_id);
+    let survivor_before = topic_snapshot(&storage, &survivor_id);
+    let expected_state = storage.topic_state(&topic_id).unwrap().unwrap();
+
+    // A winner whose own genesis is withheld: it passes every precondition and
+    // is only rejected once the reset has already been staged.
+    let [(genesis, _), (event, event_meta)] = seed_pair(topic_id, 85);
+    let result = storage.reset_topic_and_admit(
+        &topic_id,
+        &expected_state,
+        crate_storage::AdmittedBatch {
+            topic_id,
+            expected_heads: BTreeSet::new(),
+            expected_topic_state: None,
+            entries: vec![(event.clone(), event_meta)],
+            heads: [event.id].into(),
+            topic_state: None,
+            effects: crate_storage::AdmissionEffects::default(),
+        },
+        Some(&filler_eviction(topic_id, genesis.id, 0)),
+    );
+
+    assert!(matches!(result, Err(Error::MissingDependency(id)) if id == genesis.id));
+    assert_eq!(topic_snapshot(&storage, &topic_id), before);
+    assert_eq!(topic_snapshot(&storage, &survivor_id), survivor_before);
+    assert!(storage.get_op(&event.id).unwrap().is_none());
+    // The record belongs to the reset: no reset, no record to acknowledge.
+    assert!(storage.pending_evictions().unwrap().is_empty());
+}
+
+#[test]
+fn memory_reset_rollback() {
+    assert_reset_rollback(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reset_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_reset_rollback(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }

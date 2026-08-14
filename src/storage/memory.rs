@@ -3,12 +3,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, TopicInfo};
+use crate::{
+    ActorClock, ActorId, Error, EvictionKey, Op, OpId, PeerId, Result, TopicEviction, TopicId,
+    TopicInfo,
+};
 
 use super::{
-    AdmittedBatch, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL,
-    MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation, SyncPeerStatus,
-    TopicState, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
+    AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
+    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
+    SyncPeerStatus, TopicState, ensure_deps_resolvable, journalled_eviction, stored_ack_dominates,
+    sync_obligation_satisfied, topic_fingerprint_for,
 };
 
 #[derive(Clone, Default)]
@@ -16,7 +20,7 @@ pub struct MemoryStorage {
     inner: Arc<Mutex<MemoryInner>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MemoryInner {
     ops: BTreeMap<OpId, Op>,
     meta: BTreeMap<OpId, OpMeta>,
@@ -35,6 +39,7 @@ struct MemoryInner {
     peer_acks: HashMap<(PeerId, TopicId), PeerAck>,
     obligations: Vec<SyncObligation>,
     sync_statuses: BTreeMap<(TopicId, PeerId), SyncPeerStatus>,
+    evictions: BTreeMap<EvictionKey, TopicEviction>,
 }
 
 impl MemoryStorage {
@@ -44,6 +49,42 @@ impl MemoryStorage {
 
     fn lock(&self) -> Result<MutexGuard<'_, MemoryInner>> {
         self.inner.lock().map_err(Error::from)
+    }
+}
+
+#[cfg(test)]
+impl MemoryStorage {
+    /// Erase a stored op record, leaving its metadata and indexes behind. Tests
+    /// use this to build a store that is already durably inconsistent.
+    pub(crate) fn drop_op_record(&self, id: &OpId) {
+        self.inner.lock().expect("memory lock").ops.remove(id);
+    }
+
+    /// Erase a stored metadata record, leaving the op and indexes behind.
+    pub(crate) fn drop_meta_record(&self, id: &OpId) {
+        self.inner.lock().expect("memory lock").meta.remove(id);
+    }
+
+    /// Store both records and the topic/child indexes while leaving heads and
+    /// topic state alone, so the op is admitted yet reachable from no head.
+    pub(crate) fn orphan_op(&self, op: &Op, meta: &OpMeta) {
+        let mut inner = self.inner.lock().expect("memory lock");
+        inner
+            .topic_ops
+            .entry(meta.topic_id)
+            .or_default()
+            .insert(op.id);
+        for dep in &meta.deps {
+            inner.children.entry(*dep).or_default().insert(op.id);
+        }
+        inner
+            .actor_by_seq
+            .insert((meta.topic_id, meta.actor_id, meta.actor_seq), op.id);
+        inner
+            .actor_tip
+            .insert((meta.topic_id, meta.actor_id), (meta.actor_seq, op.id));
+        inner.meta.insert(op.id, meta.clone());
+        inner.ops.insert(op.id, op.clone());
     }
 }
 
@@ -58,6 +99,10 @@ impl Storage for MemoryStorage {
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
         Ok(self.lock()?.meta.get(id).cloned())
+    }
+    fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
+        let inner = self.lock()?;
+        Ok(dep_resolvable_locked(&inner, id))
     }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>> {
         let inner = self.lock()?;
@@ -171,7 +216,9 @@ impl Storage for MemoryStorage {
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         let mut inner = self.lock()?;
-        if inner.ops.contains_key(&op.id) {
+        // Only a completely stored op is already admitted; a half stored one
+        // still has to buffer so its repair runs once its deps resolve.
+        if dep_resolvable_locked(&inner, &op.id) {
             return Ok(());
         }
         let replace_pending = if let Some((_, existing, _)) = inner.pending_ops.get(&op.id) {
@@ -187,7 +234,7 @@ impl Storage for MemoryStorage {
         if meta
             .missing_deps
             .iter()
-            .any(|dep| inner.ops.contains_key(dep))
+            .any(|dep| dep_resolvable_locked(&inner, dep))
         {
             return Err(Error::AdmissionConflict);
         }
@@ -250,15 +297,29 @@ impl Storage for MemoryStorage {
             .filter(|(_, _, meta)| {
                 meta.missing_deps
                     .iter()
-                    .all(|dep| inner.ops.contains_key(dep))
+                    .all(|dep| dep_resolvable_locked(&inner, dep))
             })
             .map(|(source, op, _)| (*source, op.clone()))
+            .collect())
+    }
+    fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
+        let inner = self.lock()?;
+        Ok(inner
+            .pending_ops
+            .values()
+            .filter(|(_, _, meta)| meta.topic_id == *topic_id)
+            .flat_map(|(_, _, meta)| meta.missing_deps.iter().copied())
+            .filter(|dep| !dep_resolvable_locked(&inner, dep))
             .collect())
     }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         let mut inner = self.lock()?;
         remove_pending_locked(&mut inner, op_id);
         Ok(())
+    }
+    fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
+        let mut inner = self.lock()?;
+        Ok(purge_waiters_locked(&mut inner, dep_id))
     }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
         Ok(self.lock()?.peer_acks.get(&(*peer_id, *topic_id)).cloned())
@@ -359,14 +420,39 @@ impl Storage for MemoryStorage {
         topic_id: &TopicId,
         expected_topic_state: &TopicState,
         batch: AdmittedBatch,
+        eviction: Option<&TopicEviction>,
     ) -> Result<usize> {
         let mut inner = self.lock()?;
         if memory_topic_state_locked(&inner, topic_id).as_ref() != Some(expected_topic_state) {
             return Err(Error::AdmissionConflict);
         }
-        let removed = reset_topic_locked(&mut inner, topic_id);
-        put_admitted_batch_locked(&mut inner, batch)?;
+        // Stage both steps on a copy and swap only once the winner is admitted:
+        // a rejected winner must leave the local chain exactly as it was, never
+        // an empty topic with nothing installed in its place.
+        let mut staged = inner.clone();
+        let removed = reset_topic_locked(&mut staged, topic_id);
+        put_admitted_batch_locked(&mut staged, batch)?;
+        // The journal entry is part of the same swap: after it the discarded
+        // payloads exist nowhere else, so no ordering here can lose them.
+        if let Some((key, eviction)) = journalled_eviction(eviction) {
+            if !staged.evictions.contains_key(&key)
+                && staged.evictions.len() >= MAX_PENDING_EVICTIONS
+            {
+                return Err(Error::EvictionJournalFull);
+            }
+            staged.evictions.insert(key, eviction.clone());
+        }
+        *inner = staged;
         Ok(removed)
+    }
+
+    fn pending_evictions(&self) -> Result<Vec<TopicEviction>> {
+        Ok(self.lock()?.evictions.values().cloned().collect())
+    }
+
+    fn clear_eviction(&self, key: &EvictionKey) -> Result<()> {
+        self.lock()?.evictions.remove(key);
+        Ok(())
     }
 }
 
@@ -389,19 +475,34 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
     let mut actor_tips = BTreeMap::new();
     let mut new_entries = Vec::new();
     for (op, meta) in entries {
-        if let Some(existing) = inner.ops.get(&op.id) {
-            if existing != &op {
+        if meta.topic_id != topic_id {
+            return Err(Error::TopicMismatch);
+        }
+        let has_op = match inner.ops.get(&op.id) {
+            Some(existing) if existing != &op => {
                 return Err(Error::Storage("op id collision with different op".into()));
             }
+            Some(_) => true,
+            None => false,
+        };
+        let has_meta = inner.meta.contains_key(&op.id);
+        if has_op && has_meta {
             continue;
         }
-        if let Some(existing) =
-            inner
-                .actor_by_seq
-                .get(&(meta.topic_id, meta.actor_id, meta.actor_seq))
-            && *existing != op.id
+        let indexed = inner
+            .actor_by_seq
+            .get(&(meta.topic_id, meta.actor_id, meta.actor_seq))
+            .copied();
+        if let Some(existing) = indexed
+            && existing != op.id
         {
             return Err(Error::ActorFork);
+        }
+        // Refilling an id the chain already accounts for is not an append: its
+        // actor position is already recorded, so the checks below cannot apply.
+        if has_op || has_meta || indexed == Some(op.id) || inner.children.contains_key(&op.id) {
+            new_entries.push((op, meta));
+            continue;
         }
         let tip = actor_tips
             .get(&(meta.topic_id, meta.actor_id))
@@ -441,17 +542,7 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
         new_entries.push((op, meta));
     }
 
-    let topic_id = topic_state
-        .as_ref()
-        .map(|state| state.topic_id)
-        .or_else(|| new_entries.first().map(|(_, meta)| meta.topic_id));
-    if let Some(topic_id) = topic_id
-        && new_entries
-            .iter()
-            .any(|(_, meta)| meta.topic_id != topic_id)
-    {
-        return Err(Error::TopicMismatch);
-    }
+    ensure_deps_resolvable(&new_entries, |dep| Ok(dep_resolvable_locked(inner, dep)))?;
 
     for (op, meta) in new_entries {
         inner
@@ -465,9 +556,18 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
         inner
             .actor_by_seq
             .insert((meta.topic_id, meta.actor_id, meta.actor_seq), op.id);
-        inner
-            .actor_tip
-            .insert((meta.topic_id, meta.actor_id), (meta.actor_seq, op.id));
+        // A refilled op sits behind the tip, so the tip only ever advances.
+        let tip = inner.actor_tip.entry((meta.topic_id, meta.actor_id));
+        match tip {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 < meta.actor_seq {
+                    entry.insert((meta.actor_seq, op.id));
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((meta.actor_seq, op.id));
+            }
+        }
         inner
             .actor_clock
             .entry(meta.topic_id)
@@ -483,17 +583,15 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
         inner.ops.insert(op.id, op);
     }
 
-    if let Some(topic_id) = topic_id {
-        inner.heads.insert(topic_id, heads.clone());
-        let clock = inner
-            .actor_clock
-            .get(&topic_id)
-            .cloned()
-            .unwrap_or_default();
-        inner
-            .topic_fingerprint
-            .insert(topic_id, topic_fingerprint_for(&heads, &clock)?);
-    }
+    inner.heads.insert(topic_id, heads.clone());
+    let clock = inner
+        .actor_clock
+        .get(&topic_id)
+        .cloned()
+        .unwrap_or_default();
+    inner
+        .topic_fingerprint
+        .insert(topic_id, topic_fingerprint_for(&heads, &clock)?);
     if let Some(state) = topic_state {
         inner.topics.insert(state.topic_id, state);
     }
@@ -509,6 +607,21 @@ fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> usize {
     let op_ids = inner.topic_ops.remove(topic_id).unwrap_or_default();
     let removed = op_ids.len();
     for op_id in &op_ids {
+        // Edges pointing at this op go too, or a dependency the reset does not
+        // reach keeps naming a child the topic no longer holds.
+        let deps = inner
+            .meta
+            .get(op_id)
+            .map(|meta| meta.deps.clone())
+            .unwrap_or_default();
+        for dep in deps {
+            if let Some(children) = inner.children.get_mut(&dep) {
+                children.remove(op_id);
+                if children.is_empty() {
+                    inner.children.remove(&dep);
+                }
+            }
+        }
         inner.ops.remove(op_id);
         inner.meta.remove(op_id);
         inner.children.remove(op_id);
@@ -559,6 +672,27 @@ fn clear_satisfied_locked(inner: &mut MemoryInner, ack: &PeerAck) -> usize {
         })
         .collect();
     before - inner.obligations.len()
+}
+
+/// A dependency is only satisfied once both of its records are stored; either
+/// one alone leaves the DAG unable to traverse the edge.
+fn dep_resolvable_locked(inner: &MemoryInner, dep: &OpId) -> bool {
+    inner.ops.contains_key(dep) && inner.meta.contains_key(dep)
+}
+
+fn purge_waiters_locked(inner: &mut MemoryInner, dep_id: &OpId) -> usize {
+    let mut frontier = vec![*dep_id];
+    let mut seen = BTreeSet::new();
+    while let Some(dep) = frontier.pop() {
+        let waiters = inner.pending_waiters.get(&dep).cloned().unwrap_or_default();
+        for op_id in waiters {
+            if seen.insert(op_id) {
+                remove_pending_locked(inner, &op_id);
+                frontier.push(op_id);
+            }
+        }
+    }
+    seen.len()
 }
 
 fn remove_pending_locked(inner: &mut MemoryInner, op_id: &OpId) {

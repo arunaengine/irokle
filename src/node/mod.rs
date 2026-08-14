@@ -25,8 +25,8 @@ use crate::sync::{
     SyncSummary,
 };
 use crate::{
-    ActorId, Ed25519Signer, Error, Event, EventEnvelope, Op, OpId, PeerId, Result, Signer,
-    TopicConfig, TopicControl, TopicEviction, TopicGenesis, TopicId, actor_id_for,
+    ActorId, Ed25519Signer, Error, Event, EventEnvelope, EvictionKey, Op, OpId, PeerId, Result,
+    Signer, TopicConfig, TopicControl, TopicEviction, TopicGenesis, TopicId, actor_id_for,
 };
 
 static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -422,6 +422,57 @@ impl<S: Storage> Irokle<S> {
 
     pub fn sync_fingerprint(&self, topic_id: TopicId) -> Result<SyncFingerprint> {
         self.sync.fingerprint(topic_id)
+    }
+
+    /// Ids this node references in `topic_id` but cannot resolve locally. An
+    /// empty set means the topic is causally whole here; anything else is a
+    /// hole sync must repair before the topic can be certified to a peer.
+    pub fn topic_unresolved(&self, topic_id: TopicId) -> Result<BTreeSet<OpId>> {
+        self.oplog.topic_unresolved(&topic_id)
+    }
+
+    /// Audit stored records again on the next integrity question instead of
+    /// trusting the earlier verdict. Admission keeps topics whole, so this only
+    /// matters for damage that happened outside irokle.
+    pub fn recheck_topics(&self) -> Result<()> {
+        self.oplog.recheck_topics()
+    }
+
+    /// Discard ops of `topic_id` that no head reaches and rebuild the topic from
+    /// the ops that remain. A store damaged by the pre-`reset_topic_and_admit`
+    /// genesis reset can hold a descendant whose ancestry belongs to the
+    /// replaced chain; no peer can supply that ancestry under the current
+    /// genesis, so the topic stays unresolved until the descendant goes. The
+    /// returned payloads are the embedder's to re-emit.
+    pub fn quarantine_orphans(&self, topic_id: TopicId) -> Result<Option<TopicEviction>> {
+        self.oplog.quarantine_orphans(&topic_id)
+    }
+
+    /// Evictions this node recorded durably and no consumer has acknowledged
+    /// yet. Each was written in the same transaction that discarded the
+    /// payloads, so this is what a restart must drain before it can treat
+    /// eviction recovery as complete: an eviction delivered only through the
+    /// in-memory sink and lost to a crash is still here.
+    pub fn pending_evictions(&self) -> Result<Vec<TopicEviction>> {
+        self.storage().pending_evictions()
+    }
+
+    /// Release a journalled eviction, named by [`TopicEviction::key`]. Call this
+    /// only once the payloads are durably owned elsewhere; until then the record
+    /// is their only copy. Acknowledging twice is harmless.
+    pub fn clear_eviction(&self, key: &EvictionKey) -> Result<()> {
+        self.storage().clear_eviction(key)
+    }
+
+    /// Run [`Irokle::quarantine_orphans`] over every local topic.
+    pub fn quarantine_topics(&self) -> Result<Vec<TopicEviction>> {
+        let mut quarantined = Vec::new();
+        for info in self.list_topics()? {
+            if let Some(eviction) = self.oplog.quarantine_orphans(&info.topic_id)? {
+                quarantined.push(eviction);
+            }
+        }
+        Ok(quarantined)
     }
 
     pub fn negotiate_sync(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {

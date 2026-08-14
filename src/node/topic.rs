@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::marker::PhantomData;
 
 use crate::history::{DagQuery, HistoryOrder, limited};
@@ -168,34 +168,42 @@ pub(super) fn dag_ops<S: Storage>(
             if !seen.insert(id) {
                 continue;
             }
-            let meta = storage
-                .get_meta(&id)?
-                .ok_or_else(|| Error::Storage(format!("missing op meta for {id}")))?;
+            // A dependency still awaiting repair simply ends this branch of the
+            // walk; the rest of the DAG stays queryable.
+            let Some(meta) = storage.get_meta(&id)? else {
+                continue;
+            };
             if meta.topic_id != topic_id {
                 return Err(Error::TopicMismatch);
             }
             if query.include_heads || !is_head {
                 ids.push(id);
-                if query.limit.is_some_and(|limit| ids.len() >= limit) {
-                    break;
-                }
             }
             for dep in meta.deps {
                 queue.push_back((dep, false));
             }
         }
+        // The walk runs unbounded: `query.limit` counts usable results, so
+        // applying it here would let blocked ids spend the caller's budget and
+        // return a short page over history that is still reachable.
+        let subset = ids.iter().copied().collect::<BTreeSet<_>>();
+        let usable = topological_subset(storage, &subset)?;
         if query.order == HistoryOrder::OldestFirst {
-            let subset = ids.into_iter().collect::<BTreeSet<_>>();
-            topological_subset(storage, &subset)
-        } else {
-            ids.into_iter()
-                .map(|id| {
-                    storage
-                        .get_op(&id)?
-                        .ok_or_else(|| Error::Storage(format!("missing op {id}")))
-                })
-                .collect()
+            return Ok(limited(usable, query.limit));
         }
+        // Both orders must agree on membership: an op whose dependencies cannot
+        // be resolved is withheld here exactly as the oldest-first walk withholds
+        // it, so a caller never receives an op whose parents it cannot fetch.
+        let mut usable = usable
+            .into_iter()
+            .map(|op| (op.id, op))
+            .collect::<BTreeMap<_, _>>();
+        Ok(limited(
+            ids.into_iter()
+                .filter_map(|id| usable.remove(&id))
+                .collect(),
+            query.limit,
+        ))
     } else {
         Ok(limited(topological(storage, &topic_id)?, query.limit))
     }

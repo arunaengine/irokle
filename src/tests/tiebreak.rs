@@ -28,27 +28,8 @@ fn seed_side(
     peer_seed: u8,
     text: &str,
 ) -> (Oplog, Ed25519Signer, Op, Op) {
-    let signer = Ed25519Signer::from_bytes(&[seed; 32]);
     let peer = Ed25519Signer::from_bytes(&[peer_seed; 32]).peer_id();
-    let oplog = Oplog::with_storage(MemoryStorage::new());
-    let actor = actor_id_for(topic_id, signer.peer_id());
-    let genesis = TopicGenesis {
-        event_type_id: Note::TYPE_ID.into(),
-        initial_peers: [peer].into(),
-        replication_policy: ReplicationPolicy::default(),
-    };
-    let genesis_op = oplog
-        .create_topic_genesis(topic_id, actor, genesis, &signer)
-        .unwrap();
-    let event_op = oplog
-        .create_event_op(
-            topic_id,
-            actor,
-            EventEnvelope::encode_event(&Note { text: text.into() }).unwrap(),
-            &signer,
-        )
-        .unwrap();
-    (oplog, signer, genesis_op, event_op)
+    forked_side(MemoryStorage::new(), topic_id, seed, [peer], text)
 }
 
 fn build_fork(seed_a: u8, seed_b: u8) -> Fork {
@@ -647,4 +628,303 @@ fn structurally_invalid_genesis_is_rejected_without_reset() {
             .genesis,
         winner_genesis
     );
+}
+
+/// Every admitted op in `topic_id` must be able to resolve its dependencies.
+fn assert_dag_whole(oplog: &Oplog, topic_id: &TopicId) {
+    for op_id in oplog.storage().list_op_ids(topic_id).unwrap() {
+        let meta = oplog.storage().get_meta(&op_id).unwrap().unwrap();
+        for dep in &meta.deps {
+            assert!(
+                oplog.storage().dep_resolvable(dep).unwrap(),
+                "admitted {op_id} references dependency {dep} that is not fully stored"
+            );
+        }
+    }
+}
+
+#[test]
+fn reset_defers_stale_dependents() {
+    // The reset path reads dep presence before it wipes the topic. An op whose
+    // dependency only exists in the chain about to be discarded must be
+    // buffered, never admitted against storage that is one step from empty.
+    let fork = build_fork(11, 12);
+    let (loser_seed, winner_seed) = if fork.a_won { (12, 11) } else { (11, 12) };
+    let (loser, _, _, loser_event) = seed_side(fork.topic_id, loser_seed, winner_seed, "replay");
+    let stale_dependent = Op::sign(
+        OpBody {
+            topic_id: fork.topic_id,
+            author: fork.winner_signer.peer_id(),
+            actor_id: actor_id_for(fork.topic_id, fork.winner_signer.peer_id()),
+            actor_seq: 3,
+            actor_prev: Some(fork.winner_event.id),
+            deps: [fork.winner_event.id, loser_event.id].into(),
+            generation: 2,
+            payload: TopicPayload::Event(
+                EventEnvelope::encode_event(&Note {
+                    text: "straddles both chains".into(),
+                })
+                .unwrap(),
+            ),
+        },
+        &fork.winner_signer,
+    )
+    .unwrap();
+
+    loser
+        .receive_ops_from_peer_evicting(
+            Some(fork.winner_signer.peer_id()),
+            vec![
+                fork.winner_genesis.clone(),
+                fork.winner_event.clone(),
+                stale_dependent.clone(),
+            ],
+        )
+        .unwrap();
+
+    let admitted = admitted_ids(&loser, &fork.topic_id);
+    assert!(!admitted.contains(&stale_dependent.id));
+    assert_dag_whole(&loser, &fork.topic_id);
+}
+
+#[test]
+fn reset_keeps_dag_whole() {
+    let fork = build_fork(13, 14);
+    assert_dag_whole(&fork.winner_oplog, &fork.topic_id);
+    assert_dag_whole(&fork.loser_oplog, &fork.topic_id);
+}
+
+#[test]
+fn reset_ignores_tips() {
+    // Adopting a winning genesis judges the batch against a fresh topic: the
+    // actor slots and tips it would otherwise read belong to the chain the same
+    // transaction removes, so a re-emitted op must not read as a fork.
+    let fork = build_fork(21, 22);
+    let reemitted = fork
+        .loser_oplog
+        .create_event_op(
+            fork.topic_id,
+            actor_id_for(fork.topic_id, fork.loser_signer.peer_id()),
+            EventEnvelope::encode_event(&Note {
+                text: "re-emitted under the winner".into(),
+            })
+            .unwrap(),
+            &fork.loser_signer,
+        )
+        .unwrap();
+
+    let late = Oplog::with_storage(MemoryStorage::new());
+    late.receive_ops(vec![fork.loser_genesis.clone(), fork.loser_event.clone()])
+        .unwrap();
+    late.receive_ops_from_peer_evicting(
+        Some(fork.winner_signer.peer_id()),
+        vec![
+            fork.winner_genesis.clone(),
+            fork.winner_event.clone(),
+            reemitted.clone(),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        late.storage()
+            .topic_state(&fork.topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis,
+        fork.winner_genesis.id
+    );
+    assert_eq!(
+        admitted_ids(&late, &fork.topic_id),
+        [fork.winner_genesis.id, fork.winner_event.id, reemitted.id].into()
+    );
+}
+
+/// Rebuild the store the pre-`reset_topic_and_admit` genesis reset could leave:
+/// the winning genesis installed while a descendant of the replaced chain stays
+/// admitted with its ancestry gone.
+fn assert_quarantines_orphan<S: Corrupt>(storage: S) {
+    let topic_id = TopicId::hash(b"legacy-reset-topic");
+    let keeper = Ed25519Signer::from_bytes(&[203; 32]);
+    let peer = |seed: u8| Ed25519Signer::from_bytes(&[seed; 32]).peer_id();
+    let (_, sign_a, g_a, e_a) = forked_side(
+        MemoryStorage::new(),
+        topic_id,
+        201,
+        [peer(202), keeper.peer_id()],
+        "a-branch",
+    );
+    let (_, sign_b, g_b, e_b) = forked_side(
+        MemoryStorage::new(),
+        topic_id,
+        202,
+        [peer(201), keeper.peer_id()],
+        "b-branch",
+    );
+    let a_won = g_a.id < g_b.id;
+    let (won_genesis, won_event) = if a_won {
+        (g_a.clone(), e_a.clone())
+    } else {
+        (g_b.clone(), e_b.clone())
+    };
+    let (lost_genesis, lost_event) = if a_won { (g_b, e_b) } else { (g_a, e_a) };
+    let (won_signer, lost_signer) = if a_won {
+        (sign_a, sign_b)
+    } else {
+        (sign_b, sign_a)
+    };
+
+    // A peer that never saw the collision still serves the replaced chain.
+    let keeper_store = MemoryStorage::new();
+    Oplog::with_storage(keeper_store.clone())
+        .receive_ops(vec![lost_genesis.clone(), lost_event.clone()])
+        .unwrap();
+    let keeper_node = Irokle::with_storage(
+        keeper_store.clone(),
+        NodeConfig {
+            signer: keeper,
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+
+    let holder_log = oplog::Oplog::with_storage(storage.clone());
+    holder_log
+        .receive_ops(vec![lost_genesis.clone(), lost_event.clone()])
+        .unwrap();
+    holder_log
+        .receive_ops_from_peer_evicting(
+            Some(won_signer.peer_id()),
+            vec![won_genesis.clone(), won_event.clone()],
+        )
+        .unwrap();
+    let orphan_meta = keeper_store.get_meta(&lost_event.id).unwrap().unwrap();
+    storage.orphan_op(&lost_event, &orphan_meta);
+
+    let holder = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: lost_signer.clone(),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let lost_actor = actor_id_for(topic_id, lost_signer.peer_id());
+    assert_eq!(
+        storage.actor_tip(&topic_id, &lost_actor).unwrap(),
+        Some((orphan_meta.actor_seq, lost_event.id))
+    );
+    assert_eq!(
+        holder.topic_unresolved(topic_id).unwrap(),
+        [lost_genesis.id].into()
+    );
+
+    // Ordinary anti-entropy against the peer that still holds the replaced
+    // chain must not merge its genesis back into the winner.
+    let plan = holder
+        .negotiate_sync(
+            keeper_node.peer_id(),
+            &keeper_node.sync_summary(topic_id).unwrap(),
+        )
+        .unwrap();
+    assert!(plan.need.contains(&lost_genesis.id));
+    let data = keeper_node
+        .plan_sync_response_data(
+            holder.peer_id(),
+            &crate::sync::SyncRequest {
+                topic_id,
+                known: plan.common,
+                wants: plan.need,
+                actor_range_hints: plan.actor_range_hints,
+            },
+        )
+        .unwrap();
+    holder
+        .receive_sync_data_from(keeper_node.peer_id(), data)
+        .unwrap();
+    assert_eq!(
+        storage.topic_state(&topic_id).unwrap().unwrap().genesis,
+        won_genesis.id
+    );
+    assert!(storage.get_op(&lost_genesis.id).unwrap().is_none());
+    assert_eq!(
+        holder.topic_unresolved(topic_id).unwrap(),
+        [lost_genesis.id].into()
+    );
+
+    // A hole the frontier does reach is repair work, not quarantine work.
+    damage_op(&storage, &won_event.id, Damage::Op);
+    assert!(holder.quarantine_orphans(topic_id).unwrap().is_none());
+    assert_eq!(
+        storage.get_op(&lost_event.id).unwrap(),
+        Some(lost_event.clone())
+    );
+    holder_log.receive_ops(vec![won_event.clone()]).unwrap();
+
+    let eviction = holder
+        .quarantine_orphans(topic_id)
+        .unwrap()
+        .expect("the orphan closure no peer can repair must be quarantined");
+    assert_eq!(eviction.topic_id, topic_id);
+    assert_eq!(eviction.losing_genesis, won_genesis.id);
+    assert_eq!(eviction.winning_genesis, won_genesis.id);
+    assert_eq!(
+        eviction
+            .evicted
+            .iter()
+            .map(|op| op.op_id)
+            .collect::<Vec<_>>(),
+        vec![lost_event.id]
+    );
+    assert_eq!(eviction.evicted[0].payload, lost_event.signed.body.payload);
+
+    // The rebuild journalled its payloads in the transaction that discarded
+    // them, so losing the returned copy is not losing the payloads.
+    assert!(storage.pending_evictions().unwrap().contains(&eviction));
+    storage.clear_eviction(&eviction.key()).unwrap();
+    assert!(!storage.pending_evictions().unwrap().contains(&eviction));
+
+    assert!(holder.topic_unresolved(topic_id).unwrap().is_empty());
+    assert!(storage.get_op(&lost_event.id).unwrap().is_none());
+    assert!(storage.get_meta(&lost_event.id).unwrap().is_none());
+    assert_eq!(
+        storage.list_op_ids(&topic_id).unwrap(),
+        [won_genesis.id, won_event.id].into()
+    );
+    assert_eq!(storage.heads(&topic_id).unwrap(), [won_event.id].into());
+    let state = storage.topic_state(&topic_id).unwrap().unwrap();
+    assert_eq!(state.genesis, won_genesis.id);
+    assert_eq!(state.heads, [won_event.id].into());
+    assert_eq!(storage.actor_tip(&topic_id, &lost_actor).unwrap(), None);
+    assert_eq!(
+        storage
+            .actor_index(&topic_id, &lost_actor, orphan_meta.actor_seq)
+            .unwrap(),
+        None
+    );
+    assert_eq!(storage.actor_clock(&topic_id).unwrap().get(&lost_actor), 0);
+    assert!(storage.children(&lost_genesis.id).unwrap().is_empty());
+    assert_eq!(
+        oplog::topological(&storage, &topic_id)
+            .unwrap()
+            .iter()
+            .map(|op| op.id)
+            .collect::<Vec<_>>(),
+        vec![won_genesis.id, won_event.id]
+    );
+    assert!(holder.quarantine_orphans(topic_id).unwrap().is_none());
+}
+
+#[test]
+fn memory_quarantines_orphan() {
+    assert_quarantines_orphan(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_quarantines_orphan() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_quarantines_orphan(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }

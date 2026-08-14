@@ -134,6 +134,27 @@ pub struct SyncReport {
     pub obligations: Vec<SyncObligation>,
 }
 
+/// Which part of a topic exchange failed. Bounded on purpose: it names the
+/// message the responder could not handle, never the underlying error text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SyncFailureCode {
+    Open,
+    Fingerprint,
+    Summary,
+    Request,
+    Data,
+    Ack,
+}
+
+/// The terminal result of one topic's exchange when it could not be completed.
+/// Without it a responder that swallowed a per-topic error is indistinguishable
+/// from one that had nothing to say, and the requester marks the topic clean.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncFailure {
+    pub topic_id: TopicId,
+    pub code: SyncFailureCode,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SyncMessage {
     Open(SyncOpen),
@@ -142,6 +163,7 @@ pub enum SyncMessage {
     Request(SyncRequest),
     Data(SyncData),
     Ack(SyncAck),
+    Failure(SyncFailure),
 }
 
 #[derive(Clone)]
@@ -172,7 +194,7 @@ impl<S: Storage> SyncEngine<S> {
         Ok(SyncSummary {
             topic_id,
             event_type_id,
-            fingerprint: self.oplog.storage().topic_fingerprint(&topic_id)?,
+            fingerprint: self.topic_digest(&topic_id)?,
             heads: self.oplog.storage().heads(&topic_id)?,
             actor_clock: self.oplog.storage().actor_clock(&topic_id)?,
             actor_tips: self.actor_tips(topic_id)?,
@@ -182,8 +204,23 @@ impl<S: Storage> SyncEngine<S> {
     pub fn fingerprint(&self, topic_id: TopicId) -> Result<SyncFingerprint> {
         Ok(SyncFingerprint {
             topic_id,
-            fingerprint: self.oplog.storage().topic_fingerprint(&topic_id)?,
+            fingerprint: self.topic_digest(&topic_id)?,
         })
+    }
+
+    /// The digest a peer compares its own against. Stored heads and clock say
+    /// nothing about whether the records behind them exist, so the topic's
+    /// unresolved ids are folded in: a node holding a hole never looks equal to
+    /// a whole one, which is exactly what the matched-fingerprint fast path
+    /// assumes. Callers must still refuse that fast path while their own topic
+    /// is incomplete, since two identically damaged stores do match.
+    fn topic_digest(&self, topic_id: &TopicId) -> Result<[u8; 32]> {
+        let stored = self.oplog.storage().topic_fingerprint(topic_id)?;
+        let unresolved = self.oplog.topic_unresolved(topic_id)?;
+        if unresolved.is_empty() {
+            return Ok(stored);
+        }
+        Ok(*blake3::hash(&canonical_bytes(&(stored, &unresolved))?).as_bytes())
     }
 
     pub fn negotiate(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
@@ -223,7 +260,10 @@ impl<S: Storage> SyncEngine<S> {
         }
 
         let local_heads = self.oplog.storage().heads(&remote.topic_id)?;
-        if self.oplog.storage().topic_fingerprint(&remote.topic_id)? == remote.fingerprint {
+        // A hole moves neither heads nor the clock, so a matching fingerprint
+        // does not prove we are whole; keep negotiating until it is repaired.
+        let unresolved = self.oplog.topic_unresolved(&remote.topic_id)?;
+        if unresolved.is_empty() && self.topic_digest(&remote.topic_id)? == remote.fingerprint {
             return Ok(SyncPlan {
                 topic_id: remote.topic_id,
                 common: local_heads.clone(),
@@ -234,13 +274,30 @@ impl<S: Storage> SyncEngine<S> {
             });
         }
 
-        let common = self.find_common_ancestors(remote)?;
+        let (common, dangling) = self.survey_local(remote)?;
         let send = self.missing_closure(remote)?;
         let mut need = BTreeSet::new();
         for id in &remote.heads {
-            if self.oplog.storage().get_meta(id)?.is_none() {
+            if !self.oplog.storage().dep_resolvable(id)? {
                 need.insert(*id);
             }
+        }
+        // Anti-entropy: an id we reference but cannot resolve - a head the walk
+        // could not follow, an admitted record that is half stored, or a hole a
+        // buffered op waits on - is requested from this peer like any other
+        // missing op, so a store already holding a dangling edge heals over
+        // normal sync instead of deferring its dependents forever.
+        let repair = dangling
+            .into_iter()
+            .chain(unresolved)
+            .collect::<BTreeSet<_>>();
+        if !repair.is_empty() {
+            tracing::debug!(
+                topic_id = %remote.topic_id,
+                dangling = repair.len(),
+                "requesting unresolved dependencies from peer"
+            );
+            need.extend(repair);
         }
         Ok(SyncPlan {
             topic_id: remote.topic_id,
@@ -253,7 +310,16 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     pub fn find_common_ancestors(&self, remote: &SyncSummary) -> Result<BTreeSet<OpId>> {
+        Ok(self.survey_local(remote)?.0)
+    }
+
+    /// Walk local heads down to the frontier the remote already has, reporting
+    /// the common ancestors found there and every id the walk found stored
+    /// incompletely. The second set is what anti-entropy repair asks the peer
+    /// for; collecting it here costs no extra traversal.
+    fn survey_local(&self, remote: &SyncSummary) -> Result<(BTreeSet<OpId>, BTreeSet<OpId>)> {
         let mut common = BTreeSet::new();
+        let mut dangling = BTreeSet::new();
         let mut queue: VecDeque<_> = self
             .oplog
             .storage()
@@ -267,10 +333,16 @@ impl<S: Storage> SyncEngine<S> {
                 continue;
             }
             let Some(meta) = self.oplog.storage().get_meta(&id)? else {
+                dangling.insert(id);
                 continue;
             };
             if meta.topic_id != remote.topic_id {
                 continue;
+            }
+            // Metadata alone lets the walk continue but cannot be served, so the
+            // op record is requested while the traversal still uses the meta.
+            if self.oplog.storage().get_op(&id)?.is_none() {
+                dangling.insert(id);
             }
             if remote_contains(remote, &meta) {
                 common.insert(id);
@@ -279,7 +351,7 @@ impl<S: Storage> SyncEngine<S> {
             queue.extend(meta.deps.iter().copied());
         }
 
-        Ok(common)
+        Ok((common, dangling))
     }
 
     pub fn missing_closure(&self, remote: &SyncSummary) -> Result<Vec<Op>> {
@@ -409,15 +481,31 @@ impl<S: Storage> SyncEngine<S> {
                 accepted.insert(op_id);
             }
         }
+        let (heads, clock) = self.ack_frontier(&data.topic_id)?;
         let ack = SyncAck {
             topic_id: data.topic_id,
             peer_id: ack_peer_id,
             accepted,
-            heads: self.oplog.storage().heads(&data.topic_id)?,
-            clock: self.oplog.storage().actor_clock(&data.topic_id)?,
+            heads,
+            clock,
             signature: None,
         };
         Ok((ack, admitted.evictions))
+    }
+
+    /// Heads and clock an acknowledgement may certify. A topic holding an id it
+    /// cannot resolve is unable to replay the history those values name, so it
+    /// certifies nothing until repair completes: the source keeps its retry
+    /// obligation and this node stays visibly behind instead of going quiet.
+    fn ack_frontier(&self, topic_id: &TopicId) -> Result<(BTreeSet<OpId>, ActorClock)> {
+        if !self.oplog.topic_unresolved(topic_id)?.is_empty() {
+            tracing::debug!(%topic_id, "withholding ack frontier for an incomplete topic");
+            return Ok((BTreeSet::new(), ActorClock::new()));
+        }
+        Ok((
+            self.oplog.storage().heads(topic_id)?,
+            self.oplog.storage().actor_clock(topic_id)?,
+        ))
     }
 
     pub fn apply_ack(&self, ack: &SyncAck) -> Result<()> {
@@ -475,11 +563,12 @@ impl<S: Storage> SyncEngine<S> {
         if !state.members.contains(&peer_id) {
             return Err(Error::NotTopicMember);
         }
+        let (heads, clock) = self.ack_frontier(&topic_id)?;
         let peer_ack = PeerAck {
             peer_id,
             topic_id,
-            heads: self.oplog.storage().heads(&topic_id)?,
-            clock: self.oplog.storage().actor_clock(&topic_id)?,
+            heads,
+            clock,
         };
         self.oplog.storage().apply_peer_ack(peer_ack)?;
         Ok(())
@@ -612,7 +701,11 @@ impl<S: Storage> SyncEngine<S> {
             if !out.insert(id) {
                 continue;
             }
+            // A peer may want an id we never had, or one a topic reset removed.
+            // Serving what we do have keeps the exchange alive; the wanted id
+            // stays in the peer's request set for a peer that holds it.
             let Some(meta) = self.oplog.storage().get_meta(&id)? else {
+                out.remove(&id);
                 continue;
             };
             if meta.topic_id != *topic_id {

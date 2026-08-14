@@ -7,12 +7,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::canonical_bytes;
 use crate::topic::ReplicationPolicy;
-use crate::{ActorClock, ActorId, Op, OpId, PeerId, Result, TopicId, TopicInfo};
+use crate::{
+    ActorClock, ActorId, EvictionKey, Op, OpId, PeerId, Result, TopicEviction, TopicId, TopicInfo,
+};
 
 pub const MAX_PENDING_OPS_TOTAL: usize = 4096;
 pub const MAX_PENDING_OPS_PER_SOURCE: usize = 1024;
 pub const MAX_PENDING_WAITERS_PER_DEP: usize = 1024;
 pub const MAX_PENDING_MISSING_DEPS: usize = 128;
+/// Eviction records a store may hold unacknowledged. A healthy consumer
+/// acknowledges each record as soon as it owns the payloads durably, so this
+/// only bounds a store whose consumer stopped draining; the reset that would
+/// exceed it is refused rather than discarding a payload nothing else holds.
+pub const MAX_PENDING_EVICTIONS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpMeta {
@@ -107,9 +114,21 @@ pub struct SyncPeerStatus {
 }
 
 pub trait Storage: Clone + Send + Sync + 'static {
+    /// Durably admit `batch`. Backends must write each entry's op record and
+    /// its [`OpMeta`] in one atomic unit and must reject a batch whose entry
+    /// depends on an op with no metadata, so a committed op can never reference
+    /// a dependency the DAG cannot resolve.
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()>;
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
+    /// Whether `id` is stored completely enough to stand as a dependency. The
+    /// DAG is traversed through metadata and served from op records, so either
+    /// half alone is a hole to refill, never a resolved edge. This is the one
+    /// predicate every caller must use; backends override it to read both keys
+    /// from a single snapshot.
+    fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
+        Ok(self.get_op(id)?.is_some() && self.get_meta(id)?.is_some())
+    }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>>;
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
     fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
@@ -125,7 +144,18 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()>;
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>>;
     fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>>;
+    /// Dependencies that buffered ops of `topic_id` are still waiting for.
+    /// Sync planning turns these into wants, so a hole a peer never pushes is
+    /// actively pulled instead of stranding its dependents forever.
+    fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
+    /// Atomically drop every pending op that transitively waits on `dep_id`.
+    /// Genesis tie-break resolution uses this for a genesis that will never be
+    /// admitted here; a partial walk would strand waiters holding pending quota
+    /// against a dependency that can never arrive. Returns the number removed.
+    /// Required rather than defaulted: a composition of single removals is
+    /// correct but not atomic, and a backend must not inherit that silently.
+    fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>>;
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()>;
@@ -176,22 +206,38 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// state check prevents a stale resolver from overwriting a smaller genesis
     /// admitted by another facade. `batch` must be built against a fresh topic
     /// (empty `expected_heads`, `None` `expected_topic_state`). Returns the
-    /// number of admitted ops the reset removed. The default composition is
-    /// correct but not atomic; durable backends override it with a single
-    /// transaction.
+    /// number of admitted ops the reset removed. A rejected `batch` must leave
+    /// the local chain exactly as it was. Required rather than defaulted: a
+    /// reset followed by a separate admission is not atomic, and a backend must
+    /// not inherit that silently.
+    ///
+    /// `eviction` describes the payloads this reset discards. When it carries
+    /// any, backends must journal it under [`TopicEviction::key`] in this same
+    /// transaction: the reset is the moment those payloads stop existing
+    /// anywhere else, so a record written afterwards would leave a crash window
+    /// that loses acknowledged writes. The record is released by
+    /// [`Storage::clear_eviction`], never by the reset itself. A reset that
+    /// would push the store past [`MAX_PENDING_EVICTIONS`] outstanding records
+    /// must be refused with [`crate::Error::EvictionJournalFull`], leaving the
+    /// local chain in place.
     fn reset_topic_and_admit(
         &self,
         topic_id: &TopicId,
         expected_topic_state: &TopicState,
         batch: AdmittedBatch,
-    ) -> Result<usize> {
-        if self.topic_state(topic_id)?.as_ref() != Some(expected_topic_state) {
-            return Err(crate::Error::AdmissionConflict);
-        }
-        let removed = self.reset_topic(topic_id)?;
-        self.put_admitted_batch(batch)?;
-        Ok(removed)
-    }
+        eviction: Option<&TopicEviction>,
+    ) -> Result<usize>;
+
+    /// Journalled evictions no consumer has acknowledged yet. A restart drains
+    /// these before eviction recovery can be considered complete; each is the
+    /// only remaining copy of the payloads its reset removed.
+    fn pending_evictions(&self) -> Result<Vec<TopicEviction>>;
+
+    /// Release the journalled eviction named by `key`. The consumer calls this
+    /// only once it durably owns the payloads, so a crash before that point
+    /// leaves the record for the next restart. Releasing an absent key is not
+    /// an error: acknowledgement is idempotent.
+    fn clear_eviction(&self, key: &EvictionKey) -> Result<()>;
 
     fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
         let Some(meta) = self.get_meta(op_id)? else {
@@ -240,6 +286,38 @@ pub(super) fn sync_obligation_satisfied(obligation: &SyncObligation, ack: &PeerA
         return true;
     }
     !obligation.target_clock.is_empty() && ack.clock.dominates(&obligation.target_clock)
+}
+
+/// Reject a batch whose entry depends on an op that is not stored completely,
+/// checked against the same transaction that will write it. `stored_dep` must
+/// apply the [`Storage::dep_resolvable`] predicate inside that transaction.
+/// Enforcing this at the durability boundary is what keeps every admission path
+/// (batch admission, admission retry, genesis reset) from committing a dangling
+/// DAG edge.
+pub(super) fn ensure_deps_resolvable(
+    entries: &[(Op, OpMeta)],
+    mut stored_dep: impl FnMut(&OpId) -> Result<bool>,
+) -> Result<()> {
+    let batch = entries.iter().map(|(op, _)| op.id).collect::<BTreeSet<_>>();
+    for (_, meta) in entries {
+        for dep in &meta.deps {
+            if !batch.contains(dep) && !stored_dep(dep)? {
+                return Err(crate::Error::MissingDependency(*dep));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The eviction a reset must journal, with the key it takes. An eviction with
+/// no payloads leaves nothing to recover, so it takes no record and no
+/// acknowledgement.
+pub(super) fn journalled_eviction(
+    eviction: Option<&TopicEviction>,
+) -> Option<(EvictionKey, &TopicEviction)> {
+    eviction
+        .filter(|eviction| !eviction.evicted.is_empty())
+        .map(|eviction| (eviction.key(), eviction))
 }
 
 pub(super) fn stored_ack_dominates(existing: &PeerAck, incoming: &PeerAck) -> bool {

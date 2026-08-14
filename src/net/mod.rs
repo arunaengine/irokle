@@ -42,6 +42,7 @@ pub fn _message_type_name(message: &SyncMessage) -> &'static str {
         SyncMessage::Request(_) => "request",
         SyncMessage::Data(_) => "data",
         SyncMessage::Ack(_) => "ack",
+        SyncMessage::Failure(_) => "failure",
     }
 }
 

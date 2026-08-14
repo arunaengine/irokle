@@ -2,14 +2,16 @@
 //! Operation-log admission, DAG validation, and topic-state materialization.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
 
 use crate::storage::{
     AdmissionEffects, AdmittedBatch, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage,
     TopicState,
 };
 use crate::{
-    ActorId, Error, EventEnvelope, Op, OpBody, OpId, PeerId, Result, SignedOp, Signer,
+    ActorId, Error, EventEnvelope, EvictionKey, Op, OpBody, OpId, PeerId, Result, SignedOp, Signer,
     TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
 };
 
@@ -34,16 +36,49 @@ enum OpAdmission {
     Duplicate,
 }
 
-type GenesisResolution = (
-    Vec<Op>,
-    Option<TopicEviction>,
-    Option<OpId>,
-    Option<TopicState>,
-);
+/// How much of an op the local store already holds. `Repair` is an id the local
+/// chain already accounts for while its records are missing or half written:
+/// refilling it is not an append, so the actor-position checks that guard a new
+/// op do not apply to it.
+enum StoredOp {
+    Absent,
+    Repair,
+    Complete,
+}
+
+type GenesisResolution = (Vec<Op>, Option<ResetPlan>, Option<OpId>);
+
+/// The reset an admission must fold into its own storage transaction: the state
+/// that must still be current for it to proceed, and the record of the payloads
+/// it discards. Pairing them keeps the record inseparable from the removal.
+struct ResetPlan {
+    expected_state: TopicState,
+    eviction: TopicEviction,
+}
+
+/// The rebuild a quarantine is about to run: the topic state it must still
+/// find, the ops that stay, and the payloads the caller may re-emit.
+struct QuarantinePlan {
+    state: TopicState,
+    survivors: Vec<Op>,
+    evicted: Vec<EvictedOp>,
+}
+
+/// The batch-local view admission validates against: the entries this batch has
+/// already accepted, plus whether the topic is being reset. A reset removes the
+/// stored actor slots and tips of the topic in the same transaction, so they
+/// must not count towards the position of an op the batch installs.
+struct BatchOverlay<'a> {
+    ops: &'a BTreeMap<OpId, Op>,
+    meta: &'a BTreeMap<OpId, OpMeta>,
+    tips: &'a BTreeMap<(TopicId, ActorId), (u64, OpId)>,
+    index: &'a BTreeMap<(TopicId, ActorId, u64), OpId>,
+    reset: bool,
+}
 
 /// A single op removed from the losing side of a genesis collision, carrying
 /// enough for the application to re-emit it under the winning genesis.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvictedOp {
     pub op_id: OpId,
     pub actor_id: ActorId,
@@ -52,16 +87,36 @@ pub struct EvictedOp {
     pub payload: TopicPayload,
 }
 
-/// Reports that a topic's local chain was discarded in favour of a foreign
-/// genesis with a smaller op id. `evicted` holds the reset chain's non-genesis
-/// payloads ordered by `(actor_id, actor_seq)`; re-emission is the embedder's
-/// responsibility.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Reports ops discarded from a topic's local chain. A genesis tie-break sets
+/// `losing_genesis` to the replaced chain's genesis and `winning_genesis` to the
+/// foreign one that took its place; a quarantine of ops no head reaches has no
+/// second genesis to name, so both fields carry the surviving genesis and equal
+/// fields are what tells the two apart. `evicted` holds the discarded
+/// non-genesis payloads ordered by `(actor_id, actor_seq)`; re-emission is the
+/// embedder's responsibility.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicEviction {
     pub topic_id: TopicId,
     pub losing_genesis: OpId,
     pub winning_genesis: OpId,
     pub evicted: Vec<EvictedOp>,
+}
+
+impl TopicEviction {
+    /// Identity of this eviction's durable journal record, derived from its
+    /// content. The same discarded chain always names the same record, so
+    /// repeating the write, the delivery, or the recovery cannot multiply
+    /// entries, and a consumer can acknowledge a record from the eviction alone.
+    pub fn key(&self) -> EvictionKey {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.topic_id.as_ref());
+        hasher.update(self.losing_genesis.as_ref());
+        hasher.update(self.winning_genesis.as_ref());
+        for evicted in &self.evicted {
+            hasher.update(evicted.op_id.as_ref());
+        }
+        EvictionKey::from_bytes(*hasher.finalize().as_bytes())
+    }
 }
 
 /// Outcome of an admission pass: the accepted op ids plus any topic evictions
@@ -83,6 +138,10 @@ fn is_structural_genesis(op: &Op) -> bool {
 #[derive(Clone)]
 pub struct Oplog<S = MemoryStorage> {
     storage: S,
+    // Topics whose stored records were scanned and found whole. Admission keeps
+    // that invariant, so only damage from outside irokle can reintroduce a
+    // hole; scanning once per topic keeps the sync fast path off a full scan.
+    whole_topics: Arc<Mutex<BTreeSet<TopicId>>>,
 }
 
 impl Default for Oplog<MemoryStorage> {
@@ -93,18 +152,191 @@ impl Default for Oplog<MemoryStorage> {
 
 impl Oplog<MemoryStorage> {
     pub fn new() -> Self {
-        Self {
-            storage: MemoryStorage::new(),
-        }
+        Self::with_storage(MemoryStorage::new())
     }
 }
 
 impl<S: Storage> Oplog<S> {
     pub fn with_storage(storage: S) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            whole_topics: Arc::new(Mutex::new(BTreeSet::new())),
+        }
     }
     pub fn storage(&self) -> &S {
         &self.storage
+    }
+
+    /// Ids this topic references but cannot resolve: admitted ops whose own
+    /// records are incomplete, dependencies of admitted ops that are not fully
+    /// stored, and the holes buffered ops are still waiting for. An empty set
+    /// means every admitted op is locally usable, which is what lets sync
+    /// certify the topic; anything else is turned into concrete repair wants.
+    pub fn topic_unresolved(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
+        let mut unresolved = self.storage.pending_missing_deps(topic_id)?;
+        unresolved.extend(self.scan_stored_holes(topic_id)?);
+        Ok(unresolved)
+    }
+
+    fn scan_stored_holes(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
+        if self.whole_topics()?.contains(topic_id) {
+            return Ok(BTreeSet::new());
+        }
+        let mut holes = BTreeSet::new();
+        for id in self.storage.list_op_ids(topic_id)? {
+            let Some(meta) = self.storage.get_meta(&id)? else {
+                holes.insert(id);
+                continue;
+            };
+            if self.storage.get_op(&id)?.is_none() {
+                holes.insert(id);
+            }
+            for dep in &meta.deps {
+                if !self.storage.dep_resolvable(dep)? {
+                    holes.insert(*dep);
+                }
+            }
+        }
+        if holes.is_empty() {
+            self.whole_topics()?.insert(*topic_id);
+        }
+        Ok(holes)
+    }
+
+    /// Drop the record of which topics were found whole, so the next integrity
+    /// question audits the stored records again. Admission cannot introduce a
+    /// hole, but damage from outside irokle can, and nothing else would ever
+    /// ask a second time.
+    pub fn recheck_topics(&self) -> Result<()> {
+        self.whole_topics()?.clear();
+        Ok(())
+    }
+
+    /// Ops the topic stores that no head reaches. Admission puts every new op
+    /// into `heads` and takes it out only when a later op names it as a
+    /// dependency, so the head closure covers exactly the ops the local chain
+    /// accounts for. Anything outside it was never part of this lineage's
+    /// frontier and its ancestry cannot be validated against the current
+    /// genesis: the pre-`reset_topic_and_admit` genesis reset could leave such
+    /// a descendant behind after removing the losing chain it stood on.
+    fn topic_orphans(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
+        let mut reachable = BTreeSet::new();
+        let mut frontier = self
+            .storage
+            .heads(topic_id)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        while let Some(id) = frontier.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            // A head-reachable id with no metadata is an ordinary hole to
+            // repair, not an orphan; it still counts as accounted for.
+            let Some(meta) = self.storage.get_meta(&id)? else {
+                continue;
+            };
+            frontier.extend(meta.deps);
+        }
+        let mut orphans = self.storage.list_op_ids(topic_id)?;
+        orphans.retain(|id| !reachable.contains(id));
+        Ok(orphans)
+    }
+
+    /// Discard the ops no head reaches and rebuild the topic from the ops that
+    /// remain, in the single transaction genesis adoption already uses. The
+    /// survivors are re-validated and re-admitted from the genesis up, so heads,
+    /// clock, actor indexes, generation and fingerprint come back agreeing with
+    /// one current-genesis DAG, and acks and obligations naming the old frontier
+    /// are dropped rather than carried over. Returns the discarded payloads for
+    /// re-emission, or `None` when there is nothing to quarantine.
+    pub fn quarantine_orphans(&self, topic_id: &TopicId) -> Result<Option<TopicEviction>> {
+        if self.topic_orphans(topic_id)?.is_empty() {
+            return Ok(None);
+        }
+        // The rebuild resets the topic, so it must not interleave with a
+        // genesis tie-break resolving the same topic.
+        let _guard = GENESIS_RESOLUTION_LOCK
+            .lock()
+            .map_err(|_| Error::Storage("genesis resolution lock poisoned".into()))?;
+        for _ in 0..MAX_ADMISSION_RETRIES {
+            let Some(plan) = self.plan_quarantine(topic_id)? else {
+                return Ok(None);
+            };
+            let QuarantinePlan {
+                state,
+                survivors,
+                evicted,
+            } = plan;
+            let eviction = TopicEviction {
+                topic_id: *topic_id,
+                losing_genesis: state.genesis,
+                winning_genesis: state.genesis,
+                evicted,
+            };
+            let reset = ResetPlan {
+                expected_state: state,
+                eviction: eviction.clone(),
+            };
+            match self.admit_ops_batch(None, survivors, &BTreeSet::new(), Some(reset)) {
+                Err(Error::AdmissionConflict) => continue,
+                Err(err) => return Err(err),
+                Ok(_) => {}
+            }
+            self.whole_topics()?.remove(topic_id);
+            tracing::warn!(
+                %topic_id,
+                genesis = %eviction.winning_genesis,
+                quarantined = eviction.evicted.len(),
+                "quarantined ops no head reaches and rebuilt the topic"
+            );
+            return Ok(Some(eviction));
+        }
+        Err(Error::AdmissionConflict)
+    }
+
+    /// Split the topic's stored ops into the head closure and the orphans.
+    /// Refuses while the head closure itself has a hole: that is ordinary
+    /// repair work sync must finish first, and a rebuild would drop the whole
+    /// branch standing on it. Refuses too when the closure does not reach the
+    /// recorded genesis, since then there is no chain left to rebuild from.
+    fn plan_quarantine(&self, topic_id: &TopicId) -> Result<Option<QuarantinePlan>> {
+        let Some(state) = self.storage.topic_state(topic_id)? else {
+            return Ok(None);
+        };
+        let orphans = self.topic_orphans(topic_id)?;
+        if orphans.is_empty() {
+            return Ok(None);
+        }
+        let mut survivors = Vec::new();
+        for id in self.storage.list_op_ids(topic_id)? {
+            if orphans.contains(&id) {
+                continue;
+            }
+            let Some(op) = self.storage.get_op(&id)? else {
+                tracing::warn!(%topic_id, %id, "deferred quarantine: repair the frontier first");
+                return Ok(None);
+            };
+            survivors.push(op);
+        }
+        if !survivors.iter().any(|op| op.id == state.genesis) {
+            tracing::warn!(
+                %topic_id,
+                genesis = %state.genesis,
+                "refused quarantine: no head reaches the recorded genesis"
+            );
+            return Ok(None);
+        }
+        Ok(Some(QuarantinePlan {
+            evicted: self.evicted_ops(&orphans)?,
+            state,
+            survivors,
+        }))
+    }
+
+    fn whole_topics(&self) -> Result<std::sync::MutexGuard<'_, BTreeSet<TopicId>>> {
+        self.whole_topics
+            .lock()
+            .map_err(|_| Error::Storage("topic integrity cache lock poisoned".into()))
     }
 
     pub fn create_topic_genesis(
@@ -416,15 +648,16 @@ impl<S: Storage> Oplog<S> {
             None
         };
         for _ in 0..MAX_ADMISSION_RETRIES {
-            let (ops_to_admit, eviction, rejected_genesis, reset_expected_state) = if has_genesis {
+            let (ops_to_admit, reset, rejected_genesis) = if has_genesis {
                 self.resolve_genesis_collision(ops.clone(), verified)?
             } else {
-                (ops.clone(), None, None, None)
+                (ops.clone(), None, None)
             };
+            let eviction = reset.as_ref().map(|plan| plan.eviction.clone());
             // A won foreign genesis discards the local chain: admit the winner
             // batch against a fresh topic and fold the reset into the same
             // storage transaction as its admission (`reset_topic_and_admit`).
-            match self.admit_ops_batch(source_peer, ops_to_admit, verified, reset_expected_state) {
+            match self.admit_ops_batch(source_peer, ops_to_admit, verified, reset) {
                 Err(Error::AdmissionConflict) => continue,
                 Ok(accepted) => {
                     if let Some(losing) = rejected_genesis {
@@ -441,45 +674,36 @@ impl<S: Storage> Oplog<S> {
     /// Drain pending ops that transitively wait on a genesis that lost (or was
     /// rejected by) a collision resolution: the local topic keeps a different
     /// genesis, so that id will never be admitted here and nothing depending on
-    /// it can ever become ready. Walks the waiter index breadth-first;
-    /// `remove_pending_op` keeps the pending counters consistent.
+    /// it can ever become ready. The storage layer walks the waiter closure in
+    /// one transaction so a crash cannot strand half of it.
     fn purge_losing_pending(&self, losing_genesis: OpId) -> Result<()> {
-        let mut frontier = vec![losing_genesis];
-        let mut seen = BTreeSet::new();
-        while let Some(dep) = frontier.pop() {
-            for (_, op) in self.storage.pending_waiters(&dep)? {
-                if seen.insert(op.id) {
-                    self.storage.remove_pending_op(&op.id)?;
-                    frontier.push(op.id);
-                }
-            }
-        }
-        Ok(())
+        self.storage
+            .purge_pending_waiters(&losing_genesis)
+            .map(drop)
     }
 
     /// Resolve a genesis tie-break for a batch that carries a structurally
     /// valid genesis. Returns the ops to admit (unchanged when the incoming
     /// genesis wins or there is no collision; with a losing foreign genesis
-    /// filtered out when the local one wins), any eviction produced when the
-    /// local topic is reset, any rejected genesis to purge from pending, and
-    /// the exact pre-reset state that must still be current for the reset to
-    /// proceed.
+    /// filtered out when the local one wins), the reset the admission must
+    /// perform when the local topic loses, and any rejected genesis to purge
+    /// from pending.
     fn resolve_genesis_collision(
         &self,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
     ) -> Result<GenesisResolution> {
         let Some(genesis) = ops.iter().find(|op| is_structural_genesis(op)).cloned() else {
-            return Ok((ops, None, None, None));
+            return Ok((ops, None, None));
         };
         let topic_id = genesis.signed.body.topic_id;
         let Some(state) = self.storage.topic_state(&topic_id)? else {
             // Fresh topic: normal admission accepts the genesis.
-            return Ok((ops, None, None, None));
+            return Ok((ops, None, None));
         };
         if state.genesis == genesis.id {
             // Same node re-sending its genesis: normal dedup handles it.
-            return Ok((ops, None, None, None));
+            return Ok((ops, None, None));
         }
         // Only a signature-valid genesis may win the tie-break.
         if !verified.contains(&genesis.id) {
@@ -506,7 +730,7 @@ impl<S: Storage> Oplog<S> {
                     "rejected non-member genesis collision"
                 );
                 let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
-                return Ok((filtered, None, Some(genesis.id), None));
+                return Ok((filtered, None, Some(genesis.id)));
             }
             let eviction = self.extract_eviction(topic_id, &state, genesis.id)?;
             tracing::warn!(
@@ -516,7 +740,14 @@ impl<S: Storage> Oplog<S> {
                 evicted = eviction.evicted.len(),
                 "genesis collision resolved: reset local topic for smaller winning genesis"
             );
-            Ok((ops, Some(eviction), None, Some(state)))
+            Ok((
+                ops,
+                Some(ResetPlan {
+                    expected_state: state,
+                    eviction,
+                }),
+                None,
+            ))
         } else {
             tracing::warn!(
                 %topic_id,
@@ -526,7 +757,7 @@ impl<S: Storage> Oplog<S> {
                 "genesis collision resolved: kept local genesis, rejected larger foreign genesis"
             );
             let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
-            Ok((filtered, None, Some(genesis.id), None))
+            Ok((filtered, None, Some(genesis.id)))
         }
     }
 
@@ -542,21 +773,35 @@ impl<S: Storage> Oplog<S> {
         local_state: &TopicState,
         winning_genesis: OpId,
     ) -> Result<TopicEviction> {
+        let mut discarded = self.storage.list_op_ids(&topic_id)?;
+        discarded.remove(&local_state.genesis);
+        Ok(TopicEviction {
+            topic_id,
+            losing_genesis: local_state.genesis,
+            winning_genesis,
+            evicted: self.evicted_ops(&discarded)?,
+        })
+    }
+
+    /// Payloads for the ops named by `ids`, ordered by actor then sequence so
+    /// re-emission preserves each actor's order. A half-stored id is reported
+    /// and skipped: its payload cannot be read, and failing here would strand
+    /// the whole topic instead of discarding one unreadable record.
+    fn evicted_ops(&self, ids: &BTreeSet<OpId>) -> Result<Vec<EvictedOp>> {
         let mut metas = Vec::new();
-        for op_id in self.storage.list_op_ids(&topic_id)? {
-            if let Some(meta) = self.storage.get_meta(&op_id)? {
-                metas.push(meta);
+        for id in ids {
+            match self.storage.get_meta(id)? {
+                Some(meta) => metas.push(meta),
+                None => tracing::warn!(%id, "discarded op has no metadata to re-emit"),
             }
         }
         metas.sort_by_key(|meta| (meta.actor_id, meta.actor_seq));
         let mut evicted = Vec::new();
         for meta in metas {
-            if meta.id == local_state.genesis {
+            let Some(op) = self.storage.get_op(&meta.id)? else {
+                tracing::warn!(id = %meta.id, "discarded op has no record to re-emit");
                 continue;
-            }
-            let op = self.storage.get_op(&meta.id)?.ok_or_else(|| {
-                Error::Storage(format!("missing op during eviction: {}", meta.id))
-            })?;
+            };
             evicted.push(EvictedOp {
                 op_id: meta.id,
                 actor_id: meta.actor_id,
@@ -565,12 +810,7 @@ impl<S: Storage> Oplog<S> {
                 payload: op.signed.body.payload.clone(),
             });
         }
-        Ok(TopicEviction {
-            topic_id,
-            losing_genesis: local_state.genesis,
-            winning_genesis,
-            evicted,
-        })
+        Ok(evicted)
     }
 
     fn admit_ops_batch(
@@ -578,7 +818,7 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
-        reset_expected_state: Option<TopicState>,
+        reset_plan: Option<ResetPlan>,
     ) -> Result<BTreeSet<crate::OpId>> {
         let ops = topological_ops(ops)?;
         let mut accepted = BTreeSet::new();
@@ -592,7 +832,7 @@ impl<S: Storage> Oplog<S> {
         // On the reset path the local topic is wiped and the winner batch is
         // self-contained, so validate and admit it against a fresh topic; the
         // reset is applied atomically with these writes below.
-        let reset = reset_expected_state.is_some();
+        let reset = reset_plan.is_some();
         let (expected_heads, expected_state) = if reset {
             (BTreeSet::new(), None)
         } else {
@@ -615,18 +855,42 @@ impl<S: Storage> Oplog<S> {
             if !verified.contains(&op.id) {
                 op.validate()?;
             }
-            if self.storage.get_op(&op.id)?.is_some() {
+            let stored = if reset {
+                StoredOp::Absent
+            } else {
+                self.stored_op_state(&op)?
+            };
+            if matches!(stored, StoredOp::Complete) {
                 continue;
             }
 
-            let missing_deps = self.missing_deps_projected(&op, &overlay_ops)?;
+            let missing_deps = self.missing_deps_projected(&op, &overlay_ops, reset)?;
+            // Refilling an already-accounted id changes no head, clock entry or
+            // topic state: only the records themselves are rewritten, once its
+            // dependencies can be resolved again.
+            if matches!(stored, StoredOp::Repair) {
+                if missing_deps.is_empty() {
+                    let meta = self.meta_for_projected(&op, &overlay_meta)?;
+                    overlay_meta.insert(op.id, meta.clone());
+                    overlay_ops.insert(op.id, op.clone());
+                    accepted.insert(op.id);
+                    entries.push((op, meta));
+                } else {
+                    pending.push((op, missing_deps));
+                }
+                continue;
+            }
             if !missing_deps.is_empty() {
                 match self.validate_pending_op_projected(
                     &op,
                     &missing_deps,
-                    &overlay_meta,
-                    &overlay_tips,
-                    &overlay_index,
+                    &BatchOverlay {
+                        ops: &overlay_ops,
+                        meta: &overlay_meta,
+                        tips: &overlay_tips,
+                        index: &overlay_index,
+                        reset,
+                    },
                     state.as_ref(),
                 )? {
                     OpAdmission::Duplicate => {}
@@ -637,10 +901,13 @@ impl<S: Storage> Oplog<S> {
 
             if let OpAdmission::Duplicate = self.validate_op_projected(
                 &op,
-                &overlay_ops,
-                &overlay_meta,
-                &overlay_tips,
-                &overlay_index,
+                &BatchOverlay {
+                    ops: &overlay_ops,
+                    meta: &overlay_meta,
+                    tips: &overlay_tips,
+                    index: &overlay_index,
+                    reset,
+                },
                 &heads,
                 state.as_ref(),
             )? {
@@ -683,15 +950,13 @@ impl<S: Storage> Oplog<S> {
             entries.push((op, meta));
         }
 
-        if reset {
-            // Reset and winner admission share one storage transaction so a
-            // crash never leaves the topic empty with the winner uninstalled.
-            let reset_expected_state = reset_expected_state
-                .as_ref()
-                .ok_or(Error::AdmissionConflict)?;
+        if let Some(plan) = &reset_plan {
+            // Reset, winner admission, and the record of the discarded payloads
+            // share one storage transaction, so a crash never leaves the topic
+            // empty with the winner uninstalled or the payloads unrecorded.
             self.storage.reset_topic_and_admit(
                 &topic_id,
-                reset_expected_state,
+                &plan.expected_state,
                 AdmittedBatch {
                     topic_id,
                     expected_heads,
@@ -701,6 +966,7 @@ impl<S: Storage> Oplog<S> {
                     topic_state: topic_state_changed.then(|| state.clone()).flatten(),
                     effects: AdmissionEffects::default(),
                 },
+                Some(&plan.eviction),
             )?;
         } else if !entries.is_empty() {
             self.storage.put_admitted_batch(AdmittedBatch {
@@ -838,10 +1104,13 @@ impl<S: Storage> Oplog<S> {
             BTreeMap::from([((topic_id, actor_id, genesis_meta.actor_seq), genesis_op.id)]);
         if let OpAdmission::Duplicate = self.validate_op_projected(
             &event_op,
-            &overlay_ops,
-            &overlay_meta,
-            &overlay_tips,
-            &overlay_index,
+            &BatchOverlay {
+                ops: &overlay_ops,
+                meta: &overlay_meta,
+                tips: &overlay_tips,
+                index: &overlay_index,
+                reset: false,
+            },
             &genesis_heads,
             Some(&state),
         )? {
@@ -1071,14 +1340,24 @@ impl<S: Storage> Oplog<S> {
         })
     }
 
+    /// Dependencies this op cannot resolve yet. A dependency counts as present
+    /// only when both its op record and its metadata are stored: the DAG is
+    /// traversed through metadata, so either record alone is a hole to refill,
+    /// never a satisfied edge. On the reset path storage is about to be wiped,
+    /// so only the batch overlay counts.
     fn missing_deps_projected(
         &self,
         op: &Op,
         overlay_ops: &BTreeMap<crate::OpId, Op>,
+        reset: bool,
     ) -> Result<BTreeSet<crate::OpId>> {
         let mut missing = BTreeSet::new();
         for dep in &op.signed.body.deps {
-            if !overlay_ops.contains_key(dep) && self.storage.get_op(dep)?.is_none() {
+            if overlay_ops.contains_key(dep) {
+                continue;
+            }
+            if reset || self.storage.get_op(dep)?.is_none() || self.storage.get_meta(dep)?.is_none()
+            {
                 missing.insert(*dep);
             }
         }
@@ -1089,9 +1368,7 @@ impl<S: Storage> Oplog<S> {
         &self,
         op: &Op,
         missing_deps: &BTreeSet<crate::OpId>,
-        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
-        overlay_tips: &BTreeMap<(TopicId, ActorId), (u64, crate::OpId)>,
-        overlay_index: &BTreeMap<(TopicId, ActorId, u64), crate::OpId>,
+        overlay: &BatchOverlay<'_>,
         state: Option<&TopicState>,
     ) -> Result<OpAdmission> {
         let body = &op.signed.body;
@@ -1109,15 +1386,12 @@ impl<S: Storage> Oplog<S> {
                 actual: 0,
             });
         }
-        if let Some(existing) = self
-            .storage
-            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            .or_else(|| {
-                overlay_index
-                    .get(&(body.topic_id, body.actor_id, body.actor_seq))
-                    .copied()
-            })
-        {
+        if let Some(existing) = self.stored_actor_index(body, overlay.reset)?.or_else(|| {
+            overlay
+                .index
+                .get(&(body.topic_id, body.actor_id, body.actor_seq))
+                .copied()
+        }) {
             if existing != op.id {
                 return Err(Error::ActorFork);
             }
@@ -1171,7 +1445,7 @@ impl<S: Storage> Oplog<S> {
                 return Err(Error::ActorPrevMismatch);
             }
             if !missing_deps.contains(&prev) {
-                let prev_meta = self.meta_projected(&prev, overlay_meta)?;
+                let prev_meta = self.meta_projected(&prev, overlay.meta)?;
                 if prev_meta.topic_id != body.topic_id || prev_meta.actor_id != body.actor_id {
                     return Err(Error::ActorPrevMismatch);
                 }
@@ -1183,9 +1457,9 @@ impl<S: Storage> Oplog<S> {
                 }
             }
         }
-        let expected = match overlay_tips.get(&(body.topic_id, body.actor_id)).copied() {
+        let expected = match overlay.tips.get(&(body.topic_id, body.actor_id)).copied() {
             Some(tip) => Some(tip),
-            None => self.storage.actor_tip(&body.topic_id, &body.actor_id)?,
+            None => self.stored_actor_tip(body, overlay.reset)?,
         };
         if let Some((tip_seq, tip_id)) = expected {
             let next_seq = checked_next(tip_seq)?;
@@ -1209,7 +1483,7 @@ impl<S: Storage> Oplog<S> {
             if missing_deps.contains(dep) {
                 continue;
             }
-            let meta = self.meta_projected(dep, overlay_meta)?;
+            let meta = self.meta_projected(dep, overlay.meta)?;
             if meta.topic_id != body.topic_id {
                 return Err(Error::TopicMismatch);
             }
@@ -1220,14 +1494,10 @@ impl<S: Storage> Oplog<S> {
         Ok(OpAdmission::Admit)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn validate_op_projected(
         &self,
         op: &Op,
-        overlay_ops: &BTreeMap<crate::OpId, Op>,
-        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
-        overlay_tips: &BTreeMap<(TopicId, ActorId), (u64, crate::OpId)>,
-        overlay_index: &BTreeMap<(TopicId, ActorId, u64), crate::OpId>,
+        overlay: &BatchOverlay<'_>,
         heads: &BTreeSet<crate::OpId>,
         state: Option<&TopicState>,
     ) -> Result<OpAdmission> {
@@ -1235,15 +1505,12 @@ impl<S: Storage> Oplog<S> {
         if body.actor_id != actor_id_for(body.topic_id, body.author) {
             return Err(Error::ActorAuthorMismatch);
         }
-        if let Some(existing) = self
-            .storage
-            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            .or_else(|| {
-                overlay_index
-                    .get(&(body.topic_id, body.actor_id, body.actor_seq))
-                    .copied()
-            })
-        {
+        if let Some(existing) = self.stored_actor_index(body, overlay.reset)?.or_else(|| {
+            overlay
+                .index
+                .get(&(body.topic_id, body.actor_id, body.actor_seq))
+                .copied()
+        }) {
             if existing != op.id {
                 return Err(Error::ActorFork);
             }
@@ -1270,8 +1537,8 @@ impl<S: Storage> Oplog<S> {
                     self.projected_state_for_deps(
                         &body.topic_id,
                         &body.deps,
-                        overlay_ops,
-                        overlay_meta,
+                        overlay.ops,
+                        overlay.meta,
                     )?
                     .members
                     .contains(&body.author)
@@ -1288,8 +1555,8 @@ impl<S: Storage> Oplog<S> {
                     self.projected_state_for_deps(
                         &body.topic_id,
                         &body.deps,
-                        overlay_ops,
-                        overlay_meta,
+                        overlay.ops,
+                        overlay.meta,
                     )?
                     .members
                     .contains(&body.author)
@@ -1299,9 +1566,9 @@ impl<S: Storage> Oplog<S> {
                 }
             }
         }
-        let expected = match overlay_tips.get(&(body.topic_id, body.actor_id)).copied() {
+        let expected = match overlay.tips.get(&(body.topic_id, body.actor_id)).copied() {
             Some(tip) => Some(tip),
-            None => self.storage.actor_tip(&body.topic_id, &body.actor_id)?,
+            None => self.stored_actor_tip(body, overlay.reset)?,
         };
         let (expected_seq, expected_prev) = next_actor_position(expected)?;
         if body.actor_seq != expected_seq {
@@ -1318,7 +1585,7 @@ impl<S: Storage> Oplog<S> {
         }
         let mut generation = 0;
         for id in &body.deps {
-            let meta = self.meta_projected(id, overlay_meta)?;
+            let meta = self.meta_projected(id, overlay.meta)?;
             generation = generation.max(checked_next(meta.generation)?);
         }
         if body.generation != generation {
@@ -1327,21 +1594,57 @@ impl<S: Storage> Oplog<S> {
         Ok(OpAdmission::Admit)
     }
 
+    /// The stored actor slot and tip, or `None` on the reset path. A reset wipes
+    /// every actor index and tip of the topic in the same transaction as the
+    /// admission, so validating against them would judge the batch by a chain
+    /// that is about to stop existing.
+    fn stored_actor_index(&self, body: &OpBody, reset: bool) -> Result<Option<OpId>> {
+        if reset {
+            return Ok(None);
+        }
+        self.storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)
+    }
+
+    fn stored_actor_tip(&self, body: &OpBody, reset: bool) -> Result<Option<(u64, OpId)>> {
+        if reset {
+            return Ok(None);
+        }
+        self.storage.actor_tip(&body.topic_id, &body.actor_id)
+    }
+
     /// Re-reads storage after a tip/seq mismatch: a concurrent admission may
     /// have committed this exact op between the batch dedup check and the
-    /// validation reads. Such ops are duplicates, not gaps or forks. Op ids
-    /// are content-addressed, so an actor-index entry mapping the op's seq to
-    /// its exact id also proves admission even while the op record itself is
-    /// not yet visible mid-commit.
+    /// validation reads. Only a completely stored op is such a duplicate; a
+    /// half-stored one is damage that [`Self::stored_op_state`] routes into
+    /// repair, and calling it a duplicate is what left it broken forever.
     fn is_admitted_duplicate(&self, op: &Op) -> Result<bool> {
-        if self.storage.get_op(&op.id)?.is_some() {
-            return Ok(true);
+        self.storage.dep_resolvable(&op.id)
+    }
+
+    /// Classify what the store already holds for `op`. Both records present is
+    /// a duplicate; either record alone, or an actor slot or child edge naming
+    /// this exact id while the records are gone, is damage the local chain
+    /// already accounts for and must repair in place.
+    fn stored_op_state(&self, op: &Op) -> Result<StoredOp> {
+        let has_op = self.storage.get_op(&op.id)?.is_some();
+        let has_meta = self.storage.get_meta(&op.id)?.is_some();
+        if has_op && has_meta {
+            return Ok(StoredOp::Complete);
+        }
+        if has_op || has_meta {
+            return Ok(StoredOp::Repair);
         }
         let body = &op.signed.body;
-        Ok(self
+        if self
             .storage
             .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            == Some(op.id))
+            == Some(op.id)
+            || !self.storage.children(&op.id)?.is_empty()
+        {
+            return Ok(StoredOp::Repair);
+        }
+        Ok(StoredOp::Absent)
     }
 
     fn projected_state_for_deps(

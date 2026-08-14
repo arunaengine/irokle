@@ -24,7 +24,7 @@ pub use clock::ActorClock;
 pub use crypto::{Ed25519Signer, Signer, canonical_bytes, verify};
 pub use error::{Error, Result};
 pub use event::{Event, EventEnvelope};
-pub use ids::{ActorId, IdParseError, OpId, PeerId, TopicId, actor_id_for};
+pub use ids::{ActorId, EvictionKey, IdParseError, OpId, PeerId, TopicId, actor_id_for};
 pub use irokle_derive::Event;
 pub use node::{Irokle, IrokleBuilder, NodeConfig, PublishOptions, RawTopic, Topic, WriteConcern};
 pub use op::{Op, OpBody, SignedOp};

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Strongly typed 32-byte identifiers for topics, peers, actors, and ops.
+//! Strongly typed 32-byte identifiers for topics, peers, actors, ops, and
+//! durable eviction records.
 
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
@@ -111,6 +112,7 @@ id_type!(OpId);
 id_type!(TopicId);
 id_type!(ActorId);
 id_type!(PeerId);
+id_type!(EvictionKey);
 
 pub fn actor_id_for(topic_id: TopicId, peer_id: PeerId) -> ActorId {
     let mut hasher = blake3::Hasher::new();

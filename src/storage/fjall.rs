@@ -5,12 +5,16 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, TopicInfo};
+use crate::{
+    ActorClock, ActorId, Error, EvictionKey, Op, OpId, PeerId, Result, TopicEviction, TopicId,
+    TopicInfo,
+};
 
 use super::{
-    AdmittedBatch, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL,
-    MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation, SyncPeerStatus,
-    TopicState, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
+    AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
+    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
+    SyncPeerStatus, TopicState, ensure_deps_resolvable, journalled_eviction, stored_ack_dominates,
+    sync_obligation_satisfied, topic_fingerprint_for,
 };
 
 #[cfg(feature = "fjall")]
@@ -23,6 +27,10 @@ pub struct FjallStorage {
 
 #[cfg(feature = "fjall")]
 const FJALL_SCHEMA_VERSION: u32 = 1;
+/// Eviction journal records. No other keyspace begins with `e`, so this is the
+/// whole prefix: unlike `ob`, it cannot be shadowed by a single-letter prefix.
+#[cfg(feature = "fjall")]
+const EVICTION_PREFIX: &[u8] = b"ev";
 #[cfg(feature = "fjall")]
 const FJALL_SCHEMA_VERSION_KEY: &[u8] = b"sv";
 
@@ -129,6 +137,17 @@ impl FjallStorage {
         Ok(fjall::Readable::get(tx, records, key.as_ref())?
             .map(|v| postcard::from_bytes(v.as_ref()))
             .transpose()?)
+    }
+
+    /// Outstanding journal records, counted no further than the cap the caller
+    /// compares against.
+    fn tx_eviction_count(
+        tx: &fjall::OptimisticWriteTx,
+        records: &fjall::OptimisticTxKeyspace,
+    ) -> usize {
+        fjall::Readable::prefix(tx, records, EVICTION_PREFIX)
+            .take(MAX_PENDING_EVICTIONS)
+            .count()
     }
 
     fn tx_remove_pending_op(
@@ -260,15 +279,21 @@ impl FjallStorage {
                 if meta.topic_id != topic_id {
                     return Err(Error::TopicMismatch);
                 }
-                if let Some(existing) =
-                    Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))?
-                {
-                    if existing != *op {
-                        return Err(Error::Storage("op id collision with different op".into()));
-                    }
+                let has_op =
+                    match Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))? {
+                        Some(existing) if existing != *op => {
+                            return Err(Error::Storage("op id collision with different op".into()));
+                        }
+                        Some(_) => true,
+                        None => false,
+                    };
+                let has_meta =
+                    Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", &op.id))?
+                        .is_some();
+                if has_op && has_meta {
                     continue;
                 }
-                if let Some(existing) = Self::tx_get::<OpId>(
+                let indexed = Self::tx_get::<OpId>(
                     tx,
                     &self.records,
                     [
@@ -278,9 +303,25 @@ impl FjallStorage {
                         &meta.actor_seq.to_be_bytes(),
                     ]
                     .concat(),
-                )? && existing != op.id
+                )?;
+                if let Some(existing) = indexed
+                    && existing != op.id
                 {
                     return Err(Error::ActorFork);
+                }
+                let has_children = fjall::Readable::prefix(
+                    tx,
+                    &self.records,
+                    [b"ch".as_slice(), op.id.as_ref()].concat(),
+                )
+                .next()
+                .is_some();
+                // Refilling an id the chain already accounts for is not an
+                // append: its actor position is already recorded, so the checks
+                // below cannot apply.
+                if has_op || has_meta || indexed == Some(op.id) || has_children {
+                    new_entries.push((op.clone(), meta.clone()));
+                    continue;
                 }
                 let tip =
                     actor_tips
@@ -325,6 +366,14 @@ impl FjallStorage {
                 new_entries.push((op.clone(), meta.clone()));
             }
 
+            ensure_deps_resolvable(&new_entries, |dep| {
+                Ok(
+                    Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", dep))?.is_some()
+                        && Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", dep))?
+                            .is_some(),
+                )
+            })?;
+
             let mut clock: ActorClock =
                 Self::tx_get(tx, &self.records, Self::key_id(b"ac", &topic_id))?
                     .unwrap_or_default();
@@ -360,17 +409,23 @@ impl FjallStorage {
                     .concat(),
                     &op.id,
                 )?;
-                Self::tx_put(
-                    tx,
-                    &self.records,
-                    [
-                        b"at".as_slice(),
-                        meta.topic_id.as_ref(),
-                        meta.actor_id.as_ref(),
-                    ]
-                    .concat(),
-                    &(meta.actor_seq, op.id),
-                )?;
+                // A refilled op sits behind the tip, so the tip only advances.
+                let tip_key = [
+                    b"at".as_slice(),
+                    meta.topic_id.as_ref(),
+                    meta.actor_id.as_ref(),
+                ]
+                .concat();
+                let stored_tip: Option<(u64, OpId)> =
+                    Self::tx_get(tx, &self.records, tip_key.as_slice())?;
+                if stored_tip.is_none_or(|(seq, _)| seq < meta.actor_seq) {
+                    Self::tx_put(
+                        tx,
+                        &self.records,
+                        tip_key.as_slice(),
+                        &(meta.actor_seq, op.id),
+                    )?;
+                }
                 if let Some((source_peer, _, pending_meta)) = Self::tx_get::<(PeerId, Op, OpMeta)>(
                     tx,
                     &self.records,
@@ -447,6 +502,76 @@ impl FjallStorage {
         }
     }
 
+    /// Erase a stored op record, leaving its metadata and indexes behind. Tests
+    /// use this to build a store that is already durably inconsistent.
+    #[cfg(test)]
+    pub(crate) fn drop_op_record(&self, id: &OpId) {
+        self.transaction(|tx| {
+            tx.remove(&self.records, Self::key_id(b"o", id));
+            Ok(())
+        })
+        .expect("fjall drop op record");
+    }
+
+    /// Erase a stored metadata record, leaving the op and indexes behind.
+    #[cfg(test)]
+    pub(crate) fn drop_meta_record(&self, id: &OpId) {
+        self.transaction(|tx| {
+            tx.remove(&self.records, Self::key_id(b"m", id));
+            Ok(())
+        })
+        .expect("fjall drop meta record");
+    }
+
+    /// Store both records and the topic/child indexes while leaving heads and
+    /// topic state alone, so the op is admitted yet reachable from no head.
+    #[cfg(test)]
+    pub(crate) fn orphan_op(&self, op: &Op, meta: &OpMeta) {
+        self.transaction(|tx| {
+            Self::tx_put(tx, &self.records, Self::key_id(b"o", &op.id), op)?;
+            Self::tx_put(tx, &self.records, Self::key_id(b"m", &op.id), meta)?;
+            Self::tx_put(
+                tx,
+                &self.records,
+                [b"to".as_slice(), meta.topic_id.as_ref(), op.id.as_ref()].concat(),
+                &(),
+            )?;
+            for dep in &meta.deps {
+                Self::tx_put(
+                    tx,
+                    &self.records,
+                    [b"ch".as_slice(), dep.as_ref(), op.id.as_ref()].concat(),
+                    &(),
+                )?;
+            }
+            Self::tx_put(
+                tx,
+                &self.records,
+                [
+                    b"as".as_slice(),
+                    meta.topic_id.as_ref(),
+                    meta.actor_id.as_ref(),
+                    &meta.actor_seq.to_be_bytes(),
+                ]
+                .concat(),
+                &op.id,
+            )?;
+            Self::tx_put(
+                tx,
+                &self.records,
+                [
+                    b"at".as_slice(),
+                    meta.topic_id.as_ref(),
+                    meta.actor_id.as_ref(),
+                ]
+                .concat(),
+                &(meta.actor_seq, op.id),
+            )?;
+            Ok(())
+        })
+        .expect("fjall orphan op");
+    }
+
     fn tx_reset_topic(
         &self,
         tx: &mut fjall::OptimisticWriteTx,
@@ -462,6 +587,18 @@ impl FjallStorage {
         }
         let removed = op_ids.len();
         for op_id in &op_ids {
+            // Edges pointing at this op go too, or a dependency the reset does
+            // not reach keeps naming a child the topic no longer holds.
+            if let Some(meta) =
+                Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", op_id))?
+            {
+                for dep in &meta.deps {
+                    tx.remove(
+                        &self.records,
+                        [b"ch".as_slice(), dep.as_ref(), op_id.as_ref()].concat(),
+                    );
+                }
+            }
             tx.remove(&self.records, Self::key_id(b"o", op_id));
             tx.remove(&self.records, Self::key_id(b"m", op_id));
             let ch_prefix = [b"ch".as_slice(), op_id.as_ref()].concat();
@@ -554,6 +691,7 @@ impl Storage for FjallStorage {
         topic_id: &TopicId,
         expected_topic_state: &TopicState,
         batch: AdmittedBatch,
+        eviction: Option<&TopicEviction>,
     ) -> Result<usize> {
         self.transaction(|tx| {
             let current_heads: BTreeSet<OpId> =
@@ -570,7 +708,34 @@ impl Storage for FjallStorage {
             }
             let removed = self.tx_reset_topic(tx, topic_id)?;
             self.tx_put_admitted_batch(tx, &batch)?;
+            // The journal entry commits with the reset that made it the only
+            // copy, so no crash point can leave the payloads unrecorded.
+            if let Some((key, eviction)) = journalled_eviction(eviction) {
+                let key = Self::key_id(EVICTION_PREFIX, &key);
+                if Self::tx_get::<TopicEviction>(tx, &self.records, key.as_slice())?.is_none()
+                    && Self::tx_eviction_count(tx, &self.records) >= MAX_PENDING_EVICTIONS
+                {
+                    return Err(Error::EvictionJournalFull);
+                }
+                Self::tx_put(tx, &self.records, key, eviction)?;
+            }
             Ok(removed)
+        })
+    }
+
+    fn pending_evictions(&self) -> Result<Vec<TopicEviction>> {
+        let mut out = Vec::new();
+        for item in self.records.inner().prefix(EVICTION_PREFIX) {
+            let (_, value) = item.into_inner()?;
+            out.push(postcard::from_bytes(value.as_ref())?);
+        }
+        Ok(out)
+    }
+
+    fn clear_eviction(&self, key: &EvictionKey) -> Result<()> {
+        self.transaction(|tx| {
+            tx.remove(&self.records, Self::key_id(EVICTION_PREFIX, key));
+            Ok(())
         })
     }
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
@@ -578,6 +743,13 @@ impl Storage for FjallStorage {
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
         self.get(Self::key_id(b"m", id))
+    }
+    fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
+        let read_tx = self.db.read_tx();
+        Ok(
+            fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", id))?.is_some()
+                && fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"m", id))?.is_some(),
+        )
     }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>> {
         self.list_op_ids(topic_id)?
@@ -666,7 +838,11 @@ impl Storage for FjallStorage {
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         self.transaction(|tx| {
-            if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))?.is_some() {
+            // Only a completely stored op is already admitted; a half stored
+            // one still has to buffer so its repair runs once its deps resolve.
+            if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))?.is_some()
+                && Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", &op.id))?.is_some()
+            {
                 return Ok(());
             }
             if let Some((_, existing, _)) = Self::tx_get::<(PeerId, Op, OpMeta)>(
@@ -682,7 +858,9 @@ impl Storage for FjallStorage {
                 Self::tx_remove_pending_op(tx, &self.records, &op.id)?;
             }
             for dep in &meta.missing_deps {
-                if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", dep))?.is_some() {
+                if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", dep))?.is_some()
+                    && Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", dep))?.is_some()
+                {
                     return Err(Error::AdmissionConflict);
                 }
             }
@@ -767,6 +945,8 @@ impl Storage for FjallStorage {
             let mut ready = true;
             for dep in &meta.missing_deps {
                 if fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", dep))?.is_none()
+                    || fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"m", dep))?
+                        .is_none()
                 {
                     ready = false;
                     break;
@@ -778,8 +958,49 @@ impl Storage for FjallStorage {
         }
         Ok(out)
     }
+    fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
+        let mut out = BTreeSet::new();
+        let read_tx = self.db.read_tx();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, b"po".as_slice()) {
+            let value = item.value()?;
+            let (_, _, meta): (PeerId, Op, OpMeta) = postcard::from_bytes(value.as_ref())?;
+            if meta.topic_id != *topic_id {
+                continue;
+            }
+            for dep in &meta.missing_deps {
+                if fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", dep))?.is_none()
+                    || fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"m", dep))?
+                        .is_none()
+                {
+                    out.insert(*dep);
+                }
+            }
+        }
+        Ok(out)
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         self.transaction(|tx| Self::tx_remove_pending_op(tx, &self.records, op_id))
+    }
+    fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
+        self.transaction(|tx| {
+            let mut frontier = vec![*dep_id];
+            let mut seen = BTreeSet::new();
+            while let Some(dep) = frontier.pop() {
+                let prefix = [b"pw".as_slice(), dep.as_ref()].concat();
+                let mut waiters = Vec::new();
+                for item in fjall::Readable::prefix(tx, &self.records, prefix) {
+                    let (key, _) = item.into_inner()?;
+                    waiters.push(Self::op_id_from_key(key.as_ref(), 2 + OpId::LEN)?);
+                }
+                for op_id in waiters {
+                    if seen.insert(op_id) {
+                        Self::tx_remove_pending_op(tx, &self.records, &op_id)?;
+                        frontier.push(op_id);
+                    }
+                }
+            }
+            Ok(seen.len())
+        })
     }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
         self.get([b"ak".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat())
