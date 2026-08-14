@@ -10,30 +10,66 @@ pub fn topological<S: Storage>(storage: &S, topic_id: &TopicId) -> Result<Vec<Op
     topological_subset(storage, &ids)
 }
 
+/// Order the ops named by `ids` oldest-first.
+///
+/// An id whose records are absent, or that depends on an op with no metadata,
+/// is treated as a hole still awaiting repair: it and everything in `ids`
+/// reachable from it are left out instead of failing the whole traversal, so a
+/// sync exchange still makes progress for the ops it can resolve. Nothing is
+/// discarded - a deferred op stays admitted and reappears here once its
+/// dependency is refetched. Only a cycle among fully present ops is an error.
 pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) -> Result<Vec<Op>> {
-    let mut indeg = BTreeMap::new();
+    let mut present = BTreeMap::new();
+    let mut blocked = BTreeSet::new();
     for id in ids {
-        let meta = storage
-            .get_meta(id)?
-            .ok_or_else(|| Error::Storage(format!("missing op meta for {id}")))?;
-        indeg.insert(
-            *id,
-            meta.deps.iter().filter(|dep| ids.contains(dep)).count(),
+        let (Some(meta), Some(op)) = (storage.get_meta(id)?, storage.get_op(id)?) else {
+            blocked.insert(*id);
+            continue;
+        };
+        let mut deps_in_set = 0_usize;
+        let mut dangling = false;
+        for dep in &meta.deps {
+            if ids.contains(dep) {
+                deps_in_set += 1;
+            } else if storage.get_meta(dep)?.is_none() {
+                dangling = true;
+            }
+        }
+        if dangling {
+            blocked.insert(*id);
+        } else {
+            present.insert(*id, (op, deps_in_set));
+        }
+    }
+
+    let mut frontier = blocked.iter().copied().collect::<Vec<_>>();
+    while let Some(id) = frontier.pop() {
+        for child in storage.children(&id)? {
+            if ids.contains(&child) && blocked.insert(child) {
+                present.remove(&child);
+                frontier.push(child);
+            }
+        }
+    }
+    if !blocked.is_empty() {
+        tracing::debug!(
+            deferred = blocked.len(),
+            "deferred ops with unresolved dependencies"
         );
     }
 
-    let mut ready = indeg
+    let mut ready = present
         .iter()
-        .filter_map(|(id, count)| (*count == 0).then_some(*id))
+        .filter_map(|(id, (_, count))| (*count == 0).then_some(*id))
         .collect::<VecDeque<_>>();
-    let mut out = Vec::with_capacity(ids.len());
+    let mut out = Vec::with_capacity(present.len());
     while let Some(id) = ready.pop_front() {
-        let op = storage
-            .get_op(&id)?
-            .ok_or_else(|| Error::Storage(format!("missing op {id}")))?;
-        out.push(op);
+        let Some((op, _)) = present.get(&id) else {
+            continue;
+        };
+        out.push(op.clone());
         for child in storage.children(&id)? {
-            if let Some(count) = indeg.get_mut(&child) {
+            if let Some((_, count)) = present.get_mut(&child) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     ready.push_back(child);
@@ -42,10 +78,8 @@ pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) 
         }
     }
 
-    if out.len() != ids.len() {
-        return Err(Error::Storage(
-            "cycle or missing dependency in op graph".into(),
-        ));
+    if out.len() != present.len() {
+        return Err(Error::Storage("cycle in op graph".into()));
     }
     Ok(out)
 }

@@ -1311,3 +1311,215 @@ fn duplicate_op_with_stale_dedup_read_is_skipped_not_a_gap() {
         3
     );
 }
+
+/// Wraps storage so a chosen op's metadata reads as absent, modelling a store
+/// that already contains a dangling DAG edge.
+#[derive(Clone)]
+struct HoleStorage {
+    inner: MemoryStorage,
+    hole: OpId,
+}
+
+impl Storage for HoleStorage {
+    fn put_admitted_batch(&self, batch: crate_storage::AdmittedBatch) -> Result<(), Error> {
+        self.inner.put_admitted_batch(batch)
+    }
+    fn get_op(&self, id: &OpId) -> Result<Option<Op>, Error> {
+        if *id == self.hole {
+            return Ok(None);
+        }
+        self.inner.get_op(id)
+    }
+    fn get_meta(&self, id: &OpId) -> Result<Option<crate_storage::OpMeta>, Error> {
+        if *id == self.hole {
+            return Ok(None);
+        }
+        self.inner.get_meta(id)
+    }
+    fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>, Error> {
+        self.inner.list_ops(topic_id)
+    }
+    fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.list_op_ids(topic_id)
+    }
+    fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.heads(topic_id)
+    }
+    fn children(&self, op_id: &OpId) -> Result<BTreeSet<OpId>, Error> {
+        self.inner.children(op_id)
+    }
+    fn actor_tip(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+    ) -> Result<Option<(u64, OpId)>, Error> {
+        self.inner.actor_tip(topic_id, actor_id)
+    }
+    fn actor_index(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+        seq: u64,
+    ) -> Result<Option<OpId>, Error> {
+        self.inner.actor_index(topic_id, actor_id, seq)
+    }
+    fn actor_clock(&self, topic_id: &TopicId) -> Result<ActorClock, Error> {
+        self.inner.actor_clock(topic_id)
+    }
+    fn topic_fingerprint(&self, topic_id: &TopicId) -> Result<[u8; 32], Error> {
+        self.inner.topic_fingerprint(topic_id)
+    }
+    fn max_generation(&self, topic_id: &TopicId) -> Result<u64, Error> {
+        self.inner.max_generation(topic_id)
+    }
+    fn topic_state(&self, topic_id: &TopicId) -> Result<Option<crate_storage::TopicState>, Error> {
+        self.inner.topic_state(topic_id)
+    }
+    fn list_topics(&self) -> Result<Vec<crate::TopicInfo>, Error> {
+        self.inner.list_topics()
+    }
+    fn put_pending_op(
+        &self,
+        source_peer: PeerId,
+        op: Op,
+        meta: crate_storage::OpMeta,
+    ) -> Result<(), Error> {
+        self.inner.put_pending_op(source_peer, op, meta)
+    }
+    fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>, Error> {
+        self.inner.pending_waiters(dep_id)
+    }
+    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>, Error> {
+        self.inner.ready_pending_ops()
+    }
+    fn remove_pending_op(&self, op_id: &OpId) -> Result<(), Error> {
+        self.inner.remove_pending_op(op_id)
+    }
+    fn peer_ack(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+    ) -> Result<Option<crate_storage::PeerAck>, Error> {
+        self.inner.peer_ack(peer_id, topic_id)
+    }
+    fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<crate_storage::PeerAck>, Error> {
+        self.inner.peer_acks(topic_id)
+    }
+    fn put_sync_obligation(&self, obligation: crate_storage::SyncObligation) -> Result<(), Error> {
+        self.inner.put_sync_obligation(obligation)
+    }
+    fn all_sync_obligations(&self) -> Result<Vec<crate_storage::SyncObligation>, Error> {
+        self.inner.all_sync_obligations()
+    }
+    fn apply_peer_ack(&self, ack: crate_storage::PeerAck) -> Result<usize, Error> {
+        self.inner.apply_peer_ack(ack)
+    }
+    fn sync_obligations(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+    ) -> Result<Vec<crate_storage::SyncObligation>, Error> {
+        self.inner.sync_obligations(peer_id, topic_id)
+    }
+    fn put_sync_status(&self, status: crate_storage::SyncPeerStatus) -> Result<(), Error> {
+        self.inner.put_sync_status(status)
+    }
+    fn sync_statuses(
+        &self,
+        topic_id: &TopicId,
+    ) -> Result<Vec<crate_storage::SyncPeerStatus>, Error> {
+        self.inner.sync_statuses(topic_id)
+    }
+    fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize, Error> {
+        self.inner.clear_peer_sync_state(peer_id, topic_id)
+    }
+    fn reset_topic(&self, topic_id: &TopicId) -> Result<usize, Error> {
+        self.inner.reset_topic(topic_id)
+    }
+}
+
+/// A three-op chain plus one independent event, with the second chain op turned
+/// into a hole. Returns the holed storage and the ops in order.
+fn dangling_chain(seed: u8) -> (HoleStorage, Vec<Op>) {
+    let source = node(seed);
+    let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
+    topic.publish(Note { text: "one".into() }).unwrap();
+    topic.publish(Note { text: "two".into() }).unwrap();
+    let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+    let inner = MemoryStorage::new();
+    let seeded = oplog::Oplog::with_storage(inner.clone());
+    seeded.receive_ops(ops.clone()).unwrap();
+    let hole = ops[1].id;
+    (HoleStorage { inner, hole }, ops)
+}
+
+#[test]
+fn unknown_want_serves_the_rest() {
+    // A want we cannot resolve must not abort a whole batched exchange.
+    let (storage, ops) = dangling_chain(93);
+    let topic_id = ops[0].signed.body.topic_id;
+    let engine = crate_sync::SyncEngine::new(
+        oplog::Oplog::with_storage(storage),
+        Ed25519Signer::from_bytes(&[93; 32]).peer_id(),
+    );
+    let request = crate_sync::SyncRequest {
+        topic_id,
+        known: BTreeSet::new(),
+        wants: [ops[0].id, OpId::hash(b"never-seen")].into(),
+        actor_range_hints: Vec::new(),
+    };
+
+    let data = engine
+        .plan_response_data(Ed25519Signer::from_bytes(&[93; 32]).peer_id(), &request)
+        .unwrap();
+
+    assert_eq!(
+        data.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>(),
+        [ops[0].id].into()
+    );
+}
+
+#[test]
+fn dangling_dep_defers_dependents() {
+    // The hole and the op standing on it are deferred; the genesis still ships.
+    let (storage, ops) = dangling_chain(94);
+    let topic_id = ops[0].signed.body.topic_id;
+    let all = storage.inner.list_op_ids(&topic_id).unwrap();
+
+    let ordered = oplog::topological_subset(&storage, &all).unwrap();
+
+    let served = ordered.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+    assert_eq!(served, [ops[0].id].into());
+    // Nothing was dropped from storage: the deferred ops are still admitted.
+    assert_eq!(storage.inner.list_op_ids(&topic_id).unwrap(), all);
+}
+
+#[test]
+fn dangling_dep_keeps_dag_query() {
+    let (storage, ops) = dangling_chain(95);
+    let topic_id = ops[0].signed.body.topic_id;
+    let holder = Irokle::with_storage(
+        storage,
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[95; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+
+    let newest = holder
+        .raw_topic(topic_id)
+        .unwrap()
+        .dag(history::DagQuery {
+            heads: Vec::new(),
+            include_heads: true,
+            limit: None,
+            order: history::HistoryOrder::NewestFirst,
+        })
+        .unwrap();
+
+    let ids = newest.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+    assert!(ids.contains(&ops[2].id));
+    assert!(!ids.contains(&ops[1].id));
+}

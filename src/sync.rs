@@ -612,7 +612,11 @@ impl<S: Storage> SyncEngine<S> {
             if !out.insert(id) {
                 continue;
             }
+            // A peer may want an id we never had, or one a topic reset removed.
+            // Serving what we do have keeps the exchange alive; the wanted id
+            // stays in the peer's request set for a peer that holds it.
             let Some(meta) = self.oplog.storage().get_meta(&id)? else {
+                out.remove(&id);
                 continue;
             };
             if meta.topic_id != *topic_id {

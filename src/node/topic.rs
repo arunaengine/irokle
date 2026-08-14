@@ -168,9 +168,11 @@ pub(super) fn dag_ops<S: Storage>(
             if !seen.insert(id) {
                 continue;
             }
-            let meta = storage
-                .get_meta(&id)?
-                .ok_or_else(|| Error::Storage(format!("missing op meta for {id}")))?;
+            // A dependency still awaiting repair simply ends this branch of the
+            // walk; the rest of the DAG stays queryable.
+            let Some(meta) = storage.get_meta(&id)? else {
+                continue;
+            };
             if meta.topic_id != topic_id {
                 return Err(Error::TopicMismatch);
             }
@@ -189,11 +191,7 @@ pub(super) fn dag_ops<S: Storage>(
             topological_subset(storage, &subset)
         } else {
             ids.into_iter()
-                .map(|id| {
-                    storage
-                        .get_op(&id)?
-                        .ok_or_else(|| Error::Storage(format!("missing op {id}")))
-                })
+                .filter_map(|id| storage.get_op(&id).transpose())
                 .collect()
         }
     } else {
