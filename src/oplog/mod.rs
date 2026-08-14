@@ -4,12 +4,14 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::storage::{
     AdmissionEffects, AdmittedBatch, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage,
     TopicState,
 };
 use crate::{
-    ActorId, Error, EventEnvelope, Op, OpBody, OpId, PeerId, Result, SignedOp, Signer,
+    ActorId, Error, EventEnvelope, EvictionKey, Op, OpBody, OpId, PeerId, Result, SignedOp, Signer,
     TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
 };
 
@@ -73,7 +75,7 @@ struct BatchOverlay<'a> {
 
 /// A single op removed from the losing side of a genesis collision, carrying
 /// enough for the application to re-emit it under the winning genesis.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvictedOp {
     pub op_id: OpId,
     pub actor_id: ActorId,
@@ -89,12 +91,29 @@ pub struct EvictedOp {
 /// fields are what tells the two apart. `evicted` holds the discarded
 /// non-genesis payloads ordered by `(actor_id, actor_seq)`; re-emission is the
 /// embedder's responsibility.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicEviction {
     pub topic_id: TopicId,
     pub losing_genesis: OpId,
     pub winning_genesis: OpId,
     pub evicted: Vec<EvictedOp>,
+}
+
+impl TopicEviction {
+    /// Identity of this eviction's durable journal record, derived from its
+    /// content. The same discarded chain always names the same record, so
+    /// repeating the write, the delivery, or the recovery cannot multiply
+    /// entries, and a consumer can acknowledge a record from the eviction alone.
+    pub fn key(&self) -> EvictionKey {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.topic_id.as_ref());
+        hasher.update(self.losing_genesis.as_ref());
+        hasher.update(self.winning_genesis.as_ref());
+        for evicted in &self.evicted {
+            hasher.update(evicted.op_id.as_ref());
+        }
+        EvictionKey::from_bytes(*hasher.finalize().as_bytes())
+    }
 }
 
 /// Outcome of an admission pass: the accepted op ids plus any topic evictions
