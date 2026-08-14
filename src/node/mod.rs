@@ -25,8 +25,8 @@ use crate::sync::{
     SyncSummary,
 };
 use crate::{
-    ActorId, Ed25519Signer, Error, Event, EventEnvelope, Op, OpId, PeerId, Result, Signer,
-    TopicConfig, TopicControl, TopicEviction, TopicGenesis, TopicId, actor_id_for,
+    ActorId, Ed25519Signer, Error, Event, EventEnvelope, EvictionKey, Op, OpId, PeerId, Result,
+    Signer, TopicConfig, TopicControl, TopicEviction, TopicGenesis, TopicId, actor_id_for,
 };
 
 static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -446,6 +446,22 @@ impl<S: Storage> Irokle<S> {
     /// returned payloads are the embedder's to re-emit.
     pub fn quarantine_orphans(&self, topic_id: TopicId) -> Result<Option<TopicEviction>> {
         self.oplog.quarantine_orphans(&topic_id)
+    }
+
+    /// Evictions this node recorded durably and no consumer has acknowledged
+    /// yet. Each was written in the same transaction that discarded the
+    /// payloads, so this is what a restart must drain before it can treat
+    /// eviction recovery as complete: an eviction delivered only through the
+    /// in-memory sink and lost to a crash is still here.
+    pub fn pending_evictions(&self) -> Result<Vec<TopicEviction>> {
+        self.storage().pending_evictions()
+    }
+
+    /// Release a journalled eviction, named by [`TopicEviction::key`]. Call this
+    /// only once the payloads are durably owned elsewhere; until then the record
+    /// is their only copy. Acknowledging twice is harmless.
+    pub fn clear_eviction(&self, key: &EvictionKey) -> Result<()> {
+        self.storage().clear_eviction(key)
     }
 
     /// Run [`Irokle::quarantine_orphans`] over every local topic.

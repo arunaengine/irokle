@@ -331,8 +331,8 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
     shutdown: tokio::sync::watch::Sender<bool>,
     // Optional sink for genesis tie-break evictions produced while admitting
     // remote sync data. The embedder consumes these to re-emit the discarded
-    // payloads under the winning genesis; when unset the payloads are dropped
-    // (the oplog already logs the reset).
+    // payloads under the winning genesis; when unset they are recovered from
+    // the eviction journal instead.
     eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
 }
 
@@ -370,7 +370,8 @@ impl<S: Storage> IrohNet<S> {
     /// eviction sink. When set, every [`TopicEviction`] produced while admitting
     /// remote sync data (genesis tie-break resolution) is forwarded to the sink
     /// so the embedder can re-emit the discarded payloads under the winning
-    /// genesis; when `None` the payloads are dropped (the reset is still logged).
+    /// genesis. The sink only makes recovery prompt: with or without it, the
+    /// payloads are journalled and drained through [`Irokle::pending_evictions`].
     pub fn new_with_alpns_config_and_sink(
         endpoint: iroh::Endpoint,
         node: Irokle<S>,
@@ -400,28 +401,26 @@ impl<S: Storage> IrohNet<S> {
         })
     }
 
-    /// Forwards genesis tie-break evictions to the configured sink, or drops
-    /// them with a warning when no sink is wired.
+    /// Forwards evictions to the configured sink as the fast path. The sink is
+    /// an optimization, not the handoff: every payload is already journalled by
+    /// the transaction that discarded it, so an undelivered eviction stays
+    /// recoverable through [`Irokle::pending_evictions`].
     fn forward_evictions(&self, evictions: Vec<TopicEviction>) {
         if evictions.is_empty() {
             return;
         }
-        match &self.eviction_sink {
-            Some(sink) => {
-                for eviction in evictions {
-                    if sink.send(eviction).is_err() {
-                        tracing::warn!("eviction sink closed; dropping genesis tie-break eviction");
-                    }
-                }
-            }
-            None => {
-                for eviction in evictions {
-                    tracing::warn!(
-                        topic_id = %eviction.topic_id,
-                        evicted = eviction.evicted.len(),
-                        "no eviction sink configured; dropping genesis tie-break payloads"
-                    );
-                }
+        for eviction in evictions {
+            let undelivered = match &self.eviction_sink {
+                Some(sink) => sink.send(eviction.clone()).is_err(),
+                None => true,
+            };
+            if undelivered {
+                tracing::warn!(
+                    topic_id = %eviction.topic_id,
+                    key = %eviction.key(),
+                    evicted = eviction.evicted.len(),
+                    "eviction not delivered to a sink; recover it from the journal"
+                );
             }
         }
     }
