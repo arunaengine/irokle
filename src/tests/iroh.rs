@@ -1071,3 +1071,92 @@ async fn bad_ack_spares_other_topics() {
             .is_none()
     );
 }
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn equal_fingerprint_repairs() {
+    // Two stores with identical heads and clocks, one missing a non-head
+    // record: neither side may take the matched-fingerprint path, and the
+    // damaged side must pull the record back over a real exchange.
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_signer = Ed25519Signer::from_iroh_secret_key(bob_endpoint.secret_key());
+    let alice = Irokle::with_storage(
+        MemoryStorage::new(),
+        NodeConfig {
+            signer: Ed25519Signer::from_iroh_secret_key(alice_endpoint.secret_key()),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob_signer.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    topic.publish(Note { text: "one".into() }).unwrap();
+    topic.publish(Note { text: "two".into() }).unwrap();
+    let topic_id = topic.id();
+    let ops = oplog::topological(alice.storage(), &topic_id).unwrap();
+
+    let storage = MemoryStorage::new();
+    oplog::Oplog::with_storage(storage.clone())
+        .receive_ops(ops.clone())
+        .unwrap();
+    damage_op(&storage, &ops[1].id, Damage::Both);
+    let bob = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: bob_signer,
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let alice_net = Arc::new(net::IrohNet::new(alice_endpoint, alice.clone()).unwrap());
+    alice_net.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice_net.endpoint()).await;
+    let bob_net = net::IrohNet::new(bob_endpoint, bob.clone()).unwrap();
+
+    assert_eq!(
+        storage.topic_fingerprint(&topic_id).unwrap(),
+        alice.storage().topic_fingerprint(&topic_id).unwrap()
+    );
+    let bob_fingerprint = bob.sync_fingerprint(topic_id).unwrap();
+    assert_ne!(
+        bob_fingerprint.fingerprint,
+        alice.sync_fingerprint(topic_id).unwrap().fingerprint
+    );
+    // The damaged responder must answer its own digest with a summary.
+    let responses = bob_net
+        .handle_messages(
+            alice_net.endpoint().id(),
+            vec![
+                sync::SyncMessage::Open(alice.sync_open(topic_id)),
+                sync::SyncMessage::Fingerprint(bob_fingerprint),
+            ],
+        )
+        .unwrap();
+    assert!(matches!(
+        responses.last(),
+        Some(sync::SyncMessage::Summary(_))
+    ));
+
+    bob_net.sync_now(alice_addr, topic_id).await.unwrap();
+
+    assert!(bob.topic_unresolved(topic_id).unwrap().is_empty());
+    assert_eq!(storage.get_op(&ops[1].id).unwrap().as_ref(), Some(&ops[1]));
+    assert_eq!(
+        oplog::topological(&storage, &topic_id).unwrap().len(),
+        ops.len()
+    );
+    alice.shutdown_iroh().await;
+}

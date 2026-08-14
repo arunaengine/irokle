@@ -735,6 +735,19 @@ impl<S: Storage> IrohNet<S> {
         Ok(select_sync_peers(topic_id, self.node.peer_id(), &state).contains(&peer_id))
     }
 
+    /// Whether the local topic may be certified as synchronized. A topic
+    /// holding an unresolved id must keep negotiating even when the
+    /// fingerprints match, or the hole survives every sweep.
+    fn topic_is_whole(&self, topic_id: crate::TopicId) -> bool {
+        match self.node.topic_unresolved(topic_id) {
+            Ok(unresolved) => unresolved.is_empty(),
+            Err(error) => {
+                tracing::warn!(%topic_id, %error, "failed to check local topic integrity");
+                false
+            }
+        }
+    }
+
     fn target_needs_sync(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<bool> {
         let Some(state) = self
             .node
@@ -757,6 +770,11 @@ impl<S: Storage> IrohNet<S> {
         }
         if !select_sync_peers(topic_id, self.node.peer_id(), &state).contains(&peer_id) {
             return Ok(false);
+        }
+        // A hole clears no obligation and moves no clock, so nothing else here
+        // would ever mark the target dirty again.
+        if !self.topic_is_whole(topic_id) {
+            return Ok(true);
         }
         let local_clock = self
             .node
@@ -1055,12 +1073,20 @@ impl<S: Storage> IrohNet<S> {
         };
 
         let mut matched = BTreeSet::new();
+        let mut incomplete = BTreeSet::new();
         let mut summaries = BTreeMap::new();
         for response in responses {
             match response {
                 SyncMessage::Fingerprint(remote) => {
-                    if fingerprints.get(&remote.topic_id) == Some(&remote.fingerprint) {
+                    if fingerprints.get(&remote.topic_id) != Some(&remote.fingerprint) {
+                        continue;
+                    }
+                    // Two identically damaged stores still match, so the local
+                    // integrity check decides whether this counts as synced.
+                    if self.topic_is_whole(remote.topic_id) {
                         matched.insert(remote.topic_id);
+                    } else {
+                        incomplete.insert(remote.topic_id);
                     }
                 }
                 SyncMessage::Summary(summary) if fingerprints.contains_key(&summary.topic_id) => {
@@ -1088,8 +1114,20 @@ impl<S: Storage> IrohNet<S> {
                 .map_err(invalid_data);
             outcomes.insert(*topic_id, outcome);
         }
+        for topic_id in &incomplete {
+            summaries.remove(topic_id);
+            outcomes.insert(
+                *topic_id,
+                Err(invalid_data(
+                    "local topic is incomplete despite a matching fingerprint",
+                )),
+            );
+        }
         for topic_id in fingerprints.keys() {
-            if !matched.contains(topic_id) && !summaries.contains_key(topic_id) {
+            if !matched.contains(topic_id)
+                && !incomplete.contains(topic_id)
+                && !summaries.contains_key(topic_id)
+            {
                 outcomes.insert(
                     *topic_id,
                     Err(invalid_data("peer did not return a sync summary")),
@@ -1439,7 +1477,11 @@ impl<S: Storage> IrohNet<S> {
                     .node
                     .sync_fingerprint(fingerprint.topic_id)
                     .map_err(invalid_data)?;
-                if local.fingerprint == fingerprint.fingerprint {
+                // A damaged responder must fall through to the summary path so
+                // the requester can serve what this side cannot resolve.
+                if local.fingerprint == fingerprint.fingerprint
+                    && self.topic_is_whole(fingerprint.topic_id)
+                {
                     if state.members.contains(&peer_id) {
                         self.node
                             .record_peer_synced(peer_id, fingerprint.topic_id)

@@ -172,7 +172,7 @@ impl<S: Storage> SyncEngine<S> {
         Ok(SyncSummary {
             topic_id,
             event_type_id,
-            fingerprint: self.oplog.storage().topic_fingerprint(&topic_id)?,
+            fingerprint: self.topic_digest(&topic_id)?,
             heads: self.oplog.storage().heads(&topic_id)?,
             actor_clock: self.oplog.storage().actor_clock(&topic_id)?,
             actor_tips: self.actor_tips(topic_id)?,
@@ -182,8 +182,23 @@ impl<S: Storage> SyncEngine<S> {
     pub fn fingerprint(&self, topic_id: TopicId) -> Result<SyncFingerprint> {
         Ok(SyncFingerprint {
             topic_id,
-            fingerprint: self.oplog.storage().topic_fingerprint(&topic_id)?,
+            fingerprint: self.topic_digest(&topic_id)?,
         })
+    }
+
+    /// The digest a peer compares its own against. Stored heads and clock say
+    /// nothing about whether the records behind them exist, so the topic's
+    /// unresolved ids are folded in: a node holding a hole never looks equal to
+    /// a whole one, which is exactly what the matched-fingerprint fast path
+    /// assumes. Callers must still refuse that fast path while their own topic
+    /// is incomplete, since two identically damaged stores do match.
+    fn topic_digest(&self, topic_id: &TopicId) -> Result<[u8; 32]> {
+        let stored = self.oplog.storage().topic_fingerprint(topic_id)?;
+        let unresolved = self.oplog.topic_unresolved(topic_id)?;
+        if unresolved.is_empty() {
+            return Ok(stored);
+        }
+        Ok(*blake3::hash(&canonical_bytes(&(stored, &unresolved))?).as_bytes())
     }
 
     pub fn negotiate(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
