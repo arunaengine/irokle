@@ -1510,25 +1510,22 @@ impl<S: Storage> IrohNet<S> {
                 }
                 Ok(vec![SyncMessage::Ack(ack)])
             }
-            SyncMessage::Ack(ack) => {
-                let peer_id = remote_peer_id.ok_or_else(|| {
-                    invalid_data("sync ack requires a preceding SyncOpen with peer_id")
-                })?;
-                if ack.peer_id != peer_id {
-                    return Err(invalid_data(
-                        "sync ack peer_id does not match SyncOpen peer_id",
-                    ));
-                }
-                let topic_id = ack.topic_id;
-                self.node
-                    .apply_sync_ack(&ack)
-                    .map(|()| {
-                        self.finish_resync_attempt(peer_id, topic_id, Ok(()), self.runtime);
-                        Vec::new()
-                    })
-                    .map_err(invalid_data)
-            }
+            // Acks are collected by the session and applied together in
+            // `SyncSession::finish`, so one rejected ack cannot discard the
+            // rest; there is deliberately no second path that applies one.
+            SyncMessage::Ack(_) => Err(invalid_data("sync ack must be applied by the session")),
         }
+    }
+}
+
+/// The topic a sync message speaks for when its handling failure should be
+/// contained to that topic instead of aborting the stream.
+fn per_topic_failure_scope(message: &SyncMessage) -> Option<crate::TopicId> {
+    match message {
+        SyncMessage::Summary(summary) => Some(summary.topic_id),
+        SyncMessage::Request(request) => Some(request.topic_id),
+        SyncMessage::Data(data) => Some(data.topic_id),
+        SyncMessage::Open(_) | SyncMessage::Fingerprint(_) | SyncMessage::Ack(_) => None,
     }
 }
 
@@ -1589,15 +1586,16 @@ impl SyncSession {
             return Ok(Vec::new());
         }
 
-        // Admission failures for one topic's Data must not abort the whole
-        // stream: other topics' Data in the same stream would lose their acks
-        // and the sender would resend the identical range forever.
-        if let SyncMessage::Data(data) = &message {
-            let topic_id = data.topic_id;
+        // A data-plane failure for one topic must not abort the whole stream:
+        // the other topics batched into it would lose their summaries, data and
+        // acks, the caller marks every one of them failed, and the sender
+        // resends the identical ranges forever. Framing and authentication
+        // failures above stay fatal - those indict the peer, not one topic.
+        if let Some(topic_id) = per_topic_failure_scope(&message) {
             return match net.handle_message(message, self.remote_peer_id) {
                 Ok(responses) => Ok(responses),
                 Err(error) => {
-                    tracing::warn!(%topic_id, %error, "skipping sync data after admission failure");
+                    tracing::warn!(%topic_id, %error, "skipping sync message after topic failure");
                     Ok(Vec::new())
                 }
             };
@@ -1606,15 +1604,34 @@ impl SyncSession {
         net.handle_message(message, self.remote_peer_id)
     }
 
+    /// Apply the stream's acks independently. One rejected ack - a stale clock
+    /// after a topic reset, say - must not discard the others, or their
+    /// obligations never clear and the peer resends the same ranges forever.
     fn finish<S: Storage>(&mut self, net: &IrohNet<S>) -> io::Result<Vec<SyncMessage>> {
-        let mut responses = Vec::new();
-        for ack in std::mem::take(&mut self.acks) {
-            push_responses(
-                &mut responses,
-                net.handle_message(SyncMessage::Ack(ack), self.remote_peer_id)?,
-            )?;
+        let acks = std::mem::take(&mut self.acks);
+        if acks.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(responses)
+        let peer_id = self
+            .remote_peer_id
+            .ok_or_else(|| invalid_data("sync ack requires a preceding SyncOpen with peer_id"))?;
+        for ack in &acks {
+            if ack.peer_id != peer_id {
+                return Err(invalid_data(
+                    "sync ack peer_id does not match SyncOpen peer_id",
+                ));
+            }
+        }
+        for (ack, result) in acks.iter().zip(net.node.apply_sync_acks(&acks)) {
+            match result {
+                Ok(()) => net.finish_resync_attempt(peer_id, ack.topic_id, Ok(()), net.runtime),
+                Err(error) => {
+                    let topic_id = ack.topic_id;
+                    tracing::warn!(%topic_id, %error, "skipping rejected sync ack");
+                }
+            }
+        }
+        Ok(Vec::new())
     }
 }
 

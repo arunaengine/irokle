@@ -976,3 +976,98 @@ async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
     .await
     .expect("iroh endpoint produced a dialable address")
 }
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bad_ack_spares_other_topics() {
+    // A rejected ack must not discard the other acks batched into the same
+    // stream, or their obligations never clear and the peer resends forever.
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(bob_endpoint.secret_key())
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let net = net::IrohNet::new(alice_endpoint, alice.clone()).unwrap();
+
+    let mut topics = Vec::new();
+    for text in ["poisoned", "healthy"] {
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        topic.publish(Note { text: text.into() }).unwrap();
+        topics.push(topic.id());
+    }
+    let (poisoned, healthy) = (topics[0], topics[1]);
+
+    // A clock claiming more of alice's own actor than alice has is the shape a
+    // stale ack takes after a topic reset rewinds the local chain.
+    let mut ahead = alice.storage().actor_clock(&poisoned).unwrap();
+    ahead.observe(actor_id_for(poisoned, alice.peer_id()), 99);
+    let mut bad = sync::SyncAck {
+        topic_id: poisoned,
+        peer_id: bob.peer_id(),
+        accepted: BTreeSet::new(),
+        heads: BTreeSet::new(),
+        clock: ahead,
+        signature: None,
+    };
+    bad.sign(bob.signer()).unwrap();
+    let mut good = sync::SyncAck {
+        topic_id: healthy,
+        peer_id: bob.peer_id(),
+        accepted: BTreeSet::new(),
+        heads: alice.storage().heads(&healthy).unwrap(),
+        clock: alice.storage().actor_clock(&healthy).unwrap(),
+        signature: None,
+    };
+    good.sign(bob.signer()).unwrap();
+
+    let responses = net
+        .handle_messages(
+            bob_endpoint.id(),
+            vec![
+                sync::SyncMessage::Open(bob.sync_open(poisoned)),
+                sync::SyncMessage::Ack(bad),
+                sync::SyncMessage::Open(bob.sync_open(healthy)),
+                sync::SyncMessage::Ack(good),
+            ],
+        )
+        .expect("one rejected ack must not fail the stream");
+
+    assert!(
+        responses
+            .iter()
+            .all(|m| !matches!(m, sync::SyncMessage::Ack(_)))
+    );
+    assert!(
+        alice
+            .storage()
+            .peer_ack(&bob.peer_id(), &healthy)
+            .unwrap()
+            .is_some(),
+        "the valid ack must still be applied"
+    );
+    assert!(
+        alice
+            .storage()
+            .peer_ack(&bob.peer_id(), &poisoned)
+            .unwrap()
+            .is_none()
+    );
+}
