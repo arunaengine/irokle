@@ -28,27 +28,8 @@ fn seed_side(
     peer_seed: u8,
     text: &str,
 ) -> (Oplog, Ed25519Signer, Op, Op) {
-    let signer = Ed25519Signer::from_bytes(&[seed; 32]);
     let peer = Ed25519Signer::from_bytes(&[peer_seed; 32]).peer_id();
-    let oplog = Oplog::with_storage(MemoryStorage::new());
-    let actor = actor_id_for(topic_id, signer.peer_id());
-    let genesis = TopicGenesis {
-        event_type_id: Note::TYPE_ID.into(),
-        initial_peers: [peer].into(),
-        replication_policy: ReplicationPolicy::default(),
-    };
-    let genesis_op = oplog
-        .create_topic_genesis(topic_id, actor, genesis, &signer)
-        .unwrap();
-    let event_op = oplog
-        .create_event_op(
-            topic_id,
-            actor,
-            EventEnvelope::encode_event(&Note { text: text.into() }).unwrap(),
-            &signer,
-        )
-        .unwrap();
-    (oplog, signer, genesis_op, event_op)
+    forked_side(MemoryStorage::new(), topic_id, seed, [peer], text)
 }
 
 fn build_fork(seed_a: u8, seed_b: u8) -> Fork {
@@ -711,4 +692,50 @@ fn reset_keeps_dag_whole() {
     let fork = build_fork(13, 14);
     assert_dag_whole(&fork.winner_oplog, &fork.topic_id);
     assert_dag_whole(&fork.loser_oplog, &fork.topic_id);
+}
+
+#[test]
+fn reset_ignores_tips() {
+    // Adopting a winning genesis judges the batch against a fresh topic: the
+    // actor slots and tips it would otherwise read belong to the chain the same
+    // transaction removes, so a re-emitted op must not read as a fork.
+    let fork = build_fork(21, 22);
+    let reemitted = fork
+        .loser_oplog
+        .create_event_op(
+            fork.topic_id,
+            actor_id_for(fork.topic_id, fork.loser_signer.peer_id()),
+            EventEnvelope::encode_event(&Note {
+                text: "re-emitted under the winner".into(),
+            })
+            .unwrap(),
+            &fork.loser_signer,
+        )
+        .unwrap();
+
+    let late = Oplog::with_storage(MemoryStorage::new());
+    late.receive_ops(vec![fork.loser_genesis.clone(), fork.loser_event.clone()])
+        .unwrap();
+    late.receive_ops_from_peer_evicting(
+        Some(fork.winner_signer.peer_id()),
+        vec![
+            fork.winner_genesis.clone(),
+            fork.winner_event.clone(),
+            reemitted.clone(),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        late.storage()
+            .topic_state(&fork.topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis,
+        fork.winner_genesis.id
+    );
+    assert_eq!(
+        admitted_ids(&late, &fork.topic_id),
+        [fork.winner_genesis.id, fork.winner_event.id, reemitted.id].into()
+    );
 }

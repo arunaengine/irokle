@@ -253,6 +253,38 @@ impl Storage for StaleReadStorage {
     }
 }
 
+/// A genesis plus one event for `topic_id`, authored in `storage` by `seed`'s
+/// signer with `peers` as the other initial members. Two sides built for the
+/// same topic id fork it, which is what genesis tie-break resolution decides.
+pub(crate) fn forked_side<S: Storage>(
+    storage: S,
+    topic_id: TopicId,
+    seed: u8,
+    peers: impl IntoIterator<Item = PeerId>,
+    text: &str,
+) -> (oplog::Oplog<S>, Ed25519Signer, Op, Op) {
+    let signer = Ed25519Signer::from_bytes(&[seed; 32]);
+    let log = oplog::Oplog::with_storage(storage);
+    let actor = actor_id_for(topic_id, signer.peer_id());
+    let genesis = TopicGenesis {
+        event_type_id: Note::TYPE_ID.into(),
+        initial_peers: peers.into_iter().collect(),
+        replication_policy: ReplicationPolicy::default(),
+    };
+    let genesis_op = log
+        .create_topic_genesis(topic_id, actor, genesis, &signer)
+        .unwrap();
+    let event_op = log
+        .create_event_op(
+            topic_id,
+            actor,
+            EventEnvelope::encode_event(&Note { text: text.into() }).unwrap(),
+            &signer,
+        )
+        .unwrap();
+    (log, signer, genesis_op, event_op)
+}
+
 /// A source node holding a three-op chain that `holder_peer` may sync with.
 pub(crate) fn chain_source(seed: u8, holder_peer: PeerId) -> (Irokle, TopicId, Vec<Op>) {
     let source = node(seed);

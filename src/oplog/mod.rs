@@ -51,6 +51,18 @@ type GenesisResolution = (
     Option<TopicState>,
 );
 
+/// The batch-local view admission validates against: the entries this batch has
+/// already accepted, plus whether the topic is being reset. A reset removes the
+/// stored actor slots and tips of the topic in the same transaction, so they
+/// must not count towards the position of an op the batch installs.
+struct BatchOverlay<'a> {
+    ops: &'a BTreeMap<OpId, Op>,
+    meta: &'a BTreeMap<OpId, OpMeta>,
+    tips: &'a BTreeMap<(TopicId, ActorId), (u64, OpId)>,
+    index: &'a BTreeMap<(TopicId, ActorId, u64), OpId>,
+    reset: bool,
+}
+
 /// A single op removed from the losing side of a genesis collision, carrying
 /// enough for the application to re-emit it under the winning genesis.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -702,9 +714,13 @@ impl<S: Storage> Oplog<S> {
                 match self.validate_pending_op_projected(
                     &op,
                     &missing_deps,
-                    &overlay_meta,
-                    &overlay_tips,
-                    &overlay_index,
+                    &BatchOverlay {
+                        ops: &overlay_ops,
+                        meta: &overlay_meta,
+                        tips: &overlay_tips,
+                        index: &overlay_index,
+                        reset,
+                    },
                     state.as_ref(),
                 )? {
                     OpAdmission::Duplicate => {}
@@ -715,10 +731,13 @@ impl<S: Storage> Oplog<S> {
 
             if let OpAdmission::Duplicate = self.validate_op_projected(
                 &op,
-                &overlay_ops,
-                &overlay_meta,
-                &overlay_tips,
-                &overlay_index,
+                &BatchOverlay {
+                    ops: &overlay_ops,
+                    meta: &overlay_meta,
+                    tips: &overlay_tips,
+                    index: &overlay_index,
+                    reset,
+                },
                 &heads,
                 state.as_ref(),
             )? {
@@ -916,10 +935,13 @@ impl<S: Storage> Oplog<S> {
             BTreeMap::from([((topic_id, actor_id, genesis_meta.actor_seq), genesis_op.id)]);
         if let OpAdmission::Duplicate = self.validate_op_projected(
             &event_op,
-            &overlay_ops,
-            &overlay_meta,
-            &overlay_tips,
-            &overlay_index,
+            &BatchOverlay {
+                ops: &overlay_ops,
+                meta: &overlay_meta,
+                tips: &overlay_tips,
+                index: &overlay_index,
+                reset: false,
+            },
             &genesis_heads,
             Some(&state),
         )? {
@@ -1177,9 +1199,7 @@ impl<S: Storage> Oplog<S> {
         &self,
         op: &Op,
         missing_deps: &BTreeSet<crate::OpId>,
-        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
-        overlay_tips: &BTreeMap<(TopicId, ActorId), (u64, crate::OpId)>,
-        overlay_index: &BTreeMap<(TopicId, ActorId, u64), crate::OpId>,
+        overlay: &BatchOverlay<'_>,
         state: Option<&TopicState>,
     ) -> Result<OpAdmission> {
         let body = &op.signed.body;
@@ -1197,15 +1217,12 @@ impl<S: Storage> Oplog<S> {
                 actual: 0,
             });
         }
-        if let Some(existing) = self
-            .storage
-            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            .or_else(|| {
-                overlay_index
-                    .get(&(body.topic_id, body.actor_id, body.actor_seq))
-                    .copied()
-            })
-        {
+        if let Some(existing) = self.stored_actor_index(body, overlay.reset)?.or_else(|| {
+            overlay
+                .index
+                .get(&(body.topic_id, body.actor_id, body.actor_seq))
+                .copied()
+        }) {
             if existing != op.id {
                 return Err(Error::ActorFork);
             }
@@ -1259,7 +1276,7 @@ impl<S: Storage> Oplog<S> {
                 return Err(Error::ActorPrevMismatch);
             }
             if !missing_deps.contains(&prev) {
-                let prev_meta = self.meta_projected(&prev, overlay_meta)?;
+                let prev_meta = self.meta_projected(&prev, overlay.meta)?;
                 if prev_meta.topic_id != body.topic_id || prev_meta.actor_id != body.actor_id {
                     return Err(Error::ActorPrevMismatch);
                 }
@@ -1271,9 +1288,9 @@ impl<S: Storage> Oplog<S> {
                 }
             }
         }
-        let expected = match overlay_tips.get(&(body.topic_id, body.actor_id)).copied() {
+        let expected = match overlay.tips.get(&(body.topic_id, body.actor_id)).copied() {
             Some(tip) => Some(tip),
-            None => self.storage.actor_tip(&body.topic_id, &body.actor_id)?,
+            None => self.stored_actor_tip(body, overlay.reset)?,
         };
         if let Some((tip_seq, tip_id)) = expected {
             let next_seq = checked_next(tip_seq)?;
@@ -1297,7 +1314,7 @@ impl<S: Storage> Oplog<S> {
             if missing_deps.contains(dep) {
                 continue;
             }
-            let meta = self.meta_projected(dep, overlay_meta)?;
+            let meta = self.meta_projected(dep, overlay.meta)?;
             if meta.topic_id != body.topic_id {
                 return Err(Error::TopicMismatch);
             }
@@ -1308,14 +1325,10 @@ impl<S: Storage> Oplog<S> {
         Ok(OpAdmission::Admit)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn validate_op_projected(
         &self,
         op: &Op,
-        overlay_ops: &BTreeMap<crate::OpId, Op>,
-        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
-        overlay_tips: &BTreeMap<(TopicId, ActorId), (u64, crate::OpId)>,
-        overlay_index: &BTreeMap<(TopicId, ActorId, u64), crate::OpId>,
+        overlay: &BatchOverlay<'_>,
         heads: &BTreeSet<crate::OpId>,
         state: Option<&TopicState>,
     ) -> Result<OpAdmission> {
@@ -1323,15 +1336,12 @@ impl<S: Storage> Oplog<S> {
         if body.actor_id != actor_id_for(body.topic_id, body.author) {
             return Err(Error::ActorAuthorMismatch);
         }
-        if let Some(existing) = self
-            .storage
-            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            .or_else(|| {
-                overlay_index
-                    .get(&(body.topic_id, body.actor_id, body.actor_seq))
-                    .copied()
-            })
-        {
+        if let Some(existing) = self.stored_actor_index(body, overlay.reset)?.or_else(|| {
+            overlay
+                .index
+                .get(&(body.topic_id, body.actor_id, body.actor_seq))
+                .copied()
+        }) {
             if existing != op.id {
                 return Err(Error::ActorFork);
             }
@@ -1358,8 +1368,8 @@ impl<S: Storage> Oplog<S> {
                     self.projected_state_for_deps(
                         &body.topic_id,
                         &body.deps,
-                        overlay_ops,
-                        overlay_meta,
+                        overlay.ops,
+                        overlay.meta,
                     )?
                     .members
                     .contains(&body.author)
@@ -1376,8 +1386,8 @@ impl<S: Storage> Oplog<S> {
                     self.projected_state_for_deps(
                         &body.topic_id,
                         &body.deps,
-                        overlay_ops,
-                        overlay_meta,
+                        overlay.ops,
+                        overlay.meta,
                     )?
                     .members
                     .contains(&body.author)
@@ -1387,9 +1397,9 @@ impl<S: Storage> Oplog<S> {
                 }
             }
         }
-        let expected = match overlay_tips.get(&(body.topic_id, body.actor_id)).copied() {
+        let expected = match overlay.tips.get(&(body.topic_id, body.actor_id)).copied() {
             Some(tip) => Some(tip),
-            None => self.storage.actor_tip(&body.topic_id, &body.actor_id)?,
+            None => self.stored_actor_tip(body, overlay.reset)?,
         };
         let (expected_seq, expected_prev) = next_actor_position(expected)?;
         if body.actor_seq != expected_seq {
@@ -1406,13 +1416,32 @@ impl<S: Storage> Oplog<S> {
         }
         let mut generation = 0;
         for id in &body.deps {
-            let meta = self.meta_projected(id, overlay_meta)?;
+            let meta = self.meta_projected(id, overlay.meta)?;
             generation = generation.max(checked_next(meta.generation)?);
         }
         if body.generation != generation {
             return Err(Error::InvalidOpId);
         }
         Ok(OpAdmission::Admit)
+    }
+
+    /// The stored actor slot and tip, or `None` on the reset path. A reset wipes
+    /// every actor index and tip of the topic in the same transaction as the
+    /// admission, so validating against them would judge the batch by a chain
+    /// that is about to stop existing.
+    fn stored_actor_index(&self, body: &OpBody, reset: bool) -> Result<Option<OpId>> {
+        if reset {
+            return Ok(None);
+        }
+        self.storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)
+    }
+
+    fn stored_actor_tip(&self, body: &OpBody, reset: bool) -> Result<Option<(u64, OpId)>> {
+        if reset {
+            return Ok(None);
+        }
+        self.storage.actor_tip(&body.topic_id, &body.actor_id)
     }
 
     /// Re-reads storage after a tip/seq mismatch: a concurrent admission may
