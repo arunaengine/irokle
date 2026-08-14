@@ -178,18 +178,18 @@ pub(super) fn dag_ops<S: Storage>(
             }
             if query.include_heads || !is_head {
                 ids.push(id);
-                if query.limit.is_some_and(|limit| ids.len() >= limit) {
-                    break;
-                }
             }
             for dep in meta.deps {
                 queue.push_back((dep, false));
             }
         }
+        // The walk runs unbounded: `query.limit` counts usable results, so
+        // applying it here would let blocked ids spend the caller's budget and
+        // return a short page over history that is still reachable.
         let subset = ids.iter().copied().collect::<BTreeSet<_>>();
         let usable = topological_subset(storage, &subset)?;
         if query.order == HistoryOrder::OldestFirst {
-            return Ok(usable);
+            return Ok(limited(usable, query.limit));
         }
         // Both orders must agree on membership: an op whose dependencies cannot
         // be resolved is withheld here exactly as the oldest-first walk withholds
@@ -198,10 +198,12 @@ pub(super) fn dag_ops<S: Storage>(
             .into_iter()
             .map(|op| (op.id, op))
             .collect::<BTreeMap<_, _>>();
-        Ok(ids
-            .into_iter()
-            .filter_map(|id| usable.remove(&id))
-            .collect())
+        Ok(limited(
+            ids.into_iter()
+                .filter_map(|id| usable.remove(&id))
+                .collect(),
+            query.limit,
+        ))
     } else {
         Ok(limited(topological(storage, &topic_id)?, query.limit))
     }

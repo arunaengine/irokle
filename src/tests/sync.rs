@@ -1250,6 +1250,86 @@ fn newest_defers_child() {
     assert_eq!(newest, walk(history::HistoryOrder::OldestFirst));
 }
 
+#[test]
+fn limit_skips_blocked() {
+    // A blocked newest branch must not spend the caller's limit: the older
+    // complete branch is reachable inside the same query.
+    let a = node(120);
+    let b = node(121);
+    let topic = a
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [b.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let topic_id = topic.id();
+    topic.publish(Note { text: "a".into() }).unwrap();
+    let a_ops = oplog::topological(a.storage(), &topic_id).unwrap();
+
+    // b branches straight off the genesis, so the store below holds two heads.
+    oplog::Oplog::with_storage(b.storage().clone())
+        .receive_ops(vec![a_ops[0].clone()])
+        .unwrap();
+    let b_topic = b.open_topic::<Note>(topic_id).unwrap();
+    b_topic
+        .publish(Note {
+            text: "b one".into(),
+        })
+        .unwrap();
+    b_topic
+        .publish(Note {
+            text: "b two".into(),
+        })
+        .unwrap();
+    let b_ops = oplog::topological(b.storage(), &topic_id).unwrap();
+
+    let storage = MemoryStorage::new();
+    oplog::Oplog::with_storage(storage.clone())
+        .receive_ops(vec![
+            a_ops[0].clone(),
+            a_ops[1].clone(),
+            b_ops[1].clone(),
+            b_ops[2].clone(),
+        ])
+        .unwrap();
+    damage_op(&storage, &b_ops[1].id, Damage::Meta);
+    let holder = Irokle::with_storage(
+        storage,
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[120; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+
+    let walk = |order, limit| {
+        holder
+            .raw_topic(topic_id)
+            .unwrap()
+            .dag(history::DagQuery {
+                heads: vec![b_ops[2].id, a_ops[1].id],
+                include_heads: true,
+                limit,
+                order,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|op| op.id)
+            .collect::<Vec<_>>()
+    };
+
+    let newest = history::HistoryOrder::NewestFirst;
+    let oldest = history::HistoryOrder::OldestFirst;
+    assert_eq!(walk(newest, Some(1)), vec![a_ops[1].id]);
+    assert_eq!(walk(newest, Some(2)), vec![a_ops[1].id, a_ops[0].id]);
+    assert_eq!(walk(oldest, Some(1)), vec![a_ops[0].id]);
+    assert_eq!(
+        walk(newest, None).into_iter().collect::<BTreeSet<_>>(),
+        walk(oldest, None).into_iter().collect::<BTreeSet<_>>()
+    );
+}
+
 fn assert_repairs_hole<S: Corrupt>(storage: S, seed: u8, damage: Damage) {
     // Start from a store that really lost records for an admitted, non-head op
     // and prove ordinary sync puts them back exactly as they were.
