@@ -423,23 +423,13 @@ fn assert_reset_topic_and_admit_is_atomic<S: Storage>(storage: S) {
         effects: crate_storage::AdmissionEffects::default(),
     };
     let sealed = storage
-        .reset_topic_and_admit(
-            &topic_id,
-            &expected_state,
-            winner_batch.clone(),
-            None,
-        )
+        .reset_topic_and_admit(&topic_id, &expected_state, winner_batch.clone(), None)
         .unwrap_err();
     assert!(matches!(sealed, Error::TopicSealed));
     assert_eq!(storage.list_op_ids(&topic_id).unwrap(), old_ids);
     storage.unseal_topic(&topic_id).unwrap();
     let removed = storage
-        .reset_topic_and_admit(
-            &topic_id,
-            &expected_state,
-            winner_batch,
-            None,
-        )
+        .reset_topic_and_admit(&topic_id, &expected_state, winner_batch, None)
         .unwrap();
 
     // Both effects landed together: the old chain is gone and the winner is in.
