@@ -40,6 +40,7 @@ struct MemoryInner {
     obligations: Vec<SyncObligation>,
     sync_statuses: BTreeMap<(TopicId, PeerId), SyncPeerStatus>,
     evictions: BTreeMap<EvictionKey, TopicEviction>,
+    sealed_topics: BTreeSet<TopicId>,
 }
 
 impl MemoryStorage {
@@ -423,6 +424,9 @@ impl Storage for MemoryStorage {
         eviction: Option<&TopicEviction>,
     ) -> Result<usize> {
         let mut inner = self.lock()?;
+        if inner.sealed_topics.contains(topic_id) {
+            return Err(Error::TopicSealed);
+        }
         if memory_topic_state_locked(&inner, topic_id).as_ref() != Some(expected_topic_state) {
             return Err(Error::AdmissionConflict);
         }
@@ -444,6 +448,14 @@ impl Storage for MemoryStorage {
         }
         *inner = staged;
         Ok(removed)
+    }
+
+    fn seal_topic(&self, topic_id: &TopicId) -> Result<bool> {
+        Ok(self.lock()?.sealed_topics.insert(*topic_id))
+    }
+
+    fn unseal_topic(&self, topic_id: &TopicId) -> Result<bool> {
+        Ok(self.lock()?.sealed_topics.remove(topic_id))
     }
 
     fn pending_evictions(&self) -> Result<Vec<TopicEviction>> {

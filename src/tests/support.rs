@@ -259,6 +259,12 @@ impl Storage for StaleReadStorage {
         self.inner
             .reset_topic_and_admit(topic_id, expected_topic_state, batch, eviction)
     }
+    fn seal_topic(&self, topic_id: &TopicId) -> Result<bool, Error> {
+        self.inner.seal_topic(topic_id)
+    }
+    fn unseal_topic(&self, topic_id: &TopicId) -> Result<bool, Error> {
+        self.inner.unseal_topic(topic_id)
+    }
     fn pending_evictions(&self) -> Result<Vec<crate::TopicEviction>, Error> {
         self.inner.pending_evictions()
     }
