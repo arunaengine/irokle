@@ -412,21 +412,24 @@ fn assert_reset_topic_and_admit_is_atomic<S: Storage>(storage: S) {
         .unwrap();
 
     let expected_state = storage.topic_state(&topic_id).unwrap().unwrap();
+    storage.seal_topic(&topic_id).unwrap();
+    let winner_batch = crate_storage::AdmittedBatch {
+        topic_id,
+        expected_heads: BTreeSet::new(),
+        expected_topic_state: None,
+        entries: vec![(winner_genesis.clone(), winner_meta)],
+        heads: [winner_genesis.id].into(),
+        topic_state: Some(winner_state),
+        effects: crate_storage::AdmissionEffects::default(),
+    };
+    let sealed = storage
+        .reset_topic_and_admit(&topic_id, &expected_state, winner_batch.clone(), None)
+        .unwrap_err();
+    assert!(matches!(sealed, Error::TopicSealed));
+    assert_eq!(storage.list_op_ids(&topic_id).unwrap(), old_ids);
+    storage.unseal_topic(&topic_id).unwrap();
     let removed = storage
-        .reset_topic_and_admit(
-            &topic_id,
-            &expected_state,
-            crate_storage::AdmittedBatch {
-                topic_id,
-                expected_heads: BTreeSet::new(),
-                expected_topic_state: None,
-                entries: vec![(winner_genesis.clone(), winner_meta)],
-                heads: [winner_genesis.id].into(),
-                topic_state: Some(winner_state),
-                effects: crate_storage::AdmissionEffects::default(),
-            },
-            None,
-        )
+        .reset_topic_and_admit(&topic_id, &expected_state, winner_batch, None)
         .unwrap();
 
     // Both effects landed together: the old chain is gone and the winner is in.

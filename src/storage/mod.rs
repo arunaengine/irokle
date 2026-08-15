@@ -228,6 +228,11 @@ pub trait Storage: Clone + Send + Sync + 'static {
         eviction: Option<&TopicEviction>,
     ) -> Result<usize>;
 
+    /// Persist a drain seal that makes the topic's reset-and-admit operation
+    /// fail closed until the holder is again allowed to publish.
+    fn seal_topic(&self, topic_id: &TopicId) -> Result<bool>;
+    fn unseal_topic(&self, topic_id: &TopicId) -> Result<bool>;
+
     /// Journalled evictions no consumer has acknowledged yet. A restart drains
     /// these before eviction recovery can be considered complete; each is the
     /// only remaining copy of the payloads its reset removed.

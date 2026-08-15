@@ -457,6 +457,16 @@ impl<S: Storage> Irokle<S> {
         self.storage().pending_evictions()
     }
 
+    /// Seal a topic so a concurrent genesis reset cannot discard writes while
+    /// its departing holder proves the drain boundary.
+    pub fn seal_topic(&self, topic_id: TopicId) -> Result<bool> {
+        self.storage().seal_topic(&topic_id)
+    }
+
+    pub fn unseal_topic(&self, topic_id: TopicId) -> Result<bool> {
+        self.storage().unseal_topic(&topic_id)
+    }
+
     /// Release a journalled eviction, named by [`TopicEviction::key`]. Call this
     /// only once the payloads are durably owned elsewhere; until then the record
     /// is their only copy. Acknowledging twice is harmless.

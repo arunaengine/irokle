@@ -73,6 +73,9 @@ pub enum Error {
     #[error("eviction journal is full")]
     EvictionJournalFull,
 
+    #[error("topic is sealed against reset")]
+    TopicSealed,
+
     #[cfg(feature = "fjall")]
     #[error("fjall error: {0}")]
     Fjall(#[from] fjall::Error),

@@ -32,6 +32,8 @@ const FJALL_SCHEMA_VERSION: u32 = 1;
 #[cfg(feature = "fjall")]
 const EVICTION_PREFIX: &[u8] = b"ev";
 #[cfg(feature = "fjall")]
+const SEALED_TOPIC_PREFIX: &[u8] = b"se";
+#[cfg(feature = "fjall")]
 const FJALL_SCHEMA_VERSION_KEY: &[u8] = b"sv";
 
 #[cfg(feature = "fjall")]
@@ -694,6 +696,15 @@ impl Storage for FjallStorage {
         eviction: Option<&TopicEviction>,
     ) -> Result<usize> {
         self.transaction(|tx| {
+            if Self::tx_get::<bool>(
+                tx,
+                &self.records,
+                Self::key_id(SEALED_TOPIC_PREFIX, topic_id),
+            )?
+            .unwrap_or(false)
+            {
+                return Err(Error::TopicSealed);
+            }
             let current_heads: BTreeSet<OpId> =
                 Self::tx_get(tx, &self.records, Self::key_id(b"h", topic_id))?.unwrap_or_default();
             let current_topic_state: Option<TopicState> =
@@ -720,6 +731,28 @@ impl Storage for FjallStorage {
                 Self::tx_put(tx, &self.records, key, eviction)?;
             }
             Ok(removed)
+        })
+    }
+
+    fn seal_topic(&self, topic_id: &TopicId) -> Result<bool> {
+        let key = Self::key_id(SEALED_TOPIC_PREFIX, topic_id);
+        self.transaction(|tx| {
+            if Self::tx_get::<bool>(tx, &self.records, key.as_slice())?.is_some() {
+                return Ok(false);
+            }
+            Self::tx_put(tx, &self.records, key.clone(), &true)?;
+            Ok(true)
+        })
+    }
+
+    fn unseal_topic(&self, topic_id: &TopicId) -> Result<bool> {
+        let key = Self::key_id(SEALED_TOPIC_PREFIX, topic_id);
+        self.transaction(|tx| {
+            if Self::tx_get::<bool>(tx, &self.records, key.as_slice())?.is_none() {
+                return Ok(false);
+            }
+            tx.remove(&self.records, key.clone());
+            Ok(true)
         })
     }
 
