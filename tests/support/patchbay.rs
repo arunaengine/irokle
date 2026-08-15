@@ -101,24 +101,22 @@ impl PatchLab {
             .set_link_condition(
                 self.bob_dev.id(),
                 self.router.id(),
-                Some(::patchbay::LinkCondition::Manual(::patchbay::LinkLimits {
-                    rate_kbit: 384,
-                    loss_pct: 8.0,
-                    latency_ms: 80,
-                    jitter_ms: 25,
-                    ..::patchbay::LinkLimits::default()
-                })),
+                Some(
+                    ::patchbay::LinkCondition::new()
+                        .rate_kbit(384)
+                        .loss_pct(8.0)
+                        .latency_ms(80)
+                        .jitter_ms(25),
+                ),
             )
             .await?;
         self.bob_dev
             .iface("eth0")
             .unwrap()
             .set_condition(
-                ::patchbay::LinkCondition::Manual(::patchbay::LinkLimits {
-                    loss_pct: 4.0,
-                    latency_ms: 40,
-                    ..::patchbay::LinkLimits::default()
-                }),
+                ::patchbay::LinkCondition::new()
+                    .loss_pct(4.0)
+                    .latency_ms(40),
                 ::patchbay::LinkDirection::Both,
             )
             .await?;
@@ -308,10 +306,7 @@ pub async fn isolate(dev: &::patchbay::Device) -> TestResult<()> {
     dev.iface("eth0")
         .unwrap()
         .set_condition(
-            ::patchbay::LinkCondition::Manual(::patchbay::LinkLimits {
-                loss_pct: 100.0,
-                ..::patchbay::LinkLimits::default()
-            }),
+            ::patchbay::LinkCondition::new().loss_pct(100.0),
             ::patchbay::LinkDirection::Both,
         )
         .await?;
