@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::storage::{ControlKey, OpMeta, TopicState};
 use crate::{Error, Op, Result, TopicControl, TopicPayload};
@@ -206,4 +207,44 @@ pub(super) fn control_key(op: &Op) -> ControlKey {
         actor_seq: body.actor_seq,
         op_id: op.id,
     }
+}
+
+pub(super) fn merge_states(
+    deps: &BTreeSet<crate::OpId>,
+    projections: &BTreeMap<crate::OpId, Arc<TopicState>>,
+) -> Result<Arc<TopicState>> {
+    let mut merged: Option<Arc<TopicState>> = None;
+    for id in deps {
+        let incoming = projections.get(id).ok_or(Error::MissingDependency(*id))?;
+        let Some(current) = merged.as_mut() else {
+            merged = Some(incoming.clone());
+            continue;
+        };
+        if Arc::ptr_eq(current, incoming) {
+            continue;
+        }
+        if current.genesis != incoming.genesis {
+            return Err(Error::InvalidGenesis);
+        }
+        let current = Arc::make_mut(current);
+        for (peer, (key, member)) in &incoming.membership_controls {
+            if set_membership_control(&mut current.membership_controls, *peer, *key, *member) {
+                if *member {
+                    current.members.insert(*peer);
+                } else {
+                    current.members.remove(peer);
+                }
+            }
+        }
+        if let Some((key, policy)) = &incoming.replication_policy_control
+            && current
+                .replication_policy_control
+                .as_ref()
+                .is_none_or(|(current_key, _)| key > current_key)
+        {
+            current.replication_policy_control = Some((*key, policy.clone()));
+            current.replication_policy = policy.clone();
+        }
+    }
+    merged.ok_or(Error::TopicNotFound)
 }

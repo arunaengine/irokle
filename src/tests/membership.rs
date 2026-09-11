@@ -329,3 +329,78 @@ fn rejects_pending_nonmember() {
     let oplog = oplog::Oplog::with_storage(alice.storage().clone());
     assert!(matches!(oplog.receive_op(op), Err(Error::NotTopicMember)));
 }
+
+#[test]
+fn catchup_reads_bounded() {
+    use std::sync::atomic::Ordering;
+
+    const HISTORY: usize = 128;
+    const BACKLOG: usize = 32;
+    for removed in [false, true] {
+        let alice = node(110);
+        let bob = node(111);
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        for i in 0..HISTORY {
+            topic
+                .publish(Note {
+                    text: i.to_string(),
+                })
+                .unwrap();
+        }
+        let summary = bob.sync_summary(topic.id()).unwrap();
+        bob.receive_sync_data_from(
+            alice.peer_id(),
+            alice.plan_sync_data(bob.peer_id(), &summary).unwrap(),
+        )
+        .unwrap();
+        let bob_topic = bob.open_topic::<Note>(topic.id()).unwrap();
+        if removed {
+            bob_topic.remove_peer(alice.peer_id()).unwrap();
+        } else {
+            bob_topic
+                .publish(Note {
+                    text: "local divergence".into(),
+                })
+                .unwrap();
+        }
+        for i in 0..BACKLOG {
+            topic
+                .publish(Note {
+                    text: format!("backlog {i}"),
+                })
+                .unwrap();
+        }
+        let summary = bob.sync_summary(topic.id()).unwrap();
+        let data = alice.plan_sync_data(bob.peer_id(), &summary).unwrap();
+        assert_eq!(data.ops.len(), BACKLOG);
+        let storage = StaleReadStorage::new(bob.storage().clone());
+        let receiver = oplog::Oplog::with_storage(storage.clone());
+        receiver.receive_ops(data.ops).unwrap();
+        let reads = storage.op_reads.load(Ordering::Relaxed);
+        assert!(
+            reads <= 16 * (HISTORY + BACKLOG),
+            "catch-up reread history per event: removed={removed}, reads={reads}"
+        );
+        assert_eq!(
+            storage
+                .actor_clock(&topic.id())
+                .unwrap()
+                .get(&actor_id_for(topic.id(), alice.peer_id())),
+            (HISTORY + BACKLOG + 1) as u64
+        );
+        assert_eq!(
+            storage
+                .topic_state(&topic.id())
+                .unwrap()
+                .unwrap()
+                .members
+                .contains(&alice.peer_id()),
+            !removed
+        );
+    }
+}

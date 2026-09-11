@@ -20,7 +20,8 @@ mod topology;
 
 use helpers::{
     apply_control_to_state, checked_next, ensure_event_type, heads_after, is_local_admission_race,
-    is_semantic_rejection, materialize_topic_state, next_actor_position, pending_meta_for,
+    is_semantic_rejection, materialize_topic_state, merge_states, next_actor_position,
+    pending_meta_for,
 };
 use topology::topological_ops;
 pub use topology::{topological, topological_subset};
@@ -850,6 +851,7 @@ impl<S: Storage> Oplog<S> {
         let mut overlay_index = BTreeMap::new();
         let mut entries = Vec::new();
         let mut pending = Vec::new();
+        let mut projections = BTreeMap::new();
 
         for op in ops {
             if !verified.contains(&op.id) {
@@ -910,6 +912,7 @@ impl<S: Storage> Oplog<S> {
                 },
                 &heads,
                 state.as_ref(),
+                &mut projections,
             )? {
                 continue;
             }
@@ -1113,6 +1116,7 @@ impl<S: Storage> Oplog<S> {
             },
             &genesis_heads,
             Some(&state),
+            &mut BTreeMap::new(),
         )? {
             return Err(Error::AdmissionConflict);
         }
@@ -1500,6 +1504,7 @@ impl<S: Storage> Oplog<S> {
         overlay: &BatchOverlay<'_>,
         heads: &BTreeSet<crate::OpId>,
         state: Option<&TopicState>,
+        projections: &mut BTreeMap<OpId, Arc<TopicState>>,
     ) -> Result<OpAdmission> {
         let body = &op.signed.body;
         if body.actor_id != actor_id_for(body.topic_id, body.author) {
@@ -1534,11 +1539,12 @@ impl<S: Storage> Oplog<S> {
                 let author_is_member = if body.deps == *heads {
                     state.members.contains(&body.author)
                 } else {
-                    self.projected_state_for_deps(
+                    self.project_membership(
                         &body.topic_id,
                         &body.deps,
                         overlay.ops,
                         overlay.meta,
+                        projections,
                     )?
                     .members
                     .contains(&body.author)
@@ -1552,11 +1558,12 @@ impl<S: Storage> Oplog<S> {
                 let author_is_member = if body.deps == *heads {
                     state.members.contains(&body.author)
                 } else {
-                    self.projected_state_for_deps(
+                    self.project_membership(
                         &body.topic_id,
                         &body.deps,
                         overlay.ops,
                         overlay.meta,
+                        projections,
                     )?
                     .members
                     .contains(&body.author)
@@ -1647,29 +1654,48 @@ impl<S: Storage> Oplog<S> {
         Ok(StoredOp::Absent)
     }
 
-    fn projected_state_for_deps(
+    fn project_membership(
         &self,
         topic_id: &TopicId,
-        deps: &BTreeSet<crate::OpId>,
-        overlay_ops: &BTreeMap<crate::OpId, Op>,
-        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
-    ) -> Result<TopicState> {
-        let mut reachable = BTreeMap::new();
-        let mut stack = deps.iter().copied().collect::<Vec<_>>();
-        while let Some(id) = stack.pop() {
-            if reachable.contains_key(&id) {
+        deps: &BTreeSet<OpId>,
+        overlay_ops: &BTreeMap<OpId, Op>,
+        overlay_meta: &BTreeMap<OpId, OpMeta>,
+        projections: &mut BTreeMap<OpId, Arc<TopicState>>,
+    ) -> Result<Arc<TopicState>> {
+        let mut pending = deps.iter().map(|id| (*id, false)).collect::<Vec<_>>();
+        let mut visiting = BTreeSet::new();
+        while let Some((id, visited)) = pending.pop() {
+            if projections.contains_key(&id) {
                 continue;
             }
             let meta = self.meta_projected(&id, overlay_meta)?;
             if meta.topic_id != *topic_id {
                 return Err(Error::TopicMismatch);
             }
+            if !visited {
+                if !visiting.insert(id) {
+                    return Err(Error::Storage("cycle in op graph".into()));
+                }
+                pending.push((id, true));
+                pending.extend(meta.deps.iter().map(|dep| (*dep, false)));
+                continue;
+            }
             let op = self.op_projected(&id, overlay_ops)?;
-            stack.extend(meta.deps.iter().copied());
-            reachable.insert(id, op);
+            let state = match &op.signed.body.payload {
+                TopicPayload::Genesis(_) => {
+                    Arc::new(materialize_topic_state(vec![op], BTreeSet::new())?)
+                }
+                TopicPayload::Event(_) => merge_states(&meta.deps, projections)?,
+                TopicPayload::Control(control) => {
+                    let mut state = (*merge_states(&meta.deps, projections)?).clone();
+                    apply_control_to_state(&mut state, &op, control);
+                    Arc::new(state)
+                }
+            };
+            visiting.remove(&id);
+            projections.insert(id, state);
         }
-
-        materialize_topic_state(reachable.into_values().collect(), BTreeSet::new())
+        merge_states(deps, projections)
     }
 
     fn observed_clock_for_deps(

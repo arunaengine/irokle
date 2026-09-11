@@ -97,6 +97,7 @@ impl Corrupt for crate::storage::FjallStorage {
 /// that only affects one topic.
 #[derive(Clone)]
 pub(crate) struct StaleReadStorage {
+    pub(crate) op_reads: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) inner: MemoryStorage,
     pub(crate) hidden_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
     pub(crate) hidden_index: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
@@ -108,6 +109,7 @@ impl StaleReadStorage {
     pub(crate) fn new(inner: MemoryStorage) -> Self {
         Self {
             inner,
+            op_reads: Arc::default(),
             hidden_ops: Arc::default(),
             hidden_index: Arc::default(),
             mid_commit_ops: Arc::default(),
@@ -129,6 +131,8 @@ impl Storage for StaleReadStorage {
         self.inner.put_admitted_batch(batch)
     }
     fn get_op(&self, id: &OpId) -> Result<Option<Op>, Error> {
+        self.op_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.mid_commit_ops.lock().unwrap().contains(id) {
             return Ok(None);
         }
