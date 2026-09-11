@@ -1850,7 +1850,6 @@ async fn handle_connection<S: Storage>(
     connection: iroh::endpoint::Connection,
 ) {
     if let Some(current) = net.upgrade() {
-        let _ = current.pool.insert(connection.clone());
         current
             .resync_scheduler
             .peer_reachable(peer_id_from_endpoint_id(peer));
