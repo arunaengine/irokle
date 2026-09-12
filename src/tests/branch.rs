@@ -404,3 +404,283 @@ fn fjall_clear_keeps_branch() {
     let dir = tempfile::tempdir().unwrap();
     assert_clear_keeps_branch(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
+
+/// Events beyond the first: the author's next old-branch event, its new-branch
+/// counterpart at the same position, and a two-op old chain by the third member.
+fn old_followers(branches: &Branches) -> (Op, Op, Op, Op) {
+    let topic_id = branches.topic_id;
+    let note = |text: &str| EventEnvelope::encode_event(&Note { text: text.into() }).unwrap();
+    let old = vec![branches.old.0.clone(), branches.old.1.clone()];
+    let author_log = Oplog::new();
+    author_log.receive_ops(old.clone()).unwrap();
+    let author_actor = actor_id_for(topic_id, branches.author.peer_id());
+    let next = author_log
+        .create_event_op(topic_id, author_actor, note("next"), &branches.author)
+        .unwrap();
+    let new_log = Oplog::new();
+    new_log
+        .receive_ops(vec![branches.new.0.clone(), branches.new.1.clone()])
+        .unwrap();
+    let replacement = new_log
+        .create_event_op(
+            topic_id,
+            author_actor,
+            note("replacement"),
+            &branches.author,
+        )
+        .unwrap();
+    assert_eq!(
+        replacement.signed.body.actor_seq,
+        next.signed.body.actor_seq
+    );
+    let third_log = Oplog::new();
+    third_log.receive_ops(old).unwrap();
+    let third_actor = actor_id_for(topic_id, branches.third.peer_id());
+    let first = third_log
+        .create_event_op(topic_id, third_actor, note("first"), &branches.third)
+        .unwrap();
+    let second = third_log
+        .create_event_op(topic_id, third_actor, note("second"), &branches.third)
+        .unwrap();
+    (next, replacement, first, second)
+}
+
+/// Runs `run` on its own thread and returns once it waits at `point`.
+fn paused<S: Storage, T: Send + 'static>(
+    storage: &StaleReadStorage<S>,
+    point: GatePoint,
+    gate: &Arc<Gate>,
+    run: impl FnOnce() -> T + Send + 'static,
+) -> thread::JoinHandle<T> {
+    storage.arm_read(point, Arc::clone(gate));
+    let handle = thread::spawn({
+        let gate = Arc::clone(gate);
+        move || {
+            let result = run();
+            gate.skip();
+            result
+        }
+    });
+    gate.wait_arrival();
+    assert!(!handle.is_finished(), "{point:?} was never paused");
+    handle
+}
+
+/// A reset commits while an ack, forwarding effects, a page plan and a pending
+/// drain are paused. No old-branch work proves or owes anything on the new
+/// branch, the eviction names exactly the discarded records, usage stays exact.
+fn assert_reset_pauses<S: Storage>(inner: S, usage: impl Fn(&S) -> (u64, u64)) {
+    let branches = branches(210);
+    let topic_id = branches.topic_id;
+    let author = branches.author.peer_id();
+    let member = branches.member.peer_id();
+    let third = branches.third.peer_id();
+    let (old_genesis, old_event) = (branches.old.0.id, branches.old.1.id);
+    let (next, replacement, first, second) = old_followers(&branches);
+
+    let author_log = Oplog::new();
+    author_log
+        .receive_ops(vec![branches.old.0.clone(), branches.old.1.clone()])
+        .unwrap();
+    let author_sync = SyncEngine::new(author_log.clone(), author);
+    author_sync
+        .put_obligation(member, topic_id, [next.id].into())
+        .unwrap();
+
+    let storage = StaleReadStorage::new(inner.clone());
+    let node = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: branches.member.clone(),
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let receive = |source: PeerId, ops: Vec<Op>| {
+        node.receive_sync_data_from(source, SyncData { topic_id, ops })
+    };
+    receive(author, vec![branches.old.0.clone(), branches.old.1.clone()]).unwrap();
+    receive(third, vec![second.clone()]).unwrap();
+    assert!(
+        storage
+            .pending_missing_deps(&topic_id)
+            .unwrap()
+            .contains(&first.id)
+    );
+
+    let gates = [(); 4].map(|()| Arc::new(Gate::default()));
+    let _releases = gates.each_ref().map(Gate::releaser);
+    let member_sync = SyncEngine::new(Oplog::with_storage(storage.clone()), member);
+    let acking = paused(&storage, GatePoint::View(topic_id), &gates[0], move || {
+        member_sync.receive_data(
+            author,
+            member,
+            SyncData {
+                topic_id,
+                ops: Vec::new(),
+            },
+        )
+    });
+    // Forwarding effects commit inside the admission transaction, so the
+    // admission pauses at its dependency read just before building them.
+    let forwarding = paused(&storage, GatePoint::Meta(old_event), &gates[1], {
+        let node = node.clone();
+        let next = next.clone();
+        move || {
+            node.receive_sync_data_from(
+                author,
+                SyncData {
+                    topic_id,
+                    ops: vec![next],
+                },
+            )
+        }
+    });
+    let draining = paused(&storage, GatePoint::Meta(second.id), &gates[2], {
+        let node = node.clone();
+        let first = first.clone();
+        move || {
+            node.receive_sync_data_from(
+                third,
+                SyncData {
+                    topic_id,
+                    ops: vec![first],
+                },
+            )
+        }
+    });
+    #[cfg(feature = "iroh")]
+    let planning = paused(&storage, GatePoint::Meta(old_event), &gates[3], {
+        let node = node.clone();
+        let request = sync::SyncRequest {
+            topic_id,
+            known: BTreeSet::new(),
+            wants: BTreeSet::new(),
+            actor_range_hints: vec![sync::ActorRangeHint {
+                actor_id: branches.old.1.signed.body.actor_id,
+                from_exclusive: 0,
+                to_inclusive: u64::MAX,
+            }],
+            genesis: Some(old_genesis),
+            credit: sync::SyncCredit::default(),
+        };
+        move || {
+            node.response_page(
+                third,
+                &request,
+                sync::PageBudget::from_credit(request.credit),
+            )
+        }
+    });
+
+    storage.disarm_read();
+    let discarded = storage.list_op_ids(&topic_id).unwrap();
+    assert!(
+        discarded.contains(&first.id),
+        "the drain paused after its commit"
+    );
+    reset_to_new(&storage, &branches);
+    Oplog::with_storage(storage.clone())
+        .receive_ops_from_peer(Some(author), vec![replacement.clone()])
+        .unwrap();
+    for gate in &gates {
+        gate.release();
+    }
+
+    if let Ok((mut ack, _)) = acking.join().unwrap() {
+        ack.sign(&branches.member).unwrap();
+        let _ = author_sync.apply_ack(&ack);
+    }
+    assert!(
+        author_log
+            .storage()
+            .has_sync_obligations(&member, &topic_id)
+            .unwrap(),
+        "an ack built across the reset cleared old-branch work"
+    );
+    let _ = forwarding.join().unwrap();
+    let _ = draining.join().unwrap();
+    #[cfg(feature = "iroh")]
+    if let Ok(page) = planning.join().unwrap() {
+        assert!(
+            page.ops.iter().all(|op| discarded.contains(&op.id)),
+            "a page for the old branch carried new-branch ops"
+        );
+    }
+    assert!(
+        storage
+            .sync_obligations(&third, &topic_id)
+            .unwrap()
+            .is_empty(),
+        "forwarding work for discarded ops survived the reset"
+    );
+
+    let view = storage.topic_view(&topic_id, None).unwrap().unwrap();
+    assert_eq!(view.state.genesis, branches.new.0.id);
+    assert_eq!(view.state.heads, [replacement.id].into());
+    assert_eq!(
+        storage.list_op_ids(&topic_id).unwrap(),
+        [branches.new.0.id, branches.new.1.id, replacement.id].into()
+    );
+    let evictions = storage.pending_evictions().unwrap();
+    assert_eq!(evictions.len(), 1);
+    assert_eq!(evictions[0].losing_genesis, old_genesis);
+    assert_eq!(
+        evictions[0]
+            .evicted
+            .iter()
+            .map(|evicted| evicted.op_id)
+            .chain([old_genesis])
+            .collect::<BTreeSet<_>>(),
+        discarded
+    );
+
+    // Pending records left behind are counted exactly once each.
+    let mut waiting = std::collections::BTreeMap::new();
+    for dep in storage.pending_missing_deps(&topic_id).unwrap() {
+        for (_, op) in storage.pending_waiters(&dep).unwrap() {
+            waiting.insert(op.id, op);
+        }
+    }
+    let bytes = waiting
+        .values()
+        .map(|op| crate::storage::pending_op_bytes(op).unwrap() as u64)
+        .sum::<u64>();
+    assert_eq!(usage(&inner), (waiting.len() as u64, bytes));
+
+    // New-branch evidence for the same positions proves no old-branch op.
+    storage
+        .apply_peer_ack(crate::storage::PeerAck {
+            peer_id: member,
+            topic_id,
+            genesis: Some(branches.new.0.id),
+            heads: [replacement.id].into(),
+            clock: view.clock.clone(),
+        })
+        .unwrap();
+    for old in [old_event, next.id] {
+        assert!(!storage.peer_reached_op(&member, &old).unwrap());
+        assert!(!storage.peers_reached_op(&old).unwrap().contains(&member));
+    }
+}
+
+#[test]
+fn memory_reset_pauses() {
+    assert_reset_pauses(MemoryStorage::new(), |storage| {
+        let (ops, bytes, _, _) = storage.pending_usage(&PeerId::from_bytes([0; 32]));
+        (ops, bytes)
+    });
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reset_pauses() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_reset_pauses(
+        crate::storage::FjallStorage::open(dir.path()).unwrap(),
+        |storage| {
+            let (ops, bytes, _, _) = storage.pending_usage(&PeerId::from_bytes([0; 32]));
+            (ops, bytes)
+        },
+    );
+}

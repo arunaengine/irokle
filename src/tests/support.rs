@@ -201,9 +201,9 @@ impl Drop for GateRelease {
 /// for a topic in `failed_writes` are rejected, standing in for a storage fault
 /// that only affects one topic.
 #[derive(Clone)]
-pub(crate) struct StaleReadStorage {
+pub(crate) struct StaleReadStorage<S = MemoryStorage> {
     pub(crate) op_reads: Arc<std::sync::atomic::AtomicUsize>,
-    pub(crate) inner: MemoryStorage,
+    pub(crate) inner: S,
     pub(crate) hidden_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
     pub(crate) hidden_index: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
     pub(crate) mid_commit_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
@@ -215,8 +215,8 @@ pub(crate) struct StaleReadStorage {
     pub(crate) conflicts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl StaleReadStorage {
-    pub(crate) fn new(inner: MemoryStorage) -> Self {
+impl<S: Storage> StaleReadStorage<S> {
+    pub(crate) fn new(inner: S) -> Self {
         Self {
             inner,
             op_reads: Arc::default(),
@@ -284,7 +284,7 @@ impl StaleReadStorage {
     }
 }
 
-impl Storage for StaleReadStorage {
+impl<S: Storage> Storage for StaleReadStorage<S> {
     fn put_admitted_batch(&self, batch: crate::storage::AdmittedBatch) -> Result<(), Error> {
         if self.failed_writes.lock().unwrap().contains(&batch.topic_id) {
             return Err(Error::Storage("injected admission write failure".into()));
