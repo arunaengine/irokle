@@ -442,6 +442,9 @@ impl Storage for StaleReadStorage {
         }
         self.inner.sync_obligations(peer_id, topic_id)
     }
+    fn next_attempt_epoch(&self) -> Result<u64, Error> {
+        self.inner.next_attempt_epoch()
+    }
     fn put_sync_status(&self, status: crate::storage::SyncPeerStatus) -> Result<(), Error> {
         self.inner.put_sync_status(status)
     }

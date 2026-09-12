@@ -278,7 +278,16 @@ pub struct SyncPeerStatus {
     pub last_attempt_ms: Option<u64>,
     pub last_success_ms: Option<u64>,
     pub last_error: Option<String>,
+    /// Newest attempt identity, `(epoch, sequence)`, whose outcome set the
+    /// state, error and pending gauge.
+    pub latest_attempt: Option<(u64, u64)>,
+    /// The newest identities already counted, so a repeated completion of one
+    /// attempt counts once. Bounded by `MAX_RECENT_ATTEMPTS`.
+    pub recent_attempts: Vec<(u64, u64)>,
 }
+
+/// Attempt identities a status remembers for duplicate detection.
+pub(crate) const MAX_RECENT_ATTEMPTS: usize = 16;
 
 /// How one update moves the stored sync state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -295,6 +304,8 @@ pub enum SyncStateUpdate {
 /// gauges that leave the stored value alone when unset. Timestamps only move
 /// forward and `expected_attempts` drops the whole update unless the stored
 /// attempt total still matches, so a late outcome cannot overwrite a newer one.
+/// An update with an `attempt` identity is ordered by that identity instead of
+/// by its timestamps.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncStatusUpdate {
     pub successful_attempts: u64,
@@ -306,6 +317,10 @@ pub struct SyncStatusUpdate {
     /// Outer `None` keeps the stored error, inner `None` clears it.
     pub last_error: Option<Option<String>>,
     pub expected_attempts: Option<u64>,
+    /// `(epoch, sequence)` of the attempt this outcome belongs to. The epoch
+    /// comes from [`Storage::next_attempt_epoch`], so identities are never
+    /// reused across restarts.
+    pub attempt: Option<(u64, u64)>,
 }
 
 pub trait Storage: Clone + Send + Sync + 'static {
@@ -432,6 +447,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn has_sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<bool> {
         Ok(!self.sync_obligations(peer_id, topic_id)?.is_empty())
     }
+    /// Durably advance and return the attempt epoch, in one transaction, so
+    /// every start of a transport gets an epoch no earlier start used.
+    fn next_attempt_epoch(&self) -> Result<u64>;
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()>;
     /// Atomically fold `update` into the status of `peer_id` on `topic_id` and
     /// return the result. Backends must read, apply and write in one lock or
@@ -872,13 +890,37 @@ pub(super) fn settled_obligation(
 /// passed. A failure no newer than the stored success is stale in that sense; on
 /// an equal timestamp the success is kept, since `Failed` is the stronger claim
 /// and a genuinely failing peer is marked again by its next attempt.
+///
+/// With an attempt identity, order is the identity alone: an identity already
+/// counted changes nothing, and only an identity newer than the recorded one
+/// installs its gauges, whatever the timestamps say.
 pub(super) fn apply_status_update(status: &mut SyncPeerStatus, update: &SyncStatusUpdate) -> bool {
     let attempts = status
         .successful_attempts
         .saturating_add(status.failed_attempts);
-    let current = update.expected_attempts.is_none_or(|want| want == attempts)
-        && !stale_outcome(status, update);
-    let counted = update.successful_attempts > 0 || update.failed_attempts > 0;
+    let expected = update.expected_attempts.is_none_or(|want| want == attempts);
+    let current = match update.attempt {
+        Some(attempt) => {
+            if status.latest_attempt == Some(attempt) || status.recent_attempts.contains(&attempt) {
+                return false;
+            }
+            status.recent_attempts.push(attempt);
+            status.recent_attempts.sort_unstable();
+            let excess = status
+                .recent_attempts
+                .len()
+                .saturating_sub(MAX_RECENT_ATTEMPTS);
+            status.recent_attempts.drain(..excess);
+            let current = expected && status.latest_attempt.is_none_or(|latest| attempt > latest);
+            if current {
+                status.latest_attempt = Some(attempt);
+            }
+            current
+        }
+        None => expected && !stale_outcome(status, update),
+    };
+    let counted =
+        update.successful_attempts > 0 || update.failed_attempts > 0 || update.attempt.is_some();
     status.successful_attempts = status
         .successful_attempts
         .saturating_add(update.successful_attempts);

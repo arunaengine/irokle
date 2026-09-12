@@ -1928,6 +1928,202 @@ fn fjall_status_ordering() {
     assert_status_ordering(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
+/// Outcome of attempt `(epoch, sequence)` finished at wall clock `at`.
+fn attempt_outcome(attempt: (u64, u64), at: u64, healthy: bool) -> crate_storage::SyncStatusUpdate {
+    let state = if healthy {
+        crate_storage::SyncPeerState::Healthy
+    } else {
+        crate_storage::SyncPeerState::Failed
+    };
+    crate_storage::SyncStatusUpdate {
+        successful_attempts: u64::from(healthy),
+        failed_attempts: u64::from(!healthy),
+        last_attempt_ms: Some(at),
+        last_error: Some((!healthy).then(|| format!("attempt {attempt:?}"))),
+        state: crate_storage::SyncStateUpdate::Set(state),
+        attempt: Some(attempt),
+        ..crate_storage::SyncStatusUpdate::default()
+    }
+}
+
+/// Attempt identities, not wall clocks, decide which outcome a status shows;
+/// every attempt counts once, and the order survives a reopen.
+fn assert_attempt_order<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S) {
+    let peer = PeerId::hash(b"attempt-peer");
+    let topic_id = TopicId::hash(b"attempt-topic");
+    let first = storage.next_attempt_epoch().unwrap();
+    let epoch = storage.next_attempt_epoch().unwrap();
+    assert!(epoch > first);
+    let state = |status: &crate_storage::SyncPeerStatus| (status.state, status.latest_attempt);
+
+    // Concurrent outcomes: every attempt counts and the newest identity wins.
+    let rounds = 16_u64;
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = [true, false].map(|healthy| {
+        let storage = storage.clone();
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            for round in 0..rounds {
+                let sequence = round * 2 + u64::from(!healthy);
+                storage
+                    .update_sync_status(
+                        &peer,
+                        &topic_id,
+                        &attempt_outcome((epoch, sequence), 50, healthy),
+                    )
+                    .unwrap();
+            }
+        })
+    });
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let status = storage.sync_statuses(&topic_id).unwrap().remove(0);
+    assert_eq!(
+        (status.successful_attempts, status.failed_attempts),
+        (rounds, rounds)
+    );
+    let newest = (epoch, rounds * 2 - 1);
+    assert_eq!(
+        state(&status),
+        (crate_storage::SyncPeerState::Failed, Some(newest))
+    );
+
+    // An older identity on the same wall clock counts but installs nothing.
+    let same = storage
+        .update_sync_status(&peer, &topic_id, &attempt_outcome((epoch, 0), 50, true))
+        .unwrap();
+    assert_eq!(same.successful_attempts, rounds + 1);
+    assert_eq!(
+        state(&same),
+        (crate_storage::SyncPeerState::Failed, Some(newest))
+    );
+
+    // A newer identity installs its outcome even with a backwards wall clock.
+    let recovered = (epoch, rounds * 2);
+    let backwards = storage
+        .update_sync_status(&peer, &topic_id, &attempt_outcome(recovered, 10, true))
+        .unwrap();
+    assert_eq!(
+        state(&backwards),
+        (crate_storage::SyncPeerState::Healthy, Some(recovered))
+    );
+    assert_eq!(backwards.last_error, None);
+
+    // An old callback after the newer completion, with a later wall clock.
+    let late = storage
+        .update_sync_status(
+            &peer,
+            &topic_id,
+            &attempt_outcome((epoch, 1_000_000), 90, false),
+        )
+        .unwrap();
+    assert_eq!(late.state, crate_storage::SyncPeerState::Failed);
+    let old = storage
+        .update_sync_status(
+            &peer,
+            &topic_id,
+            &attempt_outcome((epoch, rounds * 2 + 1), 99, true),
+        )
+        .unwrap();
+    assert_eq!(
+        state(&old),
+        (
+            crate_storage::SyncPeerState::Failed,
+            Some((epoch, 1_000_000))
+        )
+    );
+    assert_eq!(old.successful_attempts, rounds + 3);
+
+    // A repeated completion counts nothing, whether newest or older.
+    for duplicate in [(epoch, 1_000_000), (epoch, rounds * 2 + 1)] {
+        let again = storage
+            .update_sync_status(&peer, &topic_id, &attempt_outcome(duplicate, 100, true))
+            .unwrap();
+        assert_eq!(again, old);
+    }
+
+    let storage = reopen(storage);
+    assert!(storage.next_attempt_epoch().unwrap() > epoch);
+    let reopened = storage.sync_statuses(&topic_id).unwrap().remove(0);
+    assert_eq!(reopened, old);
+    let stale = storage
+        .update_sync_status(&peer, &topic_id, &attempt_outcome((epoch, 3), 200, true))
+        .unwrap();
+    assert_eq!(
+        state(&stale),
+        (
+            crate_storage::SyncPeerState::Failed,
+            Some((epoch, 1_000_000))
+        )
+    );
+}
+
+#[test]
+fn memory_attempt_order() {
+    assert_attempt_order(MemoryStorage::new(), |storage| storage);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_attempt_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    assert_attempt_order(storage, |storage| {
+        drop(storage);
+        crate_storage::FjallStorage::open(dir.path()).unwrap()
+    });
+}
+
+/// A status written before attempt identities still reads, and takes one.
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reads_legacy_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer = PeerId::hash(b"legacy-status-peer");
+    let topic_id = TopicId::hash(b"legacy-status-topic");
+    drop(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    {
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .open()
+            .unwrap();
+        let records = db
+            .keyspace("records", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let legacy = (
+            peer,
+            topic_id,
+            crate_storage::SyncPeerState::Behind,
+            3_usize,
+            1_u64,
+            2_u64,
+            Some(5_u64),
+            Some(4_u64),
+            Some("dial failed".to_string()),
+        );
+        let mut tx = db.write_tx().unwrap();
+        tx.insert(
+            &records,
+            [b"ss".as_slice(), topic_id.as_ref(), peer.as_ref()].concat(),
+            postcard::to_allocvec(&legacy).unwrap(),
+        );
+        tx.commit().unwrap().unwrap();
+    }
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    let status = storage.sync_statuses(&topic_id).unwrap().remove(0);
+    assert_eq!(status.state, crate_storage::SyncPeerState::Behind);
+    assert_eq!((status.failed_attempts, status.successful_attempts), (1, 2));
+    assert_eq!(status.latest_attempt, None);
+
+    let updated = storage
+        .update_sync_status(&peer, &topic_id, &attempt_outcome((1, 1), 6, true))
+        .unwrap();
+    assert_eq!(updated.successful_attempts, 3);
+    assert_eq!(updated.latest_attempt, Some((1, 1)));
+    assert_eq!(storage.sync_statuses(&topic_id).unwrap(), vec![updated]);
+}
+
 /// Buffered pending payloads are bounded by bytes, not only by record count: a
 /// count budget multiplied by the frame limit is far more memory than a node
 /// should hold. The charge is released again when the record goes.

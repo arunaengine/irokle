@@ -65,6 +65,9 @@ const PENDING_OP_PREFIX: &[u8] = b"po";
 /// and advances it.
 #[cfg(feature = "fjall")]
 const TOPIC_EPOCH_PREFIX: &[u8] = b"ep";
+/// The durable attempt epoch, one `u64` under exactly this key.
+#[cfg(feature = "fjall")]
+const ATTEMPT_EPOCH_KEY: &[u8] = b"ae";
 
 /// Schema 1 layout of a stored acknowledgement, which did not name the branch
 /// it certified. Kept only to read those records during the upgrade; postcard
@@ -76,6 +79,44 @@ struct LegacyPeerAck {
     topic_id: TopicId,
     heads: BTreeSet<OpId>,
     clock: ActorClock,
+}
+
+/// Sync status layout before attempt identities. Postcard is not
+/// self-describing, so such records decode only with this shape.
+#[cfg(feature = "fjall")]
+#[derive(Deserialize)]
+struct LegacyPeerStatus {
+    peer_id: PeerId,
+    topic_id: TopicId,
+    state: super::SyncPeerState,
+    pending_obligations: usize,
+    failed_attempts: u64,
+    successful_attempts: u64,
+    last_attempt_ms: Option<u64>,
+    last_success_ms: Option<u64>,
+    last_error: Option<String>,
+}
+
+/// Decode a status record in the current or the earlier layout.
+#[cfg(feature = "fjall")]
+fn decode_status(bytes: &[u8]) -> Result<SyncPeerStatus> {
+    if let Ok(status) = postcard::from_bytes(bytes) {
+        return Ok(status);
+    }
+    let legacy: LegacyPeerStatus = postcard::from_bytes(bytes)?;
+    Ok(SyncPeerStatus {
+        peer_id: legacy.peer_id,
+        topic_id: legacy.topic_id,
+        state: legacy.state,
+        pending_obligations: legacy.pending_obligations,
+        failed_attempts: legacy.failed_attempts,
+        successful_attempts: legacy.successful_attempts,
+        last_attempt_ms: legacy.last_attempt_ms,
+        last_success_ms: legacy.last_success_ms,
+        last_error: legacy.last_error,
+        latest_attempt: None,
+        recent_attempts: Vec::new(),
+    })
 }
 
 /// Schema 1 and 2 layout of a sync obligation, which kept resolved and
@@ -1464,6 +1505,17 @@ impl Storage for FjallStorage {
             .is_some())
     }
 
+    fn next_attempt_epoch(&self) -> Result<u64> {
+        self.transaction(|tx| {
+            let epoch = Self::tx_get::<u64>(tx, &self.records, ATTEMPT_EPOCH_KEY)?
+                .unwrap_or_default()
+                .checked_add(1)
+                .ok_or_else(|| Error::Storage("attempt epoch overflow".into()))?;
+            Self::tx_put(tx, &self.records, ATTEMPT_EPOCH_KEY, &epoch)?;
+            Ok(epoch)
+        })
+    }
+
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()> {
         self.put(
             [
@@ -1484,7 +1536,9 @@ impl Storage for FjallStorage {
     ) -> Result<SyncPeerStatus> {
         let key = [b"ss".as_slice(), topic_id.as_ref(), peer_id.as_ref()].concat();
         self.transaction(|tx| {
-            let mut status = Self::tx_get::<SyncPeerStatus>(tx, &self.records, key.as_slice())?
+            let mut status = fjall::Readable::get(tx, &self.records, key.as_slice())?
+                .map(|bytes| decode_status(bytes.as_ref()))
+                .transpose()?
                 .unwrap_or_else(|| new_peer_status(*peer_id, *topic_id));
             // A rejected update leaves no record behind for a peer that had none.
             if apply_status_update(&mut status, update) {
@@ -1541,7 +1595,7 @@ impl Storage for FjallStorage {
         let read_tx = self.db.read_tx();
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
             let value = item.value()?;
-            out.push(postcard::from_bytes(value.as_ref())?);
+            out.push(decode_status(value.as_ref())?);
         }
         Ok(out)
     }

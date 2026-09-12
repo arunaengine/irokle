@@ -58,6 +58,7 @@ struct MemoryInner {
     topic_epochs: BTreeMap<TopicId, u64>,
     /// Bootstrap staging sessions, invisible to every topic query.
     staged: BTreeMap<(PeerId, TopicId), StagedOps>,
+    attempt_epoch: u64,
 }
 
 #[derive(Clone, Default)]
@@ -629,6 +630,15 @@ impl Storage for MemoryStorage {
             .obligations
             .get(&(*topic_id, *peer_id))
             .is_some_and(|records| !records.is_empty()))
+    }
+
+    fn next_attempt_epoch(&self) -> Result<u64> {
+        let mut inner = self.lock()?;
+        inner.attempt_epoch = inner
+            .attempt_epoch
+            .checked_add(1)
+            .ok_or_else(|| Error::Storage("attempt epoch overflow".into()))?;
+        Ok(inner.attempt_epoch)
     }
 
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()> {
