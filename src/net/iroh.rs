@@ -1207,9 +1207,32 @@ impl<S: Storage> IrohNet<S> {
         let mut group = Vec::new();
         let mut group_messages = 0_usize;
         let mut group_responses = 0_usize;
+        let mut group_bytes = 0_usize;
         for planned in pending {
+            let bytes = match planned.messages.iter().try_fold(0usize, |bytes, message| {
+                super::framed_message_len(message).map(|len| bytes.saturating_add(len))
+            }) {
+                Ok(bytes) if bytes <= MAX_SYNC_STREAM_BYTES => bytes,
+                Ok(_) => {
+                    outcomes.insert(
+                        planned.topic_id,
+                        Err(invalid_data("sync plan exceeds stream byte limit")),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    outcomes.insert(planned.topic_id, Err(error));
+                    continue;
+                }
+            };
             if !group.is_empty()
-                && (group_messages + planned.messages.len() > MAX_BATCH_STREAM_MESSAGES
+                && (group_bytes.saturating_add(bytes) > MAX_SYNC_STREAM_BYTES
+                    || (group.len() + 1).saturating_mul(96 * 1024 * 1024) > MAX_SYNC_STREAM_BYTES
+                    || group_responses
+                        .saturating_add(planned.estimated_responses)
+                        .saturating_mul(MAX_FRAME_LEN + 4)
+                        > MAX_SYNC_STREAM_BYTES
+                    || group_messages + planned.messages.len() > MAX_BATCH_STREAM_MESSAGES
                     || group_responses + planned.estimated_responses > MAX_BATCH_STREAM_MESSAGES)
             {
                 self.run_topic_batch_exchange(
@@ -1221,7 +1244,9 @@ impl<S: Storage> IrohNet<S> {
                 .await;
                 group_messages = 0;
                 group_responses = 0;
+                group_bytes = 0;
             }
+            group_bytes += bytes;
             group_messages += planned.messages.len();
             group_responses += planned.estimated_responses;
             group.push(planned);
@@ -1241,7 +1266,7 @@ impl<S: Storage> IrohNet<S> {
     ) -> io::Result<Option<PlannedTopicSync>> {
         let plan = self
             .node
-            .negotiate_sync(remote_peer_id, summary)
+            .negotiate_page(remote_peer_id, summary)
             .map_err(invalid_data)?;
         let request = crate::sync::SyncRequest {
             topic_id: plan.topic_id,
@@ -1250,7 +1275,7 @@ impl<S: Storage> IrohNet<S> {
             actor_range_hints: plan.actor_range_hints,
         };
         let mut messages = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
-        messages.extend(sync_data_messages(plan.topic_id, plan.send));
+        messages.extend(sync_data_messages(plan.topic_id, plan.send)?);
         let data_count = messages.len() - 1;
         let wants = !request.wants.is_empty() || !request.actor_range_hints.is_empty();
         let requested_ops = request.wants.len() as u64
@@ -1262,9 +1287,9 @@ impl<S: Storage> IrohNet<S> {
         if wants {
             messages.push(SyncMessage::Request(request));
         }
-        if messages.len() == 1 {
-            return Ok(None);
-        }
+        messages.push(SyncMessage::Summary(
+            self.node.sync_summary(topic_id).map_err(invalid_data)?,
+        ));
         // One summary per open, one ack per data message we send, plus the
         // data messages the peer may send for what we requested.
         let estimated_responses = 1
@@ -1276,6 +1301,7 @@ impl<S: Storage> IrohNet<S> {
             };
         Ok(Some(PlannedTopicSync {
             topic_id,
+            remote_clock: summary.actor_clock.clone(),
             messages,
             estimated_responses,
         }))
@@ -1292,8 +1318,25 @@ impl<S: Storage> IrohNet<S> {
             .iter()
             .map(|planned| planned.topic_id)
             .collect::<BTreeSet<_>>();
+        let remote_clocks = group
+            .iter()
+            .map(|planned| (planned.topic_id, planned.remote_clock.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut expected_acks = BTreeMap::<crate::TopicId, usize>::new();
+        let mut expected_data = BTreeSet::new();
         let mut messages = Vec::new();
         for planned in group {
+            for message in &planned.messages {
+                match message {
+                    SyncMessage::Data(_) => {
+                        *expected_acks.entry(planned.topic_id).or_default() += 1
+                    }
+                    SyncMessage::Request(_) => {
+                        expected_data.insert(planned.topic_id);
+                    }
+                    _ => {}
+                }
+            }
             messages.extend(planned.messages);
         }
         let fail_group = |outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
@@ -1328,14 +1371,34 @@ impl<S: Storage> IrohNet<S> {
                         tracing::warn!(topic_id = %ack.topic_id, "ignoring ack outside the exchange");
                         continue;
                     }
+                    if let Some(remaining) = expected_acks.get_mut(&ack.topic_id) {
+                        *remaining = remaining.saturating_sub(1);
+                    }
                     acks.push(ack);
                 }
                 SyncMessage::Failure(failure) if group_topics.contains(&failure.topic_id) => {
                     outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
                 }
                 SyncMessage::Summary(summary) if group_topics.contains(&summary.topic_id) => {}
+                SyncMessage::Request(request) if group_topics.contains(&request.topic_id) => {
+                    let topic_id = request.topic_id;
+                    match self
+                        .node
+                        .response_page(remote_peer_id, &request)
+                        .map_err(invalid_data)
+                        .and_then(|data| sync_data_messages(data.topic_id, data.ops))
+                    {
+                        Ok(messages) => followups.entry(topic_id).or_default().extend(messages),
+                        Err(error) => {
+                            outcomes.insert(topic_id, Err(error));
+                        }
+                    }
+                }
                 SyncMessage::Data(data) if group_topics.contains(&data.topic_id) => {
                     let data_topic_id = data.topic_id;
+                    if !data.ops.is_empty() {
+                        expected_data.remove(&data_topic_id);
+                    }
                     match self
                         .node
                         .receive_sync_data_from_evicting(remote_peer_id, data)
@@ -1349,6 +1412,14 @@ impl<S: Storage> IrohNet<S> {
                                 .entry(data_topic_id)
                                 .or_default()
                                 .push(SyncMessage::Ack(ack));
+                        }
+                        Err(crate::Error::ReceiveCommitted {
+                            evictions, source, ..
+                        }) => {
+                            self.forward_evictions(evictions);
+                            self.resync_scheduler
+                                .schedule_now(remote_peer_id, data_topic_id, true);
+                            outcomes.insert(data_topic_id, Err(invalid_data(source)));
                         }
                         Err(error) => {
                             outcomes.insert(data_topic_id, Err(invalid_data(error)));
@@ -1380,7 +1451,13 @@ impl<S: Storage> IrohNet<S> {
                 continue;
             }
             if !current_messages.is_empty()
-                && current_messages.len() + topic_acks.len() + 1 > MAX_BATCH_STREAM_MESSAGES
+                && (current_messages.len() + topic_acks.len() + 1 > MAX_BATCH_STREAM_MESSAGES
+                    || topic_acks
+                        .iter()
+                        .any(|message| matches!(message, SyncMessage::Data(_)))
+                    || current_messages
+                        .iter()
+                        .any(|message| matches!(message, SyncMessage::Data(_))))
             {
                 followup_groups.push((
                     std::mem::take(&mut current_topics),
@@ -1395,11 +1472,38 @@ impl<S: Storage> IrohNet<S> {
             followup_groups.push((current_topics, current_messages));
         }
         for (topics, messages) in followup_groups {
+            let mut summaries = topics.clone();
+            let mut remaining = BTreeMap::<crate::TopicId, usize>::new();
+            for message in &messages {
+                if let SyncMessage::Data(data) = message {
+                    *remaining.entry(data.topic_id).or_default() += 1;
+                }
+            }
             match self.sync_with(peer.clone(), &messages).await {
                 Ok(responses) => {
                     for response in responses {
                         match response {
                             SyncMessage::Summary(summary) if topics.contains(&summary.topic_id) => {
+                                summaries.remove(&summary.topic_id);
+                            }
+                            SyncMessage::Ack(ack) if topics.contains(&ack.topic_id) => {
+                                if ack.peer_id != remote_peer_id {
+                                    outcomes.insert(
+                                        ack.topic_id,
+                                        Err(invalid_data("sync ack does not match remote peer")),
+                                    );
+                                } else {
+                                    if let Some(count) = remaining.get_mut(&ack.topic_id) {
+                                        *count = count.saturating_sub(1);
+                                    }
+                                    for result in
+                                        self.node.apply_sync_acks(std::slice::from_ref(&ack))
+                                    {
+                                        if let Err(error) = result {
+                                            outcomes.insert(ack.topic_id, Err(invalid_data(error)));
+                                        }
+                                    }
+                                }
                             }
                             SyncMessage::Failure(failure) if topics.contains(&failure.topic_id) => {
                                 outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
@@ -1423,10 +1527,41 @@ impl<S: Storage> IrohNet<S> {
                     }
                 }
             }
+            for topic_id in summaries {
+                outcomes.insert(
+                    topic_id,
+                    Err(invalid_data("peer omitted sync acknowledgement summary")),
+                );
+            }
+            for (topic_id, count) in remaining {
+                if count > 0 {
+                    outcomes.insert(
+                        topic_id,
+                        Err(invalid_data("peer omitted sync acknowledgement")),
+                    );
+                }
+            }
         }
 
         for topic_id in group_topics {
-            outcomes.entry(topic_id).or_insert(Ok(()));
+            outcomes.entry(topic_id).or_insert_with(|| {
+                if expected_acks.get(&topic_id).copied().unwrap_or_default() > 0
+                    || expected_data.contains(&topic_id)
+                    || !self
+                        .node
+                        .sync_summary(topic_id)
+                        .map_err(invalid_data)?
+                        .actor_clock
+                        .dominates(&remote_clocks[&topic_id])
+                    || !self.topic_is_whole(topic_id)
+                    || self.target_needs_sync(remote_peer_id, topic_id)?
+                {
+                    self.schedule_resync(remote_peer_id, topic_id);
+                    Err(invalid_data("sync exchange is incomplete"))
+                } else {
+                    Ok(())
+                }
+            });
         }
     }
 
@@ -1458,22 +1593,32 @@ impl<S: Storage> IrohNet<S> {
         mut recv: iroh::endpoint::RecvStream,
         mut send: iroh::endpoint::SendStream,
     ) -> io::Result<()> {
-        let mut session = SyncSession::new(peer);
-        let mut limits = SyncReadLimits::default();
-        let mut responses = Vec::new();
-        while let Some(frame) = read_next_frame(&mut recv, self.runtime.sync_io_timeout).await? {
-            let frame_index = limits.observe_frame(frame.len())?;
-            let message = decode_sync_message(&frame).map_err(|err| {
-                invalid_data(format!(
-                    "invalid sync message frame {frame_index} ({} bytes): {err}",
-                    frame.len()
-                ))
-            })?;
-            push_responses(&mut responses, session.handle(self, message)?)?;
-        }
-        push_responses(&mut responses, session.finish(self)?)?;
-        write_sync_messages(&mut send, &responses, self.runtime.sync_io_timeout).await?;
-        Ok(())
+        tokio::time::timeout(self.runtime.sync_io_timeout, async {
+            let mut session = SyncSession::new(peer);
+            let mut limits = SyncReadLimits::default();
+            let mut responses = Vec::new();
+            let mut response_limits = SyncReadLimits::default();
+            while let Some(frame) = read_next_frame(&mut recv, self.runtime.sync_io_timeout).await?
+            {
+                let frame_index = limits.observe_frame(frame.len())?;
+                let message = decode_sync_message(&frame).map_err(|err| {
+                    invalid_data(format!(
+                        "invalid sync message frame {frame_index} ({} bytes): {err}",
+                        frame.len()
+                    ))
+                })?;
+                push_responses(
+                    &mut responses,
+                    session.handle(self, message)?,
+                    &mut response_limits,
+                )?;
+            }
+            push_responses(&mut responses, session.finish(self)?, &mut response_limits)?;
+            write_sync_messages(&mut send, &responses, self.runtime.sync_io_timeout).await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| timed_out("sync stream timed out"))?
     }
 
     pub fn handle_messages(
@@ -1483,10 +1628,15 @@ impl<S: Storage> IrohNet<S> {
     ) -> io::Result<Vec<SyncMessage>> {
         let mut session = SyncSession::new(peer);
         let mut responses = Vec::new();
+        let mut response_limits = SyncReadLimits::default();
         for message in messages {
-            push_responses(&mut responses, session.handle(self, message)?)?;
+            push_responses(
+                &mut responses,
+                session.handle(self, message)?,
+                &mut response_limits,
+            )?;
         }
-        push_responses(&mut responses, session.finish(self)?)?;
+        push_responses(&mut responses, session.finish(self)?, &mut response_limits)?;
         Ok(responses)
     }
 
@@ -1589,11 +1739,11 @@ impl<S: Storage> IrohNet<S> {
                 })?;
                 let plan = self
                     .node
-                    .negotiate_sync(peer_id, &summary)
+                    .negotiate_page(peer_id, &summary)
                     .map_err(invalid_data)?;
                 let mut responses = Vec::new();
                 if !plan.send.is_empty() {
-                    responses.extend(sync_data_messages(plan.topic_id, plan.send));
+                    responses.extend(sync_data_messages(plan.topic_id, plan.send)?);
                 }
                 if !plan.need.is_empty() || !plan.actor_range_hints.is_empty() {
                     responses.push(SyncMessage::Request(crate::sync::SyncRequest {
@@ -1611,9 +1761,9 @@ impl<S: Storage> IrohNet<S> {
                 })?;
                 let data = self
                     .node
-                    .plan_sync_response_data(peer_id, &request)
+                    .response_page(peer_id, &request)
                     .map_err(invalid_data)?;
-                Ok(sync_data_messages(data.topic_id, data.ops))
+                sync_data_messages(data.topic_id, data.ops)
             }
             SyncMessage::Data(data) => {
                 let data_topic_id = data.topic_id;
@@ -1626,7 +1776,15 @@ impl<S: Storage> IrohNet<S> {
                 let (ack, evictions) = self
                     .node
                     .receive_sync_data_from_evicting(source_peer, data)
-                    .map_err(invalid_data)?;
+                    .map_err(|mut error| {
+                        if let crate::Error::ReceiveCommitted { evictions, .. } = &mut error {
+                            self.forward_evictions(std::mem::take(evictions));
+                            if let Err(retry) = self.schedule_topic_recheck(data_topic_id) {
+                                tracing::warn!(%data_topic_id, %retry, "failed to schedule received topic resync");
+                            }
+                        }
+                        invalid_data(error)
+                    })?;
                 self.forward_evictions(evictions);
                 if let Err(error) = self.schedule_topic_recheck(data_topic_id) {
                     tracing::warn!(%data_topic_id, %error, "failed to schedule received topic resync");
@@ -1663,6 +1821,7 @@ fn per_topic_failure_scope(message: &SyncMessage) -> Option<crate::sync::SyncFai
 
 struct PlannedTopicSync {
     topic_id: crate::TopicId,
+    remote_clock: crate::ActorClock,
     messages: Vec<SyncMessage>,
     estimated_responses: usize,
 }
@@ -1671,6 +1830,7 @@ struct SyncSession {
     authenticated_peer_id: PeerId,
     remote_peer_id: Option<PeerId>,
     open_topic_id: Option<crate::TopicId>,
+    open_allowed: bool,
     acks: Vec<crate::sync::SyncAck>,
 }
 
@@ -1680,6 +1840,7 @@ impl SyncSession {
             authenticated_peer_id: peer_id_from_endpoint_id(peer),
             remote_peer_id: None,
             open_topic_id: None,
+            open_allowed: false,
             acks: Vec::new(),
         }
     }
@@ -1700,6 +1861,21 @@ impl SyncSession {
             }
             self.remote_peer_id = Some(open.peer_id);
             self.open_topic_id = Some(open.topic_id);
+            self.open_allowed = false;
+            let allowed = match net.node.storage().topic_state(&open.topic_id) {
+                Ok(state) => state.is_none_or(|state| peer_may_open_topic(&state, open.peer_id)),
+                Err(error) => {
+                    tracing::warn!(topic_id = %open.topic_id, %error, "failed to authorize sync topic");
+                    false
+                }
+            };
+            if !allowed {
+                return Ok(vec![SyncMessage::Failure(crate::sync::SyncFailure {
+                    topic_id: open.topic_id,
+                    code: crate::sync::SyncFailureCode::Open,
+                })]);
+            }
+            self.open_allowed = true;
         } else {
             if self.remote_peer_id.is_none() {
                 return Err(invalid_data(
@@ -1713,6 +1889,20 @@ impl SyncSession {
                     "sync message topic does not match SyncOpen topic",
                 ));
             }
+        }
+
+        if !self.open_allowed {
+            return Ok(vec![SyncMessage::Failure(crate::sync::SyncFailure {
+                topic_id: message_topic_id(&message)
+                    .ok_or_else(|| invalid_data("sync message requires a topic"))?,
+                code: crate::sync::SyncFailureCode::Open,
+            })]);
+        }
+
+        if let SyncMessage::Data(data) = &message
+            && data.ops.len() > MAX_SYNC_DATA_OPS_PER_MESSAGE
+        {
+            return Err(invalid_data("sync data has too many operations"));
         }
 
         if let SyncMessage::Ack(ack) = message {
@@ -1807,9 +1997,13 @@ impl SyncReadLimits {
     }
 }
 
-fn push_responses(out: &mut Vec<SyncMessage>, responses: Vec<SyncMessage>) -> io::Result<()> {
-    if out.len().saturating_add(responses.len()) > MAX_SYNC_MESSAGES_PER_STREAM {
-        return Err(invalid_data("sync response has too many messages"));
+fn push_responses(
+    out: &mut Vec<SyncMessage>,
+    responses: Vec<SyncMessage>,
+    limits: &mut SyncReadLimits,
+) -> io::Result<()> {
+    for response in &responses {
+        limits.observe_frame(super::framed_message_len(response)? - 4)?;
     }
     out.extend(responses);
     Ok(())
@@ -2009,6 +2203,10 @@ async fn write_sync_messages(
     messages: &[SyncMessage],
     sync_io_timeout: Duration,
 ) -> io::Result<()> {
+    let mut limits = SyncReadLimits::default();
+    for message in messages {
+        limits.observe_frame(super::framed_message_len(message)? - 4)?;
+    }
     for message in messages {
         let payload = encode_sync_message(message)?;
         let frame = encode_frame(&payload)?;
