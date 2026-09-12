@@ -13,7 +13,8 @@ use crate::{
 use super::{
     AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
     MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
-    SyncPeerStatus, TopicState, ensure_deps_resolvable, journalled_eviction, stored_ack_dominates,
+    SyncPeerStatus, SyncStatusUpdate, TopicState, apply_status_update, ensure_deps_resolvable,
+    journalled_eviction, merged_peer_ack, new_peer_status, stored_ack_dominates,
     sync_obligation_satisfied, topic_fingerprint_for, validate_batch, validate_heads,
 };
 
@@ -200,7 +201,26 @@ impl FjallStorage {
         Ok(())
     }
 
+    /// One key per id set: an ordinary target coalesces into the bare
+    /// peer/topic key and an explicit repair want keys on its ids alone, so a
+    /// repeat raises the stored watermark instead of adding a record.
     fn sync_obligation_key(obligation: &SyncObligation) -> Result<Vec<u8>> {
+        let mut key = [
+            b"ob".as_slice(),
+            obligation.peer_id.as_ref(),
+            obligation.topic_id.as_ref(),
+        ]
+        .concat();
+        if !obligation.op_ids.is_empty() {
+            let digest = blake3::hash(&postcard::to_allocvec(&obligation.op_ids)?);
+            key.extend_from_slice(digest.as_bytes());
+        }
+        Ok(key)
+    }
+
+    /// Key an earlier release wrote for the same want, digesting the ids
+    /// together with the target clock.
+    fn superseded_obligation_key(obligation: &SyncObligation) -> Result<Vec<u8>> {
         let digest = blake3::hash(&postcard::to_allocvec(&(
             &obligation.op_ids,
             &obligation.target_clock,
@@ -219,22 +239,23 @@ impl FjallStorage {
         records: &fjall::OptimisticTxKeyspace,
         obligation: &SyncObligation,
     ) -> Result<()> {
-        let legacy_digest = blake3::hash(&postcard::to_allocvec(&obligation.op_ids)?);
-        let legacy_key = [
-            b"ob".as_slice(),
-            obligation.peer_id.as_ref(),
-            obligation.topic_id.as_ref(),
-            legacy_digest.as_bytes(),
-        ]
-        .concat();
         let key = Self::sync_obligation_key(obligation)?;
-        for candidate in [&legacy_key, &key] {
-            if Self::tx_get::<SyncObligation>(tx, records, candidate)?.as_ref() == Some(obligation)
-            {
+        let mut merged = obligation.clone();
+        if let Some(existing) = Self::tx_get::<SyncObligation>(tx, records, key.as_slice())? {
+            if existing.target_clock.dominates(&merged.target_clock) {
                 return Ok(());
             }
+            merged.target_clock.merge(&existing.target_clock);
+        } else if !merged.op_ids.is_empty() {
+            let superseded = Self::superseded_obligation_key(obligation)?;
+            if let Some(existing) =
+                Self::tx_get::<SyncObligation>(tx, records, superseded.as_slice())?
+            {
+                merged.target_clock.merge(&existing.target_clock);
+                tx.remove(records, superseded);
+            }
         }
-        Self::tx_put(tx, records, key, obligation)
+        Self::tx_put(tx, records, key, &merged)
     }
     fn get<T: for<'de> Deserialize<'de>>(&self, key: impl AsRef<[u8]>) -> Result<Option<T>> {
         Ok(self
@@ -257,7 +278,12 @@ impl FjallStorage {
         .concat();
         let effective_ack = match Self::tx_get::<PeerAck>(tx, records, ack_key.as_slice())? {
             Some(existing) if stored_ack_dominates(&existing, ack) => existing,
-            _ => {
+            Some(existing) => {
+                let merged = merged_peer_ack(&existing, ack);
+                Self::tx_put(tx, records, ack_key, &merged)?;
+                merged
+            }
+            None => {
                 Self::tx_put(tx, records, ack_key, ack)?;
                 ack.clone()
             }
@@ -1177,6 +1203,47 @@ impl Storage for FjallStorage {
             .concat(),
             &status,
         )
+    }
+
+    fn update_sync_status(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+        update: &SyncStatusUpdate,
+    ) -> Result<SyncPeerStatus> {
+        let key = [b"ss".as_slice(), topic_id.as_ref(), peer_id.as_ref()].concat();
+        self.transaction(|tx| {
+            let mut status = Self::tx_get::<SyncPeerStatus>(tx, &self.records, key.as_slice())?
+                .unwrap_or_else(|| new_peer_status(*peer_id, *topic_id));
+            // A rejected update leaves no record behind for a peer that had none.
+            if apply_status_update(&mut status, update) {
+                Self::tx_put(tx, &self.records, key.as_slice(), &status)?;
+            }
+            Ok(status)
+        })
+    }
+
+    fn topic_obligation_counts(&self, topic_id: &TopicId) -> Result<BTreeMap<PeerId, usize>> {
+        let mut counts = BTreeMap::new();
+        let read_tx = self.db.read_tx();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, b"ob".as_slice()) {
+            let (key, _) = item.into_inner()?;
+            let key = key.as_ref();
+            if Self::is_op_record_key(key) {
+                continue;
+            }
+            let (peer_bytes, rest) = key
+                .get(b"ob".len()..)
+                .and_then(|rest| rest.split_at_checked(PeerId::LEN))
+                .ok_or_else(|| Error::Storage("corrupt fjall obligation key".into()))?;
+            if !rest.starts_with(topic_id.as_ref()) {
+                continue;
+            }
+            let mut peer = [0_u8; PeerId::LEN];
+            peer.copy_from_slice(peer_bytes);
+            *counts.entry(PeerId::from_bytes(peer)).or_default() += 1;
+        }
+        Ok(counts)
     }
 
     fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize> {

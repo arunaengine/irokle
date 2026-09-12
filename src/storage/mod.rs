@@ -113,6 +113,34 @@ pub struct SyncPeerStatus {
     pub last_error: Option<String>,
 }
 
+/// How one update moves the stored sync state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SyncStateUpdate {
+    #[default]
+    Keep,
+    Set(SyncPeerState),
+    /// Record falling behind without erasing an already recorded failure.
+    BehindUnlessFailed,
+}
+
+/// One atomic change to a peer's sync status. `successful_attempts` and
+/// `failed_attempts` are deltas added to the stored counters; the rest are
+/// gauges that leave the stored value alone when unset. Timestamps only move
+/// forward and `expected_attempts` drops the whole update unless the stored
+/// attempt total still matches, so a late outcome cannot overwrite a newer one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncStatusUpdate {
+    pub successful_attempts: u64,
+    pub failed_attempts: u64,
+    pub state: SyncStateUpdate,
+    pub pending_obligations: Option<usize>,
+    pub last_attempt_ms: Option<u64>,
+    pub last_success_ms: Option<u64>,
+    /// Outer `None` keeps the stored error, inner `None` clears it.
+    pub last_error: Option<Option<String>>,
+    pub expected_attempts: Option<u64>,
+}
+
 pub trait Storage: Clone + Send + Sync + 'static {
     /// Durably admit `batch`. Backends must write each entry's op record and
     /// its [`OpMeta`] in one atomic unit and must reject a batch whose entry
@@ -183,7 +211,23 @@ pub trait Storage: Clone + Send + Sync + 'static {
         Ok(!self.sync_obligations(peer_id, topic_id)?.is_empty())
     }
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()>;
+    /// Atomically fold `update` into the status of `peer_id` on `topic_id` and
+    /// return the result. Backends must read, apply and write in one lock or
+    /// transaction: two outcomes recorded at once would otherwise each miss the
+    /// other's counter increment and the later writer's state would win.
+    /// Required rather than defaulted: a composition of a read and a blind
+    /// write is not atomic, and a backend must not inherit that silently.
+    fn update_sync_status(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+        update: &SyncStatusUpdate,
+    ) -> Result<SyncPeerStatus>;
     fn sync_statuses(&self, topic_id: &TopicId) -> Result<Vec<SyncPeerStatus>>;
+    /// How many obligation records each peer holds for `topic_id`. Reports read
+    /// this instead of every stored obligation; a record count is a count of
+    /// outstanding targets, not of missing operations.
+    fn topic_obligation_counts(&self, topic_id: &TopicId) -> Result<BTreeMap<PeerId, usize>>;
     /// Drop obligations, sync status, and the stored ack for a peer that left
     /// a topic. Returns the number of cleared obligations.
     fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize>;
@@ -348,10 +392,64 @@ pub(crate) fn topic_fingerprint_for(
 }
 
 pub(super) fn sync_obligation_satisfied(obligation: &SyncObligation, ack: &PeerAck) -> bool {
-    if obligation.op_ids.is_subset(&ack.heads) {
+    // An empty id set proves nothing: without this guard it is a subset of
+    // every frontier, so any ack would clear a target clock it never reached.
+    if !obligation.op_ids.is_empty() && obligation.op_ids.is_subset(&ack.heads) {
         return true;
     }
     !obligation.target_clock.is_empty() && ack.clock.dominates(&obligation.target_clock)
+}
+
+/// Fold one status update into `status`, reporting whether the guard admitted
+/// it. Counters accumulate and timestamps only advance, so two concurrent
+/// outcomes keep both increments and a late one cannot rewind the record.
+pub(super) fn apply_status_update(status: &mut SyncPeerStatus, update: &SyncStatusUpdate) -> bool {
+    let attempts = status
+        .successful_attempts
+        .saturating_add(status.failed_attempts);
+    if update
+        .expected_attempts
+        .is_some_and(|want| want != attempts)
+    {
+        return false;
+    }
+    status.successful_attempts = status
+        .successful_attempts
+        .saturating_add(update.successful_attempts);
+    status.failed_attempts = status
+        .failed_attempts
+        .saturating_add(update.failed_attempts);
+    if let Some(pending) = update.pending_obligations {
+        status.pending_obligations = pending;
+    }
+    if let Some(attempt_ms) = update.last_attempt_ms {
+        status.last_attempt_ms = Some(status.last_attempt_ms.unwrap_or(attempt_ms).max(attempt_ms));
+    }
+    if let Some(success_ms) = update.last_success_ms {
+        status.last_success_ms = Some(status.last_success_ms.unwrap_or(success_ms).max(success_ms));
+    }
+    if let Some(error) = &update.last_error {
+        status.last_error = error.clone();
+    }
+    match update.state {
+        SyncStateUpdate::Keep => {}
+        SyncStateUpdate::Set(state) => status.state = state,
+        SyncStateUpdate::BehindUnlessFailed => {
+            if status.state != SyncPeerState::Failed {
+                status.state = SyncPeerState::Behind;
+            }
+        }
+    }
+    true
+}
+
+/// The status a backend starts from when a peer has no record yet.
+pub(super) fn new_peer_status(peer_id: PeerId, topic_id: TopicId) -> SyncPeerStatus {
+    SyncPeerStatus {
+        peer_id,
+        topic_id,
+        ..SyncPeerStatus::default()
+    }
 }
 
 /// Reject a batch whose entry depends on an op that is not stored completely,
@@ -390,4 +488,16 @@ pub(super) fn stored_ack_dominates(existing: &PeerAck, incoming: &PeerAck) -> bo
     existing.peer_id == incoming.peer_id
         && existing.topic_id == incoming.topic_id
         && existing.clock.dominates(&incoming.clock)
+}
+
+/// The ack to store once `incoming` is not covered by `existing`. Clock
+/// components the stored ack already proved are kept, so evidence that is
+/// merely incomparable adds to the record instead of regressing it. The stored
+/// frontier follows the newer ack: its clock still carries the older heads.
+pub(super) fn merged_peer_ack(existing: &PeerAck, incoming: &PeerAck) -> PeerAck {
+    let mut merged = incoming.clone();
+    if existing.peer_id == incoming.peer_id && existing.topic_id == incoming.topic_id {
+        merged.clock.merge(&existing.clock);
+    }
+    merged
 }

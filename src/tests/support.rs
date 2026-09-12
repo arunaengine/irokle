@@ -103,6 +103,7 @@ pub(crate) struct StaleReadStorage {
     pub(crate) hidden_index: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
     pub(crate) mid_commit_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
     pub(crate) failed_writes: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
+    pub(crate) failed_status: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
 }
 
 impl StaleReadStorage {
@@ -114,6 +115,7 @@ impl StaleReadStorage {
             hidden_index: Arc::default(),
             mid_commit_ops: Arc::default(),
             failed_writes: Arc::default(),
+            failed_status: Arc::default(),
         }
     }
 
@@ -240,6 +242,23 @@ impl Storage for StaleReadStorage {
     }
     fn put_sync_status(&self, status: crate::storage::SyncPeerStatus) -> Result<(), Error> {
         self.inner.put_sync_status(status)
+    }
+    fn update_sync_status(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+        update: &crate::storage::SyncStatusUpdate,
+    ) -> Result<crate::storage::SyncPeerStatus, Error> {
+        if self.failed_status.lock().unwrap().contains(topic_id) {
+            return Err(Error::Storage("injected status write failure".into()));
+        }
+        self.inner.update_sync_status(peer_id, topic_id, update)
+    }
+    fn topic_obligation_counts(
+        &self,
+        topic_id: &TopicId,
+    ) -> Result<std::collections::BTreeMap<PeerId, usize>, Error> {
+        self.inner.topic_obligation_counts(topic_id)
     }
     fn sync_statuses(
         &self,

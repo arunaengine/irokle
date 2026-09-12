@@ -11,7 +11,8 @@ use crate::{
 use super::{
     AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
     MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
-    SyncPeerStatus, TopicState, ensure_deps_resolvable, journalled_eviction, stored_ack_dominates,
+    SyncPeerStatus, SyncStatusUpdate, TopicState, apply_status_update, ensure_deps_resolvable,
+    journalled_eviction, merged_peer_ack, new_peer_status, stored_ack_dominates,
     sync_obligation_satisfied, topic_fingerprint_for, validate_batch, validate_heads,
 };
 
@@ -37,7 +38,7 @@ struct MemoryInner {
     pending_by_source: BTreeMap<PeerId, BTreeSet<OpId>>,
     pending_waiters: BTreeMap<OpId, BTreeSet<OpId>>,
     peer_acks: HashMap<(PeerId, TopicId), PeerAck>,
-    obligations: Vec<SyncObligation>,
+    obligations: BTreeMap<(PeerId, TopicId), BTreeMap<BTreeSet<OpId>, SyncObligation>>,
     sync_statuses: BTreeMap<(TopicId, PeerId), SyncPeerStatus>,
     evictions: BTreeMap<EvictionKey, TopicEviction>,
     sealed_topics: BTreeSet<TopicId>,
@@ -344,14 +345,17 @@ impl Storage for MemoryStorage {
     }
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()> {
         let mut inner = self.lock()?;
-        if !inner.obligations.contains(&obligation) {
-            inner.obligations.push(obligation);
-        }
+        put_obligation_locked(&mut inner, obligation);
         Ok(())
     }
 
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>> {
-        Ok(self.lock()?.obligations.clone())
+        Ok(self
+            .lock()?
+            .obligations
+            .values()
+            .flat_map(|records| records.values().cloned())
+            .collect())
     }
 
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {
@@ -376,9 +380,9 @@ impl Storage for MemoryStorage {
         Ok(self
             .lock()?
             .obligations
-            .iter()
-            .filter(|o| o.peer_id == *peer_id && o.topic_id == *topic_id)
-            .cloned()
+            .get(&(*peer_id, *topic_id))
+            .into_iter()
+            .flat_map(|records| records.values().cloned())
             .collect())
     }
 
@@ -386,8 +390,8 @@ impl Storage for MemoryStorage {
         Ok(self
             .lock()?
             .obligations
-            .iter()
-            .any(|o| o.peer_id == *peer_id && o.topic_id == *topic_id))
+            .get(&(*peer_id, *topic_id))
+            .is_some_and(|records| !records.is_empty()))
     }
 
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()> {
@@ -397,13 +401,43 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
+    fn update_sync_status(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+        update: &SyncStatusUpdate,
+    ) -> Result<SyncPeerStatus> {
+        let mut inner = self.lock()?;
+        let key = (*topic_id, *peer_id);
+        let mut status = inner
+            .sync_statuses
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| new_peer_status(*peer_id, *topic_id));
+        // A rejected update leaves no record behind for a peer that had none.
+        if apply_status_update(&mut status, update) {
+            inner.sync_statuses.insert(key, status.clone());
+        }
+        Ok(status)
+    }
+
+    fn topic_obligation_counts(&self, topic_id: &TopicId) -> Result<BTreeMap<PeerId, usize>> {
+        let inner = self.lock()?;
+        let mut counts = BTreeMap::new();
+        for ((peer_id, obligation_topic), records) in &inner.obligations {
+            if obligation_topic == topic_id && !records.is_empty() {
+                counts.insert(*peer_id, records.len());
+            }
+        }
+        Ok(counts)
+    }
+
     fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize> {
         let mut inner = self.lock()?;
-        let before = inner.obligations.len();
-        inner
+        let cleared = inner
             .obligations
-            .retain(|o| !(o.peer_id == *peer_id && o.topic_id == *topic_id));
-        let cleared = before - inner.obligations.len();
+            .remove(&(*peer_id, *topic_id))
+            .map_or(0, |records| records.len());
         inner.sync_statuses.remove(&(*topic_id, *peer_id));
         inner.peer_acks.remove(&(*peer_id, *topic_id));
         Ok(cleared)
@@ -643,14 +677,10 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
         inner.topics.insert(state.topic_id, state);
     }
     for obligation in effects.sync_obligations {
-        if !inner.obligations.contains(&obligation) {
-            inner.obligations.push(obligation);
-        }
+        put_obligation_locked(inner, obligation);
     }
     for peer_id in removed_peers {
-        inner
-            .obligations
-            .retain(|o| o.peer_id != peer_id || o.topic_id != topic_id);
+        inner.obligations.remove(&(peer_id, topic_id));
         inner.sync_statuses.remove(&(topic_id, peer_id));
         inner.peer_acks.remove(&(peer_id, topic_id));
     }
@@ -688,7 +718,7 @@ fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> usize {
     inner.actor_by_seq.retain(|(t, _, _), _| t != topic_id);
     inner.actor_tip.retain(|(t, _), _| t != topic_id);
     inner.peer_acks.retain(|(_, t), _| t != topic_id);
-    inner.obligations.retain(|o| o.topic_id != *topic_id);
+    inner.obligations.retain(|(_, t), _| t != topic_id);
     inner.sync_statuses.retain(|(t, _), _| t != topic_id);
     let pending: Vec<OpId> = inner
         .pending_ops
@@ -706,7 +736,12 @@ fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> usize {
     let key = (ack.peer_id, ack.topic_id);
     let effective_ack = match inner.peer_acks.get(&key) {
         Some(existing) if stored_ack_dominates(existing, &ack) => existing.clone(),
-        _ => {
+        Some(existing) => {
+            let merged = merged_peer_ack(existing, &ack);
+            inner.peer_acks.insert(key, merged.clone());
+            merged
+        }
+        None => {
             inner.peer_acks.insert(key, ack.clone());
             ack
         }
@@ -714,18 +749,36 @@ fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> usize {
     clear_satisfied_locked(inner, &effective_ack)
 }
 
+/// One record per id set, so an ordinary target coalesces into the empty-id
+/// slot while an explicit repair want keeps a slot of its own. A repeat raises
+/// the stored watermark instead of adding a record.
+fn put_obligation_locked(inner: &mut MemoryInner, obligation: SyncObligation) {
+    let records = inner
+        .obligations
+        .entry((obligation.peer_id, obligation.topic_id))
+        .or_default();
+    match records.entry(obligation.op_ids.clone()) {
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            entry.get_mut().target_clock.merge(&obligation.target_clock);
+        }
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(obligation);
+        }
+    }
+}
+
 fn clear_satisfied_locked(inner: &mut MemoryInner, ack: &PeerAck) -> usize {
-    let obligations = std::mem::take(&mut inner.obligations);
-    let before = obligations.len();
-    inner.obligations = obligations
-        .into_iter()
-        .filter(|obligation| {
-            obligation.peer_id != ack.peer_id
-                || obligation.topic_id != ack.topic_id
-                || !sync_obligation_satisfied(obligation, ack)
-        })
-        .collect();
-    before - inner.obligations.len()
+    let key = (ack.peer_id, ack.topic_id);
+    let Some(records) = inner.obligations.get_mut(&key) else {
+        return 0;
+    };
+    let before = records.len();
+    records.retain(|_, obligation| !sync_obligation_satisfied(obligation, ack));
+    let cleared = before - records.len();
+    if records.is_empty() {
+        inner.obligations.remove(&key);
+    }
+    cleared
 }
 
 /// A dependency is only satisfied once both of its records are stored; either
