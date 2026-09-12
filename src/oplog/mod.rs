@@ -36,10 +36,6 @@ const MAX_CACHED_PROJECTIONS: usize = 4096;
 /// Views a whole-topic check reads before it gives up certifying one; each
 /// retry means a reset committed during the hole scan.
 const MAX_VIEW_ATTEMPTS: usize = 4;
-// Genesis collisions are rare. Serialize their resolution across all Oplog
-// facades in this process; storage reset preconditions still provide the
-// authoritative stale-write guard.
-static GENESIS_RESOLUTION_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 struct MembershipCache {
@@ -371,11 +367,8 @@ impl<S: Storage> Oplog<S> {
         if self.topic_orphans(topic_id)?.is_empty() {
             return Ok(None);
         }
-        // The rebuild resets the topic, so it must not interleave with a
-        // genesis tie-break resolving the same topic.
-        let _guard = GENESIS_RESOLUTION_LOCK
-            .lock()
-            .map_err(|_| Error::Storage("genesis resolution lock poisoned".into()))?;
+        // The rebuild commits only if the topic still matches the planned
+        // state, so a concurrent tie-break or append makes it replan.
         for _ in 0..MAX_ADMISSION_RETRIES {
             let Some(plan) = self.plan_quarantine(topic_id)? else {
                 return Ok(None);
@@ -857,15 +850,6 @@ impl<S: Storage> Oplog<S> {
         effects: Option<ReceiveEffects<'_>>,
     ) -> Result<(BTreeSet<crate::OpId>, Option<TopicEviction>)> {
         let has_genesis = ops.iter().any(is_structural_genesis);
-        let _genesis_guard = if has_genesis {
-            Some(
-                GENESIS_RESOLUTION_LOCK
-                    .lock()
-                    .map_err(|_| Error::Storage("genesis resolution lock poisoned".into()))?,
-            )
-        } else {
-            None
-        };
         for _ in 0..MAX_ADMISSION_RETRIES {
             let (ops_to_admit, reset, rejected_genesis) = if has_genesis {
                 self.resolve_genesis_collision(ops.clone(), verified)?

@@ -136,6 +136,44 @@ fn fork_resolves_to_smaller_genesis() {
     );
 }
 
+/// A tie-break paused inside its resolution on one store must not hold up a
+/// tie-break on an unrelated store.
+#[test]
+fn unrelated_genesis_proceeds() {
+    let topic_id = TopicId::hash(b"slow-genesis-topic");
+    let peer = |seed: u8| Ed25519Signer::from_bytes(&[seed; 32]).peer_id();
+    let stale = || StaleReadStorage::new(MemoryStorage::new());
+    let (log_a, signer_a, g_a, e_a) = forked_side(stale(), topic_id, 5, [peer(6)], "a");
+    let (log_b, signer_b, g_b, e_b) = forked_side(stale(), topic_id, 6, [peer(5)], "b");
+    let (loser, loser_event, winner_peer, winner_ops) = if g_a.id < g_b.id {
+        (log_b, e_b, signer_a.peer_id(), vec![g_a, e_a])
+    } else {
+        (log_a, e_a, signer_b.peer_id(), vec![g_b, e_b])
+    };
+
+    // The loser reads its discarded event while resolving, and waits there.
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    loser
+        .storage()
+        .arm_read(GatePoint::Meta(loser_event.id), Arc::clone(&gate));
+    let slow =
+        thread::spawn(move || loser.receive_ops_from_peer_evicting(Some(winner_peer), winner_ops));
+    gate.wait_arrival();
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let unrelated = thread::spawn(move || sender.send(build_fork(7, 8)).unwrap());
+    let fork = receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("an unrelated store's tie-break waited behind a paused one");
+    assert_fork_converged(&fork);
+    unrelated.join().unwrap();
+
+    drop(release);
+    let slow = slow.join().unwrap().unwrap();
+    assert_eq!(slow.evictions.len(), 1);
+}
+
 #[test]
 fn sync_receive_data_returns_genesis_eviction() {
     let topic_id = TopicId::hash(b"genesis-fork-sync-receive");
