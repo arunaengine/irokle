@@ -21,6 +21,9 @@ const SYNC_ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/1";
 /// `plan_response_data` is willing to do for a peer-supplied hint, so a
 /// malicious peer cannot push us into walking unbounded sequence ranges.
 pub const MAX_ACTOR_RANGE_HINT_SPAN: u64 = 65_536;
+const MAX_REQUEST_ITEMS: usize = 65_536;
+const MAX_PAGE_OPS: usize = 4096;
+const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncOpen {
@@ -224,6 +227,21 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     pub fn negotiate(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
+        self.negotiate_inner(peer_id, remote, false)
+    }
+
+    /// Plan a causal prefix; repeat negotiation with the receiver's updated summary.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn negotiate_page(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
+        self.negotiate_inner(peer_id, remote, true)
+    }
+
+    fn negotiate_inner(
+        &self,
+        peer_id: PeerId,
+        remote: &SyncSummary,
+        paged: bool,
+    ) -> Result<SyncPlan> {
         // If we don't know this topic locally, the remote's heads are
         // unauthenticated claims. We must not surface them as `need`
         // because that would let a peer inflate our request set for a topic
@@ -275,7 +293,16 @@ impl<S: Storage> SyncEngine<S> {
         }
 
         let (common, dangling) = self.survey_local(remote)?;
-        let send = self.missing_closure(remote)?;
+        let send = if paged {
+            self.collect_page(
+                &remote.topic_id,
+                local_heads.clone(),
+                &BTreeSet::new(),
+                Some(remote),
+            )?
+        } else {
+            self.missing_closure(remote)?
+        };
         let mut need = BTreeSet::new();
         for id in &remote.heads {
             if !self.oplog.storage().dep_resolvable(id)? {
@@ -299,13 +326,14 @@ impl<S: Storage> SyncEngine<S> {
             );
             need.extend(repair);
         }
+        let actor_range_hints = self.needed_actor_ranges(remote, need.len())?;
         Ok(SyncPlan {
             topic_id: remote.topic_id,
             common,
             have: local_heads,
             send,
             need,
-            actor_range_hints: self.needed_actor_ranges(remote.topic_id, remote)?,
+            actor_range_hints,
         })
     }
 
@@ -397,6 +425,21 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     pub fn plan_response_data(&self, peer_id: PeerId, request: &SyncRequest) -> Result<SyncData> {
+        self.response_inner(peer_id, request, false)
+    }
+
+    /// Return a causal prefix; request the remainder after acknowledging this page.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn response_page(&self, peer_id: PeerId, request: &SyncRequest) -> Result<SyncData> {
+        self.response_inner(peer_id, request, true)
+    }
+
+    fn response_inner(
+        &self,
+        peer_id: PeerId,
+        request: &SyncRequest,
+        paged: bool,
+    ) -> Result<SyncData> {
         let Some(state) = self.oplog.storage().topic_state(&request.topic_id)? else {
             return Ok(SyncData {
                 topic_id: request.topic_id,
@@ -410,8 +453,24 @@ impl<S: Storage> SyncEngine<S> {
             });
         }
 
+        if request.actor_range_hints.len() > MAX_REQUEST_ITEMS
+            || request.wants.len() > MAX_REQUEST_ITEMS
+            || request.known.len() > MAX_REQUEST_ITEMS
+        {
+            return Err(Error::Storage("sync request exceeds work budget".into()));
+        }
         let mut wanted = request.wants.clone();
         let local_clock = self.oplog.storage().actor_clock(&request.topic_id)?;
+        let mut probes = request.wants.len() as u64;
+        for hint in &request.actor_range_hints {
+            if let Some((from, to)) = clamp_actor_range_hint(hint, local_clock.get(&hint.actor_id))
+            {
+                probes = probes.saturating_add(to - from);
+                if probes > MAX_ACTOR_RANGE_HINT_SPAN {
+                    return Err(Error::Storage("sync request exceeds work budget".into()));
+                }
+            }
+        }
         for hint in &request.actor_range_hints {
             let Some((from_exclusive, to_inclusive)) =
                 clamp_actor_range_hint(hint, local_clock.get(&hint.actor_id))
@@ -428,8 +487,13 @@ impl<S: Storage> SyncEngine<S> {
                 }
             }
         }
-        let wanted_closure = self.closure_excluding(&request.topic_id, wanted, &request.known)?;
-        let ops = topological_subset(self.oplog.storage(), &wanted_closure)?;
+        let ops = if paged {
+            self.collect_page(&request.topic_id, wanted, &request.known, None)?
+        } else {
+            let wanted_closure =
+                self.closure_excluding(&request.topic_id, wanted, &request.known)?;
+            topological_subset(self.oplog.storage(), &wanted_closure)?
+        };
         Ok(SyncData {
             topic_id: request.topic_id,
             ops,
@@ -462,35 +526,63 @@ impl<S: Storage> SyncEngine<S> {
             }
             data_op_ids.insert(op.id);
         }
-        let admitted = self.oplog.receive_ops_from_peer_preverified(
+        let (admitted, failure) = match self.oplog.receive_ops_from_peer_preverified(
             Some(source_peer_id),
             data.ops,
             verified,
-        )?;
+        ) {
+            Ok(admitted) => (admitted, None),
+            Err(Error::AdmissionCommitted { admitted, source }) => (*admitted, Some(source)),
+            Err(error) => return Err(error),
+        };
         // Admission also flushes buffered ops of other topics; an ack speaks
         // for its own topic only, and its reader files obligations under it.
-        let mut accepted = BTreeSet::new();
-        for op_id in admitted.accepted {
-            if data_op_ids.contains(&op_id)
-                || self
-                    .oplog
-                    .storage()
-                    .get_meta(&op_id)?
-                    .is_some_and(|meta| meta.topic_id == data.topic_id)
-            {
-                accepted.insert(op_id);
-            }
-        }
-        let (heads, clock) = self.ack_frontier(&data.topic_id)?;
-        let ack = SyncAck {
+        let mut ack = SyncAck {
             topic_id: data.topic_id,
             peer_id: ack_peer_id,
-            accepted,
-            heads,
-            clock,
+            accepted: admitted
+                .accepted
+                .iter()
+                .copied()
+                .filter(|id| data_op_ids.contains(id))
+                .collect(),
+            heads: BTreeSet::new(),
+            clock: ActorClock::new(),
             signature: None,
         };
-        Ok((ack, admitted.evictions))
+        let frontier = (|| {
+            for op_id in &admitted.accepted {
+                if !ack.accepted.contains(op_id)
+                    && self
+                        .oplog
+                        .storage()
+                        .get_meta(op_id)?
+                        .is_some_and(|meta| meta.topic_id == data.topic_id)
+                {
+                    ack.accepted.insert(*op_id);
+                }
+            }
+            self.ack_frontier(&data.topic_id)
+        })();
+        if let Some(source) = failure {
+            return Err(Error::ReceiveCommitted {
+                ack: Box::new(ack),
+                evictions: admitted.evictions,
+                source,
+            });
+        }
+        match frontier {
+            Ok((heads, clock)) => {
+                ack.heads = heads;
+                ack.clock = clock;
+                Ok((ack, admitted.evictions))
+            }
+            Err(source) => Err(Error::ReceiveCommitted {
+                ack: Box::new(ack),
+                evictions: admitted.evictions,
+                source: Box::new(source),
+            }),
+        }
     }
 
     /// Heads and clock an acknowledgement may certify. A topic holding an id it
@@ -661,22 +753,24 @@ impl<S: Storage> SyncEngine<S> {
 
     fn needed_actor_ranges(
         &self,
-        topic_id: TopicId,
         remote: &SyncSummary,
+        wants: usize,
     ) -> Result<Vec<ActorRangeHint>> {
-        let local_clock = self.oplog.storage().actor_clock(&topic_id)?;
+        let local_clock = self.oplog.storage().actor_clock(&remote.topic_id)?;
+        let mut remaining = MAX_ACTOR_RANGE_HINT_SPAN.saturating_sub(wants as u64);
         Ok(remote
             .actor_clock
             .iter()
             .filter_map(|(actor_id, remote_seq)| {
                 let local_seq = local_clock.get(actor_id);
-                if *remote_seq <= local_seq {
+                if *remote_seq <= local_seq || remaining == 0 {
                     return None;
                 }
                 let to_inclusive = remote_seq
                     .saturating_sub(local_seq)
-                    .min(MAX_ACTOR_RANGE_HINT_SPAN)
+                    .min(remaining)
                     .saturating_add(local_seq);
+                remaining -= to_inclusive - local_seq;
                 Some(ActorRangeHint {
                     actor_id: *actor_id,
                     from_exclusive: local_seq,
@@ -684,6 +778,80 @@ impl<S: Storage> SyncEngine<S> {
                 })
             })
             .collect())
+    }
+
+    fn collect_page(
+        &self,
+        topic_id: &TopicId,
+        roots: BTreeSet<OpId>,
+        known: &BTreeSet<OpId>,
+        remote: Option<&SyncSummary>,
+    ) -> Result<Vec<Op>> {
+        let mut stack = roots.iter().map(|id| (*id, false)).collect::<Vec<_>>();
+        let mut visiting = BTreeSet::new();
+        let mut finished = BTreeSet::new();
+        let mut available = BTreeSet::new();
+        let mut frontier = known.iter().copied().collect::<Vec<_>>();
+        while let Some(id) = frontier.pop() {
+            if available.contains(&id) {
+                continue;
+            }
+            let Some(meta) = self.oplog.storage().get_meta(&id)? else {
+                continue;
+            };
+            if meta.topic_id == *topic_id {
+                available.insert(id);
+                frontier.extend(meta.deps.iter().copied());
+            }
+        }
+        // Explicit repair wants override ancestry implied by the known frontier.
+        available.retain(|id| !roots.contains(id));
+        let mut ops = Vec::new();
+        let mut bytes = 0usize;
+        while let Some((id, expanded)) = stack.pop() {
+            if available.contains(&id) || finished.contains(&id) {
+                continue;
+            }
+            let Some(meta) = self.oplog.storage().get_meta(&id)? else {
+                finished.insert(id);
+                continue;
+            };
+            if meta.topic_id != *topic_id {
+                finished.insert(id);
+                continue;
+            }
+            if remote.is_some_and(|summary| remote_contains(summary, &meta)) {
+                available.insert(id);
+                continue;
+            }
+            if !expanded {
+                if !visiting.insert(id) {
+                    return Err(Error::Storage("cycle in op graph".into()));
+                }
+                stack.push((id, true));
+                stack.extend(meta.deps.iter().rev().map(|dep| (*dep, false)));
+                continue;
+            }
+            visiting.remove(&id);
+            finished.insert(id);
+            if !meta.deps.iter().all(|dep| available.contains(dep)) {
+                continue;
+            }
+            let Some(op) = self.oplog.storage().get_op(&id)? else {
+                continue;
+            };
+            let size = canonical_bytes(&op)?.len();
+            if size > MAX_PAGE_BYTES {
+                return Err(Error::Storage("operation exceeds sync page budget".into()));
+            }
+            if ops.len() == MAX_PAGE_OPS || bytes.saturating_add(size) > MAX_PAGE_BYTES {
+                break;
+            }
+            bytes += size;
+            available.insert(id);
+            ops.push(op);
+        }
+        Ok(ops)
     }
 
     fn closure_excluding(
@@ -700,6 +868,11 @@ impl<S: Storage> SyncEngine<S> {
             }
             if !out.insert(id) {
                 continue;
+            }
+            if out.len() > MAX_REQUEST_ITEMS {
+                return Err(Error::Storage(
+                    "sync request closure exceeds work budget".into(),
+                ));
             }
             // A peer may want an id we never had, or one a topic reset removed.
             // Serving what we do have keeps the exchange alive; the wanted id
