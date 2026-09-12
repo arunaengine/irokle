@@ -23,6 +23,17 @@ pub use frame::{
 pub use iroh::{IrohNet, IrohRuntimeConfig};
 
 #[cfg(any(feature = "iroh", test))]
+pub(crate) fn framed_message_len(message: &SyncMessage) -> io::Result<usize> {
+    let payload_len = postcard::experimental::serialized_size(message).map_err(invalid_data)?;
+    if payload_len > frame::MAX_FRAME_LEN {
+        return Err(invalid_data("sync frame exceeds maximum length"));
+    }
+    payload_len
+        .checked_add(4)
+        .ok_or_else(|| invalid_data("sync frame length overflow"))
+}
+
+#[cfg(any(feature = "iroh", test))]
 pub(crate) fn sync_data_messages(topic_id: TopicId, ops: Vec<Op>) -> io::Result<Vec<SyncMessage>> {
     use postcard::experimental::serialized_size;
 
