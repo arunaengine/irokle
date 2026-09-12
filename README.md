@@ -61,6 +61,8 @@ fn main() -> irokle::Result<()> {
 
 This example uses the transport-neutral sync API directly. Iroh examples can use `sync_now(peer_id, topic_id)` instead.
 
+For persisted or replicated topics, set an explicit, stable `#[irokle(type_id = "...")]` identifier and preserve it across compatible releases. The derive fallback uses the Rust module path and type name, so crate renames, module moves, or type renames change the wire identifier and prevent opening or syncing existing topics as that event type.
+
 ## Topics And Membership
 
 `TopicConfig::initial_peers` defines the initial signed member set. `Topic::add_peer` and `Topic::remove_peer` write membership control operations into the same DAG as application events.
@@ -92,6 +94,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, timeout};
 
 #[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
+#[irokle(type_id = "example.sync.event.v1")]
 struct MyEvent;
 
 #[tokio::main]

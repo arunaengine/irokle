@@ -65,16 +65,28 @@ struct EventConfig {
 }
 
 fn expand_event(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    if let Some(parameter) = input
+        .generics
+        .params
+        .iter()
+        .find(|parameter| !matches!(parameter, syn::GenericParam::Lifetime(_)))
+    {
+        return Err(syn::Error::new_spanned(
+            parameter,
+            "Event derive does not support type or const parameters; implement Event for each concrete type with a distinct TYPE_ID",
+        ));
+    }
+
     let config = parse_config(input)?;
+    let crate_path = &config.crate_path;
     let ident = &input.ident;
     let mut generics = input.generics.clone();
     generics
         .make_where_clause()
         .predicates
-        .push(parse_quote!(Self: ::serde::Serialize + ::serde::de::DeserializeOwned + Send + Sync + 'static));
+        .push(parse_quote!(Self: #crate_path::__serde::Serialize + #crate_path::__serde::de::DeserializeOwned + Send + Sync + 'static));
     let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
     let type_id = &config.type_id;
-    let crate_path = &config.crate_path;
 
     Ok(quote! {
         impl #impl_generics #crate_path::Event for #ident #type_generics #where_clause

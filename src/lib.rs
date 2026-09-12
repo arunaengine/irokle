@@ -29,6 +29,8 @@ pub use irokle_derive::Event;
 pub use node::{Irokle, IrokleBuilder, NodeConfig, PublishOptions, RawTopic, Topic, WriteConcern};
 pub use op::{Op, OpBody, SignedOp};
 pub use oplog::{Admitted, EvictedOp, TopicEviction};
+#[doc(hidden)]
+pub use serde as __serde;
 #[cfg(feature = "fjall")]
 pub use storage::FjallStorage;
 pub use storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
