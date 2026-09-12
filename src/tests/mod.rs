@@ -11,3 +11,5 @@ mod storage;
 mod support;
 mod sync;
 mod tiebreak;
+#[cfg(feature = "fjall")]
+mod upgrade;
