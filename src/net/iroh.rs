@@ -1664,7 +1664,13 @@ impl<S: Storage> IrohNet<S> {
                         .actor_clock
                         .dominates(&remote_clocks[&topic_id])
                     || !self.topic_is_whole(topic_id)
-                    || self.target_needs_sync(remote_peer_id, topic_id)?
+                    // Only unsent obligations remain: a missing peer ack is not
+                    // this exchange's failure when it had nothing to push.
+                    || self
+                        .node
+                        .storage()
+                        .has_sync_obligations(&remote_peer_id, &topic_id)
+                        .map_err(invalid_data)?
                 {
                     self.schedule_resync(remote_peer_id, topic_id);
                     Err(invalid_data("sync exchange is incomplete"))
