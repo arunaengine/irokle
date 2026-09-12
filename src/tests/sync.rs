@@ -1530,3 +1530,144 @@ fn recheck_finds_damage() {
         [ops[1].id].into()
     );
 }
+
+/// Two outcomes recorded for the same peer and topic at the same time, forced
+/// to interleave by a gate inside the obligation read every status update
+/// performs before it writes.
+#[test]
+fn retains_concurrent_counters() {
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[152; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let peer = PeerId::hash(b"concurrent-status-peer");
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let topic_id = topic.id();
+    storage.arm_gate(Arc::new(Rendezvous::new(2)));
+
+    let handles = [true, false].map(|success| {
+        let node = alice.clone();
+        thread::spawn(move || {
+            let failure = std::io::Error::other("concurrent sync failure");
+            let outcome = if success { Ok(()) } else { Err(&failure) };
+            node.record_sync_result(peer, topic_id, outcome).unwrap();
+        })
+    });
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let status = alice.sync_status(topic_id).unwrap();
+    assert_eq!(status.len(), 1);
+    assert_eq!(status[0].successful_attempts, 1);
+    assert_eq!(status[0].failed_attempts, 1);
+}
+
+fn assert_resolved_targets<S: Storage>(storage: S) {
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[153; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let peer = PeerId::hash(b"resolved-target-peer");
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let record = topic
+        .publish(Note {
+            text: "resolved".into(),
+        })
+        .unwrap();
+    let unknown = OpId::hash(b"resolved-target-unknown");
+
+    alice
+        .put_sync_obligation(peer, topic.id(), [record.meta.op_id, unknown].into())
+        .unwrap();
+
+    let obligations = storage.sync_obligations(&peer, &topic.id()).unwrap();
+    let clocked = obligations
+        .iter()
+        .find(|obligation| !obligation.target_clock.is_empty())
+        .expect("the resolved id keeps its actor position");
+    assert_eq!(
+        clocked.target_clock.get(&record.meta.actor_id),
+        record.meta.actor_seq
+    );
+    assert!(clocked.op_ids.contains(&record.meta.op_id));
+    assert!(!clocked.op_ids.contains(&unknown));
+    assert!(obligations.iter().any(
+        |obligation| obligation.op_ids.contains(&unknown) && obligation.target_clock.is_empty()
+    ));
+}
+
+#[test]
+fn memory_resolved_targets() {
+    assert_resolved_targets(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_resolved_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_resolved_targets(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// Forwarding obligations are the durable part of a receive; a failed status
+/// write must not stop the peers that have not been filed yet.
+#[test]
+fn forwards_without_bookkeeping() {
+    let alice = node(154);
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let bob = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[155; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let charlie = node(156);
+    let dana = node(157);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id(), charlie.peer_id(), dana.peer_id()].into(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(8),
+        })
+        .unwrap();
+    topic.publish(Note { text: "fan".into() }).unwrap();
+    let data = crate_sync::SyncData {
+        topic_id: topic.id(),
+        ops: oplog::topological(alice.storage(), &topic.id()).unwrap(),
+    };
+    storage.fail_status(topic.id());
+
+    bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+
+    for peer in [charlie.peer_id(), dana.peer_id()] {
+        assert!(
+            !storage
+                .sync_obligations(&peer, &topic.id())
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

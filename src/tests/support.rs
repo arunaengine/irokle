@@ -87,6 +87,39 @@ impl Corrupt for crate::storage::FjallStorage {
     }
 }
 
+/// Meeting point a test arms inside a storage read so two calls provably
+/// interleave without sleeping. The wait has a generous cap, so a partner that
+/// never arrives fails the assertion instead of hanging the suite.
+pub(crate) struct Rendezvous {
+    parties: usize,
+    arrived: std::sync::Mutex<usize>,
+    signal: std::sync::Condvar,
+}
+
+impl Rendezvous {
+    pub(crate) fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            arrived: std::sync::Mutex::new(0),
+            signal: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn meet(&self) {
+        let mut arrived = self.arrived.lock().unwrap();
+        *arrived += 1;
+        if *arrived >= self.parties {
+            self.signal.notify_all();
+            return;
+        }
+        let _ = self.signal.wait_timeout_while(
+            arrived,
+            std::time::Duration::from_secs(60),
+            |arrived| *arrived < self.parties,
+        );
+    }
+}
+
 /// Storage wrapper that simulates the stale reads of a concurrent admission:
 /// `get_op`/`actor_index` report "unknown" exactly once for ops in the
 /// one-shot sets, so a duplicate slips past the batch dedup check and reaches
@@ -104,6 +137,7 @@ pub(crate) struct StaleReadStorage {
     pub(crate) mid_commit_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
     pub(crate) failed_writes: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
     pub(crate) failed_status: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
+    pub(crate) obligation_gate: Arc<std::sync::Mutex<Option<Arc<Rendezvous>>>>,
 }
 
 impl StaleReadStorage {
@@ -116,7 +150,18 @@ impl StaleReadStorage {
             mid_commit_ops: Arc::default(),
             failed_writes: Arc::default(),
             failed_status: Arc::default(),
+            obligation_gate: Arc::default(),
         }
+    }
+
+    /// Reject every later status update for `topic_id`.
+    pub(crate) fn fail_status(&self, topic_id: TopicId) {
+        self.failed_status.lock().unwrap().insert(topic_id);
+    }
+
+    /// Make every later obligation read wait at `gate`.
+    pub(crate) fn arm_gate(&self, gate: Arc<Rendezvous>) {
+        *self.obligation_gate.lock().unwrap() = Some(gate);
     }
 
     #[cfg(feature = "iroh")]
@@ -238,6 +283,10 @@ impl Storage for StaleReadStorage {
         peer_id: &PeerId,
         topic_id: &TopicId,
     ) -> Result<Vec<crate::storage::SyncObligation>, Error> {
+        let gate = self.obligation_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.meet();
+        }
         self.inner.sync_obligations(peer_id, topic_id)
     }
     fn put_sync_status(&self, status: crate::storage::SyncPeerStatus) -> Result<(), Error> {
