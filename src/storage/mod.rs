@@ -253,6 +253,17 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()>;
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>>;
     fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>>;
+    /// Up to `limit` buffered ops whose dependencies all resolved, in id order
+    /// after `after`.
+    fn ready_pending_after(&self, after: Option<&OpId>, limit: usize) -> Result<Vec<(PeerId, Op)>> {
+        let mut ready = self.ready_pending_ops()?;
+        ready.sort_by_key(|(_, op)| op.id);
+        Ok(ready
+            .into_iter()
+            .filter(|(_, op)| after.is_none_or(|after| op.id > *after))
+            .take(limit)
+            .collect())
+    }
     /// Dependencies that buffered ops of `topic_id` are still waiting for.
     /// Sync planning turns these into wants, so a hole a peer never pushes is
     /// actively pulled instead of stranding its dependents forever.

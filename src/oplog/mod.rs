@@ -29,6 +29,9 @@ pub(crate) use topology::topological_subset_entries;
 pub use topology::{topological, topological_subset};
 
 const MAX_ADMISSION_RETRIES: usize = 64;
+/// Buffered ops one admission call attempts, and how many it reads at once.
+const MAX_DRAIN_OPS: usize = 4096;
+const READY_SLICE: usize = 256;
 const MAX_CACHED_PROJECTIONS: usize = 4096;
 /// Views a whole-topic check reads before it gives up certifying one; each
 /// retry means a reset committed during the hole scan.
@@ -152,6 +155,9 @@ impl TopicEviction {
 pub struct Admitted {
     pub accepted: BTreeSet<OpId>,
     pub evictions: Vec<TopicEviction>,
+    /// Buffered ops that became ready were left for a later pass because this
+    /// one reached its work limit; [`Oplog::reconcile_pending_ops`] drains them.
+    pub ready_remaining: bool,
 }
 
 fn is_structural_genesis(op: &Op) -> bool {
@@ -662,10 +668,16 @@ impl<S: Storage> Oplog<S> {
         self.receive_ops_admission(source_peer, ops, verified, effects)
     }
 
+    /// Admit every buffered op whose dependencies resolved, in finite passes.
     pub fn reconcile_pending_ops(&self) -> Result<BTreeSet<crate::OpId>> {
-        Ok(self
-            .receive_ops_admission(None, Vec::new(), &BTreeSet::new(), None)?
-            .accepted)
+        let mut accepted = BTreeSet::new();
+        loop {
+            let pass = self.receive_ops_admission(None, Vec::new(), &BTreeSet::new(), None)?;
+            accepted.extend(pass.accepted);
+            if !pass.ready_remaining {
+                return Ok(accepted);
+            }
+        }
     }
 
     pub fn receive_signed_op(&self, signed: SignedOp) -> Result<Op> {
@@ -684,21 +696,43 @@ impl<S: Storage> Oplog<S> {
         let mut admitted = Admitted::default();
         let result = (|| -> Result<()> {
             let mut queue = VecDeque::new();
-            let mut queued_pending = BTreeSet::new();
             if !ops.is_empty() {
                 queue.push_back((source_peer, ops, false));
             }
-            self.enqueue_ready_pending_ops(&mut queue, &mut queued_pending)?;
-
-            while let Some((batch_source_peer, ops, from_pending)) = queue.pop_front() {
-                let pending_op_ids = if from_pending {
-                    ops.iter().map(|op| op.id).collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
-                for op_id in &pending_op_ids {
-                    queued_pending.remove(op_id);
+            // Buffered ops come from the ready index in slices, so only ops
+            // whose waits resolved are read, and one call does finite work.
+            let mut drained = 0;
+            let mut cursor = None;
+            let mut pass_admitted = false;
+            loop {
+                if queue.is_empty() {
+                    if drained >= MAX_DRAIN_OPS {
+                        admitted.ready_remaining =
+                            !self.storage.ready_pending_after(None, 1)?.is_empty();
+                        break;
+                    }
+                    let slice = self
+                        .storage
+                        .ready_pending_after(cursor.as_ref(), READY_SLICE)?;
+                    let Some((_, last)) = slice.last() else {
+                        if !pass_admitted {
+                            break;
+                        }
+                        // Admissions of this pass may have readied ops the
+                        // cursor already passed.
+                        cursor = None;
+                        pass_admitted = false;
+                        continue;
+                    };
+                    cursor = Some(last.id);
+                    drained += slice.len();
+                    for (source, op) in slice {
+                        queue.push_back((Some(source), vec![op], true));
+                    }
                 }
+                let Some((batch_source_peer, ops, from_pending)) = queue.pop_front() else {
+                    continue;
+                };
                 // A permanent rejection names the batch, not the op inside it,
                 // so the retained copy lets one invalid record be isolated
                 // without discarding the valid ops queued beside it.
@@ -735,7 +769,6 @@ impl<S: Storage> Oplog<S> {
                     // dependency order, so only the offending subtree goes.
                     Err(_) if from_pending => {
                         for op in retained {
-                            queued_pending.insert(op.id);
                             queue.push_back((batch_source_peer, vec![op], true));
                         }
                         continue;
@@ -745,14 +778,8 @@ impl<S: Storage> Oplog<S> {
                 if let Some(eviction) = batch_eviction {
                     admitted.evictions.push(eviction);
                 }
+                pass_admitted |= !batch_accepted.is_empty();
                 admitted.accepted.extend(batch_accepted.iter().copied());
-                for op_id in &batch_accepted {
-                    self.enqueue_pending_ops(
-                        &mut queue,
-                        &mut queued_pending,
-                        self.storage.pending_waiters(op_id)?,
-                    );
-                }
             }
 
             Ok(())
@@ -820,29 +847,6 @@ impl<S: Storage> Oplog<S> {
             return Ok(None);
         };
         Ok((holder != op.id && self.storage.dep_resolvable(&holder)?).then_some(holder))
-    }
-
-    fn enqueue_ready_pending_ops(
-        &self,
-        queue: &mut VecDeque<(Option<PeerId>, Vec<Op>, bool)>,
-        queued_pending: &mut BTreeSet<crate::OpId>,
-    ) -> Result<()> {
-        let pending = self.storage.ready_pending_ops()?;
-        self.enqueue_pending_ops(queue, queued_pending, pending);
-        Ok(())
-    }
-
-    fn enqueue_pending_ops(
-        &self,
-        queue: &mut VecDeque<(Option<PeerId>, Vec<Op>, bool)>,
-        queued_pending: &mut BTreeSet<crate::OpId>,
-        pending: Vec<(PeerId, Op)>,
-    ) {
-        for (source_peer, op) in pending {
-            if queued_pending.insert(op.id) {
-                queue.push_back((Some(source_peer), vec![op], true));
-            }
-        }
     }
 
     fn admit_ops_batch_retry(
@@ -1325,21 +1329,30 @@ impl<S: Storage> Oplog<S> {
         // `entries`, so ordering after admission cannot spuriously reject it.
         for (op, missing_deps) in pending {
             let source_peer = source_peer.unwrap_or(op.signed.body.author);
-            self.storage
-                .put_pending_op(source_peer, op.clone(), pending_meta_for(&op, missing_deps))
-                .map_err(|error| {
-                    admission_failure(
-                        Admitted {
-                            accepted: accepted.clone(),
-                            evictions: reset_plan
-                                .as_ref()
-                                .map(|plan| plan.eviction.clone())
-                                .into_iter()
-                                .collect(),
-                        },
-                        error,
-                    )
-                })?;
+            let buffered = self.storage.put_pending_op(
+                source_peer,
+                op.clone(),
+                pending_meta_for(&op, missing_deps),
+            );
+            // A descendant of a rejected op can never be admitted here.
+            if let Err(Error::RejectedOp(rejected)) = &buffered {
+                tracing::debug!(op_id = %op.id, %rejected, "dropping op behind a rejected op");
+                continue;
+            }
+            buffered.map_err(|error| {
+                admission_failure(
+                    Admitted {
+                        ready_remaining: false,
+                        accepted: accepted.clone(),
+                        evictions: reset_plan
+                            .as_ref()
+                            .map(|plan| plan.eviction.clone())
+                            .into_iter()
+                            .collect(),
+                    },
+                    error,
+                )
+            })?;
         }
 
         // A reset or integrity recheck must also invalidate in-flight cache writes.

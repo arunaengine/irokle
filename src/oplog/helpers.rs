@@ -117,6 +117,7 @@ pub(super) fn is_permanent_rejection(err: &Error) -> bool {
             | Error::ActorAuthorMismatch
             | Error::TopicMismatch
             | Error::GenerationMismatch { .. }
+            | Error::RejectedOp(_)
     )
 }
 
