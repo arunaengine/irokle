@@ -11,12 +11,12 @@ use crate::{
 };
 
 use super::{
-    AckCommit, AdmittedBatch, MAX_PENDING_EVICTIONS, ObligationTarget, OpMeta, PeerAck, Storage,
-    SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit,
-    ack_covers, ack_reached_op, apply_status_update, branch_matches, ensure_deps_resolvable,
-    journalled_eviction, merged_obligation, merged_peer_ack, new_peer_status, peer_departed,
-    pending_op_bytes, settled_obligation, stored_ack_dominates, topic_fingerprint_for,
-    validate_batch, validate_heads,
+    AckCommit, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS, ObligationTarget, OpMeta,
+    PeerAck, Storage, StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate,
+    TopicState, TopicView, ack_commit, ack_covers, ack_reached_op, apply_status_update,
+    branch_matches, ensure_deps_resolvable, journalled_eviction, merged_obligation,
+    merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes, settled_obligation,
+    stored_ack_dominates, topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[cfg(feature = "fjall")]
@@ -25,6 +25,7 @@ pub struct FjallStorage {
     pub(super) db: fjall::OptimisticTxDatabase,
     pub(super) records: fjall::OptimisticTxKeyspace,
     persist_mode: fjall::PersistMode,
+    pub(super) counters: std::sync::Arc<StorageCounters>,
 }
 
 #[cfg(feature = "fjall")]
@@ -117,9 +118,15 @@ impl FjallStorage {
             records: db.keyspace("records", fjall::KeyspaceCreateOptions::default)?,
             db,
             persist_mode,
+            counters: Default::default(),
         };
         storage.ensure_schema_version()?;
         Ok(storage)
+    }
+
+    /// Work this store and its clones performed so far.
+    pub fn counters(&self) -> CounterSnapshot {
+        self.counters.snapshot()
     }
 
     /// Flush buffered transactions with the requested durability.
@@ -1109,9 +1116,11 @@ impl Storage for FjallStorage {
         })
     }
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
+        self.counters.count_op();
         self.get(Self::key_id(b"o", id))
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
+        self.counters.count_meta();
         self.get(Self::key_id(b"m", id))
     }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {

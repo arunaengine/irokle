@@ -85,6 +85,51 @@ pub struct PeerAck {
     pub clock: ActorClock,
 }
 
+/// Diagnostic counts of work a backend performed: op records and metadata
+/// read through [`Storage`], and buffered payloads decoded.
+#[derive(Debug, Default)]
+pub struct StorageCounters {
+    op_reads: std::sync::atomic::AtomicU64,
+    meta_reads: std::sync::atomic::AtomicU64,
+    pending_payload_reads: std::sync::atomic::AtomicU64,
+}
+
+/// A copy of [`StorageCounters`] at one moment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CounterSnapshot {
+    pub op_reads: u64,
+    pub meta_reads: u64,
+    pub pending_payload_reads: u64,
+}
+
+impl StorageCounters {
+    pub(crate) fn count_op(&self) {
+        self.op_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_meta(&self) {
+        self.meta_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_payloads(&self, count: usize) {
+        self.pending_payload_reads
+            .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> CounterSnapshot {
+        let read = |counter: &std::sync::atomic::AtomicU64| {
+            counter.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        CounterSnapshot {
+            op_reads: read(&self.op_reads),
+            meta_reads: read(&self.meta_reads),
+            pending_payload_reads: read(&self.pending_payload_reads),
+        }
+    }
+}
+
 /// One coherent read of a topic, taken under one lock or read transaction so
 /// every part describes the same commit.
 #[derive(Clone, Debug, PartialEq, Eq)]

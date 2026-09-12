@@ -379,6 +379,7 @@ impl FjallStorage {
             let op_id = id_at(item.key()?.as_ref(), WAITER.len() + OpId::LEN)?;
             out.extend(Self::read_pending_entry(&read_tx, &self.records, &op_id)?);
         }
+        self.counters.count_payloads(out.len());
         Ok(out)
     }
 
@@ -404,6 +405,7 @@ impl FjallStorage {
             let op_id = id_at(item.key()?.as_ref(), READY.len())?;
             out.extend(Self::read_pending_entry(&read_tx, &self.records, &op_id)?);
         }
+        self.counters.count_payloads(out.len());
         Ok(out)
     }
 

@@ -9,19 +9,20 @@ use crate::{
 };
 
 use super::{
-    AckCommit, AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS,
+    AckCommit, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS,
     MAX_PENDING_WAITERS_PER_DEP, MAX_REJECTED_PER_TOPIC, ObligationTarget, OpMeta, PeerAck,
-    PendingRecord, PendingUsage, Storage, SyncObligation, SyncPeerStatus, SyncStatusUpdate,
-    TopicState, TopicView, ack_commit, ack_covers, ack_reached_op, apply_status_update,
-    branch_matches, check_pending_quota, ensure_deps_resolvable, journalled_eviction,
-    merged_obligation, merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes,
-    settled_obligation, stored_ack_dominates, topic_fingerprint_for, validate_batch,
-    validate_heads,
+    PendingRecord, PendingUsage, Storage, StorageCounters, SyncObligation, SyncPeerStatus,
+    SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers, ack_reached_op,
+    apply_status_update, branch_matches, check_pending_quota, ensure_deps_resolvable,
+    journalled_eviction, merged_obligation, merged_peer_ack, new_peer_status, peer_departed,
+    pending_op_bytes, settled_obligation, stored_ack_dominates, topic_fingerprint_for,
+    validate_batch, validate_heads,
 };
 
 #[derive(Clone, Default)]
 pub struct MemoryStorage {
     inner: Arc<Mutex<MemoryInner>>,
+    counters: Arc<StorageCounters>,
 }
 
 #[derive(Clone, Default)]
@@ -67,6 +68,11 @@ impl MemoryStorage {
         Self::default()
     }
 
+    /// Work this store and its clones performed so far.
+    pub fn counters(&self) -> CounterSnapshot {
+        self.counters.snapshot()
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, MemoryInner>> {
         self.inner.lock().map_err(Error::from)
     }
@@ -74,6 +80,23 @@ impl MemoryStorage {
 
 #[cfg(test)]
 impl MemoryStorage {
+    /// Pool usage in total and for `source_peer`: ops and bytes of each.
+    #[cfg(test)]
+    pub(crate) fn pending_usage(&self, source_peer: &PeerId) -> (u64, u64, u64, u64) {
+        let inner = self.inner.lock().expect("memory lock");
+        let source = inner
+            .source_usage
+            .get(source_peer)
+            .copied()
+            .unwrap_or_default();
+        (
+            inner.pending_usage.ops,
+            inner.pending_usage.bytes,
+            source.ops,
+            source.bytes,
+        )
+    }
+
     /// Erase a stored op record, leaving its metadata and indexes behind. Tests
     /// use this to build a store that is already durably inconsistent.
     pub(crate) fn drop_op_record(&self, id: &OpId) {
@@ -126,9 +149,11 @@ impl Storage for MemoryStorage {
     }
 
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
+        self.counters.count_op();
         Ok(self.lock()?.ops.get(id).cloned())
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
+        self.counters.count_meta();
         Ok(self.lock()?.meta.get(id).cloned())
     }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
@@ -426,13 +451,15 @@ impl Storage for MemoryStorage {
     }
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>> {
         let inner = self.lock()?;
-        Ok(inner
+        let waiters = inner
             .pending_waiters
             .get(dep_id)
             .into_iter()
             .flatten()
             .filter_map(|op_id| pending_entry_locked(&inner, op_id))
-            .collect())
+            .collect::<Vec<_>>();
+        self.counters.count_payloads(waiters.len());
+        Ok(waiters)
     }
     fn ready_pending_after(&self, after: Option<&OpId>, limit: usize) -> Result<Vec<(PeerId, Op)>> {
         let inner = self.lock()?;
@@ -440,12 +467,14 @@ impl Storage for MemoryStorage {
             Some(after) => std::ops::Bound::Excluded(*after),
             None => std::ops::Bound::Unbounded,
         };
-        Ok(inner
+        let ready = inner
             .pending_ready
             .range((start, std::ops::Bound::Unbounded))
             .take(limit)
             .filter_map(|op_id| pending_entry_locked(&inner, op_id))
-            .collect())
+            .collect::<Vec<_>>();
+        self.counters.count_payloads(ready.len());
+        Ok(ready)
     }
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         let inner = self.lock()?;

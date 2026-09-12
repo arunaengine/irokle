@@ -228,3 +228,309 @@ fn retains_unproven_author() {
             .is_empty()
     );
 }
+
+/// Buffered ops of `count` distinct authors waiting on one missing op of
+/// `topic_id`, each charged to `source`.
+fn fill_waiters<S: Storage>(storage: &S, m: &Members, source: PeerId, count: u8, seed: u8) {
+    let missing = event_op(&m.bob, m.topic_id, 1, None, &[&m.genesis], "fill-missing");
+    for index in 0..count {
+        let author = Ed25519Signer::from_bytes(&[
+            seed, index, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+            22, 23, 24, 25, 26, 27, 28, 29, 30,
+        ]);
+        let op = event_op(&author, m.topic_id, 1, None, &[&missing], "fill");
+        let meta = crate::storage::OpMeta {
+            id: op.id,
+            topic_id: m.topic_id,
+            author: author.peer_id(),
+            actor_id: op.signed.body.actor_id,
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [missing.id].into(),
+            generation: op.signed.body.generation,
+            observed_clock: ActorClock::new(),
+            ready: false,
+            missing_deps: [missing.id].into(),
+        };
+        storage.put_pending_op(source, op, meta).unwrap();
+    }
+}
+
+/// A healthy topic's admission, fingerprint and view read no payload of a
+/// buffered op that belongs to another topic.
+fn assert_skips_unrelated<S: Storage>(storage: S, counters: impl Fn(&S) -> crate::CounterSnapshot) {
+    let busy = members(236);
+    let healthy = members(240);
+    let log = Oplog::with_storage(storage.clone());
+    log.receive_ops_from_peer(Some(busy.alice.peer_id()), vec![busy.genesis.clone()])
+        .unwrap();
+    fill_waiters(&storage, &busy, busy.alice.peer_id(), 64, 237);
+    log.receive_ops_from_peer(Some(healthy.alice.peer_id()), vec![healthy.genesis.clone()])
+        .unwrap();
+
+    let before = counters(&storage).pending_payload_reads;
+    let next = event_op(
+        &healthy.bob,
+        healthy.topic_id,
+        1,
+        None,
+        &[&healthy.genesis],
+        "next",
+    );
+    let admitted = log
+        .receive_ops_from_peer(Some(healthy.alice.peer_id()), vec![next.clone()])
+        .unwrap();
+    assert_eq!(admitted, [next.id].into());
+    let sync = crate::sync::SyncEngine::new(log.clone(), healthy.alice.peer_id());
+    sync.fingerprint(healthy.topic_id).unwrap();
+    sync.summary(healthy.topic_id).unwrap();
+    assert!(
+        storage
+            .topic_view(&healthy.topic_id, None)
+            .unwrap()
+            .unwrap()
+            .pending_missing
+            .is_empty()
+    );
+    assert_eq!(
+        counters(&storage).pending_payload_reads,
+        before,
+        "healthy-topic work decoded unrelated buffered payloads"
+    );
+}
+
+#[test]
+fn memory_skips_unrelated() {
+    assert_skips_unrelated(MemoryStorage::new(), MemoryStorage::counters);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_skips_unrelated() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_skips_unrelated(
+        crate::storage::FjallStorage::open(dir.path()).unwrap(),
+        crate::storage::FjallStorage::counters,
+    );
+}
+
+/// A rejected subtree stays rejected on its branch: re-inserting the root or
+/// a child that waits on it is refused, in either order against the rejection,
+/// and a reset of the topic forgets the markers.
+fn assert_rejection_sticks<S: Storage>(storage: S) {
+    let m = members(244);
+    let d = event_op(&m.carol, m.topic_id, 1, None, &[&m.genesis], "d");
+    let wrong = event_op(&m.bob, m.topic_id, 2, Some(&d), &[&d], "wrong");
+    let child = event_op(&m.bob, m.topic_id, 3, Some(&wrong), &[&wrong], "child");
+    let late_child = event_op(&m.bob, m.topic_id, 3, Some(&wrong), &[&wrong], "late child");
+    let log = Oplog::with_storage(storage.clone());
+    let source = Some(m.alice.peer_id());
+    log.receive_ops_from_peer(source, vec![m.genesis.clone()])
+        .unwrap();
+    log.receive_ops_from_peer(source, vec![child.clone(), wrong.clone()])
+        .unwrap();
+    log.receive_ops_from_peer(source, vec![d.clone()]).unwrap();
+    assert!(
+        storage
+            .pending_missing_deps(&m.topic_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    // The invalid root is refused outright now that its content is checkable,
+    // and stale copies of what waits on it are dropped rather than buffered.
+    assert!(
+        log.receive_ops_from_peer(source, vec![wrong.clone()])
+            .is_err()
+    );
+    for op in [&child, &late_child] {
+        assert!(
+            log.receive_ops_from_peer(source, vec![op.clone()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let pending_meta = |op: &Op, missing: OpId| crate::storage::OpMeta {
+        id: op.id,
+        topic_id: m.topic_id,
+        author: op.signed.body.author,
+        actor_id: op.signed.body.actor_id,
+        actor_seq: op.signed.body.actor_seq,
+        actor_prev: op.signed.body.actor_prev,
+        deps: op.signed.body.deps.clone(),
+        generation: op.signed.body.generation,
+        observed_clock: ActorClock::new(),
+        ready: false,
+        missing_deps: [missing].into(),
+    };
+    assert!(matches!(
+        storage.put_pending_op(
+            m.alice.peer_id(),
+            late_child.clone(),
+            pending_meta(&late_child, wrong.id)
+        ),
+        Err(Error::RejectedOp(_))
+    ));
+    assert!(
+        storage
+            .pending_missing_deps(&m.topic_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(storage.ready_pending_ops().unwrap().is_empty());
+
+    storage.reset_topic(&m.topic_id).unwrap();
+    storage
+        .put_pending_op(
+            m.alice.peer_id(),
+            late_child.clone(),
+            pending_meta(&late_child, wrong.id),
+        )
+        .unwrap();
+}
+
+#[test]
+fn memory_rejection_sticks() {
+    assert_rejection_sticks(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_rejection_sticks() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_rejection_sticks(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// Concurrent child insertion and subtree rejection never leave the child
+/// buffered behind a rejected root, whichever commits first.
+#[test]
+fn rejection_races_insertion() {
+    for _ in 0..32 {
+        let m = members(248);
+        let d = event_op(&m.carol, m.topic_id, 1, None, &[&m.genesis], "d");
+        let wrong = event_op(&m.bob, m.topic_id, 2, Some(&d), &[&d], "wrong");
+        let child = event_op(&m.bob, m.topic_id, 3, Some(&wrong), &[&wrong], "child");
+        let storage = MemoryStorage::new();
+        let log = Oplog::with_storage(storage.clone());
+        let source = Some(m.alice.peer_id());
+        log.receive_ops_from_peer(source, vec![m.genesis.clone()])
+            .unwrap();
+        log.receive_ops_from_peer(source, vec![wrong.clone()])
+            .unwrap();
+        assert!(!storage.pending_waiters(&d.id).unwrap().is_empty());
+        let barrier = Arc::new(Barrier::new(2));
+        let inserting = thread::spawn({
+            let log = log.clone();
+            let barrier = Arc::clone(&barrier);
+            let child = child.clone();
+            move || {
+                barrier.wait();
+                let _ = log.receive_ops_from_peer(source, vec![child]);
+            }
+        });
+        barrier.wait();
+        let _ = storage.reject_pending_subtree(&wrong.id);
+        inserting.join().unwrap();
+        assert!(storage.get_op(&child.id).unwrap().is_none());
+        assert!(
+            storage.pending_waiters(&wrong.id).unwrap().is_empty(),
+            "a child was buffered behind a rejected root"
+        );
+    }
+}
+
+/// A large buffered op of `author` waiting on `missing`, with its metadata.
+fn heavy_op(
+    m: &Members,
+    author: &Ed25519Signer,
+    missing: &Op,
+    bytes: usize,
+) -> (Op, crate::storage::OpMeta) {
+    let op = event_op(author, m.topic_id, 1, None, &[missing], &"x".repeat(bytes));
+    let meta = crate::storage::OpMeta {
+        id: op.id,
+        topic_id: m.topic_id,
+        author: author.peer_id(),
+        actor_id: op.signed.body.actor_id,
+        actor_seq: 1,
+        actor_prev: None,
+        deps: [missing.id].into(),
+        generation: op.signed.body.generation,
+        observed_clock: ActorClock::new(),
+        ready: false,
+        missing_deps: [missing.id].into(),
+    };
+    (op, meta)
+}
+
+/// The topic share bounds one topic even when every source is under its own
+/// quota; duplicates through another source cost nothing; every refund is the
+/// stored charge, so usage returns to zero exactly and survives a reopen.
+fn assert_exact_accounting<S: Storage>(
+    storage: S,
+    usage: impl Fn(&S, &PeerId) -> (u64, u64, u64, u64),
+    reopen: impl Fn(S) -> S,
+) {
+    let m = members(252);
+    let missing = event_op(&m.bob, m.topic_id, 1, None, &[&m.genesis], "missing");
+    let sources = [1_u8, 2, 3].map(|seed| Ed25519Signer::from_bytes(&[seed; 32]).peer_id());
+    let chunk = 3 * 1024 * 1024;
+    let mut stored = Vec::new();
+    let mut charged = 0_u64;
+    for (source_index, source) in sources[..2].iter().enumerate() {
+        for index in 0..5_u8 {
+            let author = Ed25519Signer::from_bytes(&[100 + source_index as u8 * 10 + index; 32]);
+            let (op, meta) = heavy_op(&m, &author, &missing, chunk);
+            charged += crate::storage::pending_op_bytes(&op).unwrap() as u64;
+            storage
+                .put_pending_op(*source, op.clone(), meta.clone())
+                .unwrap();
+            stored.push((*source, op, meta));
+        }
+    }
+    let (op, meta) = heavy_op(&m, &Ed25519Signer::from_bytes(&[199; 32]), &missing, chunk);
+    let refused = storage.put_pending_op(sources[2], op, meta).unwrap_err();
+    assert!(refused.to_string().contains("topic"), "got {refused}");
+    assert_eq!(usage(&storage, &sources[0]).0, 10);
+    assert_eq!(usage(&storage, &sources[0]).1, charged);
+
+    // A replay through another source neither charges it nor moves the charge.
+    let (source, op, meta) = stored[0].clone();
+    storage.put_pending_op(sources[1], op, meta).unwrap();
+    assert_eq!(usage(&storage, &sources[1]).2, 5);
+    assert_eq!(usage(&storage, &source).2, 5);
+
+    let storage = reopen(storage);
+    assert_eq!(usage(&storage, &sources[0]).1, charged);
+    for (_, op, _) in &stored[..3] {
+        storage.remove_pending_op(&op.id).unwrap();
+        storage.remove_pending_op(&op.id).unwrap();
+    }
+    storage.reset_topic(&m.topic_id).unwrap();
+    assert_eq!(usage(&storage, &sources[0]), (0, 0, 0, 0));
+    assert_eq!(usage(&storage, &sources[1]), (0, 0, 0, 0));
+}
+
+#[test]
+fn memory_exact_accounting() {
+    assert_exact_accounting(
+        MemoryStorage::new(),
+        MemoryStorage::pending_usage,
+        |storage| storage,
+    );
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_exact_accounting() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    assert_exact_accounting(
+        crate::storage::FjallStorage::open(&path).unwrap(),
+        crate::storage::FjallStorage::pending_usage,
+        move |storage| {
+            drop(storage);
+            crate::storage::FjallStorage::open(&path).unwrap()
+        },
+    );
+}

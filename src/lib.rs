@@ -33,7 +33,7 @@ pub use oplog::{Admitted, EvictedOp, TopicEviction};
 pub use serde as __serde;
 #[cfg(feature = "fjall")]
 pub use storage::FjallStorage;
-pub use storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
+pub use storage::{CounterSnapshot, MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
 pub use topic::{
     ReplicationPolicy, TopicConfig, TopicControl, TopicGenesis, TopicInfo, TopicPayload,
 };
