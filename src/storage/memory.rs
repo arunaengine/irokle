@@ -75,6 +75,7 @@ impl MemoryStorage {
 
     /// Store an ack record as is, bypassing certification. Tests use this for
     /// evidence an older schema left behind.
+    #[cfg(feature = "iroh")]
     pub(crate) fn put_raw_ack(&self, ack: PeerAck) {
         self.inner
             .lock()
