@@ -1633,13 +1633,24 @@ impl<S: Storage> Oplog<S> {
                 if body.deps.is_empty() || body.generation == 0 {
                     return Err(Error::InvalidOpId);
                 }
+                // Only buffer pending ops from known members, so non-members
+                // cannot consume per-source pending quota with ops that would
+                // be rejected at admission time anyway.
                 if let Some(state) = state {
                     ensure_event_type(&state.event_type_id, &envelope.type_id)?;
+                    if !state.members.contains(&body.author) {
+                        return Err(Error::NotTopicMember);
+                    }
                 }
             }
             TopicPayload::Control(_) => {
                 if body.deps.is_empty() || body.generation == 0 {
                     return Err(Error::InvalidOpId);
+                }
+                if let Some(state) = state
+                    && !state.members.contains(&body.author)
+                {
+                    return Err(Error::NotTopicMember);
                 }
             }
         }
