@@ -29,3 +29,5 @@ mod sync;
 mod tiebreak;
 #[cfg(feature = "fjall")]
 mod upgrade;
+#[cfg(feature = "iroh")]
+mod windows;
