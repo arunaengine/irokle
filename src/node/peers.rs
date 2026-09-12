@@ -9,13 +9,83 @@ use crate::{PeerId, TopicId};
 use super::SYNC_PEER_SHARED_OVERLAP;
 
 /// Consecutive failed attempts a peer may collect before selection passes it over.
-const PEER_FAILURE_LIMIT: u64 = 2;
+pub(crate) const PEER_FAILURE_LIMIT: u64 = 2;
 /// Alternates reachable by rotation when the whole budget is a single peer.
 const PEER_PROBE_WINDOW: usize = 4;
 /// Rotation epochs between probes that retry a peer past its retry budget.
 const PEER_PROBE_PERIOD: u64 = 4;
 
 static NO_ATTEMPTS: BTreeMap<PeerId, u64> = BTreeMap::new();
+
+/// Peers one health table tracks at once. A full table treats further peers as
+/// healthy rather than growing without limit; that only costs an attempt.
+#[cfg(any(feature = "iroh", test))]
+const MAX_TRACKED_PEERS: usize = 1024;
+
+/// Runtime peer reachability, updated from real attempts and shared by every
+/// selection path so one layer cannot pass over a peer another layer still
+/// picks. Held outside signed topic state: it is local observation, not history.
+#[derive(Debug, Default)]
+pub(crate) struct PeerHealthStore {
+    inner: std::sync::RwLock<HealthInner>,
+}
+
+#[derive(Debug, Default)]
+struct HealthInner {
+    attempts: BTreeMap<PeerId, u64>,
+    epoch: u64,
+}
+
+impl PeerHealthStore {
+    /// Records one unreachable attempt and advances the rotation epoch, so the
+    /// next selection reaches an alternate without waiting for a new publish.
+    #[cfg(any(feature = "iroh", test))]
+    pub(crate) fn record_failure(&self, peer: PeerId) {
+        let Ok(mut inner) = self.inner.write() else {
+            return;
+        };
+        let tracked = inner.attempts.len();
+        match inner.attempts.get_mut(&peer) {
+            Some(failures) => *failures = failures.saturating_add(1),
+            None if tracked < MAX_TRACKED_PEERS => {
+                inner.attempts.insert(peer, 1);
+            }
+            None => {}
+        }
+        inner.epoch = inner.epoch.wrapping_add(1);
+    }
+
+    /// Clears a peer's failure record once an attempt reaches it again. With no
+    /// peer failing there is nothing left to route around, so the rotation
+    /// epoch resets and selection returns to the policy's preferred order.
+    #[cfg(any(feature = "iroh", test))]
+    pub(crate) fn record_success(&self, peer: &PeerId) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner.attempts.remove(peer);
+            if inner.attempts.is_empty() {
+                inner.epoch = 0;
+            }
+        }
+    }
+
+    /// Runs `select` against the current view. [`PeerHealth`] borrows the
+    /// table, so the read guard has to outlive the selection.
+    pub(crate) fn with_view<R>(&self, select: impl FnOnce(PeerHealth<'_>) -> R) -> R {
+        match self.inner.read() {
+            Ok(inner) => select(PeerHealth::new(&inner.attempts, inner.epoch)),
+            Err(_) => select(PeerHealth::empty()),
+        }
+    }
+
+    /// Consecutive failures recorded for `peer`.
+    #[cfg(test)]
+    pub(crate) fn failures(&self, peer: &PeerId) -> u64 {
+        self.inner
+            .read()
+            .map(|inner| inner.attempts.get(peer).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+}
 
 /// Failed attempt counts and the rotation epoch owned by the caller. Health is
 /// deliberately outside signed topic state, so it arrives as a borrowed view.
@@ -71,7 +141,10 @@ struct CandidateOrder {
 }
 
 /// Sync targets for `local_peer` without attempt history. See
-/// [`select_sync_targets`] for the meaning of the policy fields.
+/// [`select_sync_targets`] for the meaning of the policy fields. Production
+/// selection goes through [`super::Irokle::sync_peers`], which supplies the
+/// node's runtime health; this is the policy-only order tests compare against.
+#[cfg(test)]
 pub(crate) fn select_sync_peers(
     topic_id: TopicId,
     local_peer: PeerId,

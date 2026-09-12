@@ -10,7 +10,9 @@ mod builder;
 mod peers;
 mod topic;
 
-pub(crate) use peers::select_sync_peers;
+#[cfg(test)]
+pub(crate) use peers::{PEER_FAILURE_LIMIT, select_sync_peers};
+use peers::{PeerHealthStore, select_sync_targets};
 pub use topic::{RawTopic, Topic};
 
 use crate::ActorClock;
@@ -31,6 +33,17 @@ use crate::{
 };
 
 static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a failed attempt says the peer could not be reached, rather than
+/// that one exchange was refused. Protocol rejections are topic-local, so they
+/// must not demote a peer that answers other topics fine.
+#[cfg(any(feature = "iroh", test))]
+fn is_unreachable(error: &std::io::Error) -> bool {
+    !matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+    )
+}
 const SYNC_PEER_SHARED_OVERLAP: usize = 2;
 #[cfg(feature = "iroh")]
 const SYNC_TOPIC_CONCURRENCY: usize = 8;
@@ -78,6 +91,7 @@ pub struct Irokle<S: Storage = MemoryStorage> {
     sync: SyncEngine<S>,
     config: NodeConfig,
     peer_whitelist: Arc<RwLock<Option<BTreeSet<PeerId>>>>,
+    peer_health: Arc<PeerHealthStore>,
     #[cfg(feature = "iroh")]
     net: Option<Arc<crate::net::IrohNet<S>>>,
 }
@@ -108,6 +122,7 @@ impl<S: Storage> Irokle<S> {
             oplog,
             sync,
             peer_whitelist: Arc::new(RwLock::new(config.peer_whitelist.clone())),
+            peer_health: Arc::new(PeerHealthStore::default()),
             config,
             #[cfg(feature = "iroh")]
             net: None,
@@ -121,6 +136,22 @@ impl<S: Storage> Irokle<S> {
     }
     pub fn storage(&self) -> &S {
         self.oplog.storage()
+    }
+
+    /// Sync targets for `topic_id` under the topic's replication policy and
+    /// this node's runtime peer health. Every scheduling and eligibility path
+    /// reads the same view, so an alternate chosen because a preferred peer is
+    /// unreachable is not rejected elsewhere as an unselected target.
+    pub(crate) fn sync_peers(&self, topic_id: TopicId, state: &TopicState) -> Vec<PeerId> {
+        self.peer_health
+            .with_view(|health| select_sync_targets(topic_id, self.peer_id(), state, health).peers)
+    }
+
+    /// Runtime reachability observations, updated from real attempt outcomes by
+    /// [`Irokle::record_sync_result`].
+    #[cfg(test)]
+    pub(crate) fn peer_health(&self) -> &PeerHealthStore {
+        &self.peer_health
     }
     pub fn signer(&self) -> &Ed25519Signer {
         &self.config.signer
@@ -218,7 +249,7 @@ impl<S: Storage> Irokle<S> {
             .topic_state(&topic_id)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "topic not found"))?;
-        let peers = select_sync_peers(topic_id, self.peer_id(), &state);
+        let peers = self.sync_peers(topic_id, &state);
         let mut syncs = tokio::task::JoinSet::new();
         let mut first_error = None;
         for peer in peers {
@@ -741,7 +772,7 @@ impl<S: Storage> Irokle<S> {
             .storage()
             .topic_state(&topic_id)?
             .ok_or(Error::TopicNotFound)?;
-        for peer_id in select_sync_peers(topic_id, self.peer_id(), &state) {
+        for peer_id in self.sync_peers(topic_id, &state) {
             if peer_id == source_peer_id || peer_id == self.peer_id() {
                 continue;
             }
@@ -788,7 +819,8 @@ impl<S: Storage> Irokle<S> {
         let mut target_clock = ActorClock::new();
         target_clock.observe(meta.actor_id, meta.actor_seq);
         Ok(AdmissionEffects {
-            sync_obligations: select_sync_peers(topic_id, self.peer_id(), state)
+            sync_obligations: self
+                .sync_peers(topic_id, state)
                 .into_iter()
                 .map(|peer_id| SyncObligation {
                     peer_id,
@@ -817,7 +849,7 @@ impl<S: Storage> Irokle<S> {
                 .topic_state(&topic_id)?
                 .ok_or(Error::TopicNotFound)?;
             if matches!(write_concern, WriteConcern::AsyncReplication) {
-                for peer_id in select_sync_peers(topic_id, self.peer_id(), &state) {
+                for peer_id in self.sync_peers(topic_id, &state) {
                     self.record_replication_scheduled(peer_id, topic_id)?;
                 }
             }
@@ -910,6 +942,7 @@ impl<S: Storage> Irokle<S> {
         };
         match result {
             Ok(()) => {
+                self.peer_health.record_success(&peer_id);
                 update.successful_attempts = 1;
                 update.last_success_ms = Some(attempt_ms);
                 update.last_error = Some(None);
@@ -920,6 +953,11 @@ impl<S: Storage> Irokle<S> {
                 });
             }
             Err(error) => {
+                // Only reachability failures demote a peer: a refused exchange
+                // says nothing about whether the peer answers other topics.
+                if is_unreachable(error) {
+                    self.peer_health.record_failure(peer_id);
+                }
                 update.failed_attempts = 1;
                 update.last_error = Some(Some(error.to_string()));
                 update.state = SyncStateUpdate::Set(SyncPeerState::Failed);

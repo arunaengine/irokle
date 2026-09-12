@@ -1797,3 +1797,78 @@ fn request_matches_negotiation() {
     assert!(!request.wants.is_empty());
     assert!(!request.actor_range_hints.is_empty());
 }
+
+/// Runtime reachability reaches production selection: a preferred peer that
+/// keeps failing is passed over for another permitted peer without a new
+/// publish, and is selected again once it answers.
+#[test]
+fn health_selects_alternate() {
+    let alice = node(150);
+    let members = (151..=154u8)
+        .map(|seed| Ed25519Signer::from_bytes(&[seed; 32]).peer_id())
+        .collect::<BTreeSet<_>>();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: members.clone(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(1),
+        })
+        .unwrap();
+    let state = alice.storage().topic_state(&topic.id()).unwrap().unwrap();
+
+    let selected = alice.sync_peers(topic.id(), &state);
+    assert_eq!(selected.len(), 1, "fanout one selects one target");
+    let preferred = selected[0];
+
+    // Unreachable attempts only; nothing new is published in between.
+    for _ in 0..node::PEER_FAILURE_LIMIT {
+        alice.peer_health().record_failure(preferred);
+    }
+    let failover = alice.sync_peers(topic.id(), &state);
+    assert_eq!(failover.len(), 1);
+    assert_ne!(
+        failover[0], preferred,
+        "a peer past its retry budget must not stay the only target"
+    );
+    assert!(
+        members.contains(&failover[0]),
+        "the alternate must be a permitted member"
+    );
+
+    // Recovery restores the preferred peer.
+    alice.peer_health().record_success(&preferred);
+    assert_eq!(alice.peer_health().failures(&preferred), 0);
+    assert_eq!(alice.sync_peers(topic.id(), &state), vec![preferred]);
+}
+
+/// A refused exchange is topic-local: it must not demote a peer that is
+/// reachable, while a transport failure must.
+#[test]
+fn refusal_keeps_health() {
+    let alice = node(155);
+    let bob = node(156);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+
+    let refused = std::io::Error::new(std::io::ErrorKind::InvalidData, "unsupported sync protocol");
+    for _ in 0..node::PEER_FAILURE_LIMIT {
+        alice
+            .record_sync_result(bob.peer_id(), topic.id(), Err(&refused))
+            .unwrap();
+    }
+    assert_eq!(alice.peer_health().failures(&bob.peer_id()), 0);
+
+    let unreachable = std::io::Error::new(std::io::ErrorKind::TimedOut, "iroh connect timed out");
+    alice
+        .record_sync_result(bob.peer_id(), topic.id(), Err(&unreachable))
+        .unwrap();
+    assert_eq!(alice.peer_health().failures(&bob.peer_id()), 1);
+
+    alice
+        .record_sync_result(bob.peer_id(), topic.id(), Ok(()))
+        .unwrap();
+    assert_eq!(alice.peer_health().failures(&bob.peer_id()), 0);
+}

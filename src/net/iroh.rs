@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::node::select_sync_peers;
 use crate::sync::{SyncMessage, SyncSummary};
 use crate::{Irokle, MemoryStorage, PeerId, Storage, TopicEviction};
 
@@ -1048,7 +1047,7 @@ impl<S: Storage> IrohNet<S> {
         {
             return Ok(false);
         }
-        Ok(select_sync_peers(topic_id, self.node.peer_id(), &state).contains(&peer_id))
+        Ok(self.node.sync_peers(topic_id, &state).contains(&peer_id))
     }
 
     fn local_leave_op(
@@ -1097,13 +1096,11 @@ impl<S: Storage> IrohNet<S> {
             let Some(op_id) = self.local_leave_op(&state)? else {
                 return Ok(false);
             };
-            return Ok(
-                select_sync_peers(topic_id, self.node.peer_id(), &state).contains(&peer_id)
-                    && !self
-                        .node
-                        .peer_reached_op(peer_id, op_id)
-                        .map_err(invalid_data)?,
-            );
+            return Ok(self.node.sync_peers(topic_id, &state).contains(&peer_id)
+                && !self
+                    .node
+                    .peer_reached_op(peer_id, op_id)
+                    .map_err(invalid_data)?);
         }
         if self
             .node
@@ -1113,7 +1110,7 @@ impl<S: Storage> IrohNet<S> {
         {
             return Ok(true);
         }
-        if !select_sync_peers(topic_id, self.node.peer_id(), &state).contains(&peer_id) {
+        if !self.node.sync_peers(topic_id, &state).contains(&peer_id) {
             return Ok(false);
         }
         // A hole clears no obligation and moves no clock, so nothing else here
@@ -1150,7 +1147,7 @@ impl<S: Storage> IrohNet<S> {
             return Ok(Vec::new());
         }
         let mut targets = Vec::new();
-        for peer_id in select_sync_peers(topic_id, self.node.peer_id(), &state) {
+        for peer_id in self.node.sync_peers(topic_id, &state) {
             if self.target_needs_sync(peer_id, topic_id)? {
                 targets.push(peer_id);
             }
@@ -2025,7 +2022,8 @@ impl<S: Storage> IrohNet<S> {
                 continue;
             }
             targets.extend(
-                select_sync_peers(topic.topic_id, self.node.peer_id(), &state)
+                self.node
+                    .sync_peers(topic.topic_id, &state)
                     .into_iter()
                     .map(|peer_id| (peer_id, topic.topic_id)),
             );
