@@ -6,6 +6,21 @@ use irokle::{Irokle, TopicConfig};
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, timeout};
 
+/// Sync until the goal is reached. `WouldBlock` means a page budget ran out
+/// while the sync was still making progress, so it is called again.
+async fn sync_until_done(
+    node: &Irokle,
+    peer: irokle::PeerId,
+    topic: irokle::TopicId,
+) -> std::io::Result<()> {
+    loop {
+        match node.sync_now(peer, topic).await {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            result => return result,
+        }
+    }
+}
+
 #[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
 struct ChatEvent {
     author: String,
@@ -42,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     timeout(
         Duration::from_secs(10),
-        alice.sync_now(bob.peer_id(), alice_topic.id()),
+        sync_until_done(&alice, bob.peer_id(), alice_topic.id()),
     )
     .await??;
 
@@ -54,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     timeout(
         Duration::from_secs(10),
-        bob.sync_now(alice.peer_id(), alice_topic.id()),
+        sync_until_done(&bob, alice.peer_id(), alice_topic.id()),
     )
     .await??;
 
@@ -62,6 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for record in history {
         println!("{}: {}", record.event.author, record.event.text);
     }
+
+    alice.shutdown_iroh().await;
+    bob.shutdown_iroh().await;
 
     Ok(())
 }

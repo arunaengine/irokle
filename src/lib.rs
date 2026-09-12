@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Public facade and re-exports for Irokle's signed topic operation log.
+//!
+//! Start with [`Irokle`]. Sync over Iroh speaks [`sync::SYNC_PROTOCOL`]; data for a topic
+//! a node does not hold is staged until its history makes the node a member, see
+//! [`ReceiveOutcome`]. Custom backends implement [`Storage`]; see the README for guidance.
 
 pub mod clock;
 pub mod crypto;

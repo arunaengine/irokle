@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             text: "persisted on disk".into(),
         })?;
         let topic_id = topic.id();
-        node.endpoint().expect("iroh endpoint").close().await;
+        node.shutdown_iroh().await;
         topic_id
     };
 
@@ -50,6 +50,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", record.event.text);
     }
 
-    recovered.endpoint().expect("iroh endpoint").close().await;
+    recovered.shutdown_iroh().await;
     Ok(())
 }

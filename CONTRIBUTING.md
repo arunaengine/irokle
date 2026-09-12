@@ -20,6 +20,14 @@ cargo test --locked --all-features --doc
 cargo doc --locked --all-features --no-deps
 ```
 
+CI also runs the Iroh network tests in Linux network namespaces. They need `iproute2`, `nftables` and permission to create namespaces:
+
+```bash
+cargo test --locked --features iroh --test iroh_patchbay_sync -- --nocapture --test-threads=1
+```
+
+Changes to the wire format must change `irokle::sync::SYNC_PROTOCOL`, which is also the Iroh ALPN. Changes to the Fjall layout must raise the schema version and add a migration that rechecks the version inside its transaction.
+
 ### Workflow
 
 Please make sure that you either create an issue or a PR draft first to give everyone an opportunity to discuss the best approach for your contribution.

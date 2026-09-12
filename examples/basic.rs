@@ -2,7 +2,7 @@
 //! Minimal in-memory example showing typed events and manual sync planning.
 
 use irokle::history::HistoryOrder;
-use irokle::{Ed25519Signer, Irokle, TopicConfig};
+use irokle::{Ed25519Signer, Irokle, ReceiveOutcome, TopicConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
@@ -31,7 +31,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bob_summary = bob.sync_summary(alice_topic.id())?;
     let data_for_bob = alice.plan_sync_data(bob.peer_id(), &bob_summary)?;
-    let (ack, _) = bob.receive_sync_data_from(alice.peer_id(), data_for_bob)?;
+    // Bob does not hold the topic yet: the data is staged until its history
+    // makes Bob and Alice members. The genesis here already does.
+    let ack = match bob.receive_sync_outcome(alice.peer_id(), data_for_bob)? {
+        ReceiveOutcome::Acked { ack, .. } => ack,
+        ReceiveOutcome::Staged(staged) => {
+            return Err(format!("still staged: {} ops", staged.ops).into());
+        }
+    };
     alice.apply_sync_ack(&ack)?;
 
     let bob_topic = bob.open_topic::<ChatEvent>(alice_topic.id())?;

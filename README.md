@@ -6,9 +6,9 @@ Irokle is a signed Merkle-DAG operation log for invite-only topics. Application 
 
 - Signed operations: every event or control change is signed by the peer that authored it.
 - Topic membership: topics are not public broadcast channels; typed access is gated by the current signed member set.
-- Deterministic sync: peers exchange summaries, missing operation closures, requests, and signed acknowledgements.
+- Paged sync: peers exchange summaries, requests with a receive credit, bounded pages of operations, and signed acknowledgements. The Iroh wire protocol is `irokle/sync/3`.
 - Bounded fanout: topic replication is capped by `ReplicationPolicy::max_sync_peers` so a node does not sync with every member by default.
-- Observability: sync status records expose pending obligations, failure counts, last errors, last success, and per-state counts.
+- Observability: sync status records expose pending obligations, failure counts, last errors, last success, the newest attempt, and per-state counts.
 - Storage choices: `MemoryStorage` is available by default; `FjallStorage` is available behind the `fjall` feature.
 - Iroh integration: the `iroh` feature syncs over `iroh::Endpoint` using `PeerId`/`NodeId` dialing.
 
@@ -61,6 +61,8 @@ fn main() -> irokle::Result<()> {
 
 This example uses the transport-neutral sync API directly. Iroh examples can use `sync_now(peer_id, topic_id)` instead.
 
+Bob does not hold the topic before the first receive. Data for an unknown topic is staged first and becomes visible only when its history makes both Bob and the sender members, as it does here. See "Joining A Topic" below.
+
 For persisted or replicated topics, set an explicit, stable `#[irokle(type_id = "...")]` identifier and preserve it across compatible releases. The derive fallback uses the Rust module path and type name, so crate renames, module moves, or type renames change the wire identifier and prevent opening or syncing existing topics as that event type.
 
 ## Topics And Membership
@@ -68,6 +70,15 @@ For persisted or replicated topics, set an explicit, stable `#[irokle(type_id = 
 `TopicConfig::initial_peers` defines the initial signed member set. `Topic::add_peer` and `Topic::remove_peer` write membership control operations into the same DAG as application events.
 
 When a node receives a topic for the first time, it can discover it through `list_topics()` and then open it with `open_topic::<E>(topic_id)` if its local peer is a current member. A node can reject membership with `Irokle::reject_topic(topic_id)` or `Topic::leave()`. Rejection is represented as a signed `RemovePeer` control operation, so other nodes can observe and sync the decision.
+
+## Joining A Topic
+
+Data for a topic that a node does not hold yet is not admitted right away. It is staged per sender and topic, apart from every topic query. Once the staged history contains the genesis and makes both the receiving node and the sender members, the whole history is admitted in one storage transaction. Before that, the node has no topic state, no history and sends no acknowledgement.
+
+- `Irokle::receive_sync_outcome` returns `ReceiveOutcome::Acked { ack, evictions }` or `ReceiveOutcome::Staged(staged)`. `StagedTopic` reports the staged clock and the staged op and byte counts. It is a receipt, not an acknowledgement.
+- `receive_sync_data_from` and `receive_sync_data_from_evicting` keep their signatures and return `Error::BootstrapPending { staged }` while data stays staged.
+- Over Iroh, a staging node answers with a `SyncMessage::Receipt`. The inviter continues the next page from the receipt clock until the invitation arrives.
+- Staging is bounded: 64 MiB in total, 32 MiB and 65536 ops per session, 64 sessions, 8 sessions per sender, and sessions idle for 10 minutes are dropped.
 
 ## Bounded Replication
 
@@ -130,6 +141,10 @@ By default, Iroh auto-accept only admits brand-new topics from peers in `peer_wh
 
 Automatic acceptance requires a dedicated Irokle endpoint; `build()` rejects additional protocols configured through `with_alpn` or `with_alpns` while auto-accept is enabled. For multiple protocols, call `without_auto_accept()` after `with_net(endpoint)` and route incoming connections manually. Construction replaces the endpoint ALPN list with the builder-configured protocols plus Irokle, so include every required protocol in `with_alpns`.
 
+Nodes speak the sync protocol `irokle/sync/3` (`irokle::sync::SYNC_PROTOCOL`, also the ALPN). A peer that only offers `irokle/sync/2` cannot connect, so upgrade every node of a deployment together. In version 3 a requester sends a `SyncRequest` with its branch (`genesis`) and a receive credit. The responder reads the whole request stream, then replies with every control message first, one bounded page of data per request, and a `SyncMessage::Page` that says whether more is left. A request for another branch fails for that topic and receives no data.
+
+Manual syncs (`sync_now`, `sync_addr_now`, `sync_endpoint_now`, `sync_topic_now`) keep paging while each page makes progress, up to 64 pages. They return `Ok(())` only when the sync goal is reached. When the page budget runs out while work is still moving, they return an `io::Error` of kind `WouldBlock`. That is progress, not a failure: call again, or let the resync loop continue.
+
 `sync_addr_now(endpoint_addr, topic_id)` remains available for explicit one-off manual dialing in local/offline setups. The peer registry API was removed; when discovery is configured, peers are identified by `PeerId`/Iroh `EndpointId`.
 
 Iroh runtime behavior is configurable when defaults are not appropriate for the deployment:
@@ -151,7 +166,7 @@ let node = irokle::Irokle::builder()
     .build()?;
 ```
 
-Use `shutdown_iroh().await` during orderly shutdown to close the endpoint and abort tracked background accept/resync tasks.
+Use `shutdown_iroh().await` during orderly shutdown. It closes the endpoint and returns only when every task the net started has ended. It can be called more than once. `IrohNet::shutdown_with_timeout(timeout)` waits at most `timeout` and returns `ShutdownOutcome::Complete` or `ShutdownOutcome::Incomplete { running }`; after an incomplete result the net still owns the running tasks.
 
 ## Sync Failures And Status
 
@@ -164,7 +179,23 @@ let statuses = node.sync_status(topic_id)?;
 let counts = node.sync_state_counts(topic_id)?;
 ```
 
-Each `SyncPeerStatus` includes `state`, `pending_obligations`, `failed_attempts`, `successful_attempts`, `last_attempt_ms`, `last_success_ms`, and `last_error`.
+Each `SyncPeerStatus` includes `state`, `pending_obligations`, `failed_attempts`, `successful_attempts`, `last_attempt_ms`, `last_success_ms`, `last_error`, and `latest_attempt`. An attempt is identified by `(epoch, sequence)`, where the epoch is a durable counter that grows each time a net starts, so an older attempt cannot overwrite the state of a newer one.
+
+A `SyncObligation` names the work one peer still owes for one topic. Its `target` is either `ObligationTarget::Clock(clock)`, one coalesced record that clears when a certified acknowledgement reaches the clock, or `ObligationTarget::Repair(ids)`, explicit operation ids that clear one by one. Acknowledgements certify one branch: they are signed with the topic genesis, and evidence for another genesis or without one certifies nothing.
+
+## Storage Backends
+
+`Storage` is implemented by `MemoryStorage` and, with the `fjall` feature, by `FjallStorage`. A custom backend must implement every required method. Methods that combine several reads or writes must do them in one lock or one transaction; the method documentation says which. In particular:
+
+- `topic_view` reads state, heads, clock, tips, fingerprint, data epoch, pending holes and one peer's acknowledgement as one view.
+- `actor_range` returns indexed positions of one actor after a sequence, for page planning.
+- `peer_reached_op` and `peers_reached_op` read the op, the genesis and the acknowledgements from one view.
+- `put_sync_obligation` and `clear_peer_sync_state` take the expected genesis and write nothing when it no longer matches.
+- `sync_obligation_count` counts obligation records without decoding them where the backend can.
+- `next_attempt_epoch` durably advances the attempt epoch.
+- `stage_bootstrap_ops`, `staged_bootstrap_ops`, `promote_bootstrap`, `discard_bootstrap` and `expire_bootstrap` keep staged data apart from every topic query. `promote_bootstrap` admits the whole history and drops the staging in one transaction.
+
+`FjallStorage` stores schema version 4. Opening a database at schema 1, 2 or 3 migrates it in place, one transaction per step, and each step checks the version again, so concurrent or repeated opens are safe. Acknowledgements from before schema 2 stay stored but are uncertified. A database with a newer, unknown schema version is refused.
 
 ## Disk Recovery
 
@@ -174,7 +205,7 @@ See `examples/iroh_fjall_recovery.rs` for a complete example that creates a topi
 
 ## Examples
 
-- `examples/basic.rs`: in-memory typed events plus transport-neutral sync planning.
+- `examples/basic.rs`: in-memory typed events plus transport-neutral sync planning, including the receive outcome of a first receive.
 - `examples/rdf.rs`: observed-remove RDF projection implemented as application code on top of event history.
 - `examples/iroh_chat.rs`: NodeId-only Iroh chat sync using discovery.
 - `examples/iroh_topic_intro.rs`: introduces a peer to a topic, opens it on the receiver, then rejects membership.

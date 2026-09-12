@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     println!("iroh runtime configured for peer {}", node.peer_id());
+    node.shutdown_iroh().await;
 
     Ok(())
 }
