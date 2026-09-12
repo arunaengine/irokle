@@ -430,6 +430,8 @@ pub use memory::MemoryStorage;
 #[cfg(feature = "fjall")]
 mod fjall;
 #[cfg(feature = "fjall")]
+mod fjall_pending;
+#[cfg(feature = "fjall")]
 pub use fjall::FjallStorage;
 
 pub(super) fn validate_batch(batch: &AdmittedBatch) -> Result<()> {
