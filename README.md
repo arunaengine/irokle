@@ -128,6 +128,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 By default, Iroh auto-accept only admits brand-new topics from peers in `peer_whitelist`. The whitelist starts as `Some(empty)`, so add allowed peers with `with_peer_whitelist`, `add_peer_to_whitelist`, `add_peers_to_whitelist`, or `set_peer_whitelist`. Set the whitelist to `None` only when unknown-topic admission should be unrestricted. For production deployments, keep the Irokle sync ALPN dedicated to trusted peers and whitelist topic introducers explicitly.
 
+Automatic acceptance requires a dedicated Irokle endpoint; `build()` rejects additional protocols configured through `with_alpn` or `with_alpns` while auto-accept is enabled. For multiple protocols, call `without_auto_accept()` after `with_net(endpoint)` and route incoming connections manually. Construction replaces the endpoint ALPN list with the builder-configured protocols plus Irokle, so include every required protocol in `with_alpns`.
+
 `sync_addr_now(endpoint_addr, topic_id)` remains available for explicit one-off manual dialing in local/offline setups. The peer registry API was removed; when discovery is configured, peers are identified by `PeerId`/Iroh `EndpointId`.
 
 Iroh runtime behavior is configurable when defaults are not appropriate for the deployment:

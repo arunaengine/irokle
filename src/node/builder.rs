@@ -228,6 +228,16 @@ impl<S: Storage> IrokleBuilder<S> {
     pub fn build(self) -> Result<Irokle<S>> {
         #[cfg(feature = "iroh")]
         if let Some(endpoint) = self.endpoint {
+            if self.auto_accept
+                && self
+                    .alpns
+                    .iter()
+                    .any(|alpn| alpn.as_slice() != crate::net::IROKLE_SYNC_ALPN)
+            {
+                return Err(Error::Storage(
+                    "iroh auto accept requires a dedicated endpoint; call without_auto_accept after with_net and route connections manually".into(),
+                ));
+            }
             let node = Irokle::with_storage(self.storage, self.config)?;
             let net = std::sync::Arc::new(
                 crate::net::IrohNet::new_with_alpns_config_and_sink(
