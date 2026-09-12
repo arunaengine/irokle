@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::sync::{SyncMessage, SyncSummary};
-use crate::{Irokle, MemoryStorage, PeerId, Storage, TopicEviction};
+use crate::{Irokle, MemoryStorage, PeerId, ReceiveOutcome, Storage, TopicEviction};
 
 use super::frame::{MAX_FRAME_LEN, MAX_SYNC_DATA_OPS_PER_MESSAGE};
 use super::{
@@ -46,6 +46,8 @@ const RESYNC_PROGRESS_TURN: Duration = Duration::ZERO;
 /// it reports what it reached. Bounds the caller's wait instead of paging on
 /// until the peer stops publishing.
 const MAX_SYNC_NOW_PAGES: usize = 64;
+/// Staging receipts remembered per peer and topic, oldest dropped first.
+const MAX_BOOTSTRAP_RECEIPTS: usize = 1024;
 
 /// Result of [`IrohNet::shutdown_with_timeout`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -678,6 +680,33 @@ impl ConnectionPool {
     }
 }
 
+/// The newest staging receipt each peer returned for a topic it does not hold,
+/// kept in memory only so the next push continues where staging stands.
+#[derive(Default)]
+struct ReceiptLog {
+    clocks: BTreeMap<(PeerId, crate::TopicId), crate::ActorClock>,
+    order: std::collections::VecDeque<(PeerId, crate::TopicId)>,
+}
+
+impl ReceiptLog {
+    fn record(&mut self, key: (PeerId, crate::TopicId), clock: crate::ActorClock) {
+        if self.clocks.insert(key, clock).is_none() {
+            self.order.push_back(key);
+            if self.order.len() > MAX_BOOTSTRAP_RECEIPTS
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.clocks.remove(&oldest);
+            }
+        }
+    }
+
+    fn clear(&mut self, key: &(PeerId, crate::TopicId)) {
+        if self.clocks.remove(key).is_some() {
+            self.order.retain(|kept| kept != key);
+        }
+    }
+}
+
 pub struct IrohNet<S: Storage = MemoryStorage> {
     pool: ConnectionPool,
     node: Irokle<S>,
@@ -687,6 +716,7 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
     resync_started: AtomicBool,
     quarantine_started: AtomicBool,
     outbound_streams: AtomicU64,
+    receipts: Mutex<ReceiptLog>,
     shutdown: tokio::sync::watch::Sender<bool>,
     tasks: Arc<TaskTracker>,
     // Optional sink for genesis tie-break evictions produced while admitting
@@ -757,6 +787,7 @@ impl<S: Storage> IrohNet<S> {
             resync_started: AtomicBool::new(false),
             quarantine_started: AtomicBool::new(false),
             outbound_streams: AtomicU64::new(0),
+            receipts: Mutex::default(),
             shutdown,
             tasks: Arc::default(),
             eviction_sink,
@@ -1901,9 +1932,20 @@ impl<S: Storage> IrohNet<S> {
         summary: &SyncSummary,
     ) -> io::Result<Option<PlannedTopicSync>> {
         let budget = crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default());
+        // A peer still staging this topic continues from its newest receipt.
+        let staged = match (
+            summary.genesis,
+            self.receipt_clock(remote_peer_id, topic_id),
+        ) {
+            (None, Some(clock)) => Some(SyncSummary {
+                actor_clock: clock,
+                ..summary.clone()
+            }),
+            _ => None,
+        };
         let (mut plan, mut push_more) = self
             .node
-            .negotiate_page(remote_peer_id, summary, budget)
+            .negotiate_page(remote_peer_id, staged.as_ref().unwrap_or(summary), budget)
             .map_err(invalid_data)?;
         let view = self
             .node
@@ -2082,7 +2124,16 @@ impl<S: Storage> IrohNet<S> {
                         continue;
                     }
                     owed_acks.remove(&ack.topic_id);
+                    self.receipt_log().clear(&(remote_peer_id, ack.topic_id));
                     acks.push(ack);
+                }
+                // Staging continues on the peer: nothing is certified, but the
+                // goal is not reached and the next page goes on from here.
+                SyncMessage::Receipt(receipt) if group_topics.contains(&receipt.topic_id) => {
+                    owed_acks.remove(&receipt.topic_id);
+                    more.insert(receipt.topic_id);
+                    self.receipt_log()
+                        .record((remote_peer_id, receipt.topic_id), receipt.clock);
                 }
                 SyncMessage::Failure(failure) if group_topics.contains(&failure.topic_id) => {
                     outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
@@ -2364,15 +2415,34 @@ impl<S: Storage> IrohNet<S> {
             .filter(|ack| ack.genesis == Some(view.state.genesis))
             .map(|ack| ack.clock.clone())
             .unwrap_or_default();
+        let staged = self
+            .receipt_clock(peer_id, topic_id)
+            .map_or(0, |clock| covered(&clock, &goal.outbound));
         Ok(GoalProgress {
             inbound: covered(&view.clock, &goal.inbound),
             outbound: covered(&certified, &goal.outbound),
+            staged,
             holes: self
                 .node
                 .view_unresolved(&view)
                 .map_err(invalid_data)?
                 .len(),
         })
+    }
+
+    fn receipt_log(&self) -> std::sync::MutexGuard<'_, ReceiptLog> {
+        // The log is only a planning hint, so a poisoned one is still usable.
+        self.receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn receipt_clock(
+        &self,
+        peer_id: PeerId,
+        topic_id: crate::TopicId,
+    ) -> Option<crate::ActorClock> {
+        self.receipt_log().clocks.get(&(peer_id, topic_id)).cloned()
     }
 
     pub async fn accept_one(&self) -> io::Result<Option<iroh::EndpointId>> {
@@ -2578,9 +2648,9 @@ impl<S: Storage> IrohNet<S> {
                 self.node
                     .ensure_iroh_peer_whitelisted(source_peer, &data)
                     .map_err(invalid_data)?;
-                let (ack, evictions) = self
+                let outcome = self
                     .node
-                    .receive_sync_data_from_evicting(source_peer, data)
+                    .receive_sync_outcome(source_peer, data)
                     .map_err(|mut error| {
                         if let crate::Error::ReceiveCommitted { evictions, .. } = &mut error {
                             self.forward_evictions(std::mem::take(evictions));
@@ -2590,6 +2660,15 @@ impl<S: Storage> IrohNet<S> {
                         }
                         invalid_data(error)
                     })?;
+                let (ack, evictions) = match outcome {
+                    ReceiveOutcome::Acked { ack, evictions } => (*ack, evictions),
+                    ReceiveOutcome::Staged(staged) => {
+                        return Ok(vec![SyncMessage::Receipt(crate::sync::SyncReceipt {
+                            topic_id: data_topic_id,
+                            clock: staged.clock,
+                        })]);
+                    }
+                };
                 self.forward_evictions(evictions);
                 if let Err(error) = self.schedule_topic_recheck(data_topic_id) {
                     tracing::warn!(%data_topic_id, %error, "failed to schedule received topic resync");
@@ -2600,9 +2679,9 @@ impl<S: Storage> IrohNet<S> {
             // `SyncSession::finish`, so one rejected ack cannot discard the
             // rest; there is deliberately no second path that applies one.
             SyncMessage::Ack(_) => Err(invalid_data("sync ack must be applied by the session")),
-            SyncMessage::Failure(_) | SyncMessage::Page(_) => Err(invalid_data(
-                "sync failure and page are response-only messages",
-            )),
+            SyncMessage::Failure(_) | SyncMessage::Page(_) | SyncMessage::Receipt(_) => Err(
+                invalid_data("sync failure, page and receipt are response-only messages"),
+            ),
         }
     }
 }
@@ -2621,7 +2700,10 @@ fn per_topic_failure_scope(message: &SyncMessage) -> Option<crate::sync::SyncFai
         SyncMessage::Summary(summary) => (summary.topic_id, crate::sync::SyncFailureCode::Summary),
         SyncMessage::Request(request) => (request.topic_id, crate::sync::SyncFailureCode::Request),
         SyncMessage::Data(data) => (data.topic_id, crate::sync::SyncFailureCode::Data),
-        SyncMessage::Ack(_) | SyncMessage::Failure(_) | SyncMessage::Page(_) => return None,
+        SyncMessage::Ack(_)
+        | SyncMessage::Failure(_)
+        | SyncMessage::Page(_)
+        | SyncMessage::Receipt(_) => return None,
     };
     Some(crate::sync::SyncFailure { topic_id, code })
 }
@@ -2678,6 +2760,8 @@ struct GoalProgress {
     inbound: u64,
     outbound: u64,
     holes: usize,
+    /// Positions of the outbound goal the peer reported staged, not certified.
+    staged: u64,
 }
 
 impl GoalProgress {
@@ -2691,6 +2775,7 @@ impl GoalProgress {
         self.inbound > before.inbound
             || self.outbound > before.outbound
             || self.holes < before.holes
+            || self.staged > before.staged
     }
 }
 
@@ -2711,6 +2796,8 @@ struct SyncSession {
     controls: Vec<SyncMessage>,
     /// One ack per topic that received data, covering every message of it.
     replies: BTreeMap<crate::TopicId, crate::sync::SyncAck>,
+    /// Newest staging receipt per topic that has no ack in this stream.
+    receipts: BTreeMap<crate::TopicId, crate::sync::SyncReceipt>,
     /// Requests to serve once the whole stream is read, latest per topic.
     requests: BTreeMap<crate::TopicId, crate::sync::SyncRequest>,
 }
@@ -2725,6 +2812,7 @@ impl SyncSession {
             acks: Vec::new(),
             controls: Vec::new(),
             replies: BTreeMap::new(),
+            receipts: BTreeMap::new(),
             requests: BTreeMap::new(),
         }
     }
@@ -2792,7 +2880,9 @@ impl SyncSession {
                 self.requests.insert(request.topic_id, request);
                 Ok(())
             }
-            SyncMessage::Page(_) => Err(invalid_data("sync page is a response-only message")),
+            SyncMessage::Page(_) | SyncMessage::Receipt(_) => Err(invalid_data(
+                "sync page and receipt are response-only messages",
+            )),
             message => {
                 // A data-plane failure for one topic must not abort the stream:
                 // the other topics batched into it would lose their replies. It
@@ -2817,12 +2907,21 @@ impl SyncSession {
         }
     }
 
-    /// Queue one reply, folding acks of the same topic into the newest one.
+    /// Queue one reply, folding acks and receipts of a topic into the newest.
     fn keep_reply<S: Storage>(&mut self, net: &IrohNet<S>, reply: SyncMessage) -> io::Result<()> {
-        let SyncMessage::Ack(mut ack) = reply else {
-            self.controls.push(reply);
-            return Ok(());
+        let mut ack = match reply {
+            SyncMessage::Ack(ack) => ack,
+            SyncMessage::Receipt(receipt) => {
+                self.receipts.insert(receipt.topic_id, receipt);
+                return Ok(());
+            }
+            reply => {
+                self.controls.push(reply);
+                return Ok(());
+            }
         };
+        // Promotion supersedes the staging this stream reported before.
+        self.receipts.remove(&ack.topic_id);
         if let Some(earlier) = self.replies.remove(&ack.topic_id) {
             ack.accepted.extend(earlier.accepted);
             ack.sign(net.node.signer()).map_err(invalid_data)?;
@@ -2841,6 +2940,11 @@ impl SyncSession {
             std::mem::take(&mut self.replies)
                 .into_values()
                 .map(SyncMessage::Ack),
+        );
+        responses.extend(
+            std::mem::take(&mut self.receipts)
+                .into_values()
+                .map(SyncMessage::Receipt),
         );
         let requests = std::mem::take(&mut self.requests);
         let Some(peer_id) = self.remote_peer_id else {
@@ -2915,7 +3019,10 @@ impl SyncSession {
         }
         for (ack, result) in bound.iter().zip(net.node.apply_sync_acks(&bound)) {
             match result {
-                Ok(()) => net.reconsider_target(peer_id, ack.topic_id),
+                Ok(()) => {
+                    net.receipt_log().clear(&(peer_id, ack.topic_id));
+                    net.reconsider_target(peer_id, ack.topic_id);
+                }
                 Err(error) => {
                     let topic_id = ack.topic_id;
                     tracing::warn!(%topic_id, %error, "skipping rejected sync ack");
@@ -3259,6 +3366,7 @@ fn message_topic_id(message: &SyncMessage) -> Option<crate::TopicId> {
         SyncMessage::Ack(ack) => Some(ack.topic_id),
         SyncMessage::Failure(failure) => Some(failure.topic_id),
         SyncMessage::Page(page) => Some(page.topic_id),
+        SyncMessage::Receipt(receipt) => Some(receipt.topic_id),
     }
 }
 

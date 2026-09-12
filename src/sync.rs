@@ -128,6 +128,14 @@ pub struct SyncPage {
     pub more: bool,
 }
 
+/// Staged progress of data for a topic the receiver does not hold yet. It is
+/// never an ack: it certifies nothing and clears no obligation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncReceipt {
+    pub topic_id: TopicId,
+    pub clock: ActorClock,
+}
+
 #[cfg(feature = "iroh")]
 /// Bounds of one planned page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,6 +257,7 @@ pub enum SyncMessage {
     Ack(SyncAck),
     Failure(SyncFailure),
     Page(SyncPage),
+    Receipt(SyncReceipt),
 }
 
 #[derive(Clone)]

@@ -87,6 +87,7 @@ pub fn _message_type_name(message: &SyncMessage) -> &'static str {
         SyncMessage::Ack(_) => "ack",
         SyncMessage::Failure(_) => "failure",
         SyncMessage::Page(_) => "page",
+        SyncMessage::Receipt(_) => "receipt",
     }
 }
 
