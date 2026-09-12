@@ -1842,15 +1842,39 @@ impl<S: Storage> IrohNet<S> {
 
         let mut fingerprints = BTreeMap::new();
         let mut request = Vec::with_capacity(topic_ids.len() * 2);
-        for topic_id in topic_ids {
-            match self.node.sync_fingerprint(*topic_id) {
-                Ok(fingerprint) => {
-                    request.push(SyncMessage::Open(self.node.sync_open(*topic_id)));
-                    fingerprints.insert(*topic_id, fingerprint.fingerprint);
+        let topics = topic_ids.to_vec();
+        let prepared = self
+            .run_job(Lane::Control, move |shared| {
+                topics
+                    .into_iter()
+                    .map(|topic_id| {
+                        let prepared = shared
+                            .node
+                            .sync_fingerprint(topic_id)
+                            .map(|fingerprint| (shared.node.sync_open(topic_id), fingerprint));
+                        (topic_id, prepared)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                for topic_id in topic_ids {
+                    outcomes.insert(*topic_id, Err(clone_error(&error)));
+                }
+                return BatchOutcomes::new(outcomes, advanced, settled);
+            }
+        };
+        for (topic_id, prepared) in prepared {
+            match prepared {
+                Ok((open, fingerprint)) => {
+                    request.push(SyncMessage::Open(open));
+                    fingerprints.insert(topic_id, fingerprint.fingerprint);
                     request.push(SyncMessage::Fingerprint(fingerprint));
                 }
                 Err(error) => {
-                    outcomes.insert(*topic_id, Err(invalid_data(error)));
+                    outcomes.insert(topic_id, Err(invalid_data(error)));
                 }
             }
         }
@@ -1867,8 +1891,7 @@ impl<S: Storage> IrohNet<S> {
             }
         };
 
-        let mut matched = BTreeSet::new();
-        let mut incomplete = BTreeSet::new();
+        let mut matching = BTreeMap::new();
         let mut summaries = BTreeMap::new();
         for response in responses {
             match response {
@@ -1876,13 +1899,7 @@ impl<S: Storage> IrohNet<S> {
                     if fingerprints.get(&remote.topic_id) != Some(&remote.fingerprint) {
                         continue;
                     }
-                    // Two identically damaged stores still match, so the local
-                    // integrity check decides whether this counts as synced.
-                    if self.topic_is_whole(remote.topic_id) {
-                        matched.insert(remote.topic_id);
-                    } else {
-                        incomplete.insert(remote.topic_id);
-                    }
+                    matching.insert(remote.topic_id, remote.fingerprint);
                 }
                 SyncMessage::Summary(summary) if fingerprints.contains_key(&summary.topic_id) => {
                     summaries.insert(summary.topic_id, summary);
@@ -1905,35 +1922,54 @@ impl<S: Storage> IrohNet<S> {
                 }
             }
         }
-        for topic_id in &matched {
-            summaries.remove(topic_id);
-            let outcome = self
-                .node
-                .record_fingerprint(remote_peer_id, *topic_id, fingerprints[topic_id])
-                .map_err(invalid_data)
-                .and_then(|matched| {
-                    if matched {
-                        Ok(())
-                    } else {
-                        Err(invalid_data("topic changed during fingerprint exchange"))
-                    }
-                });
-            outcomes.insert(*topic_id, outcome);
-        }
-        for topic_id in &incomplete {
-            summaries.remove(topic_id);
-            outcomes.insert(
-                *topic_id,
-                Err(invalid_data(
-                    "local topic is incomplete despite a matching fingerprint",
-                )),
-            );
+        // Two identically damaged stores still match, so the local integrity
+        // check decides whether a matching fingerprint counts as synced.
+        let decided = self
+            .run_job(Lane::Control, move |shared| {
+                matching
+                    .into_iter()
+                    .map(|(topic_id, fingerprint)| {
+                        if !shared.topic_is_whole(topic_id) {
+                            return (
+                                topic_id,
+                                Err(invalid_data(
+                                    "local topic is incomplete despite a matching fingerprint",
+                                )),
+                            );
+                        }
+                        let outcome = shared
+                            .node
+                            .record_fingerprint(remote_peer_id, topic_id, fingerprint)
+                            .map_err(invalid_data)
+                            .and_then(|matched| {
+                                if matched {
+                                    Ok(())
+                                } else {
+                                    Err(invalid_data("topic changed during fingerprint exchange"))
+                                }
+                            });
+                        (topic_id, outcome)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        let decided = match decided {
+            Ok(decided) => decided,
+            Err(error) => {
+                for topic_id in fingerprints.keys() {
+                    outcomes
+                        .entry(*topic_id)
+                        .or_insert_with(|| Err(clone_error(&error)));
+                }
+                return BatchOutcomes::new(outcomes, advanced, settled);
+            }
+        };
+        for (topic_id, outcome) in decided {
+            summaries.remove(&topic_id);
+            outcomes.insert(topic_id, outcome);
         }
         for topic_id in fingerprints.keys() {
-            if !matched.contains(topic_id)
-                && !incomplete.contains(topic_id)
-                && !summaries.contains_key(topic_id)
-            {
+            if !outcomes.contains_key(topic_id) && !summaries.contains_key(topic_id) {
                 outcomes
                     .entry(*topic_id)
                     .or_insert_with(|| Err(invalid_data("peer did not return a sync summary")));
@@ -1941,8 +1977,28 @@ impl<S: Storage> IrohNet<S> {
         }
 
         let mut pending = Vec::with_capacity(summaries.len());
-        for (topic_id, summary) in summaries {
-            match self.plan_topic_messages(remote_peer_id, topic_id, &summary) {
+        let summary_topics = summaries.keys().copied().collect::<Vec<_>>();
+        let plans = self
+            .run_job(Lane::Bulk, move |shared| {
+                summaries
+                    .into_iter()
+                    .map(|(topic_id, summary)| {
+                        (
+                            topic_id,
+                            shared.plan_topic_messages(remote_peer_id, topic_id, &summary),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_else(|error| {
+                summary_topics
+                    .into_iter()
+                    .map(|topic_id| (topic_id, Err(clone_error(&error))))
+                    .collect()
+            });
+        for (topic_id, plan) in plans {
+            match plan {
                 Ok(Some(planned)) => pending.push(planned),
                 Ok(None) => {
                     outcomes.insert(topic_id, Ok(()));
