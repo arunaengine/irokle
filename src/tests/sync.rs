@@ -1872,3 +1872,68 @@ fn refusal_keeps_health() {
         .unwrap();
     assert_eq!(alice.peer_health().failures(&bob.peer_id()), 0);
 }
+
+/// One topic whose records cannot be read is a per-topic outcome: maintenance
+/// still visits the topics after it, and work owed for a healthy topic is still
+/// scheduled rather than being lost with the first failure.
+#[test]
+fn faulting_topic_spares_others() {
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[160; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let peer = Ed25519Signer::from_bytes(&[161; 32]).peer_id();
+
+    let mut topics = Vec::new();
+    for _ in 0..2 {
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        topics.push(topic);
+    }
+    // Fault the topic enumeration reaches first.
+    let order = alice.list_topics().unwrap();
+    let faulting = order[0].topic_id;
+    let healthy = order[1].topic_id;
+    let healthy_topic = topics
+        .iter()
+        .find(|topic| topic.id() == healthy)
+        .expect("healthy topic");
+    let record = healthy_topic
+        .publish(Note {
+            text: "owed".into(),
+        })
+        .unwrap();
+    alice
+        .put_sync_obligation(peer, healthy, [record.meta.op_id].into())
+        .unwrap();
+    storage.fail_heads(faulting);
+
+    // Maintenance reports no global failure and leaves the bad topic for later.
+    assert!(
+        alice.quarantine_topics().unwrap().is_empty(),
+        "a topic-local read failure must not abort the pass"
+    );
+
+    // The healthy topic's durable work is still there to be scheduled.
+    let owed = storage
+        .all_sync_obligations()
+        .unwrap()
+        .into_iter()
+        .filter(|obligation| obligation.topic_id == healthy)
+        .count();
+    assert_eq!(owed, 1, "healthy work must survive a topic-local failure");
+    assert!(
+        alice.storage().heads(&healthy).is_ok(),
+        "the healthy topic stays readable"
+    );
+}

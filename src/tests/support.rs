@@ -138,6 +138,7 @@ pub(crate) struct StaleReadStorage {
     pub(crate) failed_writes: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
     pub(crate) failed_status: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
     pub(crate) obligation_gate: Arc<std::sync::Mutex<Option<Arc<Rendezvous>>>>,
+    pub(crate) failed_heads: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
 }
 
 impl StaleReadStorage {
@@ -151,7 +152,14 @@ impl StaleReadStorage {
             failed_writes: Arc::default(),
             failed_status: Arc::default(),
             obligation_gate: Arc::default(),
+            failed_heads: Arc::default(),
         }
+    }
+
+    /// Make every later head read of `topic_id` fail, standing in for one
+    /// topic whose records cannot be read while the others are fine.
+    pub(crate) fn fail_heads(&self, topic_id: TopicId) {
+        self.failed_heads.lock().unwrap().insert(topic_id);
     }
 
     /// Reject every later status update for `topic_id`.
@@ -198,6 +206,9 @@ impl Storage for StaleReadStorage {
         self.inner.list_op_ids(topic_id)
     }
     fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
+        if self.failed_heads.lock().unwrap().contains(topic_id) {
+            return Err(Error::Storage("injected head read failure".into()));
+        }
         self.inner.heads(topic_id)
     }
     fn children(&self, op_id: &OpId) -> Result<BTreeSet<OpId>, Error> {

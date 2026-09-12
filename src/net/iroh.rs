@@ -1179,8 +1179,15 @@ impl<S: Storage> IrohNet<S> {
         // The sweep is the one pass that revisits every topic, so let it audit
         // stored records again rather than reuse an earlier whole verdict, and
         // clear damage no peer can repair before planning the resyncs.
-        self.node.recheck_topics().map_err(invalid_data)?;
-        self.forward_evictions(self.node.quarantine_topics().map_err(invalid_data)?);
+        // Maintenance is separate from scheduling: durable work owed for
+        // healthy topics must be scheduled even when maintenance cannot run.
+        if let Err(error) = self.node.recheck_topics() {
+            tracing::warn!(%error, "sweep could not refresh topic caches");
+        }
+        match self.node.quarantine_topics() {
+            Ok(evictions) => self.forward_evictions(evictions),
+            Err(error) => tracing::warn!(%error, "sweep could not quarantine topics"),
+        }
         let mut scheduled = self.schedule_persisted_obligations()?;
         for (peer_id, topic_id) in self.full_sweep_resync_targets()? {
             self.resync_scheduler.schedule_now(peer_id, topic_id, true);
@@ -2005,20 +2012,29 @@ impl<S: Storage> IrohNet<S> {
     fn full_sweep_resync_targets(&self) -> io::Result<BTreeSet<(PeerId, crate::TopicId)>> {
         let mut targets = BTreeSet::new();
         for topic in self.node.storage().list_topics().map_err(invalid_data)? {
-            let Some(state) = self
-                .node
-                .storage()
-                .topic_state(&topic.topic_id)
-                .map_err(invalid_data)?
-            else {
-                continue;
+            let state = match self.node.storage().topic_state(&topic.topic_id) {
+                Ok(Some(state)) => state,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        topic_id = %topic.topic_id,
+                        %error,
+                        "skipping one unreadable topic while planning the sweep"
+                    );
+                    continue;
+                }
             };
             if !state.members.contains(&self.node.peer_id()) {
-                targets.extend(
-                    self.dirty_selected_targets(topic.topic_id)?
-                        .into_iter()
-                        .map(|peer_id| (peer_id, topic.topic_id)),
-                );
+                match self.dirty_selected_targets(topic.topic_id) {
+                    Ok(dirty) => {
+                        targets.extend(dirty.into_iter().map(|peer_id| (peer_id, topic.topic_id)))
+                    }
+                    Err(error) => tracing::warn!(
+                        topic_id = %topic.topic_id,
+                        %error,
+                        "skipping one topic while planning the sweep"
+                    ),
+                }
                 continue;
             }
             targets.extend(

@@ -492,12 +492,23 @@ impl<S: Storage> Irokle<S> {
         self.storage().clear_eviction(key)
     }
 
-    /// Run [`Irokle::quarantine_orphans`] over every local topic.
+    /// Run [`Irokle::quarantine_orphans`] over every local topic. One topic that
+    /// cannot be quarantined, because it is sealed or its records are
+    /// unreadable, is a per-topic outcome: the remaining topics are still
+    /// visited and every eviction already committed is still returned, because
+    /// each was written in the transaction that discarded its payloads. Only a
+    /// failure to enumerate topics at all is reported as a global failure.
     pub fn quarantine_topics(&self) -> Result<Vec<TopicEviction>> {
         let mut quarantined = Vec::new();
         for info in self.list_topics()? {
-            if let Some(eviction) = self.oplog.quarantine_orphans(&info.topic_id)? {
-                quarantined.push(eviction);
+            match self.oplog.quarantine_orphans(&info.topic_id) {
+                Ok(Some(eviction)) => quarantined.push(eviction),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    topic_id = %info.topic_id,
+                    %error,
+                    "leaving topic quarantine for a later sweep"
+                ),
             }
         }
         Ok(quarantined)
