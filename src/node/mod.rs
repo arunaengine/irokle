@@ -1077,11 +1077,9 @@ impl<S: Storage> Irokle<S> {
         }
     }
 
-    /// Record how attempt `(epoch, sequence)` ended. The state follows the
-    /// outcome, not the pending count: a partial pull stays `Behind` even when
-    /// nothing is owed outbound. Complete and Advanced count as successful
-    /// attempts, Blocked and Failed as failed ones. Peer health is left to
-    /// the caller, which knows whether a failure was a reachability failure.
+    /// Record how attempt `(epoch, sequence)` ended. The state follows the outcome,
+    /// so a partial pull stays `Behind`; Complete and Advanced count as successes,
+    /// Blocked and Failed as failures. Peer health is left to the caller.
     #[cfg(any(feature = "iroh", test))]
     pub(crate) fn record_attempt_result(
         &self,

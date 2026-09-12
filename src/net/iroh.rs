@@ -3350,10 +3350,9 @@ impl SyncSession {
                 "sync page and receipt are response-only messages",
             )),
             message => {
-                // A data-plane failure for one topic must not abort the stream:
-                // the other topics batched into it would lose their replies. It
-                // must not read as success either, so the topic gets an explicit
-                // failure. Framing and authentication failures above stay fatal.
+                // A data-plane failure fails only its topic, explicitly, so the
+                // other topics batched into the stream keep their replies.
+                // Framing and authentication failures above stay fatal.
                 let failure = per_topic_failure_scope(&message);
                 match net.handle_message(message, self.remote_peer_id) {
                     Ok(responses) => {
