@@ -19,6 +19,8 @@ pub use frame::{
     IROKLE_SYNC_ALPN, MAX_SYNC_DATA_OPS_PER_MESSAGE, decode_frame, decode_frames,
     decode_sync_message, encode_frame, encode_frames, encode_sync_message,
 };
+#[cfg(all(feature = "iroh", test))]
+pub(crate) use iroh::StreamLimits;
 #[cfg(feature = "iroh")]
 pub use iroh::{IrohNet, IrohRuntimeConfig, ShutdownOutcome};
 

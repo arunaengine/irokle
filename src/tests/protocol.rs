@@ -1,0 +1,345 @@
+use std::time::{Duration, Instant};
+
+use super::iroh::ready_addr;
+use super::support::*;
+use crate::net::StreamLimits;
+use crate::sync::{ActorRangeHint, SyncCredit, SyncData, SyncMessage, SyncRequest};
+
+async fn bind(transport: Option<iroh::endpoint::QuicTransportConfig>) -> iroh::Endpoint {
+    let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()]);
+    if let Some(transport) = transport {
+        builder = builder.transport_config(transport);
+    }
+    builder.bind().await.unwrap()
+}
+
+struct Peer {
+    node: Irokle,
+    net: Arc<net::IrohNet<MemoryStorage>>,
+}
+
+fn peer(endpoint: iroh::Endpoint, runtime: net::IrohRuntimeConfig, limits: StreamLimits) -> Peer {
+    let node = Irokle::builder()
+        .with_iroh_secret_key(endpoint.secret_key())
+        .build()
+        .unwrap();
+    let net = net::IrohNet::new_with_config(endpoint, node.clone(), runtime)
+        .unwrap()
+        .with_stream_limits(limits);
+    Peer {
+        node,
+        net: Arc::new(net),
+    }
+}
+
+async fn serve(peer: &Peer) -> iroh::EndpointAddr {
+    peer.net.start_accept_loop().unwrap();
+    ready_addr(peer.net.endpoint()).await
+}
+
+/// Topic `topic_id` of `owner` with `events` notes of `text_len` bytes, shared
+/// with `member`, which holds only the genesis. Returns the owner's ops.
+fn seed_topic(
+    owner: &Irokle,
+    member: &Irokle,
+    topic_id: TopicId,
+    events: usize,
+    text_len: usize,
+) -> Vec<Op> {
+    let log = oplog::Oplog::with_storage(owner.storage().clone());
+    let actor = actor_id_for(topic_id, owner.peer_id());
+    let genesis = TopicGenesis {
+        event_type_id: Note::TYPE_ID.into(),
+        initial_peers: [owner.peer_id(), member.peer_id()].into(),
+        replication_policy: ReplicationPolicy::default(),
+    };
+    let mut ops = vec![
+        log.create_topic_genesis(topic_id, actor, genesis, owner.signer())
+            .unwrap(),
+    ];
+    for index in 0..events {
+        let note = Note {
+            text: format!("{index:0>text_len$}"),
+        };
+        let envelope = EventEnvelope::encode_event(&note).unwrap();
+        ops.push(
+            log.create_event_op(topic_id, actor, envelope, owner.signer())
+                .unwrap(),
+        );
+    }
+    let genesis = SyncData {
+        topic_id,
+        ops: ops[..1].to_vec(),
+    };
+    member
+        .receive_sync_data_from(owner.peer_id(), genesis)
+        .unwrap();
+    ops
+}
+
+/// Notes `member` appends to its copy of `topic_id`.
+fn member_events(member: &Irokle, topic_id: TopicId, count: usize, text_len: usize) -> Vec<Op> {
+    let topic = member.open_topic::<Note>(topic_id).unwrap();
+    (0..count)
+        .map(|index| {
+            let text = format!("{index:0>text_len$}");
+            let record = topic.publish(Note { text }).unwrap();
+            member
+                .storage()
+                .get_op(&record.meta.op_id)
+                .unwrap()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// A request for every event of `owner` in `topic_id` after its genesis.
+fn events_request(owner: &Irokle, topic_id: TopicId, credit: SyncCredit) -> SyncRequest {
+    SyncRequest {
+        topic_id,
+        known: BTreeSet::new(),
+        wants: BTreeSet::new(),
+        actor_range_hints: vec![ActorRangeHint {
+            actor_id: actor_id_for(topic_id, owner.peer_id()),
+            from_exclusive: 1,
+            to_inclusive: u64::MAX,
+        }],
+        genesis: genesis_of(owner.storage(), &topic_id),
+        credit,
+    }
+}
+
+fn open(member: &Irokle, topic_id: TopicId) -> SyncMessage {
+    SyncMessage::Open(member.sync_open(topic_id))
+}
+
+fn push(topic_id: TopicId, ops: Vec<Op>) -> Vec<SyncMessage> {
+    crate::net::sync_data_messages(topic_id, ops).unwrap()
+}
+
+fn data_ids(replies: &[SyncMessage], topic_id: TopicId) -> Vec<OpId> {
+    replies
+        .iter()
+        .filter_map(|reply| match reply {
+            SyncMessage::Data(data) if data.topic_id == topic_id => Some(data.ops.iter()),
+            _ => None,
+        })
+        .flatten()
+        .map(|op| op.id)
+        .collect()
+}
+
+/// The page result of `topic_id`: `Some(more)`, or `None` when absent.
+fn page_more(replies: &[SyncMessage], topic_id: TopicId) -> Option<bool> {
+    let mut pages = replies.iter().filter_map(|reply| match reply {
+        SyncMessage::Page(page) if page.topic_id == topic_id => Some(page.more),
+        _ => None,
+    });
+    let more = pages.next();
+    assert!(pages.next().is_none(), "one page result per topic");
+    more
+}
+
+fn acked(replies: &[SyncMessage], topic_id: TopicId) -> bool {
+    replies
+        .iter()
+        .any(|reply| matches!(reply, SyncMessage::Ack(ack) if ack.topic_id == topic_id))
+}
+
+fn topic(byte: u8) -> TopicId {
+    TopicId::from_bytes([byte; 32])
+}
+
+/// Tiny QUIC receive windows on both sides, a request answered by a large page
+/// and a large pushed suffix in the same stream: the exchange completes on
+/// reads and writes, not on the I/O timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn small_windows_complete() {
+    let transport = || {
+        iroh::endpoint::QuicTransportConfig::builder()
+            .stream_receive_window(iroh::endpoint::VarInt::from_u32(16 * 1024))
+            .receive_window(iroh::endpoint::VarInt::from_u32(64 * 1024))
+            .build()
+    };
+    let timeout = Duration::from_secs(120);
+    let runtime = net::IrohRuntimeConfig {
+        sync_io_timeout: timeout,
+        ..net::IrohRuntimeConfig::default()
+    };
+    let alice = peer(
+        bind(Some(transport())).await,
+        runtime,
+        StreamLimits::default(),
+    );
+    let bob = peer(
+        bind(Some(transport())).await,
+        runtime,
+        StreamLimits::default(),
+    );
+    let alice_addr = serve(&alice).await;
+    let topic_id = topic(11);
+    let owned = seed_topic(&alice.node, &bob.node, topic_id, 600, 1024);
+    let pushed = member_events(&bob.node, topic_id, 600, 1024);
+
+    let mut messages = vec![
+        open(&bob.node, topic_id),
+        SyncMessage::Request(events_request(&alice.node, topic_id, SyncCredit::default())),
+    ];
+    messages.extend(push(topic_id, pushed.clone()));
+    let started = Instant::now();
+    let replies = bob.net.sync_with(alice_addr, &messages).await.unwrap();
+    assert!(started.elapsed() < timeout / 4, "{:?}", started.elapsed());
+
+    assert!(acked(&replies, topic_id));
+    assert_eq!(page_more(&replies, topic_id), Some(false));
+    let served = data_ids(&replies, topic_id);
+    let expected = owned[1..].iter().map(|op| op.id).collect::<Vec<_>>();
+    assert_eq!(served, expected);
+    let stored = alice.node.storage().list_op_ids(&topic_id).unwrap();
+    assert!(pushed.iter().all(|op| stored.contains(&op.id)));
+    alice.net.shutdown().await;
+    bob.net.shutdown().await;
+}
+
+/// Replies of many topics above one stream's scaled budget: every topic keeps
+/// its ack and page result, and repeated manual syncs finish every topic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aggregate_budget_continues() {
+    let limits = StreamLimits {
+        bytes: 96 * 1024,
+        messages: 48,
+        batch_messages: 24,
+    };
+    let runtime = net::IrohRuntimeConfig::default();
+    let alice = peer(bind(None).await, runtime, limits);
+    let bob = peer(bind(None).await, runtime, limits);
+    let alice_addr = serve(&alice).await;
+    let topics = (21..27).map(topic).collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    for topic_id in &topics {
+        seed_topic(&alice.node, &bob.node, *topic_id, 200, 256);
+        messages.push(open(&bob.node, *topic_id));
+        messages.extend(push(*topic_id, member_events(&bob.node, *topic_id, 1, 8)));
+        messages.push(SyncMessage::Request(events_request(
+            &alice.node,
+            *topic_id,
+            SyncCredit::default(),
+        )));
+    }
+
+    let replies = bob
+        .net
+        .sync_with(alice_addr.clone(), &messages)
+        .await
+        .unwrap();
+    let mut continued = 0;
+    for topic_id in &topics {
+        assert!(
+            acked(&replies, *topic_id),
+            "every pushed topic keeps its ack"
+        );
+        let more = page_more(&replies, *topic_id).expect("page result");
+        assert!(more || !data_ids(&replies, *topic_id).is_empty());
+        continued += usize::from(more);
+    }
+    assert!(continued > 0, "the replies must exceed the stream budget");
+
+    for topic_id in &topics {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            assert!(attempts <= 8, "topic did not finish");
+            match bob.net.sync_now(alice_addr.clone(), *topic_id).await {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("sync failed: {error}"),
+            }
+        }
+        assert_eq!(
+            bob.node.storage().actor_clock(topic_id).unwrap(),
+            alice.node.storage().actor_clock(topic_id).unwrap()
+        );
+    }
+    alice.net.shutdown().await;
+    bob.net.shutdown().await;
+}
+
+/// Hand-built streams served by `alice` for `bob`, without a connection.
+async fn stream_pair(limits: StreamLimits) -> (Peer, Peer) {
+    let runtime = net::IrohRuntimeConfig::default();
+    let alice = peer(bind(None).await, runtime, limits);
+    let bob = peer(bind(None).await, runtime, StreamLimits::default());
+    (alice, bob)
+}
+
+fn serve_stream(alice: &Peer, bob: &Peer, messages: Vec<SyncMessage>) -> Vec<SyncMessage> {
+    alice
+        .net
+        .handle_messages(bob.net.endpoint().id(), messages)
+        .unwrap()
+}
+
+/// Controls that fill the message budget exactly leave no room for data, but
+/// every ack and page result is still sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controls_fill_budget() {
+    let topics = (31..34).map(topic).collect::<Vec<_>>();
+    // Each topic replies with a summary for its open, an ack and a page result.
+    let limits = StreamLimits {
+        messages: 3 * topics.len(),
+        ..StreamLimits::default()
+    };
+    let (alice, bob) = stream_pair(limits).await;
+    let mut messages = Vec::new();
+    for topic_id in &topics {
+        seed_topic(&alice.node, &bob.node, *topic_id, 50, 8);
+        messages.push(open(&bob.node, *topic_id));
+        messages.extend(push(*topic_id, member_events(&bob.node, *topic_id, 1, 8)));
+        messages.push(SyncMessage::Request(events_request(
+            &alice.node,
+            *topic_id,
+            SyncCredit::default(),
+        )));
+    }
+
+    let replies = serve_stream(&alice, &bob, messages);
+    assert_eq!(replies.len(), limits.messages);
+    for topic_id in &topics {
+        assert!(acked(&replies, *topic_id));
+        assert_eq!(page_more(&replies, *topic_id), Some(true));
+        assert!(data_ids(&replies, *topic_id).is_empty());
+    }
+    alice.net.shutdown().await;
+    bob.net.shutdown().await;
+}
+
+/// Repeated requests, a repeated open and a summary in one stream serve each
+/// op once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicates_served_once() {
+    let (alice, bob) = stream_pair(StreamLimits::default()).await;
+    let topic_id = topic(41);
+    let owned = seed_topic(&alice.node, &bob.node, topic_id, 40, 8);
+    member_events(&bob.node, topic_id, 1, 8);
+    let request =
+        SyncMessage::Request(events_request(&alice.node, topic_id, SyncCredit::default()));
+    let summary = SyncMessage::Summary(bob.node.sync_summary(topic_id).unwrap());
+    let messages = vec![
+        open(&bob.node, topic_id),
+        request.clone(),
+        request.clone(),
+        summary.clone(),
+        open(&bob.node, topic_id),
+        summary,
+        request,
+    ];
+
+    let replies = serve_stream(&alice, &bob, messages);
+    let served = data_ids(&replies, topic_id);
+    let expected = owned[1..].iter().map(|op| op.id).collect::<Vec<_>>();
+    assert_eq!(served, expected);
+    assert_eq!(page_more(&replies, topic_id), Some(false));
+    alice.net.shutdown().await;
+    bob.net.shutdown().await;
+}

@@ -983,7 +983,7 @@ async fn genesis_tiebreak_eviction_reaches_sink_via_builder_net() {
 }
 
 #[cfg(feature = "iroh")]
-async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
+pub(super) async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
     use futures::StreamExt;
     use iroh::Watcher;
 

@@ -49,6 +49,26 @@ const MAX_SYNC_NOW_PAGES: usize = 64;
 /// Staging receipts remembered per peer and topic, oldest dropped first.
 const MAX_BOOTSTRAP_RECEIPTS: usize = 1024;
 
+/// Bounds of one sync stream. Tests scale them down; everything else uses the
+/// defaults.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StreamLimits {
+    pub(crate) bytes: usize,
+    pub(crate) messages: usize,
+    /// Messages one batched request stream may carry.
+    pub(crate) batch_messages: usize,
+}
+
+impl Default for StreamLimits {
+    fn default() -> Self {
+        Self {
+            bytes: MAX_SYNC_STREAM_BYTES,
+            messages: MAX_SYNC_MESSAGES_PER_STREAM,
+            batch_messages: MAX_BATCH_STREAM_MESSAGES,
+        }
+    }
+}
+
 /// Result of [`IrohNet::shutdown_with_timeout`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShutdownOutcome {
@@ -716,6 +736,7 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
     resync_started: AtomicBool,
     quarantine_started: AtomicBool,
     outbound_streams: AtomicU64,
+    limits: StreamLimits,
     receipts: Mutex<ReceiptLog>,
     shutdown: tokio::sync::watch::Sender<bool>,
     tasks: Arc<TaskTracker>,
@@ -787,11 +808,18 @@ impl<S: Storage> IrohNet<S> {
             resync_started: AtomicBool::new(false),
             quarantine_started: AtomicBool::new(false),
             outbound_streams: AtomicU64::new(0),
+            limits: StreamLimits::default(),
             receipts: Mutex::default(),
             shutdown,
             tasks: Arc::default(),
             eviction_sink,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_stream_limits(mut self, limits: StreamLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Forwards evictions to the configured sink as the fast path. The sink is
@@ -1517,8 +1545,9 @@ impl<S: Storage> IrohNet<S> {
         tokio::time::timeout(self.runtime.sync_io_timeout, async {
             let (mut send, mut recv) = connection.open_bi().await.map_err(other)?;
             self.outbound_streams.fetch_add(1, Ordering::Relaxed);
-            write_sync_messages(&mut send, messages, self.runtime.sync_io_timeout).await?;
-            read_sync_messages(&mut recv, self.runtime.sync_io_timeout).await
+            let timeout = self.runtime.sync_io_timeout;
+            write_sync_messages(&mut send, messages, timeout, self.limits).await?;
+            read_sync_messages(&mut recv, timeout, self.limits).await
         })
         .await
         .map_err(|_| timed_out("sync exchange timed out"))?
@@ -1854,7 +1883,7 @@ impl<S: Storage> IrohNet<S> {
             let bytes = match planned.messages.iter().try_fold(0usize, |bytes, message| {
                 super::framed_message_len(message).map(|len| bytes.saturating_add(len))
             }) {
-                Ok(bytes) if bytes <= MAX_SYNC_STREAM_BYTES => bytes,
+                Ok(bytes) if bytes <= self.limits.bytes => bytes,
                 Ok(_) => {
                     outcomes.insert(
                         planned.topic_id,
@@ -1868,9 +1897,9 @@ impl<S: Storage> IrohNet<S> {
                 }
             };
             if !group.is_empty()
-                && (group_bytes.saturating_add(bytes) > MAX_SYNC_STREAM_BYTES
-                    || group_messages + planned.messages.len() > MAX_BATCH_STREAM_MESSAGES
-                    || group_responses + planned.estimated_responses > MAX_BATCH_STREAM_MESSAGES)
+                && (group_bytes.saturating_add(bytes) > self.limits.bytes
+                    || group_messages + planned.messages.len() > self.limits.batch_messages
+                    || group_responses + planned.estimated_responses > self.limits.batch_messages)
             {
                 self.run_topic_batch_exchange(
                     peer.clone(),
@@ -2258,7 +2287,7 @@ impl<S: Storage> IrohNet<S> {
                     .any(|message| matches!(message, SyncMessage::Data(_)))
             };
             if !current_messages.is_empty()
-                && (current_messages.len() + replies.len() + 1 > MAX_BATCH_STREAM_MESSAGES
+                && (current_messages.len() + replies.len() + 1 > self.limits.batch_messages
                     || carries_data(&replies)
                     || carries_data(&current_messages))
             {
@@ -2478,7 +2507,7 @@ impl<S: Storage> IrohNet<S> {
     ) -> io::Result<()> {
         tokio::time::timeout(self.runtime.sync_io_timeout, async {
             let mut session = SyncSession::new(peer);
-            let mut limits = SyncReadLimits::default();
+            let mut limits = SyncReadLimits::new(self.limits);
             while let Some(frame) = read_next_frame(&mut recv, self.runtime.sync_io_timeout).await?
             {
                 let frame_index = limits.observe_frame(frame.len())?;
@@ -2491,7 +2520,8 @@ impl<S: Storage> IrohNet<S> {
                 session.handle(self, message)?;
             }
             let responses = session.finish(self)?;
-            write_sync_messages(&mut send, &responses, self.runtime.sync_io_timeout).await?;
+            let timeout = self.runtime.sync_io_timeout;
+            write_sync_messages(&mut send, &responses, timeout, self.limits).await?;
             Ok(())
         })
         .await
@@ -2959,13 +2989,14 @@ impl SyncSession {
             bytes += super::framed_message_len(response)?;
         }
         let mut messages = responses.len() + requests.len();
-        if bytes > MAX_SYNC_STREAM_BYTES || messages > MAX_SYNC_MESSAGES_PER_STREAM {
+        let limits = net.limits;
+        if bytes > limits.bytes || messages > limits.messages {
             return Err(invalid_data("sync reply controls exceed the stream budget"));
         }
         let mut left = requests.len();
         for (topic_id, request) in requests {
-            let share_bytes = (MAX_SYNC_STREAM_BYTES - bytes) / left;
-            let share_messages = (MAX_SYNC_MESSAGES_PER_STREAM - messages) / left;
+            let share_bytes = (limits.bytes - bytes) / left;
+            let share_messages = (limits.messages - messages) / left;
             left -= 1;
             let mut budget = crate::sync::PageBudget::from_credit(request.credit);
             budget.bytes = budget.bytes.min(share_bytes);
@@ -3055,22 +3086,30 @@ fn fit_page(
     }
 }
 
-#[derive(Default)]
 struct SyncReadLimits {
+    limits: StreamLimits,
     messages: usize,
     bytes: usize,
 }
 
 impl SyncReadLimits {
+    fn new(limits: StreamLimits) -> Self {
+        Self {
+            limits,
+            messages: 0,
+            bytes: 0,
+        }
+    }
+
     fn observe_frame(&mut self, frame_len: usize) -> io::Result<usize> {
-        if self.messages >= MAX_SYNC_MESSAGES_PER_STREAM {
+        if self.messages >= self.limits.messages {
             return Err(invalid_data("sync stream has too many messages"));
         }
         self.bytes = self
             .bytes
             .checked_add(frame_len + 4)
             .ok_or_else(|| invalid_data("sync stream byte count overflow"))?;
-        if self.bytes > MAX_SYNC_STREAM_BYTES {
+        if self.bytes > self.limits.bytes {
             return Err(invalid_data("sync stream exceeds maximum byte length"));
         }
         let frame_index = self.messages;
@@ -3244,9 +3283,10 @@ impl<S: Storage> Drop for IrohNet<S> {
 async fn read_sync_messages(
     recv: &mut iroh::endpoint::RecvStream,
     sync_io_timeout: Duration,
+    stream_limits: StreamLimits,
 ) -> io::Result<Vec<SyncMessage>> {
     let mut messages = Vec::new();
-    let mut limits = SyncReadLimits::default();
+    let mut limits = SyncReadLimits::new(stream_limits);
     while let Some(frame) = read_next_frame(recv, sync_io_timeout).await? {
         let frame_index = limits.observe_frame(frame.len())?;
         messages.push(decode_sync_message(&frame).map_err(|err| {
@@ -3263,8 +3303,9 @@ async fn write_sync_messages(
     send: &mut iroh::endpoint::SendStream,
     messages: &[SyncMessage],
     sync_io_timeout: Duration,
+    stream_limits: StreamLimits,
 ) -> io::Result<()> {
-    let mut limits = SyncReadLimits::default();
+    let mut limits = SyncReadLimits::new(stream_limits);
     for message in messages {
         limits.observe_frame(super::framed_message_len(message)? - 4)?;
     }

@@ -16,6 +16,8 @@ mod pages;
 mod pending;
 #[cfg(feature = "iroh")]
 mod planning;
+#[cfg(feature = "iroh")]
+mod protocol;
 mod storage;
 pub(crate) mod support;
 mod sync;
