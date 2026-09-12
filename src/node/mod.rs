@@ -15,9 +15,8 @@ pub use topic::{RawTopic, Topic};
 
 use crate::ActorClock;
 use crate::history::{DagQuery, HistoryOrder, ordered};
-use crate::oplog::{Oplog, topological, topological_subset};
+use crate::oplog::{Oplog, topological_subset_entries};
 use crate::reducer::EventRecord;
-#[cfg(feature = "iroh")]
 use crate::storage::{AdmissionEffects, OpMeta, SyncObligation, TopicState};
 use crate::storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
 use crate::sync::{
@@ -239,6 +238,7 @@ impl<S: Storage> Irokle<S> {
     }
 
     pub fn create_topic<E: Event>(&self, mut config: TopicConfig) -> Result<Topic<E, S>> {
+        self.validate_concern(&self.config.default_write_concern)?;
         config.initial_peers.insert(self.peer_id());
         let topic_id = self.next_topic_id::<E>()?;
         let actor_id = actor_id_for(topic_id, self.peer_id());
@@ -248,7 +248,7 @@ impl<S: Storage> Irokle<S> {
             replication_policy: config.replication_policy,
         };
         #[cfg(feature = "iroh")]
-        let op = self.oplog.create_topic_genesis_with_effects(
+        let op = self.oplog.create_topic_effects(
             topic_id,
             actor_id,
             genesis,
@@ -272,7 +272,7 @@ impl<S: Storage> Irokle<S> {
             op.id,
             &self.config.default_write_concern,
             "topic genesis replication wake failed",
-        )?;
+        );
         Ok(Topic::new(self.clone(), topic_id, actor_id))
     }
 
@@ -282,6 +282,7 @@ impl<S: Storage> Irokle<S> {
         mut config: TopicConfig,
         event: E,
     ) -> Result<(Topic<E, S>, EventRecord<E>)> {
+        self.validate_concern(&self.config.default_write_concern)?;
         config.initial_peers.insert(self.peer_id());
         let topic_id = self.next_topic_id::<E>()?;
         let actor_id = actor_id_for(topic_id, self.peer_id());
@@ -291,8 +292,7 @@ impl<S: Storage> Irokle<S> {
             replication_policy: config.replication_policy,
         };
         let envelope = EventEnvelope::encode_event(&event)?;
-        #[cfg(feature = "iroh")]
-        let (_, event_op) = self.oplog.create_topic_genesis_with_event_with_effects(
+        let (_, (event_op, meta)) = self.oplog.create_genesis_effects(
             topic_id,
             actor_id,
             genesis,
@@ -308,19 +308,6 @@ impl<S: Storage> Irokle<S> {
                 )
             },
         )?;
-        #[cfg(not(feature = "iroh"))]
-        let (_, event_op) = self.oplog.create_topic_genesis_with_event(
-            topic_id,
-            actor_id,
-            genesis,
-            envelope,
-            &self.config.signer,
-        )?;
-        let meta = self
-            .oplog
-            .storage()
-            .get_meta(&event_op.id)?
-            .ok_or(Error::Storage("missing op meta after publish".into()))?;
         let record = EventRecord::new(
             event,
             event_op.id,
@@ -334,7 +321,7 @@ impl<S: Storage> Irokle<S> {
             event_op.id,
             &self.config.default_write_concern,
             "topic genesis replication wake failed",
-        )?;
+        );
         Ok((Topic::new(self.clone(), topic_id, actor_id), record))
     }
 
@@ -489,6 +476,16 @@ impl<S: Storage> Irokle<S> {
         self.sync.negotiate(peer_id, remote)
     }
 
+    #[cfg(feature = "iroh")]
+    pub(crate) fn negotiate_page(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
+        self.sync.negotiate_page(peer_id, remote)
+    }
+
+    #[cfg(feature = "iroh")]
+    pub(crate) fn response_page(&self, peer_id: PeerId, request: &SyncRequest) -> Result<SyncData> {
+        self.sync.response_page(peer_id, request)
+    }
+
     pub fn plan_sync_data(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncData> {
         self.sync.plan_data(peer_id, remote)
     }
@@ -548,16 +545,49 @@ impl<S: Storage> Irokle<S> {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let (mut ack, evictions) =
-            self.sync
-                .receive_data_preverified(source_peer_id, self.peer_id(), data, &verified)?;
-        for (op_id, peer) in removals {
-            if peer != self.peer_id() && ack.accepted.contains(&op_id) {
-                self.storage().clear_peer_sync_state(&peer, &ack.topic_id)?;
+        let (mut ack, evictions) = match self.sync.receive_data_preverified(
+            source_peer_id,
+            self.peer_id(),
+            data,
+            &verified,
+        ) {
+            Ok(received) => received,
+            Err(error) => {
+                #[cfg(feature = "iroh")]
+                if let Error::ReceiveCommitted { ack, .. } = &error
+                    && let Some(net) = &self.net
+                {
+                    net.schedule_resync(source_peer_id, ack.topic_id);
+                    if let Err(error) = net.schedule_topic_recheck(ack.topic_id) {
+                        tracing::warn!(topic_id = %ack.topic_id, %error, "committed receive recheck failed");
+                    }
+                }
+                return Err(error);
             }
+        };
+        let result = (|| -> Result<()> {
+            for (op_id, peer) in removals {
+                if peer != self.peer_id() && ack.accepted.contains(&op_id) {
+                    self.storage().clear_peer_sync_state(&peer, &ack.topic_id)?;
+                }
+            }
+            self.put_receive_forward_obligations(source_peer_id, ack.topic_id, &ack.accepted)?;
+            ack.sign(&self.config.signer)
+        })();
+        if let Err(source) = result {
+            #[cfg(feature = "iroh")]
+            if let Some(net) = &self.net {
+                net.schedule_resync(source_peer_id, ack.topic_id);
+                if let Err(error) = net.schedule_topic_recheck(ack.topic_id) {
+                    tracing::warn!(topic_id = %ack.topic_id, %error, "committed receive recheck failed");
+                }
+            }
+            return Err(Error::ReceiveCommitted {
+                ack: Box::new(ack),
+                evictions,
+                source: Box::new(source),
+            });
         }
-        self.put_receive_forward_obligations(source_peer_id, ack.topic_id, &ack.accepted)?;
-        ack.sign(&self.config.signer)?;
         Ok((ack, evictions))
     }
 
@@ -568,7 +598,13 @@ impl<S: Storage> Irokle<S> {
         let (mut ack, evictions) = self
             .sync
             .receive_data(self.peer_id(), self.peer_id(), data)?;
-        ack.sign(&self.config.signer)?;
+        if let Err(source) = ack.sign(&self.config.signer) {
+            return Err(Error::ReceiveCommitted {
+                ack: Box::new(ack),
+                evictions,
+                source: Box::new(source),
+            });
+        }
         Ok((ack, evictions))
     }
 
@@ -733,7 +769,17 @@ impl<S: Storage> Irokle<S> {
         Ok(())
     }
 
-    #[cfg(feature = "iroh")]
+    fn validate_concern(&self, concern: &WriteConcern) -> Result<()> {
+        if matches!(concern, WriteConcern::AsyncReplication) {
+            #[cfg(feature = "iroh")]
+            if self.net.is_some() {
+                return Ok(());
+            }
+            return Err(Error::ReplicationUnavailable);
+        }
+        Ok(())
+    }
+
     fn replication_admission_effects(
         &self,
         topic_id: TopicId,
@@ -742,7 +788,7 @@ impl<S: Storage> Irokle<S> {
         state: &TopicState,
         write_concern: &WriteConcern,
     ) -> Result<AdmissionEffects> {
-        if !matches!(write_concern, WriteConcern::AsyncReplication) || self.net.is_none() {
+        if !matches!(write_concern, WriteConcern::AsyncReplication) {
             return Ok(AdmissionEffects::default());
         }
 
@@ -768,29 +814,28 @@ impl<S: Storage> Irokle<S> {
         _op_id: OpId,
         write_concern: &WriteConcern,
         wake_failed_message: &'static str,
-    ) -> Result<()> {
+    ) {
         let Some(net) = &self.net else {
-            return Ok(());
+            return;
         };
-
-        let state = self
-            .storage()
-            .topic_state(&topic_id)?
-            .ok_or(Error::TopicNotFound)?;
-        let peers = select_sync_peers(topic_id, self.peer_id(), &state);
-
-        if matches!(write_concern, WriteConcern::AsyncReplication) {
-            for peer_id in peers.iter().copied() {
-                self.record_replication_scheduled(peer_id, topic_id)?;
+        let result = (|| -> Result<()> {
+            let state = self
+                .storage()
+                .topic_state(&topic_id)?
+                .ok_or(Error::TopicNotFound)?;
+            if matches!(write_concern, WriteConcern::AsyncReplication) {
+                for peer_id in select_sync_peers(topic_id, self.peer_id(), &state) {
+                    self.record_replication_scheduled(peer_id, topic_id)?;
+                }
             }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(%topic_id, %error, "committed replication bookkeeping failed");
         }
-
-        net.schedule_topic_recheck(topic_id).map_err(|error| {
+        if let Err(error) = net.schedule_topic_recheck(topic_id) {
             tracing::warn!(%topic_id, %error, "{}", wake_failed_message);
-            Error::Storage(format!("failed to schedule iroh resync: {error}"))
-        })?;
-
-        Ok(())
+        }
     }
 
     fn record_replication_scheduled(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
@@ -906,9 +951,9 @@ impl<S: Storage> Irokle<S> {
         event: E,
         options: PublishOptions,
     ) -> Result<EventRecord<E>> {
+        self.validate_concern(&options.write_concern)?;
         let envelope = EventEnvelope::encode_event(&event)?;
-        #[cfg(feature = "iroh")]
-        let op = self.oplog.create_event_op_with_effects(
+        let (op, meta) = self.oplog.create_event_effects(
             topic_id,
             actor_id,
             envelope,
@@ -923,15 +968,6 @@ impl<S: Storage> Irokle<S> {
                 )
             },
         )?;
-        #[cfg(not(feature = "iroh"))]
-        let op = self
-            .oplog
-            .create_event_op(topic_id, actor_id, envelope, &self.config.signer)?;
-        let meta = self
-            .oplog
-            .storage()
-            .get_meta(&op.id)?
-            .ok_or(Error::Storage("missing op meta after publish".into()))?;
         let record = EventRecord::new(
             event,
             op.id,
@@ -939,15 +975,13 @@ impl<S: Storage> Irokle<S> {
             meta.actor_seq,
             meta.observed_clock,
         );
-        #[cfg(not(feature = "iroh"))]
-        let _ = &options;
         #[cfg(feature = "iroh")]
         self.wake_async_replication(
             topic_id,
             op.id,
             &options.write_concern,
             "async replication wake failed",
-        )?;
+        );
         Ok(record)
     }
 
@@ -957,12 +991,13 @@ impl<S: Storage> Irokle<S> {
         actor_id: ActorId,
         control: TopicControl,
     ) -> Result<()> {
+        self.validate_concern(&self.config.default_write_concern)?;
         let removed_peer = match &control {
             TopicControl::RemovePeer { peer } => Some(*peer),
             _ => None,
         };
         #[cfg(feature = "iroh")]
-        let op = self.oplog.create_control_op_with_effects(
+        let op = self.oplog.create_control_effects(
             topic_id,
             actor_id,
             control,
@@ -986,11 +1021,12 @@ impl<S: Storage> Irokle<S> {
             op.id,
             &self.config.default_write_concern,
             "topic control replication wake failed",
-        )?;
+        );
         if let Some(peer) = removed_peer
             && peer != self.peer_id()
+            && let Err(error) = self.storage().clear_peer_sync_state(&peer, &topic_id)
         {
-            self.storage().clear_peer_sync_state(&peer, &topic_id)?;
+            tracing::warn!(%topic_id, %peer, %error, "committed removal cleanup failed");
         }
         Ok(())
     }
@@ -1000,14 +1036,15 @@ impl<S: Storage> Irokle<S> {
         topic_id: TopicId,
         order: HistoryOrder,
     ) -> Result<Vec<EventRecord<E>>> {
+        let storage = self.oplog.storage();
+        let ids = storage.list_op_ids(&topic_id)?;
+        let entries = topological_subset_entries(storage, &ids)?;
+        if entries.len() != ids.len() || !self.oplog.topic_unresolved(&topic_id)?.is_empty() {
+            return Err(Error::Storage("incomplete topic history".into()));
+        }
         let mut records = Vec::new();
-        for op in topological(self.oplog.storage(), &topic_id)? {
+        for (op, meta) in entries {
             if let crate::TopicPayload::Event(envelope) = &op.signed.body.payload {
-                let meta = self
-                    .oplog
-                    .storage()
-                    .get_meta(&op.id)?
-                    .ok_or(Error::Storage("missing op meta".into()))?;
                 records.push(EventRecord::new(
                     envelope.decode_event::<E>()?,
                     op.id,
@@ -1020,7 +1057,7 @@ impl<S: Storage> Irokle<S> {
         Ok(ordered(records, order))
     }
 
-    pub(crate) fn topic_history_after_clock<E: Event>(
+    pub(crate) fn history_after_clock<E: Event>(
         &self,
         topic_id: TopicId,
         clock: &ActorClock,
@@ -1028,7 +1065,6 @@ impl<S: Storage> Irokle<S> {
     ) -> Result<Vec<EventRecord<E>>> {
         let storage = self.oplog.storage();
         let mut seen = BTreeSet::new();
-        let mut needed = BTreeSet::new();
         let mut queue = storage
             .heads(&topic_id)?
             .into_iter()
@@ -1044,19 +1080,19 @@ impl<S: Storage> Irokle<S> {
             if meta.topic_id != topic_id {
                 return Err(Error::TopicMismatch);
             }
-            if clock.get(&meta.actor_id) >= meta.actor_seq {
-                continue;
-            }
-            needed.insert(op_id);
             queue.extend(meta.deps);
         }
 
+        let entries = topological_subset_entries(storage, &seen)?;
+        if entries.len() != seen.len() || !self.oplog.topic_unresolved(&topic_id)?.is_empty() {
+            return Err(Error::Storage("incomplete topic history".into()));
+        }
         let mut records = Vec::new();
-        for op in topological_subset(storage, &needed)? {
+        for (op, meta) in entries {
+            if clock.get(&meta.actor_id) >= meta.actor_seq {
+                continue;
+            }
             if let crate::TopicPayload::Event(envelope) = &op.signed.body.payload {
-                let meta = storage
-                    .get_meta(&op.id)?
-                    .ok_or(Error::Storage("missing op meta".into()))?;
                 records.push(EventRecord::new(
                     envelope.decode_event::<E>()?,
                     op.id,

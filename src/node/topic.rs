@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::marker::PhantomData;
 
 use crate::history::{DagQuery, HistoryOrder, limited};
@@ -81,8 +81,7 @@ impl<E: Event, S: Storage> Topic<E, S> {
         clock: &ActorClock,
         order: HistoryOrder,
     ) -> Result<Vec<EventRecord<E>>> {
-        self.node
-            .topic_history_after_clock(self.topic_id, clock, order)
+        self.node.history_after_clock(self.topic_id, clock, order)
     }
 
     pub fn dag(&self, query: DagQuery<OpId>) -> Result<Vec<Op>> {
@@ -102,10 +101,26 @@ impl<E: Event, S: Storage> Topic<E, S> {
     }
 
     pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {
+        if self
+            .node
+            .storage()
+            .get_meta(&op_id)?
+            .is_some_and(|meta| meta.topic_id != self.topic_id)
+        {
+            return Err(Error::TopicMismatch);
+        }
         self.node.peer_reached_op(peer_id, op_id)
     }
 
     pub fn peers_reached_op(&self, op_id: OpId) -> Result<Vec<PeerId>> {
+        if self
+            .node
+            .storage()
+            .get_meta(&op_id)?
+            .is_some_and(|meta| meta.topic_id != self.topic_id)
+        {
+            return Err(Error::TopicMismatch);
+        }
         self.node.peers_reached_op(op_id)
     }
 
@@ -139,10 +154,26 @@ impl<S: Storage> RawTopic<S> {
     }
 
     pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {
+        if self
+            .oplog
+            .storage()
+            .get_meta(&op_id)?
+            .is_some_and(|meta| meta.topic_id != self.topic_id)
+        {
+            return Err(Error::TopicMismatch);
+        }
         self.oplog.storage().peer_reached_op(&peer_id, &op_id)
     }
 
     pub fn peers_reached_op(&self, op_id: OpId) -> Result<Vec<PeerId>> {
+        if self
+            .oplog
+            .storage()
+            .get_meta(&op_id)?
+            .is_some_and(|meta| meta.topic_id != self.topic_id)
+        {
+            return Err(Error::TopicMismatch);
+        }
         self.oplog.storage().peers_reached_op(&op_id)
     }
 }
@@ -152,19 +183,23 @@ pub(super) fn dag_ops<S: Storage>(
     topic_id: TopicId,
     query: DagQuery<OpId>,
 ) -> Result<Vec<Op>> {
-    if query.order == HistoryOrder::NewestFirst || !query.heads.is_empty() {
+    if query.limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    if query.order == HistoryOrder::NewestFirst || !query.heads.is_empty() || !query.include_heads {
         let starts = if query.heads.is_empty() {
             storage.heads(&topic_id)?.into_iter().collect::<Vec<_>>()
         } else {
             query.heads
         };
+        let excluded = if query.include_heads {
+            BTreeSet::new()
+        } else {
+            starts.iter().copied().collect()
+        };
         let mut seen = BTreeSet::new();
-        let mut queue = starts
-            .into_iter()
-            .map(|head| (head, true))
-            .collect::<VecDeque<_>>();
-        let mut ids = Vec::new();
-        while let Some((id, is_head)) = queue.pop_front() {
+        let mut queue = starts.into_iter().collect::<VecDeque<_>>();
+        while let Some(id) = queue.pop_front() {
             if !seen.insert(id) {
                 continue;
             }
@@ -176,34 +211,22 @@ pub(super) fn dag_ops<S: Storage>(
             if meta.topic_id != topic_id {
                 return Err(Error::TopicMismatch);
             }
-            if query.include_heads || !is_head {
-                ids.push(id);
-            }
             for dep in meta.deps {
-                queue.push_back((dep, false));
+                queue.push_back(dep);
             }
         }
         // The walk runs unbounded: `query.limit` counts usable results, so
         // applying it here would let blocked ids spend the caller's budget and
         // return a short page over history that is still reachable.
-        let subset = ids.iter().copied().collect::<BTreeSet<_>>();
-        let usable = topological_subset(storage, &subset)?;
-        if query.order == HistoryOrder::OldestFirst {
-            return Ok(limited(usable, query.limit));
+        let mut usable = topological_subset(storage, &seen)?;
+        usable.retain(|op| !excluded.contains(&op.id));
+        if query.order == HistoryOrder::NewestFirst {
+            usable.reverse();
         }
         // Both orders must agree on membership: an op whose dependencies cannot
         // be resolved is withheld here exactly as the oldest-first walk withholds
         // it, so a caller never receives an op whose parents it cannot fetch.
-        let mut usable = usable
-            .into_iter()
-            .map(|op| (op.id, op))
-            .collect::<BTreeMap<_, _>>();
-        Ok(limited(
-            ids.into_iter()
-                .filter_map(|id| usable.remove(&id))
-                .collect(),
-            query.limit,
-        ))
+        Ok(limited(usable, query.limit))
     } else {
         Ok(limited(topological(storage, &topic_id)?, query.limit))
     }

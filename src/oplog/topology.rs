@@ -2,12 +2,22 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::storage::Storage;
+use crate::storage::{OpMeta, Storage};
 use crate::{Error, Op, Result, TopicId};
 
 pub fn topological<S: Storage>(storage: &S, topic_id: &TopicId) -> Result<Vec<Op>> {
+    Ok(topological_entries(storage, topic_id)?
+        .into_iter()
+        .map(|(op, _)| op)
+        .collect())
+}
+
+pub(crate) fn topological_entries<S: Storage>(
+    storage: &S,
+    topic_id: &TopicId,
+) -> Result<Vec<(Op, OpMeta)>> {
     let ids = storage.list_op_ids(topic_id)?;
-    topological_subset(storage, &ids)
+    topological_subset_entries(storage, &ids)
 }
 
 /// Order the ops named by `ids` oldest-first.
@@ -19,10 +29,21 @@ pub fn topological<S: Storage>(storage: &S, topic_id: &TopicId) -> Result<Vec<Op
 /// discarded - a deferred op stays admitted and reappears here once its
 /// dependency is refetched. Only a cycle among fully present ops is an error.
 pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) -> Result<Vec<Op>> {
+    Ok(topological_subset_entries(storage, ids)?
+        .into_iter()
+        .map(|(op, _)| op)
+        .collect())
+}
+
+pub(crate) fn topological_subset_entries<S: Storage>(
+    storage: &S,
+    ids: &BTreeSet<crate::OpId>,
+) -> Result<Vec<(Op, OpMeta)>> {
     let mut present = BTreeMap::new();
+    let mut children: BTreeMap<crate::OpId, BTreeSet<crate::OpId>> = BTreeMap::new();
     let mut blocked = BTreeSet::new();
     for id in ids {
-        let (Some(meta), Some(op)) = (storage.get_meta(id)?, storage.get_op(id)?) else {
+        let Some(meta) = storage.get_meta(id)? else {
             blocked.insert(*id);
             continue;
         };
@@ -31,23 +52,28 @@ pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) 
         for dep in &meta.deps {
             if ids.contains(dep) {
                 deps_in_set += 1;
+                children.entry(*dep).or_default().insert(*id);
             } else if !storage.dep_resolvable(dep)? {
                 dangling = true;
             }
         }
+        let Some(op) = storage.get_op(id)? else {
+            blocked.insert(*id);
+            continue;
+        };
         if dangling {
             blocked.insert(*id);
         } else {
-            present.insert(*id, (op, deps_in_set));
+            present.insert(*id, (op, meta, deps_in_set));
         }
     }
 
     let mut frontier = blocked.iter().copied().collect::<Vec<_>>();
     while let Some(id) = frontier.pop() {
-        for child in storage.children(&id)? {
-            if ids.contains(&child) && blocked.insert(child) {
-                present.remove(&child);
-                frontier.push(child);
+        for child in children.get(&id).into_iter().flatten() {
+            if ids.contains(child) && blocked.insert(*child) {
+                present.remove(child);
+                frontier.push(*child);
             }
         }
     }
@@ -60,25 +86,26 @@ pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) 
 
     let mut ready = present
         .iter()
-        .filter_map(|(id, (_, count))| (*count == 0).then_some(*id))
+        .filter_map(|(id, (_, _, count))| (*count == 0).then_some(*id))
         .collect::<VecDeque<_>>();
-    let mut out = Vec::with_capacity(present.len());
+    let expected = present.len();
+    let mut out = Vec::with_capacity(expected);
     while let Some(id) = ready.pop_front() {
-        let Some((op, _)) = present.get(&id) else {
+        let Some((op, meta, _)) = present.remove(&id) else {
             continue;
         };
-        out.push(op.clone());
-        for child in storage.children(&id)? {
-            if let Some((_, count)) = present.get_mut(&child) {
+        out.push((op, meta));
+        for child in children.get(&id).into_iter().flatten() {
+            if let Some((_, _, count)) = present.get_mut(child) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    ready.push_back(child);
+                    ready.push_back(*child);
                 }
             }
         }
     }
 
-    if out.len() != present.len() {
+    if out.len() != expected {
         return Err(Error::Storage("cycle in op graph".into()));
     }
     Ok(out)

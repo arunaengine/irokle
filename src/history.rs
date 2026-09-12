@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! User-facing history and DAG traversal helpers.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::hash::Hash;
 
 /// Ordering used when traversing linearized history.
@@ -81,26 +81,50 @@ where
     I: Clone + Eq + Hash,
     F: FnMut(&I) -> Vec<I>,
 {
+    if query.limit == Some(0) {
+        return Vec::new();
+    }
+
+    let heads = query.heads;
+    let excluded = (!query.include_heads).then(|| heads.iter().cloned().collect::<HashSet<_>>());
     let mut seen = HashSet::new();
-    let mut queue: VecDeque<(I, bool)> = query.heads.into_iter().map(|head| (head, true)).collect();
+    let mut stack = heads
+        .into_iter()
+        .map(|head| (head, false))
+        .collect::<Vec<_>>();
+    if query.order == HistoryOrder::OldestFirst {
+        stack.reverse();
+    }
     let mut out = Vec::new();
 
-    while let Some((id, is_head)) = queue.pop_front() {
+    while let Some((id, expanded)) = stack.pop() {
+        if expanded {
+            if excluded.as_ref().is_none_or(|heads| !heads.contains(&id)) {
+                out.push(id);
+                if query.order == HistoryOrder::OldestFirst
+                    && query.limit.is_some_and(|limit| out.len() >= limit)
+                {
+                    return out;
+                }
+            }
+            continue;
+        }
         if !seen.insert(id.clone()) {
             continue;
         }
 
-        if query.include_heads || !is_head {
-            out.push(id.clone());
-            if query.limit.is_some_and(|limit| out.len() >= limit) {
-                break;
-            }
+        stack.push((id.clone(), true));
+        let mut predecessors = parents(&id);
+        if query.order == HistoryOrder::OldestFirst {
+            predecessors.reverse();
         }
-
-        for parent in parents(&id) {
-            queue.push_back((parent, false));
+        for predecessor in predecessors {
+            stack.push((predecessor, false));
         }
     }
 
-    ordered(out, query.order)
+    if query.order == HistoryOrder::NewestFirst {
+        out.reverse();
+    }
+    limited(out, query.limit)
 }
