@@ -11,7 +11,7 @@ use crate::storage::{
     AdmissionEffects, AdmittedBatch, FjallStorage, OpMeta, PeerAck, SyncObligation,
     SyncStatusUpdate, TopicState, TopicView,
 };
-use crate::sync::{ActorRangeHint, SyncData, SyncEngine, SyncRequest};
+use crate::sync::{SyncData, SyncEngine};
 use crate::{EvictionKey, SyncPeerStatus, TopicEviction, TopicInfo};
 
 const REPS: usize = 3;
@@ -423,16 +423,25 @@ fn unrelated_pool() {
     each_backend("pending_pool", params, pending_pool, pending_pool);
 }
 
-fn range_hints(local: &ActorClock, clock: &ActorClock) -> Vec<ActorRangeHint> {
-    local
-        .iter()
-        .filter(|(actor, seq)| clock.get(actor) < **seq)
-        .map(|(actor, seq)| ActorRangeHint {
-            actor_id: *actor,
-            from_exclusive: clock.get(actor),
-            to_inclusive: *seq,
-        })
-        .collect()
+/// One page as a requester asks for it from the responder's summary. Only the
+/// responder's work is timed and counted.
+fn serve_page<S: Storage>(
+    responder: &SyncEngine<Counting<S>>,
+    requester: &SyncEngine<MemoryStorage>,
+    storage: &Counting<S>,
+    topic_id: TopicId,
+    (author, reader): (PeerId, PeerId),
+) -> (Vec<Op>, f64, [u64; 4]) {
+    let summary = responder.summary(topic_id).unwrap();
+    let mut request = requester.plan_request(author, &summary).unwrap();
+    // Range hints only: a wanted head beyond one page yields a non-causal page.
+    request.wants.clear();
+    let before = storage.snapshot();
+    let started = Instant::now();
+    let page = responder.response_page(reader, &request).unwrap();
+    let ms = millis(started);
+    let after = storage.snapshot();
+    (page.ops, ms, std::array::from_fn(|i| after[i] - before[i]))
 }
 
 /// A requester holding only the genesis catches up page by page.
@@ -442,32 +451,29 @@ fn catch_up<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
     let topic_id = ops[0].signed.body.topic_id;
     load(&storage, &ops);
     let responder = SyncEngine::new(Oplog::with_storage(storage.clone()), author.peer_id());
-    let requester = Oplog::new();
-    requester.receive_ops(vec![ops[0].clone()]).unwrap();
+    let log = Oplog::new();
+    log.receive_ops(vec![ops[0].clone()]).unwrap();
+    let requester = SyncEngine::new(log.clone(), reader);
     let local = storage.actor_clock(&topic_id).unwrap();
 
-    let before = storage.snapshot();
-    let (mut ms, mut pages) = (0.0, 0);
-    loop {
-        let clock = requester.storage().actor_clock(&topic_id).unwrap();
-        if clock.dominates(&local) {
-            break;
-        }
-        let request = SyncRequest {
-            topic_id,
-            known: BTreeSet::new(),
-            wants: BTreeSet::new(),
-            actor_range_hints: range_hints(&local, &clock),
-        };
-        let served = Instant::now();
-        let page = responder.response_page(reader, &request).unwrap();
-        ms += millis(served);
-        assert!(!page.ops.is_empty(), "a page behind the goal must advance");
-        requester.receive_ops(page.ops).unwrap();
+    let (mut ms, mut pages, mut reads) = (0.0, 0, [0; 4]);
+    while !log
+        .storage()
+        .actor_clock(&topic_id)
+        .unwrap()
+        .dominates(&local)
+    {
+        assert!(pages < 64, "catch-up stopped advancing");
+        let peers = (author.peer_id(), reader);
+        let (page, page_ms, page_reads) =
+            serve_page(&responder, &requester, &storage, topic_id, peers);
+        ms += page_ms;
+        reads = std::array::from_fn(|i| reads[i] + page_reads[i]);
+        log.receive_ops(page).unwrap();
         pages += 1;
     }
     let mut counters = vec![("pages", pages)];
-    counters.extend(read_delta(before, storage.snapshot()));
+    counters.extend(read_delta([0; 4], reads));
     Sample { ms, counters }
 }
 
@@ -491,31 +497,23 @@ fn steady_page<S: Storage>(storage: Counting<S>) -> Vec<Sample> {
     let mut ops = signed_chain(&author, "bench-steady", &[reader], 16384, note);
     let topic_id = ops[0].signed.body.topic_id;
     load(&storage, &ops);
+    let peer_log = Oplog::new();
+    load(peer_log.storage(), &ops);
+    let requester = SyncEngine::new(peer_log.clone(), reader);
     let log = Oplog::with_storage(storage.clone());
     let responder = SyncEngine::new(log.clone(), author.peer_id());
     (0..REPS)
         .map(|index| {
             let op = next_op(&author, ops.last().unwrap(), note(16384 + index));
             log.receive_ops(vec![op.clone()]).unwrap();
-            let request = SyncRequest {
-                topic_id,
-                known: BTreeSet::new(),
-                wants: BTreeSet::new(),
-                actor_range_hints: vec![ActorRangeHint {
-                    actor_id: op.signed.body.actor_id,
-                    from_exclusive: op.signed.body.actor_seq - 1,
-                    to_inclusive: op.signed.body.actor_seq,
-                }],
-            };
-            let before = storage.snapshot();
-            let started = Instant::now();
-            let page = responder.response_page(reader, &request).unwrap();
-            let ms = millis(started);
-            assert_eq!(page.ops, vec![op.clone()]);
+            let peers = (author.peer_id(), reader);
+            let (page, ms, reads) = serve_page(&responder, &requester, &storage, topic_id, peers);
+            assert_eq!(page, vec![op.clone()]);
+            peer_log.receive_ops(page).unwrap();
             ops.push(op);
             Sample {
                 ms,
-                counters: read_delta(before, storage.snapshot()),
+                counters: read_delta([0; 4], reads),
             }
         })
         .collect()
