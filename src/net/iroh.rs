@@ -1225,11 +1225,12 @@ impl<S: Storage> IrohNet<S> {
         Ok(Some(handle.spawn(async move {
             let _task = task;
             let _running = running;
-            let mut sweep_pending = net.upgrade().is_some_and(|current| {
-                current.schedule_startup_resync().inspect_err(|error| {
+            let mut sweep_pending = match net.upgrade() {
+                Some(current) => current.schedule_startup_resync().await.inspect_err(|error| {
                     tracing::warn!(%error, "failed to schedule startup resync sweep");
-                }).is_err()
-            });
+                }).is_err(),
+                None => false,
+            };
             let mut sweep_backoff = runtime.resync_initial_backoff.max(Duration::from_millis(1));
             let mut full_sweep = Box::pin(tokio::time::sleep_until(if sweep_pending {
                 tokio::time::Instant::now() + sweep_backoff
@@ -1256,11 +1257,12 @@ impl<S: Storage> IrohNet<S> {
                         continue;
                     }
                     _ = &mut full_sweep, if sweep_pending || !runtime.full_sweep_interval.is_zero() => {
-                        sweep_pending = net.upgrade().is_some_and(|current| {
-                            current.schedule_full_sweep_resync().inspect_err(|error| {
+                        sweep_pending = match net.upgrade() {
+                            Some(current) => current.schedule_full_sweep_resync().await.inspect_err(|error| {
                                 tracing::warn!(%error, "failed to schedule full resync sweep");
-                            }).is_err()
-                        });
+                            }).is_err(),
+                            None => false,
+                        };
                         let delay = if sweep_pending {
                             sweep_backoff = sweep_backoff.saturating_mul(2)
                                 .min(runtime.resync_max_backoff.max(Duration::from_millis(1)));
@@ -1478,10 +1480,12 @@ impl<S: Storage> SharedNet<S> {
 }
 
 impl<S: Storage> IrohNet<S> {
-    fn schedule_startup_resync(self: &Arc<Self>) -> io::Result<usize> {
-        self.schedule_full_sweep_resync()
+    async fn schedule_startup_resync(self: &Arc<Self>) -> io::Result<usize> {
+        self.schedule_full_sweep_resync().await
     }
+}
 
+impl<S: Storage> SharedNet<S> {
     fn schedule_persisted_obligations(&self) -> io::Result<usize> {
         let targets = self
             .node
@@ -1497,24 +1501,30 @@ impl<S: Storage> IrohNet<S> {
         }
         Ok(targets.len())
     }
+}
 
-    fn schedule_full_sweep_resync(self: &Arc<Self>) -> io::Result<usize> {
-        // The sweep is the one pass that revisits every topic, so let it audit
-        // stored records again rather than reuse an earlier whole verdict.
-        if let Err(error) = self.node.recheck_topics() {
-            tracing::warn!(%error, "sweep could not refresh topic caches");
-        }
+impl<S: Storage> IrohNet<S> {
+    async fn schedule_full_sweep_resync(self: &Arc<Self>) -> io::Result<usize> {
         // Durable work is scheduled before maintenance starts, and maintenance
         // runs as its own job, so no topic it visits can delay that work.
         let scheduled = self
-            .schedule_persisted_obligations()
-            .and_then(|mut scheduled| {
-                for (peer_id, topic_id) in self.full_sweep_resync_targets()? {
-                    self.resync_scheduler.schedule_now(peer_id, topic_id, true);
+            .run_job(Lane::Control, |shared| {
+                // The sweep is the one pass that revisits every topic, so let it
+                // audit stored records again rather than reuse a whole verdict.
+                if let Err(error) = shared.node.recheck_topics() {
+                    tracing::warn!(%error, "sweep could not refresh topic caches");
+                }
+                let mut scheduled = shared.schedule_persisted_obligations()?;
+                for (peer_id, topic_id) in shared.full_sweep_resync_targets()? {
+                    shared
+                        .resync_scheduler
+                        .schedule_now(peer_id, topic_id, true);
                     scheduled += 1;
                 }
                 Ok(scheduled)
-            });
+            })
+            .await
+            .and_then(|scheduled| scheduled);
         self.spawn_quarantine();
         scheduled
     }
