@@ -1211,10 +1211,14 @@ impl<S: Storage> SyncEngine<S> {
             closure.insert(id);
             stack.extend(meta.deps.iter().copied());
         }
+        let mut ordered = topological_subset(storage, &closure)?;
+        // Wants unconnected inside the closure still depend on each other through
+        // covered ops, so a cut page must keep the oldest generations first.
+        ordered.sort_by_key(|op| op.signed.body.generation);
         let mut ops = Vec::new();
         let mut sent = BTreeSet::new();
         let mut bytes = 0;
-        for op in topological_subset(storage, &closure)? {
+        for op in ordered {
             // A walk cut short leaves ancestors unsent; an op above them waits.
             let deps = &op.signed.body.deps;
             if !deps

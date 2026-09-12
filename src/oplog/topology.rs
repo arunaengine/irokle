@@ -186,12 +186,16 @@ pub(crate) fn topological_ops(ops: Vec<Op>) -> Result<Vec<Op>> {
         }
         indeg.insert(*id, count);
     }
+    // Oldest generation first: ops unconnected inside the batch may still
+    // depend on each other through stored ops, as repaired holes do.
+    let generation = |id: &crate::OpId| by_id.get(id).map_or(0, |op| op.signed.body.generation);
     let mut ready = indeg
         .iter()
-        .filter_map(|(id, count)| (*count == 0).then_some(*id))
-        .collect::<VecDeque<_>>();
+        .filter(|(_, count)| **count == 0)
+        .map(|(id, _)| (generation(id), *id))
+        .collect::<BTreeSet<_>>();
     let mut out = Vec::with_capacity(by_id.len());
-    while let Some(id) = ready.pop_front() {
+    while let Some((_, id)) = ready.pop_first() {
         out.push(
             by_id
                 .get(&id)
@@ -202,7 +206,7 @@ pub(crate) fn topological_ops(ops: Vec<Op>) -> Result<Vec<Op>> {
             if let Some(count) = indeg.get_mut(child) {
                 *count = (*count).saturating_sub(1);
                 if *count == 0 {
-                    ready.push_back(*child);
+                    ready.insert((generation(child), *child));
                 }
             }
         }

@@ -10,6 +10,7 @@ mod combined;
 mod core;
 #[cfg(feature = "iroh")]
 mod exchange;
+mod holes;
 #[cfg(feature = "iroh")]
 mod iroh;
 mod membership;
