@@ -1703,7 +1703,10 @@ impl<S: Storage> IrohNet<S> {
             // Drops the pooled connection only when it is already closed.
             let _ = self.pool.get(&endpoint_id);
         }
-        let noted = copy_result(&result);
+        let noted = match &result {
+            Err(error) if !advancing => Err(clone_error(error)),
+            _ => Ok(()),
+        };
         let finished = self
             .run_job(Lane::Control, move |shared| {
                 shared.note_outcome(remote_peer_id, [noted.as_ref().copied()]);
@@ -3918,6 +3921,10 @@ fn clone_error(error: &io::Error) -> io::Error {
 fn other(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
+
+#[cfg(test)]
+#[path = "../tests/scheduler.rs"]
+mod scheduler_tests;
 
 #[cfg(test)]
 mod tests {

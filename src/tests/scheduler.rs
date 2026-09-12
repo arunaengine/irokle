@@ -1,0 +1,314 @@
+//! Real exchanges run through the resync scheduler's own claims, leases and
+//! batch path, with the scheduler state checked directly.
+
+use super::*;
+use crate::TopicId;
+use crate::tests::support::Note;
+
+/// Wide enough that a backoff step cannot pass while a test is running.
+const BACKOFF: Duration = Duration::from_secs(60);
+
+type Lookup = iroh::address_lookup::memory::MemoryLookup;
+
+fn runtime() -> IrohRuntimeConfig {
+    IrohRuntimeConfig {
+        connect_timeout: Duration::from_secs(2),
+        sync_io_timeout: Duration::from_secs(120),
+        resync_interval: BACKOFF,
+        resync_initial_backoff: BACKOFF,
+        resync_max_backoff: Duration::from_secs(600),
+        full_sweep_interval: Duration::ZERO,
+        ..IrohRuntimeConfig::default()
+    }
+}
+
+async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
+    use futures::StreamExt;
+    use iroh::Watcher;
+    let addr = endpoint.addr();
+    if !addr.addrs.is_empty() {
+        return addr;
+    }
+    let mut stream = endpoint.watch_addr().stream();
+    tokio::time::timeout(Duration::from_secs(5), async move {
+        loop {
+            let addr = stream.next().await.expect("address stream");
+            if !addr.addrs.is_empty() {
+                return addr;
+            }
+        }
+    })
+    .await
+    .expect("dialable address")
+}
+
+async fn bind(lookup: &Lookup) -> iroh::Endpoint {
+    iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .address_lookup(lookup.clone())
+        .alpns(vec![IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap()
+}
+
+/// A node that only answers: its net accepts but never runs a resync loop.
+async fn server<S: Storage>(
+    storage: S,
+    lookup: &Lookup,
+    trusted: PeerId,
+    limits: StreamLimits,
+) -> (Irokle<S>, Arc<IrohNet<S>>) {
+    let endpoint = bind(lookup).await;
+    let node = Irokle::builder()
+        .with_storage(storage)
+        .with_iroh_secret_key(endpoint.secret_key())
+        .with_peer_whitelist([trusted])
+        .build()
+        .unwrap();
+    let net = Arc::new(
+        IrohNet::new(endpoint, node.clone())
+            .unwrap()
+            .with_stream_limits(limits),
+    );
+    net.start_accept_loop().unwrap();
+    lookup.add_endpoint_info(ready_addr(net.endpoint()).await);
+    (node, net)
+}
+
+/// A node whose net starts no loop, so the test owns every claim.
+async fn client(lookup: &Lookup, limits: StreamLimits) -> (Irokle, Arc<IrohNet>) {
+    let endpoint = bind(lookup).await;
+    let node = Irokle::builder()
+        .with_iroh_secret_key(endpoint.secret_key())
+        .build()
+        .unwrap();
+    let net = IrohNet::new_with_config(endpoint, node.clone(), runtime())
+        .unwrap()
+        .with_stream_limits(limits);
+    (node, Arc::new(net))
+}
+
+/// A topic of `owner` shared with `member`, which holds only its genesis.
+fn shared_topic<S: Storage>(owner: &Irokle, member: &Irokle<S>) -> TopicId {
+    let topic = owner
+        .create_topic::<Note>(crate::TopicConfig {
+            initial_peers: [member.peer_id()].into(),
+            ..crate::TopicConfig::default()
+        })
+        .unwrap();
+    let ops = crate::oplog::topological(owner.storage(), &topic.id()).unwrap();
+    member
+        .receive_sync_data_from(
+            owner.peer_id(),
+            crate::sync::SyncData {
+                topic_id: topic.id(),
+                ops,
+            },
+        )
+        .unwrap();
+    topic.id()
+}
+
+fn publish<S: Storage>(node: &Irokle<S>, topic_id: TopicId, count: usize, text_len: usize) {
+    let topic = node.open_topic::<Note>(topic_id).unwrap();
+    for index in 0..count {
+        topic
+            .publish(Note {
+                text: format!("{index:0>text_len$}"),
+            })
+            .unwrap();
+    }
+}
+
+fn clock<S: Storage>(node: &Irokle<S>, topic_id: TopicId) -> crate::ActorClock {
+    node.storage().actor_clock(&topic_id).unwrap()
+}
+
+fn status(node: &Irokle, peer_id: PeerId, topic_id: TopicId) -> crate::SyncPeerStatus {
+    node.sync_status(topic_id)
+        .unwrap()
+        .into_iter()
+        .find(|status| status.peer_id == peer_id)
+        .expect("a recorded attempt")
+}
+
+/// Runs every due target through the real batch path, one peer turn at a time,
+/// until nothing is due. Returns the number of turns.
+async fn drain_due(net: &Arc<IrohNet>, cap: usize) -> usize {
+    for turn in 0..cap {
+        let Some((peer_id, claims)) = net
+            .resync_scheduler
+            .due_targets_by_peer(1, MAX_TOPICS_PER_RESYNC_BATCH)
+            .pop()
+        else {
+            return turn;
+        };
+        let lease = net.resync_scheduler.lease(claims, BACKOFF);
+        net.sync_peer_batch_with_runtime(peer_id, lease, runtime())
+            .await;
+    }
+    panic!("targets were still due after {cap} turns");
+}
+
+/// A client pulling from a server whose small stream budget cuts pages to a
+/// few ops, and a topic longer than the manual page budget.
+struct Paged {
+    alice: Irokle,
+    net: Arc<IrohNet>,
+    bob: Irokle,
+    bob_net: Arc<IrohNet>,
+    bob_addr: iroh::EndpointAddr,
+    topic_id: TopicId,
+}
+
+async fn paged_pull() -> Paged {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let limits = StreamLimits {
+        bytes: 16 * 1024,
+        ..StreamLimits::default()
+    };
+    let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
+    let topic_id = shared_topic(&alice, &bob);
+    publish(&bob, topic_id, MAX_SYNC_NOW_PAGES * 20, 1024);
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    Paged {
+        alice,
+        net,
+        bob,
+        bob_net,
+        bob_addr,
+        topic_id,
+    }
+}
+
+/// A manual sync that runs out of pages with work left reports `WouldBlock`,
+/// counts as progress, and leaves a due continuation that the scheduler then
+/// runs to the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn budget_schedules_continuation() {
+    let paged = paged_pull().await;
+    let bob_peer = paged.bob.peer_id();
+    let result = paged
+        .net
+        .sync_now(paged.bob_addr.clone(), paged.topic_id)
+        .await;
+    assert_eq!(
+        result.as_ref().map_err(io::Error::kind),
+        Err(io::ErrorKind::WouldBlock),
+        "{result:?}"
+    );
+    let target = clock(&paged.bob, paged.topic_id);
+    let pulled = clock(&paged.alice, paged.topic_id);
+    assert!(
+        !pulled.dominates(&target),
+        "the budget ended the pull early"
+    );
+    assert!(covered(&pulled, &target) > MAX_SYNC_NOW_PAGES as u64);
+    assert_eq!(
+        paged
+            .net
+            .resync_scheduler
+            .target_state(bob_peer, paged.topic_id),
+        Some((None, 0, None)),
+        "the continuation is scheduled and unowned"
+    );
+    assert!(paged.net.resync_scheduler.next_due().unwrap() <= tokio::time::Instant::now());
+    assert_eq!(paged.alice.peer_health().failures(&bob_peer), 0);
+    assert_eq!(
+        status(&paged.alice, bob_peer, paged.topic_id).failed_attempts,
+        0
+    );
+
+    drain_due(&paged.net, 256).await;
+    assert!(
+        clock(&paged.alice, paged.topic_id).dominates(&target),
+        "the scheduled continuation did not finish the pull"
+    );
+    paged.net.shutdown().await;
+    paged.bob_net.shutdown().await;
+}
+
+/// The continuation a manual sync leaves behind is not new work: a target in
+/// failure backoff keeps its failure count and its delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rearm_keeps_backoff() {
+    let paged = paged_pull().await;
+    let bob_peer = paged.bob.peer_id();
+    let scheduler = &paged.net.resync_scheduler;
+    scheduler.schedule_now(bob_peer, paged.topic_id, false);
+    let (_, mut claims) = scheduler.due_targets_by_peer(1, 1).pop().unwrap();
+    scheduler.complete_failed(claims.remove(0), BACKOFF, Duration::from_secs(600));
+
+    let result = paged
+        .net
+        .sync_now(paged.bob_addr.clone(), paged.topic_id)
+        .await;
+    assert_eq!(
+        result.as_ref().map_err(io::Error::kind),
+        Err(io::ErrorKind::WouldBlock),
+        "{result:?}"
+    );
+    let (active, failures, force) = scheduler.target_state(bob_peer, paged.topic_id).unwrap();
+    assert_eq!((active, failures), (None, 1));
+    assert!(force.is_some(), "the failed attempt still owes its retry");
+    assert!(
+        scheduler.next_due().unwrap() > tokio::time::Instant::now() + BACKOFF / 2,
+        "the continuation reset the failure backoff"
+    );
+    paged.net.shutdown().await;
+    paged.bob_net.shutdown().await;
+}
+
+/// An advancing push continues at once when nothing else waits, but behind a
+/// target that became due while it ran, and without a new work revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continuation_yields_turn() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let (bob, bob_net) = server(
+        MemoryStorage::new(),
+        &lookup,
+        alice.peer_id(),
+        StreamLimits::default(),
+    )
+    .await;
+    let topic_id = shared_topic(&alice, &bob);
+    // More than a push page plus the page the peer requests back.
+    let page = crate::sync::SyncCredit::default().ops as usize;
+    publish(&alice, topic_id, 2 * page + 256, 1);
+    let bob_peer = bob.peer_id();
+    let scheduler = &net.resync_scheduler;
+    scheduler.schedule_now(bob_peer, topic_id, false);
+    let (_, claims) = scheduler.due_targets_by_peer(1, 1).pop().unwrap();
+    let covered_work = claims[0].covered;
+    // The smallest id also wins a tie on the due instant.
+    let waiting = PeerId::from_bytes([0; 32]);
+    scheduler.schedule_now(waiting, topic_id, false);
+
+    let lease = scheduler.lease(claims, BACKOFF);
+    net.sync_peer_batch_with_runtime(bob_peer, lease, runtime())
+        .await;
+    assert!(!clock(&bob, topic_id).dominates(&clock(&alice, topic_id)));
+    assert_eq!(
+        scheduler.target_state(bob_peer, topic_id),
+        Some((None, 0, None)),
+        "an advancing page is not a failure"
+    );
+    let key = ResyncTargetKey {
+        peer_id: bob_peer,
+        topic_id,
+    };
+    assert_eq!(
+        scheduler.inner.lock().unwrap()[&key].requested,
+        covered_work,
+        "the continuation bumped the work revision"
+    );
+    let next = scheduler.due_targets_by_peer(1, 1).pop().unwrap();
+    assert_eq!(next.0, waiting, "the continuation jumped the queue");
+    let next = scheduler.due_targets_by_peer(1, 1).pop().unwrap();
+    assert_eq!(next.0, bob_peer, "the continuation must run next");
+    drop(scheduler.lease(next.1, BACKOFF));
+    net.shutdown().await;
+    bob_net.shutdown().await;
+}
