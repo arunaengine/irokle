@@ -33,6 +33,14 @@ const MAX_SYNC_MESSAGES_PER_STREAM: usize = 4096;
 // reply (which can echo up to two messages per topic) stays under its own cap.
 const MAX_BATCH_STREAM_MESSAGES: usize = MAX_SYNC_MESSAGES_PER_STREAM / 2;
 const MAX_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
+/// Delay before a topic that advanced but still owes work is served again.
+/// Short enough to keep catching up, long enough to let other peers take a
+/// turn on the shared slots.
+const RESYNC_PROGRESS_TURN: Duration = Duration::from_millis(50);
+/// Pages one `sync_now` call will fetch while each is really advancing, before
+/// it reports what it reached. Bounds the caller's wait instead of paging on
+/// until the peer stops publishing.
+const MAX_SYNC_NOW_PAGES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IrohRuntimeConfig {
@@ -982,6 +990,7 @@ impl<S: Storage> IrohNet<S> {
         claim: ResyncTarget,
         result: std::result::Result<(), &io::Error>,
         runtime: IrohRuntimeConfig,
+        advanced: bool,
     ) {
         let peer_id = claim.key.peer_id;
         let topic_id = claim.key.topic_id;
@@ -999,6 +1008,9 @@ impl<S: Storage> IrohNet<S> {
         }
 
         match result {
+            Ok(()) if advanced => self
+                .resync_scheduler
+                .complete_dirty(claim, RESYNC_PROGRESS_TURN),
             Ok(()) => self
                 .resync_scheduler
                 .complete_dirty(claim, runtime.resync_interval),
@@ -1253,8 +1265,17 @@ impl<S: Storage> IrohNet<S> {
     ) -> io::Result<()> {
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
         let endpoint_id = peer.id;
-        let mut outcomes = self.run_topic_batch(peer, &[topic_id]).await;
-        let result = outcomes.remove(&topic_id).unwrap_or(Ok(()));
+        // A bounded page is not the goal: keep paging while the exchange really
+        // advances, up to a caller budget, so catching up is not reported as an
+        // I/O error merely because another page is needed.
+        let mut result = Ok(());
+        for _ in 0..MAX_SYNC_NOW_PAGES {
+            let mut outcomes = self.run_topic_batch(peer.clone(), &[topic_id]).await;
+            result = outcomes.results.remove(&topic_id).unwrap_or(Ok(()));
+            if result.is_err() || !outcomes.advanced.contains(&topic_id) {
+                break;
+            }
+        }
         if result.is_err() {
             // Drops the pooled connection only when it is already closed.
             let _ = self.pool.get(&endpoint_id);
@@ -1289,7 +1310,7 @@ impl<S: Storage> IrohNet<S> {
             Ok(addr) => addr,
             Err(error) => {
                 for claim in lease.drain_claims() {
-                    self.finish_resync_attempt(claim, Err(&error), runtime);
+                    self.finish_resync_attempt(claim, Err(&error), runtime, false);
                 }
                 return;
             }
@@ -1310,7 +1331,7 @@ impl<S: Storage> IrohNet<S> {
                 }
                 Err(error) => {
                     if let Some(claim) = lease.take_claim(&target.key) {
-                        self.finish_resync_attempt(claim, Err(&error), runtime);
+                        self.finish_resync_attempt(claim, Err(&error), runtime, false);
                     }
                 }
             }
@@ -1330,7 +1351,7 @@ impl<S: Storage> IrohNet<S> {
                     let _ = self
                         .node
                         .record_sync_result(peer_id, claim.key.topic_id, Err(&error));
-                    self.finish_resync_attempt(claim, Err(&error), runtime);
+                    self.finish_resync_attempt(claim, Err(&error), runtime, false);
                 }
                 return;
             }
@@ -1380,9 +1401,10 @@ impl<S: Storage> IrohNet<S> {
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
         let endpoint_id = peer.id;
         let outcomes = self.run_topic_batch(peer, topic_ids).await;
+        let advanced = outcomes.advanced;
         let mut failures = 0_usize;
         let mut first_error = None;
-        for (topic_id, outcome) in outcomes {
+        for (topic_id, outcome) in outcomes.results {
             let record_result = match &outcome {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -1400,7 +1422,12 @@ impl<S: Storage> IrohNet<S> {
                 peer_id: remote_peer_id,
                 topic_id,
             }) {
-                self.finish_resync_attempt(claim, record_result, runtime);
+                self.finish_resync_attempt(
+                    claim,
+                    record_result,
+                    runtime,
+                    advanced.contains(&topic_id),
+                );
             }
         }
         if let Some(error) = first_error {
@@ -1423,9 +1450,10 @@ impl<S: Storage> IrohNet<S> {
         &self,
         peer: iroh::EndpointAddr,
         topic_ids: &[crate::TopicId],
-    ) -> BTreeMap<crate::TopicId, io::Result<()>> {
+    ) -> BatchOutcomes {
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
         let mut outcomes = BTreeMap::new();
+        let mut advanced = BTreeSet::new();
 
         let mut fingerprints = BTreeMap::new();
         let mut request = Vec::with_capacity(topic_ids.len() * 2);
@@ -1442,7 +1470,7 @@ impl<S: Storage> IrohNet<S> {
             }
         }
         if fingerprints.is_empty() {
-            return outcomes;
+            return BatchOutcomes::new(outcomes, advanced);
         }
         let responses = match self.sync_with(peer.clone(), &request).await {
             Ok(responses) => responses,
@@ -1450,7 +1478,7 @@ impl<S: Storage> IrohNet<S> {
                 for topic_id in fingerprints.keys() {
                     outcomes.insert(*topic_id, Err(clone_error(&error)));
                 }
-                return outcomes;
+                return BatchOutcomes::new(outcomes, advanced);
             }
         };
 
@@ -1488,7 +1516,7 @@ impl<S: Storage> IrohNet<S> {
                             .entry(*topic_id)
                             .or_insert_with(|| Err(clone_error(&error)));
                     }
-                    return outcomes;
+                    return BatchOutcomes::new(outcomes, advanced);
                 }
             }
         }
@@ -1571,6 +1599,7 @@ impl<S: Storage> IrohNet<S> {
                     remote_peer_id,
                     std::mem::take(&mut group),
                     &mut outcomes,
+                    &mut advanced,
                 )
                 .await;
                 group_messages = 0;
@@ -1583,10 +1612,16 @@ impl<S: Storage> IrohNet<S> {
             group.push(planned);
         }
         if !group.is_empty() {
-            self.run_topic_batch_exchange(peer, remote_peer_id, group, &mut outcomes)
-                .await;
+            self.run_topic_batch_exchange(
+                peer,
+                remote_peer_id,
+                group,
+                &mut outcomes,
+                &mut advanced,
+            )
+            .await;
         }
-        outcomes
+        BatchOutcomes::new(outcomes, advanced)
     }
 
     fn plan_topic_messages(
@@ -1676,6 +1711,7 @@ impl<S: Storage> IrohNet<S> {
         remote_peer_id: PeerId,
         group: Vec<PlannedTopicSync>,
         outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
+        advanced: &mut BTreeSet<crate::TopicId>,
     ) {
         let group_topics = group
             .iter()
@@ -1684,6 +1720,17 @@ impl<S: Storage> IrohNet<S> {
         let remote_clocks = group
             .iter()
             .map(|planned| (planned.topic_id, planned.remote_clock.clone()))
+            .collect::<BTreeMap<_, _>>();
+        // Progress is read from durable local state before the exchange. Bytes
+        // moved, repeated ids and unchanged cursors are not progress.
+        let before = group_topics
+            .iter()
+            .map(|topic_id| {
+                (
+                    *topic_id,
+                    self.topic_progress_mark(remote_peer_id, *topic_id),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         let mut expected_acks = BTreeMap::<crate::TopicId, usize>::new();
         let mut expected_data = BTreeSet::new();
@@ -1907,8 +1954,12 @@ impl<S: Storage> IrohNet<S> {
         }
 
         for topic_id in group_topics {
-            outcomes.entry(topic_id).or_insert_with(|| {
-                if expected_acks.get(&topic_id).copied().unwrap_or_default() > 0
+            if outcomes.contains_key(&topic_id) {
+                continue;
+            }
+            let owes_more = (|| -> io::Result<bool> {
+                Ok(
+                    expected_acks.get(&topic_id).copied().unwrap_or_default() > 0
                     || expected_data.contains(&topic_id)
                     || !self
                         .node
@@ -1923,15 +1974,46 @@ impl<S: Storage> IrohNet<S> {
                         .node
                         .storage()
                         .has_sync_obligations(&remote_peer_id, &topic_id)
-                        .map_err(invalid_data)?
-                {
+                        .map_err(invalid_data)?,
+                )
+            })();
+            let outcome = match owes_more {
+                Ok(false) => Ok(()),
+                Ok(true) => {
                     self.schedule_resync(remote_peer_id, topic_id);
-                    Err(invalid_data("sync exchange is incomplete"))
-                } else {
-                    Ok(())
+                    if self.topic_progress_mark(remote_peer_id, topic_id) == before[&topic_id] {
+                        // Nothing durable moved, so retrying at once would spin.
+                        // Back off with an explicit reason instead.
+                        Err(invalid_data("sync exchange made no progress"))
+                    } else {
+                        // A bounded page that really advanced is served again
+                        // after a fair turn; it is not a failed attempt.
+                        advanced.insert(topic_id);
+                        Ok(())
+                    }
                 }
-            });
+                Err(error) => Err(error),
+            };
+            outcomes.insert(topic_id, outcome);
         }
+    }
+
+    /// Durable state a topic exchange can be judged against: the local clock,
+    /// whether the topic is whole, and whether work is still owed to this peer.
+    /// A change in any of these is real progress; an unchanged mark is not.
+    fn topic_progress_mark(
+        &self,
+        peer_id: PeerId,
+        topic_id: crate::TopicId,
+    ) -> (Option<crate::ActorClock>, bool, bool) {
+        (
+            self.node.storage().actor_clock(&topic_id).ok(),
+            self.topic_is_whole(topic_id),
+            self.node
+                .storage()
+                .has_sync_obligations(&peer_id, &topic_id)
+                .unwrap_or(true),
+        )
     }
 
     pub async fn accept_one(&self) -> io::Result<Option<iroh::EndpointId>> {
@@ -2202,6 +2284,23 @@ fn per_topic_failure_scope(message: &SyncMessage) -> Option<crate::sync::SyncFai
         SyncMessage::Ack(_) | SyncMessage::Failure(_) => return None,
     };
     Some(crate::sync::SyncFailure { topic_id, code })
+}
+
+/// Per-topic results of one batch, with the topics that made durable progress
+/// but still owe more work. Advancing pages are kept apart from failures so a
+/// catch-up that is working is not retried as an unreachable peer.
+struct BatchOutcomes {
+    results: BTreeMap<crate::TopicId, io::Result<()>>,
+    advanced: BTreeSet<crate::TopicId>,
+}
+
+impl BatchOutcomes {
+    fn new(
+        results: BTreeMap<crate::TopicId, io::Result<()>>,
+        advanced: BTreeSet<crate::TopicId>,
+    ) -> Self {
+        Self { results, advanced }
+    }
 }
 
 struct PlannedTopicSync {
@@ -2804,6 +2903,28 @@ mod tests {
         let targets = due.remove(0).1;
         assert_eq!(targets.len(), 1);
         targets[0]
+    }
+
+    /// A bounded page that really advanced is served again after a short turn.
+    /// It must not grow the network backoff or count as a failed attempt: that
+    /// is what turned working catch-up into a failing peer.
+    #[test]
+    fn progress_keeps_backoff() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(21), topic(22), false);
+        let advancing = one_claim(&scheduler);
+        scheduler.complete_dirty(advancing, RESYNC_PROGRESS_TURN);
+        let (active, failures, _) = scheduler.target_state(peer(21), topic(22)).unwrap();
+        assert!(active.is_none(), "the attempt is finished");
+        assert_eq!(failures, 0, "progress must not grow the network backoff");
+
+        // A no-progress exchange does back off, so repeats cannot spin.
+        let blocked_scheduler = ResyncScheduler::default();
+        blocked_scheduler.schedule_now(peer(23), topic(24), false);
+        let blocked = one_claim(&blocked_scheduler);
+        blocked_scheduler.complete_failed(blocked, BACKOFF, Duration::from_secs(600));
+        let (_, failures, _) = blocked_scheduler.target_state(peer(23), topic(24)).unwrap();
+        assert_eq!(failures, 1, "a no-progress exchange must back off");
     }
 
     #[test]
