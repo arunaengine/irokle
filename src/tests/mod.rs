@@ -1,4 +1,6 @@
 mod ack;
+#[cfg(all(feature = "fjall", feature = "iroh"))]
+mod bench;
 mod bootstrap;
 mod branch;
 #[cfg(feature = "iroh")]
