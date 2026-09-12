@@ -2128,13 +2128,19 @@ impl<S: Storage> IrohNet<S> {
                         frame.len()
                     ))
                 })?;
-                push_responses(
+                if push_responses(
                     &mut responses,
                     session.handle(self, message)?,
                     &mut response_limits,
-                )?;
+                )? {
+                    tracing::debug!(
+                        %peer,
+                        "reply reached the stream budget; sending the legal prefix"
+                    );
+                    break;
+                }
             }
-            push_responses(&mut responses, session.finish(self)?, &mut response_limits)?;
+            let _ = push_responses(&mut responses, session.finish(self)?, &mut response_limits)?;
             write_sync_messages(&mut send, &responses, self.runtime.sync_io_timeout).await?;
             Ok(())
         })
@@ -2151,13 +2157,15 @@ impl<S: Storage> IrohNet<S> {
         let mut responses = Vec::new();
         let mut response_limits = SyncReadLimits::default();
         for message in messages {
-            push_responses(
+            if push_responses(
                 &mut responses,
                 session.handle(self, message)?,
                 &mut response_limits,
-            )?;
+            )? {
+                break;
+            }
         }
-        push_responses(&mut responses, session.finish(self)?, &mut response_limits)?;
+        let _ = push_responses(&mut responses, session.finish(self)?, &mut response_limits)?;
         Ok(responses)
     }
 
@@ -2541,6 +2549,25 @@ struct SyncReadLimits {
 }
 
 impl SyncReadLimits {
+    /// Whether one more frame of `frame_len` fits in the stream budget. Used
+    /// for outgoing replies, where crossing the cap must stop the reply rather
+    /// than fail it: the prefix already built is legal and useful.
+    fn accept_frame(&mut self, frame_len: usize) -> io::Result<bool> {
+        if self.messages >= MAX_SYNC_MESSAGES_PER_STREAM {
+            return Ok(false);
+        }
+        let total = self
+            .bytes
+            .checked_add(frame_len + 4)
+            .ok_or_else(|| invalid_data("sync stream byte count overflow"))?;
+        if total > MAX_SYNC_STREAM_BYTES {
+            return Ok(false);
+        }
+        self.bytes = total;
+        self.messages += 1;
+        Ok(true)
+    }
+
     fn observe_frame(&mut self, frame_len: usize) -> io::Result<usize> {
         if self.messages >= MAX_SYNC_MESSAGES_PER_STREAM {
             return Err(invalid_data("sync stream has too many messages"));
@@ -2558,16 +2585,23 @@ impl SyncReadLimits {
     }
 }
 
+/// Appends the replies that fit in the stream budget and reports whether any
+/// were left out. A reply that would cross the cap belongs to the next
+/// exchange: failing here would discard a legal prefix the peer can use and
+/// turn a bounded page into a protocol error.
 fn push_responses(
     out: &mut Vec<SyncMessage>,
     responses: Vec<SyncMessage>,
     limits: &mut SyncReadLimits,
-) -> io::Result<()> {
-    for response in &responses {
-        limits.observe_frame(super::framed_message_len(response)? - 4)?;
+) -> io::Result<bool> {
+    for response in responses {
+        let frame_len = super::framed_message_len(&response)? - 4;
+        if !limits.accept_frame(frame_len)? {
+            return Ok(true);
+        }
+        out.push(response);
     }
-    out.extend(responses);
-    Ok(())
+    Ok(false)
 }
 
 /// Clears the resync start latch when the loop task actually ends, including on
@@ -2981,6 +3015,39 @@ mod tests {
         let targets = due.remove(0).1;
         assert_eq!(targets.len(), 1);
         targets[0]
+    }
+
+    /// A reply that reaches the stream budget keeps the legal prefix instead of
+    /// failing the whole response. Exercised here through the message cap; the
+    /// byte cap takes the same branch, but a fixture at the default 256 MiB
+    /// reply limit is not run as a unit test.
+    #[test]
+    fn reply_cap_keeps_prefix() {
+        let mut limits = SyncReadLimits::default();
+        let mut out = Vec::new();
+        let responses = (0..=MAX_SYNC_MESSAGES_PER_STREAM)
+            .map(|index| {
+                SyncMessage::Fingerprint(crate::sync::SyncFingerprint {
+                    topic_id: topic(index as u8),
+                    fingerprint: [0; 32],
+                })
+            })
+            .collect::<Vec<_>>();
+        let truncated = push_responses(&mut out, responses, &mut limits).unwrap();
+        assert!(truncated, "the reply must report what it left out");
+        assert_eq!(
+            out.len(),
+            MAX_SYNC_MESSAGES_PER_STREAM,
+            "the legal prefix must be kept, not discarded"
+        );
+
+        // A following push adds nothing and still reports truncation.
+        let more = vec![SyncMessage::Fingerprint(crate::sync::SyncFingerprint {
+            topic_id: topic(0),
+            fingerprint: [1; 32],
+        })];
+        assert!(push_responses(&mut out, more, &mut limits).unwrap());
+        assert_eq!(out.len(), MAX_SYNC_MESSAGES_PER_STREAM);
     }
 
     /// A topic settled during a batch leaves the lease, so the batch deadline
