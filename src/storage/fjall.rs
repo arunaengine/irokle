@@ -578,12 +578,14 @@ impl FjallStorage {
         Self::tx_put(tx, records, key, &merged)
     }
 
+    // Every read goes through a snapshot: a plain keyspace read also sees the
+    // items of a commit that is still being applied.
     fn get<T: for<'de> Deserialize<'de>>(&self, key: impl AsRef<[u8]>) -> Result<Option<T>> {
-        Ok(self
-            .records
-            .get(key)?
-            .map(|v| postcard::from_bytes(v.as_ref()))
-            .transpose()?)
+        Ok(
+            fjall::Readable::get(&self.db.read_tx(), &self.records, key)?
+                .map(|v| postcard::from_bytes(v.as_ref()))
+                .transpose()?,
+        )
     }
 
     /// How `ack` may commit against the topic as this transaction sees it. The
@@ -1187,7 +1189,7 @@ impl Storage for FjallStorage {
 
     fn pending_evictions(&self) -> Result<Vec<TopicEviction>> {
         let mut out = Vec::new();
-        for item in self.records.inner().prefix(EVICTION_PREFIX) {
+        for item in fjall::Readable::prefix(&self.db.read_tx(), &self.records, EVICTION_PREFIX) {
             let (_, value) = item.into_inner()?;
             out.push(postcard::from_bytes(value.as_ref())?);
         }
@@ -1231,7 +1233,7 @@ impl Storage for FjallStorage {
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         let prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
         let mut out = BTreeSet::new();
-        for item in self.records.inner().prefix(prefix) {
+        for item in fjall::Readable::prefix(&self.db.read_tx(), &self.records, prefix) {
             let (key, _) = item.into_inner()?;
             out.insert(Self::op_id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
         }
@@ -1243,7 +1245,7 @@ impl Storage for FjallStorage {
     fn children(&self, op_id: &OpId) -> Result<BTreeSet<OpId>> {
         let prefix = [b"ch".as_slice(), op_id.as_ref()].concat();
         let mut out = BTreeSet::new();
-        for item in self.records.inner().prefix(prefix) {
+        for item in fjall::Readable::prefix(&self.db.read_tx(), &self.records, prefix) {
             let (key, _) = item.into_inner()?;
             out.insert(Self::op_id_from_key(key.as_ref(), 2 + OpId::LEN)?);
         }
@@ -1324,7 +1326,7 @@ impl Storage for FjallStorage {
     fn list_topics(&self) -> Result<Vec<TopicInfo>> {
         // v0 keeps this simple: scan durable topic records instead of maintaining a second index.
         let mut out = Vec::new();
-        for item in self.records.inner().prefix(b"ts") {
+        for item in fjall::Readable::prefix(&self.db.read_tx(), &self.records, b"ts") {
             let value = item.value()?;
             let s: TopicState = postcard::from_bytes(value.as_ref())?;
             out.push(TopicInfo {
