@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::TopicId;
-use crate::tests::support::Note;
+use crate::tests::support::{Gate, GatePoint, Note, StaleReadStorage};
 
 /// Wide enough that a backoff step cannot pass while a test is running.
 const BACKOFF: Duration = Duration::from_secs(60);
@@ -309,6 +309,247 @@ async fn continuation_yields_turn() {
     let next = scheduler.due_targets_by_peer(1, 1).pop().unwrap();
     assert_eq!(next.0, bob_peer, "the continuation must run next");
     drop(scheduler.lease(next.1, BACKOFF));
+    net.shutdown().await;
+    bob_net.shutdown().await;
+}
+
+/// A peer that keeps answering without the data it claims backs off: every
+/// unchanged attempt is one failure with a growing delay, never a fast loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_peer_backoff() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let (bob, bob_net) = server(
+        MemoryStorage::new(),
+        &lookup,
+        alice.peer_id(),
+        StreamLimits::default(),
+    )
+    .await;
+    let topic_id = shared_topic(&alice, &bob);
+    publish(&bob, topic_id, 20, 1);
+    let ops = crate::oplog::topological(bob.storage(), &topic_id).unwrap();
+    bob.storage().drop_op_record(&ops[3].id);
+    bob.recheck_topics().unwrap();
+    let bob_peer = bob.peer_id();
+
+    net.resync_scheduler.schedule_now(bob_peer, topic_id, false);
+    let turns = drain_due(&net, 8).await;
+    assert!(turns <= 3, "{turns} turns for one unchanged peer");
+    let (active, failures, force) = net
+        .resync_scheduler
+        .target_state(bob_peer, topic_id)
+        .unwrap();
+    assert_eq!((active, failures), (None, 1));
+    assert!(force.is_some());
+    assert!(net.resync_scheduler.next_due().unwrap() > tokio::time::Instant::now() + BACKOFF / 2);
+
+    // A later forced retry meets the same answer and doubles the delay.
+    net.resync_scheduler.schedule_now(bob_peer, topic_id, true);
+    let streams = net.outbound_sync_streams();
+    assert_eq!(drain_due(&net, 8).await, 1);
+    assert!(
+        net.outbound_sync_streams() - streams <= 4,
+        "one unchanged attempt must not loop over streams"
+    );
+    let (_, failures, _) = net
+        .resync_scheduler
+        .target_state(bob_peer, topic_id)
+        .unwrap();
+    assert_eq!(failures, 2);
+    assert!(net.resync_scheduler.next_due().unwrap() > tokio::time::Instant::now() + BACKOFF);
+    assert!(!clock(&alice, topic_id).dominates(&clock(&bob, topic_id)));
+    assert_eq!(status(&alice, bob_peer, topic_id).failed_attempts, 2);
+    assert_eq!(
+        alice.peer_health().failures(&bob_peer),
+        0,
+        "a refusal is not unreachability"
+    );
+    net.shutdown().await;
+    bob_net.shutdown().await;
+}
+
+/// The first topic of a batch finishes its push, pull and ack follow-up and is
+/// published. The second then stalls at the peer until the batch deadline
+/// expires: only the second is failed, and the first is not reinserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expiry_spares_settled() {
+    let lookup = Lookup::new();
+    // One topic per exchange, so the first settles before the second is sent.
+    let limits = StreamLimits {
+        batch_messages: 1,
+        ..StreamLimits::default()
+    };
+    let (alice, net) = client(&lookup, limits).await;
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let (bob, bob_net) = server(
+        storage.clone(),
+        &lookup,
+        alice.peer_id(),
+        StreamLimits::default(),
+    )
+    .await;
+    let mut topics = [shared_topic(&alice, &bob), shared_topic(&alice, &bob)];
+    topics.sort();
+    let [first, second] = topics;
+    publish(&bob, first, 1, 1);
+    publish(&alice, first, 1, 1);
+    let stalled = alice
+        .open_topic::<Note>(second)
+        .unwrap()
+        .publish(Note {
+            text: "stalled".into(),
+        })
+        .unwrap()
+        .meta
+        .op_id;
+    let bob_peer = bob.peer_id();
+    let scheduler = &net.resync_scheduler;
+    scheduler.schedule_now(bob_peer, first, false);
+    scheduler.schedule_now(bob_peer, second, false);
+    let (_, claims) = scheduler.due_targets_by_peer(1, 8).pop().unwrap();
+    assert_eq!(claims.len(), 2);
+    let lease = scheduler.lease(claims, BACKOFF);
+
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    storage.arm_read(GatePoint::Meta(stalled), Arc::clone(&gate));
+    // The deadline is taken from this config; the streams keep the long timeout.
+    let deadline = IrohRuntimeConfig {
+        connect_timeout: Duration::ZERO,
+        sync_io_timeout: Duration::from_secs(2),
+        ..runtime()
+    };
+    let batch = tokio::spawn({
+        let net = Arc::clone(&net);
+        async move {
+            net.sync_peer_batch_with_runtime(bob_peer, lease, deadline)
+                .await
+        }
+    });
+    tokio::task::spawn_blocking({
+        let gate = Arc::clone(&gate);
+        move || gate.wait_arrival()
+    })
+    .await
+    .unwrap();
+    assert!(
+        !batch.is_finished(),
+        "the second topic never reached the peer"
+    );
+    // Pulled data may leave the finished topic due again, never owned or failed.
+    let first_state = scheduler.target_state(bob_peer, first);
+    assert!(
+        matches!(first_state, None | Some((None, 0, None))),
+        "{first_state:?}"
+    );
+    assert!(clock(&alice, first).dominates(&clock(&bob, first)));
+    assert_eq!(status(&alice, bob_peer, first).successful_attempts, 1);
+
+    tokio::time::timeout(Duration::from_secs(60), batch)
+        .await
+        .expect("the batch deadline never fired")
+        .unwrap();
+    assert!(
+        !gate.has_left(),
+        "the deadline, not the peer, ended the batch"
+    );
+    assert_eq!(
+        scheduler.target_state(bob_peer, first),
+        first_state,
+        "the settled topic was reinserted"
+    );
+    let settled = status(&alice, bob_peer, first);
+    assert_eq!(
+        (settled.successful_attempts, settled.failed_attempts),
+        (1, 0)
+    );
+    let (active, failures, force) = scheduler.target_state(bob_peer, second).unwrap();
+    assert_eq!((active, failures), (None, 1));
+    assert!(force.is_some());
+    assert_eq!(status(&alice, bob_peer, second).failed_attempts, 1);
+    assert_eq!(alice.peer_health().failures(&bob_peer), 1);
+
+    drop(release);
+    net.shutdown().await;
+    bob_net.shutdown().await;
+}
+
+/// One failed connection is one health failure, however many topics the batch
+/// carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failure_counted_once() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let down = crate::Signer::peer_id(&crate::Ed25519Signer::generate());
+    for (round, topics) in [1_usize, 300].into_iter().enumerate() {
+        for _ in 0..topics {
+            let topic = alice
+                .create_topic::<Note>(crate::TopicConfig {
+                    initial_peers: [down].into(),
+                    ..crate::TopicConfig::default()
+                })
+                .unwrap();
+            net.resync_scheduler.schedule_now(down, topic.id(), false);
+        }
+        let (_, claims) = net
+            .resync_scheduler
+            .due_targets_by_peer(1, MAX_TOPICS_PER_RESYNC_BATCH)
+            .pop()
+            .unwrap();
+        assert_eq!(claims.len(), topics);
+        let lease = net.resync_scheduler.lease(claims, BACKOFF);
+        net.sync_peer_batch_with_runtime(down, lease, runtime())
+            .await;
+        assert_eq!(
+            alice.peer_health().failures(&down),
+            round as u64 + 1,
+            "a batch of {topics} topics"
+        );
+    }
+    net.shutdown().await;
+}
+
+/// A manual sync of a target the scheduler has claimed leaves that claim to
+/// its owner: it neither completes nor fails the attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_keeps_claim() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let (bob, bob_net) = server(
+        MemoryStorage::new(),
+        &lookup,
+        alice.peer_id(),
+        StreamLimits::default(),
+    )
+    .await;
+    let topic_id = shared_topic(&alice, &bob);
+    publish(&alice, topic_id, 3, 1);
+    let bob_peer = bob.peer_id();
+    net.resync_scheduler.schedule_now(bob_peer, topic_id, false);
+    let (_, claims) = net
+        .resync_scheduler
+        .due_targets_by_peer(1, 1)
+        .pop()
+        .unwrap();
+    let attempt = claims[0].attempt;
+    let lease = net.resync_scheduler.lease(claims, Duration::ZERO);
+
+    net.sync_now(ready_addr(bob_net.endpoint()).await, topic_id)
+        .await
+        .unwrap();
+    assert!(clock(&bob, topic_id).dominates(&clock(&alice, topic_id)));
+    assert_eq!(
+        net.resync_scheduler.target_state(bob_peer, topic_id),
+        Some((Some(attempt), 0, None)),
+        "the manual sync took over the scheduler's attempt"
+    );
+    drop(lease);
+    let (active, _, _) = net
+        .resync_scheduler
+        .target_state(bob_peer, topic_id)
+        .unwrap();
+    assert_eq!(active, None);
     net.shutdown().await;
     bob_net.shutdown().await;
 }
