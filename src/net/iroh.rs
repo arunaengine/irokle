@@ -700,7 +700,11 @@ impl<S: Storage> IrohNet<S> {
     }
 
     pub async fn shutdown(&self) {
-        let _ = self.shutdown.send(true);
+        // `send` reports failure and leaves the stored value alone when no
+        // receiver exists, which loses the intent entirely if shutdown runs
+        // before any loop subscribes. `send_replace` always stores it, so a
+        // loop started afterwards still sees the terminal state.
+        self.shutdown.send_replace(true);
         self.endpoint().close().await;
     }
 
@@ -3318,6 +3322,32 @@ mod tests {
             .build()
             .unwrap();
         Arc::new(IrohNet::new(endpoint, node).unwrap())
+    }
+
+    /// Shutdown before any loop subscribes must still be recorded. The watch
+    /// channel has no receivers at that point, so a plain send would drop the
+    /// intent and let a loop started later run as if the net were live.
+    #[tokio::test]
+    async fn shutdown_without_receivers() {
+        let net = test_net().await;
+        assert!(!net.is_shutdown());
+        net.shutdown().await;
+        assert!(
+            net.is_shutdown(),
+            "terminal shutdown must be retained with no watch receivers"
+        );
+
+        // Repeating it is safe and stays terminal.
+        net.shutdown().await;
+        assert!(net.is_shutdown());
+        assert!(
+            !dispatch_due_resyncs(
+                &Arc::downgrade(&net),
+                &mut tokio::task::JoinSet::new(),
+                IrohRuntimeConfig::default(),
+            ),
+            "a terminally closed net must not dispatch new work"
+        );
     }
 
     #[tokio::test]
