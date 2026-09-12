@@ -656,3 +656,40 @@ fn saturated_pools_serve_healthy() {
     storage.reset_topic(&busy[1].topic_id).unwrap();
     assert_eq!(storage.pending_usage(&sources[2]), (0, 0, 0, 0));
 }
+
+/// A backend failure while a dependency arrives fails that receive but keeps
+/// the op buffered behind it, so resending the dependency admits both.
+#[test]
+fn backend_failure_retains() {
+    let m = members(236);
+    let missing = event_op(&m.bob, m.topic_id, 1, None, &[&m.genesis], "missing");
+    let child = event_op(&m.bob, m.topic_id, 2, Some(&missing), &[&missing], "child");
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let log = Oplog::with_storage(storage.clone());
+    let source = Some(m.alice.peer_id());
+    log.receive_ops_from_peer(source, vec![m.genesis.clone()])
+        .unwrap();
+    log.receive_ops_from_peer(source, vec![child.clone()])
+        .unwrap();
+
+    storage.failed_writes.lock().unwrap().insert(m.topic_id);
+    assert!(matches!(
+        log.receive_ops_from_peer(source, vec![missing.clone()]),
+        Err(Error::Storage(_))
+    ));
+    assert!(buffered(&storage, &m.topic_id, &child));
+    assert_eq!(storage.pending_waiters(&missing.id).unwrap().len(), 1);
+
+    storage.failed_writes.lock().unwrap().clear();
+    assert_eq!(
+        log.receive_ops_from_peer(source, vec![missing.clone()])
+            .unwrap(),
+        BTreeSet::from([missing.id, child.id])
+    );
+    assert!(
+        storage
+            .pending_missing_deps(&m.topic_id)
+            .unwrap()
+            .is_empty()
+    );
+}
