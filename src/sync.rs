@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::oplog::{Oplog, TopicEviction, topological_subset};
-use crate::storage::{PeerAck, Storage, SyncObligation};
+use crate::storage::{PeerAck, Storage, SyncObligation, TopicState, TopicView};
 use crate::{
     ActorClock, ActorId, Error, Op, OpId, PeerId, Result, Signer, TopicId, actor_id_for,
     canonical_bytes, verify,
@@ -211,26 +211,44 @@ impl<S: Storage> SyncEngine<S> {
         }
     }
 
+    /// The topic as one view reads it. Heads, clock, tips and the digest all
+    /// describe the same commit, so no part can come from a replaced branch.
     pub fn summary(&self, topic_id: TopicId) -> Result<SyncSummary> {
-        let event_type_id = self
-            .oplog
-            .storage()
-            .topic_state(&topic_id)?
-            .map(|state| state.event_type_id);
+        let Some(view) = self.oplog.storage().topic_view(&topic_id, None)? else {
+            return Ok(SyncSummary {
+                topic_id,
+                event_type_id: None,
+                fingerprint: self.oplog.storage().topic_fingerprint(&topic_id)?,
+                heads: BTreeSet::new(),
+                actor_clock: ActorClock::new(),
+                actor_tips: BTreeMap::new(),
+            });
+        };
+        let fingerprint = self.view_digest(&view)?;
+        let actor_tips = view
+            .tips
+            .iter()
+            .filter(|(actor_id, (seq, _))| view.clock.get(actor_id) == *seq)
+            .map(|(actor_id, tip)| (*actor_id, *tip))
+            .collect();
         Ok(SyncSummary {
             topic_id,
-            event_type_id,
-            fingerprint: self.topic_digest(&topic_id)?,
-            heads: self.oplog.storage().heads(&topic_id)?,
-            actor_clock: self.oplog.storage().actor_clock(&topic_id)?,
-            actor_tips: self.actor_tips(topic_id)?,
+            event_type_id: Some(view.state.event_type_id),
+            fingerprint,
+            heads: view.state.heads,
+            actor_clock: view.clock,
+            actor_tips,
         })
     }
 
     pub fn fingerprint(&self, topic_id: TopicId) -> Result<SyncFingerprint> {
+        let fingerprint = match self.oplog.storage().topic_view(&topic_id, None)? {
+            Some(view) => self.view_digest(&view)?,
+            None => self.oplog.storage().topic_fingerprint(&topic_id)?,
+        };
         Ok(SyncFingerprint {
             topic_id,
-            fingerprint: self.topic_digest(&topic_id)?,
+            fingerprint,
         })
     }
 
@@ -240,13 +258,12 @@ impl<S: Storage> SyncEngine<S> {
     /// a whole one, which is exactly what the matched-fingerprint fast path
     /// assumes. Callers must still refuse that fast path while their own topic
     /// is incomplete, since two identically damaged stores do match.
-    fn topic_digest(&self, topic_id: &TopicId) -> Result<[u8; 32]> {
-        let stored = self.oplog.storage().topic_fingerprint(topic_id)?;
-        let unresolved = self.oplog.topic_unresolved(topic_id)?;
+    fn view_digest(&self, view: &TopicView) -> Result<[u8; 32]> {
+        let (unresolved, _) = self.oplog.view_unresolved(view)?;
         if unresolved.is_empty() {
-            return Ok(stored);
+            return Ok(view.fingerprint);
         }
-        Ok(*blake3::hash(&canonical_bytes(&(stored, &unresolved))?).as_bytes())
+        Ok(*blake3::hash(&canonical_bytes(&(view.fingerprint, &unresolved))?).as_bytes())
     }
 
     pub fn negotiate(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
@@ -305,11 +322,16 @@ impl<S: Storage> SyncEngine<S> {
             });
         }
 
-        let local_heads = self.oplog.storage().heads(&remote.topic_id)?;
+        let view = self
+            .oplog
+            .storage()
+            .topic_view(&remote.topic_id, None)?
+            .ok_or(Error::TopicNotFound)?;
+        let local_heads = view.state.heads.clone();
         // A hole moves neither heads nor the clock, so a matching fingerprint
         // does not prove we are whole; keep negotiating until it is repaired.
-        let unresolved = self.oplog.topic_unresolved(&remote.topic_id)?;
-        if unresolved.is_empty() && self.topic_digest(&remote.topic_id)? == remote.fingerprint {
+        let (unresolved, _) = self.oplog.view_unresolved(&view)?;
+        if unresolved.is_empty() && view.fingerprint == remote.fingerprint {
             return Ok(SyncPlan {
                 topic_id: remote.topic_id,
                 common: local_heads.clone(),
@@ -606,8 +628,8 @@ impl<S: Storage> SyncEngine<S> {
             });
         }
         match frontier {
-            Ok((genesis, heads, clock)) => {
-                ack.genesis = Some(genesis);
+            Ok((state, heads, clock)) => {
+                ack.genesis = Some(state.genesis);
                 ack.heads = heads;
                 ack.clock = clock;
                 Ok((ack, admitted.evictions))
@@ -620,26 +642,22 @@ impl<S: Storage> SyncEngine<S> {
         }
     }
 
-    /// Heads and clock an acknowledgement may certify. A topic holding an id it
+    /// Heads and clock an acknowledgement may certify, all read from one view
+    /// together with the genesis they are signed for. A topic holding an id it
     /// cannot resolve is unable to replay the history those values name, so it
     /// certifies nothing until repair completes: the source keeps its retry
     /// obligation and this node stays visibly behind instead of going quiet.
-    fn ack_frontier(&self, topic_id: &TopicId) -> Result<(OpId, BTreeSet<OpId>, ActorClock)> {
-        let genesis = self
+    fn ack_frontier(&self, topic_id: &TopicId) -> Result<(TopicState, BTreeSet<OpId>, ActorClock)> {
+        let (view, whole) = self
             .oplog
-            .storage()
-            .topic_state(topic_id)?
-            .ok_or(Error::TopicNotFound)?
-            .genesis;
-        if !self.oplog.topic_unresolved(topic_id)?.is_empty() {
+            .whole_view(topic_id)?
+            .ok_or(Error::TopicNotFound)?;
+        if !whole {
             tracing::debug!(%topic_id, "withholding ack frontier for an incomplete topic");
-            return Ok((genesis, BTreeSet::new(), ActorClock::new()));
+            return Ok((view.state, BTreeSet::new(), ActorClock::new()));
         }
-        Ok((
-            genesis,
-            self.oplog.storage().heads(topic_id)?,
-            self.oplog.storage().actor_clock(topic_id)?,
-        ))
+        let heads = view.state.heads.clone();
+        Ok((view.state, heads, view.clock))
     }
 
     pub fn apply_ack(&self, ack: &SyncAck) -> Result<()> {
@@ -694,19 +712,14 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     pub fn record_peer_synced(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
-        let state = self
-            .oplog
-            .storage()
-            .topic_state(&topic_id)?
-            .ok_or(Error::TopicNotFound)?;
+        let (state, heads, clock) = self.ack_frontier(&topic_id)?;
         if !state.members.contains(&peer_id) {
             return Err(Error::NotTopicMember);
         }
-        let (genesis, heads, clock) = self.ack_frontier(&topic_id)?;
         let peer_ack = PeerAck {
             peer_id,
             topic_id,
-            genesis: Some(genesis),
+            genesis: Some(state.genesis),
             heads,
             clock,
         };
@@ -714,6 +727,9 @@ impl<S: Storage> SyncEngine<S> {
         Ok(())
     }
 
+    /// Record that `peer_id` matched this topic's fingerprint. The compared
+    /// fingerprint and the certified frontier come from the same view, so a
+    /// reset after the comparison cannot swap in the replacement branch.
     #[cfg(feature = "iroh")]
     pub(crate) fn record_fingerprint(
         &self,
@@ -721,22 +737,17 @@ impl<S: Storage> SyncEngine<S> {
         topic_id: TopicId,
         fingerprint: [u8; 32],
     ) -> Result<bool> {
-        let state = self
-            .oplog
-            .storage()
-            .topic_state(&topic_id)?
-            .ok_or(Error::TopicNotFound)?;
+        let (state, heads, clock) = self.ack_frontier(&topic_id)?;
         if !state.members.contains(&peer_id) {
             return Err(Error::NotTopicMember);
         }
-        let (genesis, heads, clock) = self.ack_frontier(&topic_id)?;
         if crate::storage::topic_fingerprint_for(&heads, &clock)? != fingerprint {
             return Ok(false);
         }
         self.oplog.storage().apply_peer_ack(PeerAck {
             peer_id,
             topic_id,
-            genesis: Some(genesis),
+            genesis: Some(state.genesis),
             heads,
             clock,
         })?;
@@ -744,11 +755,12 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     fn validate_ack(&self, ack: &SyncAck) -> Result<()> {
-        let state = self
+        let view = self
             .oplog
             .storage()
-            .topic_state(&ack.topic_id)?
+            .topic_view(&ack.topic_id, None)?
             .ok_or(Error::TopicNotFound)?;
+        let state = &view.state;
         match ack.genesis {
             Some(genesis) if genesis == state.genesis => {}
             Some(_) => return Err(Error::StaleIncarnation),
@@ -766,11 +778,7 @@ impl<S: Storage> SyncEngine<S> {
         // no peer can hold more. Other actors reach a peer through a third
         // member before they reach us, so their entries stay unchecked.
         let local_actor = actor_id_for(ack.topic_id, self.peer_id);
-        let local_seq = self
-            .oplog
-            .storage()
-            .actor_clock(&ack.topic_id)?
-            .get(&local_actor);
+        let local_seq = view.clock.get(&local_actor);
         let claimed_seq = ack.clock.get(&local_actor);
         if claimed_seq > local_seq {
             return Err(Error::InvalidSyncAck(format!(
@@ -856,18 +864,6 @@ impl<S: Storage> SyncEngine<S> {
             peer_id,
             obligations: self.oplog.storage().sync_obligations(&peer_id, &topic_id)?,
         })
-    }
-
-    fn actor_tips(&self, topic_id: TopicId) -> Result<BTreeMap<ActorId, (u64, OpId)>> {
-        let mut tips = BTreeMap::new();
-        for (actor_id, seq) in self.oplog.storage().actor_clock(&topic_id)?.iter() {
-            if let Some((tip_seq, tip_id)) = self.oplog.storage().actor_tip(&topic_id, actor_id)?
-                && tip_seq == *seq
-            {
-                tips.insert(*actor_id, (tip_seq, tip_id));
-            }
-        }
-        Ok(tips)
     }
 
     fn needed_actor_ranges(

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::{
     AdmissionEffects, AdmittedBatch, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage,
-    TopicState,
+    TopicState, TopicView,
 };
 use crate::{
     ActorId, Error, EventEnvelope, EvictionKey, Op, OpBody, OpId, PeerId, Result, SignedOp, Signer,
@@ -30,6 +30,9 @@ pub use topology::{topological, topological_subset};
 
 const MAX_ADMISSION_RETRIES: usize = 64;
 const MAX_CACHED_PROJECTIONS: usize = 4096;
+/// Views a whole-topic check reads before it gives up certifying one; each
+/// retry means a reset committed during the hole scan.
+const MAX_VIEW_ATTEMPTS: usize = 4;
 // Genesis collisions are rare. Serialize their resolution across all Oplog
 // facades in this process; storage reset preconditions still provide the
 // authoritative stale-write guard.
@@ -192,10 +195,10 @@ fn admission_failure(mut admitted: Admitted, error: Error) -> Error {
 #[derive(Clone)]
 pub struct Oplog<S = MemoryStorage> {
     storage: S,
-    // Topics whose stored records were scanned and found whole. Admission keeps
-    // that invariant, so only damage from outside irokle can reintroduce a
-    // hole; scanning once per topic keeps the sync fast path off a full scan.
-    whole_topics: Arc<Mutex<BTreeSet<TopicId>>>,
+    // Branch and data epoch each topic was scanned and found whole at. Admission
+    // keeps that invariant, so only a reset or damage from outside irokle can
+    // reintroduce a hole; scanning once per epoch keeps sync off a full scan.
+    whole_topics: Arc<Mutex<BTreeMap<TopicId, (OpId, u64)>>>,
     membership_cache: Arc<Mutex<MembershipCache>>,
 }
 
@@ -215,7 +218,7 @@ impl<S: Storage> Oplog<S> {
     pub fn with_storage(storage: S) -> Self {
         Self {
             storage,
-            whole_topics: Arc::new(Mutex::new(BTreeSet::new())),
+            whole_topics: Arc::new(Mutex::new(BTreeMap::new())),
             membership_cache: Arc::new(Mutex::new(MembershipCache::default())),
         }
     }
@@ -229,15 +232,57 @@ impl<S: Storage> Oplog<S> {
     /// means every admitted op is locally usable, which is what lets sync
     /// certify the topic; anything else is turned into concrete repair wants.
     pub fn topic_unresolved(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
-        let mut unresolved = self.storage.pending_missing_deps(topic_id)?;
-        unresolved.extend(self.scan_stored_holes(topic_id)?);
-        Ok(unresolved)
+        match self.storage.topic_view(topic_id, None)? {
+            Some(view) => Ok(self.view_unresolved(&view)?.0),
+            None => {
+                let mut unresolved = self.storage.pending_missing_deps(topic_id)?;
+                unresolved.extend(self.scan_stored_holes(topic_id)?);
+                Ok(unresolved)
+            }
+        }
+    }
+
+    /// Ids `view`'s topic cannot resolve, and whether a hole scan ran. A scan
+    /// is not part of the view, so its whole verdict is recorded only under the
+    /// view's branch and epoch, where a later reset cannot reuse it.
+    pub(crate) fn view_unresolved(&self, view: &TopicView) -> Result<(BTreeSet<OpId>, bool)> {
+        let topic_id = view.state.topic_id;
+        let key = (view.state.genesis, view.epoch);
+        let mut unresolved = view.pending_missing.clone();
+        if self.whole_topics()?.get(&topic_id) == Some(&key) {
+            return Ok((unresolved, false));
+        }
+        let holes = self.scan_stored_holes(&topic_id)?;
+        if holes.is_empty() {
+            self.whole_topics()?.insert(topic_id, key);
+        }
+        unresolved.extend(holes);
+        Ok((unresolved, true))
+    }
+
+    /// A view of the topic and whether that view is whole. A view is whole
+    /// only when the recorded verdict for its own branch and epoch says so
+    /// without a scan in between, so a reset during a scan cannot lend the
+    /// verdict to the frontier being certified.
+    pub(crate) fn whole_view(&self, topic_id: &TopicId) -> Result<Option<(TopicView, bool)>> {
+        let mut last = None;
+        for _ in 0..MAX_VIEW_ATTEMPTS {
+            let Some(view) = self.storage.topic_view(topic_id, None)? else {
+                return Ok(None);
+            };
+            let (unresolved, scanned) = self.view_unresolved(&view)?;
+            if !unresolved.is_empty() {
+                return Ok(Some((view, false)));
+            }
+            if !scanned {
+                return Ok(Some((view, true)));
+            }
+            last = Some(view);
+        }
+        Ok(last.map(|view| (view, false)))
     }
 
     fn scan_stored_holes(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
-        if self.whole_topics()?.contains(topic_id) {
-            return Ok(BTreeSet::new());
-        }
         let mut holes = BTreeSet::new();
         for id in self.storage.list_op_ids(topic_id)? {
             let Some(meta) = self.storage.get_meta(&id)? else {
@@ -252,9 +297,6 @@ impl<S: Storage> Oplog<S> {
                     holes.insert(*dep);
                 }
             }
-        }
-        if holes.is_empty() {
-            self.whole_topics()?.insert(*topic_id);
         }
         Ok(holes)
     }
@@ -394,7 +436,7 @@ impl<S: Storage> Oplog<S> {
         }))
     }
 
-    fn whole_topics(&self) -> Result<std::sync::MutexGuard<'_, BTreeSet<TopicId>>> {
+    fn whole_topics(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<TopicId, (OpId, u64)>>> {
         self.whole_topics
             .lock()
             .map_err(|_| Error::Storage("topic integrity cache lock poisoned".into()))

@@ -120,6 +120,70 @@ impl Rendezvous {
     }
 }
 
+/// One-shot pause a test arms at a storage read. The reader reports its
+/// arrival and waits for release; every wait is capped, and the guard returned
+/// by [`Gate::releaser`] releases on drop, so a failed assertion cannot leave a
+/// reader parked.
+#[derive(Default)]
+pub(crate) struct Gate {
+    state: std::sync::Mutex<(bool, bool)>,
+    signal: std::sync::Condvar,
+}
+
+/// A gate and the read it waits at.
+pub(crate) type ArmedGate = (GatePoint, Arc<Gate>);
+
+/// Which storage read a [`Gate`] pauses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GatePoint {
+    View(TopicId),
+    Meta(OpId),
+}
+
+impl Gate {
+    /// Called by the reader: report arrival and wait for release.
+    pub(crate) fn pass(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.signal.notify_all();
+        let _ =
+            self.signal
+                .wait_timeout_while(state, std::time::Duration::from_secs(60), |state| !state.1);
+    }
+
+    /// Called by a party that finished without reaching the gate, so a waiter
+    /// for arrival wakes up.
+    pub(crate) fn skip(&self) {
+        self.state.lock().unwrap().0 = true;
+        self.signal.notify_all();
+    }
+
+    /// Wait until a reader arrived or [`Gate::skip`] ran.
+    pub(crate) fn wait_arrival(&self) {
+        let state = self.state.lock().unwrap();
+        let _ =
+            self.signal
+                .wait_timeout_while(state, std::time::Duration::from_secs(60), |state| !state.0);
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.signal.notify_all();
+    }
+
+    pub(crate) fn releaser(self: &Arc<Self>) -> GateRelease {
+        GateRelease(Arc::clone(self))
+    }
+}
+
+pub(crate) struct GateRelease(Arc<Gate>);
+
+impl Drop for GateRelease {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 /// Storage wrapper that simulates the stale reads of a concurrent admission:
 /// `get_op`/`actor_index` report "unknown" exactly once for ops in the
 /// one-shot sets, so a duplicate slips past the batch dedup check and reaches
@@ -139,6 +203,7 @@ pub(crate) struct StaleReadStorage {
     pub(crate) failed_status: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
     pub(crate) obligation_gate: Arc<std::sync::Mutex<Option<Arc<Rendezvous>>>>,
     pub(crate) failed_heads: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
+    pub(crate) read_gate: Arc<std::sync::Mutex<Option<ArmedGate>>>,
 }
 
 impl StaleReadStorage {
@@ -153,6 +218,31 @@ impl StaleReadStorage {
             failed_status: Arc::default(),
             obligation_gate: Arc::default(),
             failed_heads: Arc::default(),
+            read_gate: Arc::default(),
+        }
+    }
+
+    /// Pause the next read at `point` on `gate`, once.
+    pub(crate) fn arm_read(&self, point: GatePoint, gate: Arc<Gate>) {
+        *self.read_gate.lock().unwrap() = Some((point, gate));
+    }
+
+    /// Drop a gate no reader took, so the test's own reads pass freely.
+    pub(crate) fn disarm_read(&self) {
+        self.read_gate.lock().unwrap().take();
+    }
+
+    /// Wait at the armed gate if `point` is the armed read, disarming it.
+    fn gate_read(&self, point: GatePoint) {
+        let gate = {
+            let mut armed = self.read_gate.lock().unwrap();
+            match armed.as_ref() {
+                Some((armed_point, _)) if *armed_point == point => armed.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, gate)) = gate {
+            gate.pass();
         }
     }
 
@@ -197,7 +287,9 @@ impl Storage for StaleReadStorage {
         self.inner.get_op(id)
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<crate::storage::OpMeta>, Error> {
-        self.inner.get_meta(id)
+        let meta = self.inner.get_meta(id);
+        self.gate_read(GatePoint::Meta(*id));
+        meta
     }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>, Error> {
         self.inner.list_ops(topic_id)
@@ -255,7 +347,9 @@ impl Storage for StaleReadStorage {
         topic_id: &TopicId,
         peer_id: Option<&PeerId>,
     ) -> Result<Option<crate::storage::TopicView>, Error> {
-        self.inner.topic_view(topic_id, peer_id)
+        let view = self.inner.topic_view(topic_id, peer_id);
+        self.gate_read(GatePoint::View(*topic_id));
+        view
     }
     fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool, Error> {
         self.inner.peer_reached_op(peer_id, op_id)
