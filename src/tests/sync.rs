@@ -1963,3 +1963,85 @@ fn faulting_topic_spares_others() {
         "the healthy topic stays readable"
     );
 }
+
+/// Forwarded receives of N and then 2N ops keep one clock record per peer owed
+/// the work, and their status bookkeeping decodes no obligation record.
+fn assert_forwards_coalesce<S: Storage>(storage: S, counters: impl Fn() -> crate::CounterSnapshot) {
+    let bob_signer = Ed25519Signer::from_bytes(&[172; 32]);
+    let carol = Ed25519Signer::from_bytes(&[173; 32]).peer_id();
+    let alice = node(171);
+    let bob = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: bob_signer.clone(),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob_signer.peer_id(), carol].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let topic_id = topic.id();
+    let alice_actor = actor_id_for(topic_id, alice.peer_id());
+    let rounds = 8;
+
+    let mut sent = BTreeSet::new();
+    for round in 1..=2 {
+        for index in 0..rounds {
+            topic
+                .publish(Note {
+                    text: format!("{round}-{index}"),
+                })
+                .unwrap();
+        }
+        let ops = oplog::topological(alice.storage(), &topic_id)
+            .unwrap()
+            .into_iter()
+            .filter(|op| sent.insert(op.id))
+            .collect::<Vec<_>>();
+        let before = counters().obligation_reads;
+        bob.receive_sync_data_from(alice.peer_id(), sync::SyncData { topic_id, ops })
+            .unwrap();
+        assert_eq!(counters().obligation_reads, before, "round {round}");
+
+        assert_eq!(
+            storage.topic_obligation_counts(&topic_id).unwrap(),
+            [(carol, 1)].into(),
+            "round {round}"
+        );
+        let records = storage.sync_obligations(&carol, &topic_id).unwrap();
+        assert!(matches!(
+            &records[..],
+            [crate::storage::SyncObligation {
+                target: crate::storage::ObligationTarget::Clock(clock),
+                ..
+            }] if clock.get(&alice_actor) == 1 + round * rounds
+        ));
+        let status = bob.sync_status(topic_id).unwrap();
+        assert!(
+            status
+                .iter()
+                .any(|status| status.peer_id == carol && status.pending_obligations == 1)
+        );
+    }
+}
+
+#[test]
+fn memory_forwards_coalesce() {
+    let storage = MemoryStorage::new();
+    let counters = storage.clone();
+    assert_forwards_coalesce(storage, move || counters.counters());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_forwards_coalesce() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+    let counters = storage.clone();
+    assert_forwards_coalesce(storage, move || counters.counters());
+}

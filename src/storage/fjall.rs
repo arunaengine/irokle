@@ -1391,6 +1391,7 @@ impl Storage for FjallStorage {
             }
             out.push(postcard::from_bytes(value.as_ref())?);
         }
+        self.counters.count_obligations(out.len());
         Ok(out)
     }
 
@@ -1434,7 +1435,25 @@ impl Storage for FjallStorage {
             let value = item.value()?;
             out.push(postcard::from_bytes(value.as_ref())?);
         }
+        self.counters.count_obligations(out.len());
         Ok(out)
+    }
+
+    fn sync_obligation_count(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize> {
+        let read_tx = self.db.read_tx();
+        let mut count = 0;
+        for target in [
+            ObligationTarget::Clock(ActorClock::new()),
+            ObligationTarget::Repair(BTreeSet::new()),
+        ] {
+            let key = Self::obligation_key(&SyncObligation {
+                peer_id: *peer_id,
+                topic_id: *topic_id,
+                target,
+            });
+            count += usize::from(fjall::Readable::contains_key(&read_tx, &self.records, key)?);
+        }
+        Ok(count)
     }
 
     fn has_sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<bool> {

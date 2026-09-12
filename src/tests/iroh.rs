@@ -1549,3 +1549,67 @@ async fn fallback_gets_work() {
     alice.shutdown_iroh().await;
     alternate.shutdown_iroh().await;
 }
+/// Offline async publishes of N and then 2N events keep one clock record per
+/// peer, not one per publish.
+#[cfg(feature = "iroh")]
+async fn assert_publishes_coalesce<S: Storage>(storage: S) {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let peers = [182, 183].map(|seed| Ed25519Signer::from_bytes(&[seed; 32]).peer_id());
+    let alice = Irokle::builder()
+        .with_storage(storage.clone())
+        .with_net(endpoint)
+        .with_write_concern(WriteConcern::AsyncReplication)
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: peers.into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let actor = actor_id_for(topic.id(), alice.peer_id());
+    let rounds = 8;
+
+    for round in 1..=2 {
+        for index in 0..rounds {
+            topic
+                .publish(Note {
+                    text: format!("{round}-{index}"),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            storage.topic_obligation_counts(&topic.id()).unwrap(),
+            peers.map(|peer| (peer, 1)).into(),
+            "round {round}"
+        );
+        for peer in peers {
+            let records = storage.sync_obligations(&peer, &topic.id()).unwrap();
+            assert!(matches!(
+                &records[..],
+                [crate::storage::SyncObligation {
+                    target: crate::storage::ObligationTarget::Clock(clock),
+                    ..
+                }] if clock.get(&actor) == 1 + round * rounds
+            ));
+        }
+    }
+    alice.shutdown_iroh().await;
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_publishes_coalesce() {
+    assert_publishes_coalesce(MemoryStorage::new()).await;
+}
+
+#[cfg(all(feature = "iroh", feature = "fjall"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fjall_publishes_coalesce() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_publishes_coalesce(crate::storage::FjallStorage::open(dir.path()).unwrap()).await;
+}

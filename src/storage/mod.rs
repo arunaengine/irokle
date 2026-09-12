@@ -95,14 +95,15 @@ pub struct PeerAck {
 }
 
 /// Diagnostic counts of work a backend performed: op records and metadata
-/// read through [`Storage`], buffered payloads decoded and write transactions
-/// attempted.
+/// read through [`Storage`], buffered payloads and obligation records decoded
+/// and write transactions attempted.
 #[derive(Debug, Default)]
 pub struct StorageCounters {
     op_reads: std::sync::atomic::AtomicU64,
     meta_reads: std::sync::atomic::AtomicU64,
     index_reads: std::sync::atomic::AtomicU64,
     pending_payload_reads: std::sync::atomic::AtomicU64,
+    obligation_reads: std::sync::atomic::AtomicU64,
     transaction_attempts: std::sync::atomic::AtomicU64,
 }
 
@@ -113,6 +114,7 @@ pub struct CounterSnapshot {
     pub meta_reads: u64,
     pub index_reads: u64,
     pub pending_payload_reads: u64,
+    pub obligation_reads: u64,
     pub transaction_attempts: u64,
 }
 
@@ -138,6 +140,11 @@ impl StorageCounters {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub(crate) fn count_obligations(&self, count: usize) {
+        self.obligation_reads
+            .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn count_payloads(&self, count: usize) {
         self.pending_payload_reads
             .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
@@ -152,6 +159,7 @@ impl StorageCounters {
             meta_reads: read(&self.meta_reads),
             index_reads: read(&self.index_reads),
             pending_payload_reads: read(&self.pending_payload_reads),
+            obligation_reads: read(&self.obligation_reads),
             transaction_attempts: read(&self.transaction_attempts),
         }
     }
@@ -416,6 +424,11 @@ pub trait Storage: Clone + Send + Sync + 'static {
     }
     fn sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId)
     -> Result<Vec<SyncObligation>>;
+    /// How many obligation records `peer_id` holds for `topic_id`, one per
+    /// target kind. Backends answer from keys without decoding the records.
+    fn sync_obligation_count(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize> {
+        Ok(self.sync_obligations(peer_id, topic_id)?.len())
+    }
     fn has_sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<bool> {
         Ok(!self.sync_obligations(peer_id, topic_id)?.is_empty())
     }

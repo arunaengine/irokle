@@ -989,7 +989,7 @@ impl<S: Storage> Irokle<S> {
     }
 
     fn record_replication_scheduled(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
-        let pending = self.storage().sync_obligations(&peer_id, &topic_id)?.len();
+        let pending = self.storage().sync_obligation_count(&peer_id, &topic_id)?;
         let state = if pending > 0 {
             SyncStateUpdate::BehindUnlessFailed
         } else {
@@ -1085,7 +1085,7 @@ impl<S: Storage> Irokle<S> {
         result: std::result::Result<(), &std::io::Error>,
     ) -> Result<()> {
         let attempt_ms = now_millis()?;
-        let pending = self.storage().sync_obligations(&peer_id, &topic_id)?.len();
+        let pending = self.storage().sync_obligation_count(&peer_id, &topic_id)?;
         let mut update = SyncStatusUpdate {
             pending_obligations: Some(pending),
             last_attempt_ms: Some(attempt_ms),

@@ -49,7 +49,8 @@ struct MemoryInner {
     topic_usage: BTreeMap<TopicId, PendingUsage>,
     rejected: BTreeMap<TopicId, RejectedIds>,
     peer_acks: HashMap<(PeerId, TopicId), PeerAck>,
-    obligations: BTreeMap<(PeerId, TopicId), BTreeMap<ObligationKind, SyncObligation>>,
+    /// Keyed topic first, so one topic's records are a range.
+    obligations: BTreeMap<(TopicId, PeerId), BTreeMap<ObligationKind, SyncObligation>>,
     sync_statuses: BTreeMap<(TopicId, PeerId), SyncPeerStatus>,
     evictions: BTreeMap<EvictionKey, TopicEviction>,
     sealed_topics: BTreeSet<TopicId>,
@@ -326,7 +327,7 @@ impl Storage for MemoryStorage {
                 inner.peer_acks.get(&(*peer_id, *topic_id)).cloned(),
                 inner
                     .obligations
-                    .get(&(*peer_id, *topic_id))
+                    .get(&(*topic_id, *peer_id))
                     .is_some_and(|records| !records.is_empty()),
             ),
             None => (None, false),
@@ -575,12 +576,14 @@ impl Storage for MemoryStorage {
     }
 
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>> {
-        Ok(self
+        let out: Vec<_> = self
             .lock()?
             .obligations
             .values()
             .flat_map(|records| records.values().cloned())
-            .collect())
+            .collect();
+        self.counters.count_obligations(out.len());
+        Ok(out)
     }
 
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {
@@ -601,20 +604,30 @@ impl Storage for MemoryStorage {
         peer_id: &PeerId,
         topic_id: &TopicId,
     ) -> Result<Vec<SyncObligation>> {
+        let out: Vec<_> = self
+            .lock()?
+            .obligations
+            .get(&(*topic_id, *peer_id))
+            .into_iter()
+            .flat_map(|records| records.values().cloned())
+            .collect();
+        self.counters.count_obligations(out.len());
+        Ok(out)
+    }
+
+    fn sync_obligation_count(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize> {
         Ok(self
             .lock()?
             .obligations
-            .get(&(*peer_id, *topic_id))
-            .into_iter()
-            .flat_map(|records| records.values().cloned())
-            .collect())
+            .get(&(*topic_id, *peer_id))
+            .map_or(0, BTreeMap::len))
     }
 
     fn has_sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<bool> {
         Ok(self
             .lock()?
             .obligations
-            .get(&(*peer_id, *topic_id))
+            .get(&(*topic_id, *peer_id))
             .is_some_and(|records| !records.is_empty()))
     }
 
@@ -648,8 +661,13 @@ impl Storage for MemoryStorage {
     fn topic_obligation_counts(&self, topic_id: &TopicId) -> Result<BTreeMap<PeerId, usize>> {
         let inner = self.lock()?;
         let mut counts = BTreeMap::new();
-        for ((peer_id, obligation_topic), records) in &inner.obligations {
-            if obligation_topic == topic_id && !records.is_empty() {
+        let first = (*topic_id, PeerId::from_bytes([0; 32]));
+        for ((_, peer_id), records) in inner
+            .obligations
+            .range(first..)
+            .take_while(|((topic, _), _)| topic == topic_id)
+        {
+            if !records.is_empty() {
                 counts.insert(*peer_id, records.len());
             }
         }
@@ -668,7 +686,7 @@ impl Storage for MemoryStorage {
         }
         let cleared = inner
             .obligations
-            .remove(&(*peer_id, *topic_id))
+            .remove(&(*topic_id, *peer_id))
             .map_or(0, |records| records.len());
         inner.sync_statuses.remove(&(*topic_id, *peer_id));
         inner.peer_acks.remove(&(*peer_id, *topic_id));
@@ -1032,7 +1050,7 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
         put_obligation_locked(inner, obligation);
     }
     for peer_id in removed_peers {
-        inner.obligations.remove(&(peer_id, topic_id));
+        inner.obligations.remove(&(topic_id, peer_id));
         inner.sync_statuses.remove(&(topic_id, peer_id));
         inner.peer_acks.remove(&(peer_id, topic_id));
     }
@@ -1071,7 +1089,7 @@ fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> Result<usi
     inner.actor_by_seq.retain(|(t, _, _), _| t != topic_id);
     inner.actor_tip.retain(|(t, _), _| t != topic_id);
     inner.peer_acks.retain(|(_, t), _| t != topic_id);
-    inner.obligations.retain(|(_, t), _| t != topic_id);
+    inner.obligations.retain(|(t, _), _| t != topic_id);
     inner.sync_statuses.retain(|(t, _), _| t != topic_id);
     inner.rejected.remove(topic_id);
     for op_id in inner
@@ -1129,7 +1147,7 @@ fn merged_obligation_locked(
 ) -> Result<SyncObligation> {
     let existing = inner
         .obligations
-        .get(&(obligation.peer_id, obligation.topic_id))
+        .get(&(obligation.topic_id, obligation.peer_id))
         .and_then(|records| records.get(&ObligationKind::of(obligation)))
         .cloned();
     merged_obligation(existing, obligation)
@@ -1142,13 +1160,13 @@ fn put_obligation_locked(inner: &mut MemoryInner, obligation: SyncObligation) {
     }
     inner
         .obligations
-        .entry((obligation.peer_id, obligation.topic_id))
+        .entry((obligation.topic_id, obligation.peer_id))
         .or_default()
         .insert(ObligationKind::of(&obligation), obligation);
 }
 
 fn clear_satisfied_locked(inner: &mut MemoryInner, ack: &PeerAck) -> Result<usize> {
-    let key = (ack.peer_id, ack.topic_id);
+    let key = (ack.topic_id, ack.peer_id);
     let Some(records) = inner.obligations.get(&key) else {
         return Ok(0);
     };
