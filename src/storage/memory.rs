@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{
@@ -9,14 +9,14 @@ use crate::{
 };
 
 use super::{
-    AckCommit, AdmittedBatch, MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL,
-    MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
-    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, ObligationTarget, OpMeta, PeerAck, Storage,
-    SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit,
-    ack_covers, ack_reached_op, apply_status_update, branch_matches, ensure_deps_resolvable,
-    journalled_eviction, merged_obligation, merged_peer_ack, new_peer_status, peer_departed,
-    pending_op_bytes, settled_obligation, stored_ack_dominates, topic_fingerprint_for,
-    validate_batch, validate_heads,
+    AckCommit, AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS,
+    MAX_PENDING_WAITERS_PER_DEP, MAX_REJECTED_PER_TOPIC, ObligationTarget, OpMeta, PeerAck,
+    PendingRecord, PendingUsage, Storage, SyncObligation, SyncPeerStatus, SyncStatusUpdate,
+    TopicState, TopicView, ack_commit, ack_covers, ack_reached_op, apply_status_update,
+    branch_matches, check_pending_quota, ensure_deps_resolvable, journalled_eviction,
+    merged_obligation, merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes,
+    settled_obligation, stored_ack_dominates, topic_fingerprint_for, validate_batch,
+    validate_heads,
 };
 
 #[derive(Clone, Default)]
@@ -37,9 +37,15 @@ struct MemoryInner {
     topic_fingerprint: BTreeMap<TopicId, [u8; 32]>,
     max_generation: BTreeMap<TopicId, u64>,
     topics: BTreeMap<TopicId, TopicState>,
-    pending_ops: BTreeMap<OpId, (PeerId, Op, OpMeta)>,
-    pending_by_source: BTreeMap<PeerId, BTreeSet<OpId>>,
+    pending_ops: BTreeMap<OpId, Op>,
+    pending_records: BTreeMap<OpId, PendingRecord>,
+    pending_by_topic: BTreeMap<TopicId, BTreeSet<OpId>>,
     pending_waiters: BTreeMap<OpId, BTreeSet<OpId>>,
+    pending_ready: BTreeSet<OpId>,
+    pending_usage: PendingUsage,
+    source_usage: BTreeMap<PeerId, PendingUsage>,
+    topic_usage: BTreeMap<TopicId, PendingUsage>,
+    rejected: BTreeMap<TopicId, RejectedIds>,
     peer_acks: HashMap<(PeerId, TopicId), PeerAck>,
     obligations: BTreeMap<(PeerId, TopicId), BTreeMap<ObligationKind, SyncObligation>>,
     sync_statuses: BTreeMap<(TopicId, PeerId), SyncPeerStatus>,
@@ -47,8 +53,13 @@ struct MemoryInner {
     sealed_topics: BTreeSet<TopicId>,
     /// Destructive data epochs; a reset keeps and advances them.
     topic_epochs: BTreeMap<TopicId, u64>,
-    pending_bytes: usize,
-    pending_source_bytes: BTreeMap<PeerId, usize>,
+}
+
+/// Rejected ids of one topic, bounded by dropping the oldest.
+#[derive(Clone, Default)]
+struct RejectedIds {
+    order: VecDeque<OpId>,
+    ids: BTreeSet<OpId>,
 }
 
 impl MemoryStorage {
@@ -306,27 +317,22 @@ impl Storage for MemoryStorage {
         Ok(peers)
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
+        let charge = pending_op_bytes(&op)? as u64;
+        let topic_id = op.signed.body.topic_id;
+        if meta.topic_id != topic_id || meta.id != op.id {
+            return Err(Error::TopicMismatch);
+        }
+        if meta.missing_deps.len() > MAX_PENDING_MISSING_DEPS {
+            return Err(Error::Storage(
+                "pending op has too many missing deps".into(),
+            ));
+        }
         let mut inner = self.lock()?;
         // Only a completely stored op is already admitted; a half stored one
         // still has to buffer so its repair runs once its deps resolve.
         if dep_resolvable_locked(&inner, &op.id) {
             return Ok(());
         }
-        let replaced = if let Some((source, existing, pending_meta)) = inner.pending_ops.get(&op.id)
-        {
-            if existing != &op {
-                return Err(Error::Storage(
-                    "pending op id collision with different op".into(),
-                ));
-            }
-            Some((
-                *source,
-                pending_meta.missing_deps.clone(),
-                pending_op_bytes(existing)?,
-            ))
-        } else {
-            None
-        };
         if meta
             .missing_deps
             .iter()
@@ -334,75 +340,88 @@ impl Storage for MemoryStorage {
         {
             return Err(Error::AdmissionConflict);
         }
-        if meta.missing_deps.len() > MAX_PENDING_MISSING_DEPS {
-            return Err(Error::Storage(
-                "pending op has too many missing deps".into(),
-            ));
+        if let Some(rejected) = inner.rejected.get(&topic_id).and_then(|rejected| {
+            std::iter::once(&op.id)
+                .chain(&meta.missing_deps)
+                .find(|id| rejected.ids.contains(id))
+        }) {
+            return Err(Error::RejectedOp(*rejected));
         }
-        if replaced.is_none() && inner.pending_ops.len() >= MAX_PENDING_OPS_TOTAL {
-            return Err(Error::Storage("pending op buffer is full".into()));
-        }
-        // A replaced record refunds its own charge first, so the budget check
-        // sees the space this insertion actually needs.
-        let charge = pending_op_bytes(&op)?;
-        let replaced_bytes = replaced.as_ref().map_or(0, |(_, _, bytes)| *bytes);
-        if inner
-            .pending_bytes
-            .saturating_sub(replaced_bytes)
-            .saturating_add(charge)
-            > MAX_PENDING_BYTES_TOTAL
-        {
-            return Err(Error::Storage("pending byte budget is full".into()));
-        }
-        let source_pending = inner
-            .pending_by_source
-            .get(&source_peer)
-            .map_or(0, BTreeSet::len);
-        let replaces_source = replaced
-            .as_ref()
-            .is_some_and(|(source, _, _)| *source == source_peer);
-        if !replaces_source && source_pending >= MAX_PENDING_OPS_PER_SOURCE {
-            return Err(Error::Storage("pending op source quota exceeded".into()));
-        }
-        let source_bytes = inner
-            .pending_source_bytes
-            .get(&source_peer)
-            .copied()
-            .unwrap_or(0);
-        if source_bytes
-            .saturating_sub(if replaces_source { replaced_bytes } else { 0 })
-            .saturating_add(charge)
-            > MAX_PENDING_BYTES_PER_SOURCE
-        {
-            return Err(Error::Storage(
-                "pending byte quota exceeded for source".into(),
-            ));
-        }
+        let previous = match inner.pending_records.get(&op.id) {
+            Some(_) if inner.pending_ops.get(&op.id) != Some(&op) => {
+                return Err(Error::Storage(
+                    "pending op id collision with different op".into(),
+                ));
+            }
+            Some(record) if record.missing == meta.missing_deps => return Ok(()),
+            Some(record) => Some(record.missing.clone()),
+            None => None,
+        };
         for dep in &meta.missing_deps {
-            let replaces_waiter = replaced
+            let already = previous
                 .as_ref()
-                .is_some_and(|(_, missing, _)| missing.contains(dep));
-            if !replaces_waiter
+                .is_some_and(|missing| missing.contains(dep));
+            if !already
                 && inner.pending_waiters.get(dep).map_or(0, BTreeSet::len)
                     >= MAX_PENDING_WAITERS_PER_DEP
             {
                 return Err(Error::Storage("pending waiter quota exceeded".into()));
             }
         }
-        if replaced.is_some() {
-            remove_pending_locked(&mut inner, &op.id);
+        if previous.is_none() {
+            check_pending_quota(
+                inner.pending_usage,
+                inner
+                    .source_usage
+                    .get(&source_peer)
+                    .copied()
+                    .unwrap_or_default(),
+                inner
+                    .topic_usage
+                    .get(&topic_id)
+                    .copied()
+                    .unwrap_or_default(),
+                charge,
+            )?;
+        }
+
+        // A known op keeps its stored source and charge; only its waits move.
+        let previous = previous.unwrap_or_default();
+        for dep in previous.difference(&meta.missing_deps) {
+            unwait_locked(&mut inner, dep, &op.id);
         }
         for dep in &meta.missing_deps {
             inner.pending_waiters.entry(*dep).or_default().insert(op.id);
         }
+        if meta.missing_deps.is_empty() {
+            inner.pending_ready.insert(op.id);
+        } else {
+            inner.pending_ready.remove(&op.id);
+        }
+        if let Some(record) = inner.pending_records.get_mut(&op.id) {
+            record.missing = meta.missing_deps;
+            return Ok(());
+        }
+        inner.pending_usage = inner.pending_usage.charged(charge);
+        let source = inner.source_usage.entry(source_peer).or_default();
+        *source = source.charged(charge);
+        let topic = inner.topic_usage.entry(topic_id).or_default();
+        *topic = topic.charged(charge);
         inner
-            .pending_by_source
-            .entry(source_peer)
+            .pending_by_topic
+            .entry(topic_id)
             .or_default()
             .insert(op.id);
-        inner.pending_bytes = inner.pending_bytes.saturating_add(charge);
-        *inner.pending_source_bytes.entry(source_peer).or_default() += charge;
-        inner.pending_ops.insert(op.id, (source_peer, op, meta));
+        inner.pending_records.insert(
+            op.id,
+            PendingRecord {
+                source: source_peer,
+                topic_id,
+                missing: meta.missing_deps,
+                charge,
+            },
+        );
+        inner.pending_ops.insert(op.id, op);
         Ok(())
     }
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>> {
@@ -412,25 +431,20 @@ impl Storage for MemoryStorage {
             .get(dep_id)
             .into_iter()
             .flatten()
-            .filter_map(|op_id| {
-                inner
-                    .pending_ops
-                    .get(op_id)
-                    .map(|(source, op, _)| (*source, op.clone()))
-            })
+            .filter_map(|op_id| pending_entry_locked(&inner, op_id))
             .collect())
     }
-    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>> {
+    fn ready_pending_after(&self, after: Option<&OpId>, limit: usize) -> Result<Vec<(PeerId, Op)>> {
         let inner = self.lock()?;
+        let start = match after {
+            Some(after) => std::ops::Bound::Excluded(*after),
+            None => std::ops::Bound::Unbounded,
+        };
         Ok(inner
-            .pending_ops
-            .values()
-            .filter(|(_, _, meta)| {
-                meta.missing_deps
-                    .iter()
-                    .all(|dep| dep_resolvable_locked(&inner, dep))
-            })
-            .map(|(source, op, _)| (*source, op.clone()))
+            .pending_ready
+            .range((start, std::ops::Bound::Unbounded))
+            .take(limit)
+            .filter_map(|op_id| pending_entry_locked(&inner, op_id))
             .collect())
     }
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
@@ -439,22 +453,44 @@ impl Storage for MemoryStorage {
     }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         let mut inner = self.lock()?;
-        remove_pending_locked(&mut inner, op_id);
-        Ok(())
+        remove_pending_locked(&mut inner, op_id)
     }
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
         let mut inner = self.lock()?;
-        Ok(purge_waiters_locked(&mut inner, dep_id))
+        let closure = waiter_closure_locked(&inner, dep_id);
+        for op_id in &closure {
+            remove_pending_locked(&mut inner, op_id)?;
+        }
+        Ok(closure.len())
     }
     fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize> {
         let mut inner = self.lock()?;
-        // One guard covers the root and its closure, so no reader sees the root
-        // gone while its waiters still hold quota against it.
-        if !inner.pending_ops.contains_key(op_id) {
+        // One guard covers the markers, the root and its closure, so no reader
+        // sees the root gone while a waiter still holds quota against it.
+        let Some(topic_id) = inner
+            .pending_records
+            .get(op_id)
+            .map(|record| record.topic_id)
+        else {
             return Ok(0);
+        };
+        let mut subtree = waiter_closure_locked(&inner, op_id);
+        subtree.insert(*op_id);
+        for id in &subtree {
+            remove_pending_locked(&mut inner, id)?;
         }
-        remove_pending_locked(&mut inner, op_id);
-        Ok(1 + purge_waiters_locked(&mut inner, op_id))
+        let rejected = inner.rejected.entry(topic_id).or_default();
+        for id in &subtree {
+            if rejected.ids.insert(*id) {
+                rejected.order.push_back(*id);
+            }
+        }
+        while rejected.order.len() > MAX_REJECTED_PER_TOPIC {
+            if let Some(oldest) = rejected.order.pop_front() {
+                rejected.ids.remove(&oldest);
+            }
+        }
+        Ok(subtree.len())
     }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
         Ok(self.lock()?.peer_acks.get(&(*peer_id, *topic_id)).cloned())
@@ -593,7 +629,7 @@ impl Storage for MemoryStorage {
 
     fn reset_topic(&self, topic_id: &TopicId) -> Result<usize> {
         let mut inner = self.lock()?;
-        Ok(reset_topic_locked(&mut inner, topic_id))
+        reset_topic_locked(&mut inner, topic_id)
     }
 
     fn reset_topic_and_admit(
@@ -614,7 +650,7 @@ impl Storage for MemoryStorage {
         // a rejected winner must leave the local chain exactly as it was, never
         // an empty topic with nothing installed in its place.
         let mut staged = inner.clone();
-        let removed = reset_topic_locked(&mut staged, topic_id);
+        let removed = reset_topic_locked(&mut staged, topic_id)?;
         admit_batch_locked(&mut staged, batch)?;
         // The journal entry is part of the same swap: after it the discarded
         // payloads exist nowhere else, so no ordering here can lose them.
@@ -818,7 +854,8 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
             .entry(meta.topic_id)
             .and_modify(|generation| *generation = (*generation).max(meta.generation))
             .or_insert(meta.generation);
-        remove_pending_locked(inner, &op.id);
+        remove_pending_locked(inner, &op.id)?;
+        settle_waiters_locked(inner, &op.id);
         inner.meta.insert(op.id, meta);
         inner.ops.insert(op.id, op);
     }
@@ -846,7 +883,7 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
     Ok(())
 }
 
-fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> usize {
+fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> Result<usize> {
     *inner.topic_epochs.entry(*topic_id).or_default() += 1;
     let op_ids = inner.topic_ops.remove(topic_id).unwrap_or_default();
     let removed = op_ids.len();
@@ -880,16 +917,16 @@ fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> usize {
     inner.peer_acks.retain(|(_, t), _| t != topic_id);
     inner.obligations.retain(|(_, t), _| t != topic_id);
     inner.sync_statuses.retain(|(t, _), _| t != topic_id);
-    let pending: Vec<OpId> = inner
-        .pending_ops
-        .iter()
-        .filter(|(_, (_, _, meta))| meta.topic_id == *topic_id)
-        .map(|(id, _)| *id)
-        .collect();
-    for op_id in pending {
-        remove_pending_locked(inner, &op_id);
+    inner.rejected.remove(topic_id);
+    for op_id in inner
+        .pending_by_topic
+        .get(topic_id)
+        .cloned()
+        .unwrap_or_default()
+    {
+        remove_pending_locked(inner, &op_id)?;
     }
-    removed
+    Ok(removed)
 }
 
 fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> Result<usize> {
@@ -992,11 +1029,12 @@ fn stored_op_branch<'a>(inner: &'a MemoryInner, op_id: &OpId) -> Option<(&'a OpM
 
 fn pending_missing_locked(inner: &MemoryInner, topic_id: &TopicId) -> BTreeSet<OpId> {
     inner
-        .pending_ops
-        .values()
-        .filter(|(_, _, meta)| meta.topic_id == *topic_id)
-        .flat_map(|(_, _, meta)| meta.missing_deps.iter().copied())
-        .filter(|dep| !dep_resolvable_locked(inner, dep))
+        .pending_by_topic
+        .get(topic_id)
+        .into_iter()
+        .flatten()
+        .filter_map(|op_id| inner.pending_records.get(op_id))
+        .flat_map(|record| record.missing.iter().copied())
         .collect()
 }
 
@@ -1006,55 +1044,87 @@ fn dep_resolvable_locked(inner: &MemoryInner, dep: &OpId) -> bool {
     inner.ops.contains_key(dep) && inner.meta.contains_key(dep)
 }
 
-fn purge_waiters_locked(inner: &mut MemoryInner, dep_id: &OpId) -> usize {
+fn pending_entry_locked(inner: &MemoryInner, op_id: &OpId) -> Option<(PeerId, Op)> {
+    let record = inner.pending_records.get(op_id)?;
+    Some((record.source, inner.pending_ops.get(op_id)?.clone()))
+}
+
+/// Every buffered op that transitively waits on `dep_id`, excluding it.
+fn waiter_closure_locked(inner: &MemoryInner, dep_id: &OpId) -> BTreeSet<OpId> {
     let mut frontier = vec![*dep_id];
     let mut seen = BTreeSet::new();
     while let Some(dep) = frontier.pop() {
-        let waiters = inner.pending_waiters.get(&dep).cloned().unwrap_or_default();
-        for op_id in waiters {
-            if seen.insert(op_id) {
-                remove_pending_locked(inner, &op_id);
-                frontier.push(op_id);
+        for op_id in inner.pending_waiters.get(&dep).into_iter().flatten() {
+            if seen.insert(*op_id) {
+                frontier.push(*op_id);
             }
         }
     }
-    seen.len()
+    seen.remove(dep_id);
+    seen
 }
 
-fn remove_pending_locked(inner: &mut MemoryInner, op_id: &OpId) {
-    let Some((source, op, meta)) = inner.pending_ops.remove(op_id) else {
-        return;
-    };
-    // The charge is recomputed from the same op, so it matches what insertion
-    // added. A record that could not be serialized was never charged.
-    let bytes = pending_op_bytes(&op).unwrap_or(0);
-    inner.pending_bytes = inner.pending_bytes.saturating_sub(bytes);
-    if let std::collections::btree_map::Entry::Occupied(mut entry) =
-        inner.pending_source_bytes.entry(source)
-    {
-        let left = entry.get().saturating_sub(bytes);
-        if left == 0 {
-            entry.remove();
-        } else {
-            *entry.get_mut() = left;
+/// Stop `op_id` waiting on `dep`.
+fn unwait_locked(inner: &mut MemoryInner, dep: &OpId, op_id: &OpId) {
+    if let Some(waiters) = inner.pending_waiters.get_mut(dep) {
+        waiters.remove(op_id);
+        if waiters.is_empty() {
+            inner.pending_waiters.remove(dep);
         }
     }
-    for dep in meta.missing_deps {
-        if let Some(waiters) = inner.pending_waiters.get_mut(&dep) {
-            waiters.remove(op_id);
-            if waiters.is_empty() {
-                inner.pending_waiters.remove(&dep);
+}
+
+/// `admitted` resolved: its waiters stop waiting on it, and a waiter with
+/// nothing left to wait for joins the ready index.
+fn settle_waiters_locked(inner: &mut MemoryInner, admitted: &OpId) {
+    for waiter in inner.pending_waiters.remove(admitted).unwrap_or_default() {
+        if let Some(record) = inner.pending_records.get_mut(&waiter) {
+            record.missing.remove(admitted);
+            if record.missing.is_empty() {
+                inner.pending_ready.insert(waiter);
             }
         }
     }
+}
+
+fn remove_pending_locked(inner: &mut MemoryInner, op_id: &OpId) -> Result<()> {
+    let Some(record) = inner.pending_records.get(op_id) else {
+        return Ok(());
+    };
+    // Refunds are checked before anything changes, so a broken counter leaves
+    // the records as they were instead of half removed.
+    let usage = |usage: Option<&PendingUsage>| usage.copied().unwrap_or_default();
+    let total = inner.pending_usage.refunded(record.charge)?;
+    let source = usage(inner.source_usage.get(&record.source)).refunded(record.charge)?;
+    let topic = usage(inner.topic_usage.get(&record.topic_id)).refunded(record.charge)?;
+    let Some(record) = inner.pending_records.remove(op_id) else {
+        return Ok(());
+    };
+    inner.pending_usage = total;
+    if source == PendingUsage::default() {
+        inner.source_usage.remove(&record.source);
+    } else {
+        inner.source_usage.insert(record.source, source);
+    }
+    if topic == PendingUsage::default() {
+        inner.topic_usage.remove(&record.topic_id);
+    } else {
+        inner.topic_usage.insert(record.topic_id, topic);
+    }
+    for dep in &record.missing {
+        unwait_locked(inner, dep, op_id);
+    }
     if let std::collections::btree_map::Entry::Occupied(mut entry) =
-        inner.pending_by_source.entry(source)
+        inner.pending_by_topic.entry(record.topic_id)
     {
         entry.get_mut().remove(op_id);
         if entry.get().is_empty() {
             entry.remove();
         }
     }
+    inner.pending_ready.remove(op_id);
+    inner.pending_ops.remove(op_id);
+    Ok(())
 }
 
 fn memory_topic_state_locked(inner: &MemoryInner, topic_id: &TopicId) -> Option<TopicState> {

@@ -369,8 +369,12 @@ impl Storage for StaleReadStorage {
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>, Error> {
         self.inner.pending_waiters(dep_id)
     }
-    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>, Error> {
-        self.inner.ready_pending_ops()
+    fn ready_pending_after(
+        &self,
+        after: Option<&OpId>,
+        limit: usize,
+    ) -> Result<Vec<(PeerId, Op)>, Error> {
+        self.inner.ready_pending_after(after, limit)
     }
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
         self.inner.pending_missing_deps(topic_id)

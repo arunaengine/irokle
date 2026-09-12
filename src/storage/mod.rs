@@ -22,6 +22,12 @@ pub const MAX_PENDING_WAITERS_PER_DEP: usize = 1024;
 pub const MAX_PENDING_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 pub const MAX_PENDING_BYTES_PER_SOURCE: usize = 16 * 1024 * 1024;
 pub const MAX_PENDING_MISSING_DEPS: usize = 128;
+/// Pending ops and bytes one topic may hold, so one busy topic leaves room in
+/// the shared pool for the others.
+pub const MAX_PENDING_OPS_PER_TOPIC: usize = 2048;
+pub const MAX_PENDING_BYTES_PER_TOPIC: usize = 32 * 1024 * 1024;
+/// Rejected op ids a topic remembers, oldest dropped first.
+pub const MAX_REJECTED_PER_TOPIC: usize = 4096;
 /// Eviction records a store may hold unacknowledged. A healthy consumer
 /// acknowledges each record as soon as it owns the payloads durably, so this
 /// only bounds a store whose consumer stopped draining; the reset that would
@@ -250,20 +256,18 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// Required rather than defaulted: separate reads can mix two commits.
     fn topic_view(&self, topic_id: &TopicId, peer_id: Option<&PeerId>)
     -> Result<Option<TopicView>>;
+    /// Buffer `op` until `meta.missing_deps` resolve. A duplicate keeps its
+    /// stored source and charge. An op that is or waits on a rejected id of
+    /// its topic is refused with [`crate::Error::RejectedOp`].
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()>;
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>>;
-    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>>;
-    /// Up to `limit` buffered ops whose dependencies all resolved, in id order
-    /// after `after`.
-    fn ready_pending_after(&self, after: Option<&OpId>, limit: usize) -> Result<Vec<(PeerId, Op)>> {
-        let mut ready = self.ready_pending_ops()?;
-        ready.sort_by_key(|(_, op)| op.id);
-        Ok(ready
-            .into_iter()
-            .filter(|(_, op)| after.is_none_or(|after| op.id > *after))
-            .take(limit)
-            .collect())
+    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>> {
+        self.ready_pending_after(None, usize::MAX)
     }
+    /// Up to `limit` buffered ops whose dependencies all resolved, in id order
+    /// after `after`. Backends keep a ready index, so no payload of a waiting
+    /// op is read.
+    fn ready_pending_after(&self, after: Option<&OpId>, limit: usize) -> Result<Vec<(PeerId, Op)>>;
     /// Dependencies that buffered ops of `topic_id` are still waiting for.
     /// Sync planning turns these into wants, so a hole a peer never pushes is
     /// actively pulled instead of stranding its dependents forever.
@@ -487,11 +491,76 @@ pub(super) fn validate_heads(
     Ok(())
 }
 
-/// Serialized size charged against the pending byte budgets. Deterministic for
-/// a given operation, so the charge on insertion and the refund on removal
-/// always match.
+/// Serialized size charged against the pending byte budgets, counted without
+/// allocating the encoding. Backends store the charge and refund that value.
 pub(crate) fn pending_op_bytes(op: &Op) -> Result<usize> {
-    Ok(postcard::to_allocvec(op)?.len())
+    Ok(postcard::experimental::serialized_size(op)?)
+}
+
+/// Pending ops and serialized bytes one scope holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PendingUsage {
+    pub(super) ops: u64,
+    pub(super) bytes: u64,
+}
+
+impl PendingUsage {
+    pub(super) fn charged(self, bytes: u64) -> Self {
+        Self {
+            ops: self.ops + 1,
+            bytes: self.bytes + bytes,
+        }
+    }
+
+    /// Usage after refunding one op of `bytes`. Underflow means the counters
+    /// no longer describe the records, which is corruption, not a clean pool.
+    pub(super) fn refunded(self, bytes: u64) -> Result<Self> {
+        match (self.ops.checked_sub(1), self.bytes.checked_sub(bytes)) {
+            (Some(ops), Some(bytes)) => Ok(Self { ops, bytes }),
+            _ => Err(crate::Error::Storage(
+                "pending accounting does not match the buffered records".into(),
+            )),
+        }
+    }
+}
+
+/// A buffered op's description, stored apart from its payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PendingRecord {
+    pub(super) source: PeerId,
+    pub(super) topic_id: TopicId,
+    pub(super) missing: BTreeSet<OpId>,
+    pub(super) charge: u64,
+}
+
+/// Refuse a new pending op of `charge` bytes that would push the total, its
+/// source or its topic past their limits.
+pub(super) fn check_pending_quota(
+    total: PendingUsage,
+    source: PendingUsage,
+    topic: PendingUsage,
+    charge: u64,
+) -> Result<()> {
+    let refuse = |message: &str| Err(crate::Error::Storage(message.into()));
+    if total.ops >= MAX_PENDING_OPS_TOTAL as u64 {
+        return refuse("pending op buffer is full");
+    }
+    if total.bytes + charge > MAX_PENDING_BYTES_TOTAL as u64 {
+        return refuse("pending byte budget is full");
+    }
+    if source.ops >= MAX_PENDING_OPS_PER_SOURCE as u64 {
+        return refuse("pending op source quota exceeded");
+    }
+    if source.bytes + charge > MAX_PENDING_BYTES_PER_SOURCE as u64 {
+        return refuse("pending byte quota exceeded for source");
+    }
+    if topic.ops >= MAX_PENDING_OPS_PER_TOPIC as u64 {
+        return refuse("pending op topic quota exceeded");
+    }
+    if topic.bytes + charge > MAX_PENDING_BYTES_PER_TOPIC as u64 {
+        return refuse("pending byte quota exceeded for topic");
+    }
+    Ok(())
 }
 
 pub(crate) fn topic_fingerprint_for(

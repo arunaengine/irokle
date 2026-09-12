@@ -1467,10 +1467,13 @@ impl Storage for FjallStorage {
         }
         Ok(out)
     }
-    fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>> {
+    fn ready_pending_after(&self, after: Option<&OpId>, limit: usize) -> Result<Vec<(PeerId, Op)>> {
         let mut out = Vec::new();
         let read_tx = self.db.read_tx();
         for item in fjall::Readable::prefix(&read_tx, &self.records, b"po".as_slice()) {
+            if out.len() >= limit {
+                break;
+            }
             let value = item.value()?;
             let (source, op, meta): (PeerId, Op, OpMeta) = postcard::from_bytes(value.as_ref())?;
             let mut ready = true;
@@ -1483,7 +1486,7 @@ impl Storage for FjallStorage {
                     break;
                 }
             }
-            if ready {
+            if ready && after.is_none_or(|after| op.id > *after) {
                 out.push((source, op));
             }
         }

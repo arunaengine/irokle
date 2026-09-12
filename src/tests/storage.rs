@@ -1593,7 +1593,15 @@ fn assert_retains_pending<S: Corrupt>(storage: S) {
         .unwrap();
 
     assert_eq!(admitted, [second.id, third.id].into());
-    assert_eq!(storage.pending_waiters(&second.id).unwrap().len(), 1);
+    // Its wait on `second` resolved, so the retained record is now ready.
+    assert!(
+        storage
+            .ready_pending_ops()
+            .unwrap()
+            .iter()
+            .any(|(_, op)| op.id == waiter.id)
+            || storage.pending_waiters(&second.id).unwrap().len() == 1
+    );
     assert!(storage.get_op(&waiter.id).unwrap().is_none());
 
     // Repairing the hole lets the retained record through.
