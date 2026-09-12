@@ -39,7 +39,7 @@ static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
 /// Whether a failed attempt says the peer could not be reached, rather than
 /// that one exchange was refused. Protocol rejections are topic-local, so they
 /// must not demote a peer that answers other topics fine.
-#[cfg(any(feature = "iroh", test))]
+#[cfg(feature = "iroh")]
 fn is_unreachable(error: &std::io::Error) -> bool {
     !matches!(
         error.kind(),
@@ -1051,6 +1051,32 @@ impl<S: Storage> Irokle<S> {
         Ok(counts)
     }
 
+    /// Record one attempt's reachability, once per attempt however many topics
+    /// it served. Only reachability failures demote a peer: a refused exchange
+    /// says nothing about other topics. Returns whether selection changed.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn note_peer_outcome<'a>(
+        &self,
+        peer_id: PeerId,
+        results: impl IntoIterator<Item = std::result::Result<(), &'a std::io::Error>>,
+    ) -> bool {
+        let mut reached = false;
+        let mut unreachable = false;
+        for result in results {
+            match result {
+                Ok(()) => reached = true,
+                Err(error) => unreachable |= is_unreachable(error),
+            }
+        }
+        if reached {
+            self.peer_health.record_success(&peer_id)
+        } else if unreachable {
+            self.peer_health.record_failure(peer_id)
+        } else {
+            false
+        }
+    }
+
     #[cfg(any(feature = "iroh", test))]
     pub(crate) fn record_sync_result(
         &self,
@@ -1067,7 +1093,6 @@ impl<S: Storage> Irokle<S> {
         };
         match result {
             Ok(()) => {
-                self.peer_health.record_success(&peer_id);
                 update.successful_attempts = 1;
                 update.last_success_ms = Some(attempt_ms);
                 update.last_error = Some(None);
@@ -1078,11 +1103,6 @@ impl<S: Storage> Irokle<S> {
                 });
             }
             Err(error) => {
-                // Only reachability failures demote a peer: a refused exchange
-                // says nothing about whether the peer answers other topics.
-                if is_unreachable(error) {
-                    self.peer_health.record_failure(peer_id);
-                }
                 update.failed_attempts = 1;
                 update.last_error = Some(Some(error.to_string()));
                 update.state = SyncStateUpdate::Set(SyncPeerState::Failed);

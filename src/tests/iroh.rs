@@ -1465,3 +1465,87 @@ async fn shutdown_awaits_tasks() {
     let _ = request.await;
     bob_net.shutdown().await;
 }
+
+/// With sweeps off and no new publish, a failing preferred peer must hand its
+/// topic to an allowed alternate: the health change itself schedules the work.
+/// The preferred peer's own obligation stays outstanding for when it returns.
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_gets_work() {
+    let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+    let keys = [iroh::SecretKey::generate(), iroh::SecretKey::generate()];
+    let peers = keys
+        .each_ref()
+        .map(|key| crate::Ed25519Signer::from_iroh_secret_key(key).peer_id());
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .address_lookup(lookup.clone())
+        .bind()
+        .await
+        .unwrap();
+    let runtime = net::IrohRuntimeConfig {
+        connect_timeout: std::time::Duration::from_secs(2),
+        sync_io_timeout: std::time::Duration::from_secs(10),
+        resync_interval: std::time::Duration::from_millis(50),
+        resync_initial_backoff: std::time::Duration::from_millis(10),
+        resync_max_backoff: std::time::Duration::from_millis(50),
+        full_sweep_interval: std::time::Duration::ZERO,
+        ..net::IrohRuntimeConfig::default()
+    };
+    let alice = Irokle::builder()
+        .with_iroh_runtime_config(runtime)
+        .with_net(alice_endpoint)
+        .build()
+        .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: peers.into(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(1),
+        })
+        .unwrap();
+    let state = alice.storage().topic_state(&topic.id()).unwrap().unwrap();
+    let preferred = node::select_sync_peers(topic.id(), alice.peer_id(), &state)[0];
+    let alternate_index = usize::from(peers[0] == preferred);
+    let alternate_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .secret_key(keys[alternate_index].clone())
+        .address_lookup(lookup.clone())
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let alternate = Irokle::builder()
+        .with_peer_whitelist([alice.peer_id()])
+        .with_net(alternate_endpoint)
+        .build()
+        .unwrap();
+    lookup.add_endpoint_info(ready_addr(alternate.endpoint().unwrap()).await);
+
+    // The preferred peer never runs. Only this publish creates work.
+    topic
+        .publish(Note {
+            text: "fall back".into(),
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while alternate.list_topics().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the alternate was never contacted: {:?} failures {}",
+            alice.sync_status(topic.id()).unwrap(),
+            alice.peer_health().failures(&preferred)
+        )
+    });
+    assert!(
+        alice
+            .storage()
+            .has_sync_obligations(&preferred, &topic.id())
+            .unwrap(),
+        "the failing peer's own work must stay outstanding"
+    );
+
+    alice.shutdown_iroh().await;
+    alternate.shutdown_iroh().await;
+}

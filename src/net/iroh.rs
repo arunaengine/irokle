@@ -384,6 +384,21 @@ impl ResyncScheduler {
         self.notify.notify_one();
     }
 
+    /// Up to `limit` topics queued for `peer_id`.
+    fn peer_topics(&self, peer_id: PeerId, limit: usize) -> Vec<crate::TopicId> {
+        let targets = self.inner.lock().expect("resync scheduler lock poisoned");
+        let start = ResyncTargetKey {
+            peer_id,
+            topic_id: crate::TopicId::from_bytes([0; 32]),
+        };
+        targets
+            .range(start..)
+            .take_while(|(key, _)| key.peer_id == peer_id)
+            .take(limit)
+            .map(|(key, _)| key.topic_id)
+            .collect()
+    }
+
     fn peer_reachable(&self, peer_id: PeerId) {
         let now = tokio::time::Instant::now();
         let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
@@ -826,14 +841,34 @@ impl<S: Storage> IrohNet<S> {
 
     pub fn note_peer_reachable(&self, peer_id: PeerId) {
         self.resync_scheduler.peer_reachable(peer_id);
+        self.note_outcome(peer_id, [Ok(())]);
+    }
+
+    /// Feed one attempt's outcome to peer health. When that changes which
+    /// peers are selected, the topics queued for the peer are rechecked now, so
+    /// an alternate gets real work without a new publish or a full sweep.
+    fn note_outcome<'a>(
+        &self,
+        peer_id: PeerId,
+        results: impl IntoIterator<Item = std::result::Result<(), &'a io::Error>>,
+    ) {
+        if !self.node.note_peer_outcome(peer_id, results) {
+            return;
+        }
+        for topic_id in self
+            .resync_scheduler
+            .peer_topics(peer_id, MAX_TOPICS_PER_RESYNC_BATCH)
+        {
+            if let Err(error) = self.schedule_topic_recheck(topic_id) {
+                tracing::warn!(%peer_id, %topic_id, %error, "failed to recheck topic after a health change");
+            }
+        }
     }
 
     /// Marks the peer on an externally accepted connection as reachable.
     /// Outbound sync dials separately because reverse stream support is not guaranteed.
     pub fn register_connection(&self, connection: iroh::endpoint::Connection) -> io::Result<()> {
-        let peer = connection.remote_id();
-        self.resync_scheduler
-            .peer_reachable(peer_id_from_endpoint_id(peer));
+        self.note_peer_reachable(peer_id_from_endpoint_id(connection.remote_id()));
         Ok(())
     }
 
@@ -1197,7 +1232,14 @@ impl<S: Storage> IrohNet<S> {
         {
             return Ok(false);
         }
-        Ok(self.node.sync_peers(topic_id, &state).contains(&peer_id))
+        // Durable work owed to this peer keeps it a target, blocked with its
+        // backoff, even while selection routes other work around it.
+        Ok(self.node.sync_peers(topic_id, &state).contains(&peer_id)
+            || self
+                .node
+                .storage()
+                .has_sync_obligations(&peer_id, &topic_id)
+                .map_err(invalid_data)?)
     }
 
     fn local_leave_op(
@@ -1420,6 +1462,7 @@ impl<S: Storage> IrohNet<S> {
             // Drops the pooled connection only when it is already closed.
             let _ = self.pool.get(&endpoint_id);
         }
+        self.note_outcome(remote_peer_id, [result.as_ref().copied()]);
         // An exhausted budget is progress, not an unreachable peer.
         let record_result = match &result {
             Err(error) if !advancing => Err(error),
@@ -1492,6 +1535,7 @@ impl<S: Storage> IrohNet<S> {
                 // Only the claims this batch never finished belong to the
                 // timeout; a released chunk keeps its recorded result.
                 let error = timed_out("peer sync batch timed out");
+                self.note_outcome(peer_id, [Err(&error)]);
                 for claim in lease.drain_claims() {
                     let _ =
                         self.node
@@ -1540,6 +1584,13 @@ impl<S: Storage> IrohNet<S> {
         let outcomes = self
             .run_topic_batch(peer, topic_ids, Some((lease, runtime)))
             .await;
+        self.note_outcome(
+            remote_peer_id,
+            outcomes
+                .results
+                .values()
+                .map(|result| result.as_ref().copied()),
+        );
         let mut failures = 0_usize;
         let mut first_error = None;
         for (topic_id, outcome) in &outcomes.results {
@@ -3004,9 +3055,7 @@ async fn handle_connection<S: Storage>(
                     if let Err(error) = current.handle_stream(peer, recv, send).await {
                         tracing::warn!(%peer, %error, "failed to handle iroh sync stream");
                     } else {
-                        current
-                            .resync_scheduler
-                            .peer_reachable(peer_id_from_endpoint_id(peer));
+                                                current.note_peer_reachable(peer_id_from_endpoint_id(peer));
                     }
                 });
             }

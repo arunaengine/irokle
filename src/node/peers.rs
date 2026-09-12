@@ -39,33 +39,42 @@ struct HealthInner {
 impl PeerHealthStore {
     /// Records one unreachable attempt and advances the rotation epoch, so the
     /// next selection reaches an alternate without waiting for a new publish.
+    /// Returns whether selection may have moved, which every recorded failure can.
     #[cfg(any(feature = "iroh", test))]
-    pub(crate) fn record_failure(&self, peer: PeerId) {
+    pub(crate) fn record_failure(&self, peer: PeerId) -> bool {
         let Ok(mut inner) = self.inner.write() else {
-            return;
+            return false;
         };
         let tracked = inner.attempts.len();
-        match inner.attempts.get_mut(&peer) {
-            Some(failures) => *failures = failures.saturating_add(1),
+        let failures = match inner.attempts.get_mut(&peer) {
+            Some(failures) => {
+                *failures = failures.saturating_add(1);
+                *failures
+            }
             None if tracked < MAX_TRACKED_PEERS => {
                 inner.attempts.insert(peer, 1);
+                1
             }
-            None => {}
-        }
+            None => 0,
+        };
         inner.epoch = inner.epoch.wrapping_add(1);
+        failures > 0
     }
 
     /// Clears a peer's failure record once an attempt reaches it again. With no
     /// peer failing there is nothing left to route around, so the rotation
     /// epoch resets and selection returns to the policy's preferred order.
+    /// Returns whether the peer had failures, so selection may move back to it.
     #[cfg(any(feature = "iroh", test))]
-    pub(crate) fn record_success(&self, peer: &PeerId) {
-        if let Ok(mut inner) = self.inner.write() {
-            inner.attempts.remove(peer);
-            if inner.attempts.is_empty() {
-                inner.epoch = 0;
-            }
+    pub(crate) fn record_success(&self, peer: &PeerId) -> bool {
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
+        let failed = inner.attempts.remove(peer).is_some();
+        if inner.attempts.is_empty() {
+            inner.epoch = 0;
         }
+        failed
     }
 
     /// Runs `select` against the current view. [`PeerHealth`] borrows the
