@@ -1167,58 +1167,51 @@ impl<S: Storage> IrohNet<S> {
         }
     }
 
+    /// Whether `peer_id` still needs this topic, judged from one view. Only an
+    /// ack certified for the view's own branch can show the peer caught up;
+    /// evidence that names no branch or another one proves nothing.
     fn target_needs_sync(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<bool> {
-        let Some(state) = self
+        let Some(view) = self
             .node
             .storage()
-            .topic_state(&topic_id)
+            .topic_view(&topic_id, Some(&peer_id))
             .map_err(invalid_data)?
         else {
             return Ok(false);
         };
+        let state = &view.state;
         if !state.members.contains(&peer_id) {
             return Ok(false);
         }
         if !state.members.contains(&self.node.peer_id()) {
-            let Some(op_id) = self.local_leave_op(&state)? else {
+            let Some(op_id) = self.local_leave_op(state)? else {
                 return Ok(false);
             };
-            return Ok(self.node.sync_peers(topic_id, &state).contains(&peer_id)
+            return Ok(self.node.sync_peers(topic_id, state).contains(&peer_id)
                 && !self
                     .node
                     .peer_reached_op(peer_id, op_id)
                     .map_err(invalid_data)?);
         }
-        if self
-            .node
-            .storage()
-            .has_sync_obligations(&peer_id, &topic_id)
-            .map_err(invalid_data)?
-        {
+        if view.owed {
             return Ok(true);
         }
-        if !self.node.sync_peers(topic_id, &state).contains(&peer_id) {
+        if !self.node.sync_peers(topic_id, state).contains(&peer_id) {
             return Ok(false);
         }
         // A hole clears no obligation and moves no clock, so nothing else here
         // would ever mark the target dirty again.
-        if !self.topic_is_whole(topic_id) {
-            return Ok(true);
+        match self.node.view_unresolved(&view) {
+            Ok(unresolved) if unresolved.is_empty() => {}
+            Ok(_) => return Ok(true),
+            Err(error) => {
+                tracing::warn!(%topic_id, %error, "failed to check local topic integrity");
+                return Ok(true);
+            }
         }
-        let local_clock = self
-            .node
-            .storage()
-            .actor_clock(&topic_id)
-            .map_err(invalid_data)?;
-        let Some(ack) = self
-            .node
-            .storage()
-            .peer_ack(&peer_id, &topic_id)
-            .map_err(invalid_data)?
-        else {
-            return Ok(true);
-        };
-        Ok(!ack.clock.dominates(&local_clock))
+        Ok(!view.ack.as_ref().is_some_and(|ack| {
+            ack.genesis == Some(state.genesis) && ack.clock.dominates(&view.clock)
+        }))
     }
 
     fn dirty_selected_targets(&self, topic_id: crate::TopicId) -> io::Result<Vec<PeerId>> {
@@ -3622,6 +3615,33 @@ mod tests {
             .expect("the target stays scheduled")
             .saturating_duration_since(tokio::time::Instant::now());
         assert!(delay > BACKOFF, "peer evidence reset the failure backoff");
+    }
+
+    /// Evidence migrated without a branch certifies nothing, so a clock it
+    /// carries must not mark the target as synchronized.
+    #[tokio::test]
+    async fn legacy_ack_needs_sync() {
+        let net = test_net().await;
+        let peer_id = peer(90);
+        let topic = net
+            .node
+            .create_topic::<Ping>(crate::TopicConfig {
+                initial_peers: [peer_id].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap();
+        let clock = net.node.storage().actor_clock(&topic.id()).unwrap();
+        net.node.storage().put_raw_ack(crate::storage::PeerAck {
+            peer_id,
+            topic_id: topic.id(),
+            genesis: None,
+            heads: net.node.storage().heads(&topic.id()).unwrap(),
+            clock,
+        });
+        assert!(
+            net.target_needs_sync(peer_id, topic.id()).unwrap(),
+            "an uncertified clock hid work the peer still needs"
+        );
     }
 
     #[tokio::test]

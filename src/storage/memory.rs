@@ -73,6 +73,16 @@ impl MemoryStorage {
         self.inner.lock().expect("memory lock").meta.remove(id);
     }
 
+    /// Store an ack record as is, bypassing certification. Tests use this for
+    /// evidence an older schema left behind.
+    pub(crate) fn put_raw_ack(&self, ack: PeerAck) {
+        self.inner
+            .lock()
+            .expect("memory lock")
+            .peer_acks
+            .insert((ack.peer_id, ack.topic_id), ack);
+    }
+
     /// Store both records and the topic/child indexes while leaving heads and
     /// topic state alone, so the op is admitted yet reachable from no head.
     pub(crate) fn orphan_op(&self, op: &Op, meta: &OpMeta) {

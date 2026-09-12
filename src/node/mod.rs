@@ -449,6 +449,16 @@ impl<S: Storage> Irokle<S> {
         self.oplog.topic_unresolved(&topic_id)
     }
 
+    /// Ids `view`'s topic cannot resolve, with any hole scan recorded under the
+    /// view's own branch and epoch.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn view_unresolved(
+        &self,
+        view: &crate::storage::TopicView,
+    ) -> Result<BTreeSet<OpId>> {
+        Ok(self.oplog.view_unresolved(view)?.0)
+    }
+
     /// Audit stored records again on the next integrity question instead of
     /// trusting the earlier verdict. Admission keeps topics whole, so this only
     /// matters for damage that happened outside irokle.
@@ -1141,18 +1151,22 @@ impl<S: Storage> Irokle<S> {
 
     pub(crate) fn topic_observed_clock(&self, topic_id: TopicId) -> Result<ActorClock> {
         let storage = self.oplog.storage();
-        let state = storage
-            .topic_state(&topic_id)?
+        let view = storage
+            .topic_view(&topic_id, None)?
             .ok_or(Error::TopicNotFound)?;
+        let state = view.state;
         let local_peer = self.peer_id();
-        let mut clock = storage.actor_clock(&topic_id)?;
+        let mut clock = view.clock;
         for peer in &state.members {
             if *peer == local_peer {
                 continue;
             }
+            // Only evidence certified for this branch says what a peer holds.
             match storage.peer_ack(peer, &topic_id)? {
-                Some(ack) => clock = clock.intersect(&ack.clock),
-                None => return Ok(ActorClock::new()),
+                Some(ack) if ack.genesis == Some(state.genesis) => {
+                    clock = clock.intersect(&ack.clock)
+                }
+                _ => return Ok(ActorClock::new()),
             }
         }
         Ok(clock)
