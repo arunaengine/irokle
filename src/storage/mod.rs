@@ -186,6 +186,12 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// Required rather than defaulted: a composition of single removals is
     /// correct but not atomic, and a backend must not inherit that silently.
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize>;
+    /// Atomically drop a permanently invalid pending `op_id` and every pending
+    /// op transitively waiting on it, or nothing at all once `op_id` is no
+    /// longer buffered, so a concurrent admission keeps its waiters. Required
+    /// rather than defaulted for the same atomicity reason as above; the count
+    /// returned includes `op_id`.
+    fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>>;
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()>;

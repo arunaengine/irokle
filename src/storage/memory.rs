@@ -331,6 +331,16 @@ impl Storage for MemoryStorage {
         let mut inner = self.lock()?;
         Ok(purge_waiters_locked(&mut inner, dep_id))
     }
+    fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize> {
+        let mut inner = self.lock()?;
+        // One guard covers the root and its closure, so no reader sees the root
+        // gone while its waiters still hold quota against it.
+        if !inner.pending_ops.contains_key(op_id) {
+            return Ok(0);
+        }
+        remove_pending_locked(&mut inner, op_id);
+        Ok(1 + purge_waiters_locked(&mut inner, op_id))
+    }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
         Ok(self.lock()?.peer_acks.get(&(*peer_id, *topic_id)).cloned())
     }

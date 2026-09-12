@@ -20,8 +20,8 @@ mod topology;
 
 use helpers::{
     apply_control_to_state, checked_next, ensure_event_type, heads_after, is_local_admission_race,
-    is_semantic_rejection, materialize_topic_state, merge_states, next_actor_position,
-    pending_meta_for,
+    is_pending_retry, is_permanent_rejection, materialize_topic_state, merge_states,
+    next_actor_position, pending_meta_for,
 };
 pub(crate) use topology::topological_ids;
 use topology::topological_ops;
@@ -646,9 +646,18 @@ impl<S: Storage> Oplog<S> {
                 let (batch_accepted, batch_eviction) =
                     match self.admit_ops_batch_retry(batch_source_peer, ops, verified) {
                         Ok(outcome) => outcome,
-                        Err(err) if from_pending && is_semantic_rejection(&err) => {
+                        Err(err) if from_pending && is_permanent_rejection(&err) => {
                             for op_id in pending_op_ids {
-                                self.storage.remove_pending_op(&op_id)?;
+                                tracing::debug!(%op_id, error = %err, "rejecting pending subtree");
+                                self.storage.reject_pending_subtree(&op_id)?;
+                            }
+                            continue;
+                        }
+                        // A repairable failure keeps the buffered record and
+                        // must not fail the ops the caller actually sent.
+                        Err(err) if from_pending && is_pending_retry(&err) => {
+                            for op_id in pending_op_ids {
+                                tracing::debug!(%op_id, error = %err, "retaining pending op");
                             }
                             continue;
                         }

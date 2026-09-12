@@ -101,7 +101,10 @@ pub(super) fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
     }
 }
 
-pub(super) fn is_semantic_rejection(err: &Error) -> bool {
+/// Failures no later local state can turn into an admission: the signed op
+/// itself is invalid. Discarding a pending op destroys signed work, so a
+/// state dependent failure must never be classified here.
+pub(super) fn is_permanent_rejection(err: &Error) -> bool {
     #[cfg(feature = "iroh")]
     if matches!(err, Error::OpTooLarge) {
         return true;
@@ -110,18 +113,27 @@ pub(super) fn is_semantic_rejection(err: &Error) -> bool {
         err,
         Error::InvalidSignature
             | Error::InvalidPublicKey
-            | Error::InvalidOpId
             | Error::WrongSigner
-            | Error::EventTypeMismatch { .. }
+            | Error::ActorAuthorMismatch
+            | Error::TopicMismatch
+    )
+}
+
+/// Failures a later arrival, membership control or genesis replacement can
+/// still resolve. The buffered record must survive, and one stuck pending op
+/// must not fail the caller's whole receive.
+pub(super) fn is_pending_retry(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::MissingDependency(_)
             | Error::TopicNotFound
             | Error::NotTopicMember
+            | Error::EventTypeMismatch { .. }
+            | Error::InvalidGenesis
             | Error::ActorSeqGap { .. }
             | Error::ActorPrevMismatch
             | Error::ActorFork
-            | Error::ActorAuthorMismatch
-            | Error::TopicMismatch
-            | Error::MissingDependency(_)
-            | Error::InvalidGenesis
+            | Error::InvalidOpId
             | Error::Decode(_)
     )
 }

@@ -346,6 +346,9 @@ impl Storage for StaleReadStorage {
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize, Error> {
         self.inner.purge_pending_waiters(dep_id)
     }
+    fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize, Error> {
+        self.inner.reject_pending_subtree(op_id)
+    }
 }
 
 /// A genesis plus one event for `topic_id`, authored in `storage` by `seed`'s

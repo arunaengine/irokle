@@ -1481,3 +1481,280 @@ fn fjall_coalesced_targets() {
     let dir = tempfile::tempdir().unwrap();
     assert_coalesced_targets(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
+
+/// A dependency hole a later repair can close must leave the buffered op in
+/// place: that hole is the condition the pending buffer exists for.
+fn assert_retains_pending<S: Corrupt>(storage: S) {
+    let source = node(95);
+    let outsider = Ed25519Signer::from_bytes(&[96; 32]);
+    let topic = source
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [outsider.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    for text in ["one", "two", "three"] {
+        topic.publish(Note { text: text.into() }).unwrap();
+    }
+    let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+    let (genesis, first, second, third) = (
+        ops[0].clone(),
+        ops[1].clone(),
+        ops[2].clone(),
+        ops[3].clone(),
+    );
+    // Depending on `second` alone rather than on the heads makes admission
+    // project membership through an ancestry walk that reads the genesis.
+    let waiter = Op::sign(
+        OpBody {
+            topic_id: topic.id(),
+            author: outsider.peer_id(),
+            actor_id: actor_id_for(topic.id(), outsider.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [second.id].into(),
+            generation: second.signed.body.generation + 1,
+            payload: TopicPayload::Event(
+                EventEnvelope::encode_event(&Note {
+                    text: "waiter".into(),
+                })
+                .unwrap(),
+            ),
+        },
+        &outsider,
+    )
+    .unwrap();
+
+    let log = oplog::Oplog::with_storage(storage.clone());
+    log.receive_ops_from_peer(Some(source.peer_id()), vec![waiter.clone()])
+        .unwrap();
+    log.receive_ops_from_peer(Some(source.peer_id()), vec![genesis.clone(), first.clone()])
+        .unwrap();
+    assert_eq!(storage.pending_waiters(&second.id).unwrap().len(), 1);
+
+    // The genesis metadata the walk needs disappears after the waiter was
+    // buffered, so admitting the waiter fails on a dependency that can return.
+    damage_op(&storage, &genesis.id, Damage::Meta);
+    let fresh = oplog::Oplog::with_storage(storage.clone());
+    let admitted = fresh
+        .receive_ops_from_peer(Some(source.peer_id()), vec![second.clone(), third.clone()])
+        .unwrap();
+
+    assert_eq!(admitted, [second.id, third.id].into());
+    assert_eq!(storage.pending_waiters(&second.id).unwrap().len(), 1);
+    assert!(storage.get_op(&waiter.id).unwrap().is_none());
+
+    // Repairing the hole lets the retained record through.
+    let repaired = fresh
+        .receive_ops_from_peer(Some(source.peer_id()), vec![genesis.clone()])
+        .unwrap();
+    assert_eq!(repaired, [genesis.id, waiter.id].into());
+    assert!(storage.get_op(&waiter.id).unwrap().is_some());
+    assert!(storage.pending_waiters(&second.id).unwrap().is_empty());
+}
+
+#[test]
+fn memory_retains_pending() {
+    assert_retains_pending(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_retains_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_retains_pending(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// Rejecting a permanently invalid pending root must take its whole waiting
+/// subtree, and only that subtree, in one durable step.
+fn assert_rejects_subtree<S: Storage>(storage: S) {
+    let source = node(97);
+    let outsider = Ed25519Signer::from_bytes(&[98; 32]);
+    let topic = source
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [outsider.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    for text in ["one", "two", "three"] {
+        topic.publish(Note { text: text.into() }).unwrap();
+    }
+    let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+    let (genesis, root, child, grandchild) = (
+        ops[0].clone(),
+        ops[1].clone(),
+        ops[2].clone(),
+        ops[3].clone(),
+    );
+    // Waits on the same withheld genesis as `root` without being behind it.
+    let sibling = Op::sign(
+        OpBody {
+            topic_id: topic.id(),
+            author: outsider.peer_id(),
+            actor_id: actor_id_for(topic.id(), outsider.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [genesis.id].into(),
+            generation: genesis.signed.body.generation + 1,
+            payload: TopicPayload::Event(
+                EventEnvelope::encode_event(&Note {
+                    text: "sibling".into(),
+                })
+                .unwrap(),
+            ),
+        },
+        &outsider,
+    )
+    .unwrap();
+
+    let log = oplog::Oplog::with_storage(storage.clone());
+    for op in [&grandchild, &child, &root, &sibling] {
+        log.receive_ops_from_peer(Some(source.peer_id()), vec![op.clone()])
+            .unwrap();
+    }
+    assert_eq!(storage.pending_waiters(&genesis.id).unwrap().len(), 2);
+    assert_eq!(
+        storage.pending_missing_deps(&topic.id()).unwrap(),
+        [genesis.id, root.id, child.id].into()
+    );
+
+    assert_eq!(storage.reject_pending_subtree(&root.id).unwrap(), 3);
+
+    let waiting = storage.pending_waiters(&genesis.id).unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].1.id, sibling.id);
+    assert!(storage.pending_waiters(&root.id).unwrap().is_empty());
+    assert!(storage.pending_waiters(&child.id).unwrap().is_empty());
+    assert_eq!(
+        storage.pending_missing_deps(&topic.id()).unwrap(),
+        [genesis.id].into()
+    );
+    // A second rejection of the same root changes nothing.
+    assert_eq!(storage.reject_pending_subtree(&root.id).unwrap(), 0);
+    assert_eq!(storage.pending_waiters(&genesis.id).unwrap().len(), 1);
+
+    assert_eq!(
+        log.receive_ops_from_peer(Some(source.peer_id()), vec![genesis.clone()])
+            .unwrap(),
+        [genesis.id, sibling.id].into()
+    );
+    for rejected in [&root, &child, &grandchild] {
+        assert!(storage.get_op(&rejected.id).unwrap().is_none());
+    }
+    assert!(storage.ready_pending_ops().unwrap().is_empty());
+    assert!(
+        storage
+            .pending_missing_deps(&topic.id())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn memory_rejects_subtree() {
+    assert_rejects_subtree(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_rejects_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_rejects_subtree(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// A pending op whose dependency turns out to belong to another topic can never
+/// be admitted here, so admission must clear it together with what waits behind
+/// it, including the repair wants that would otherwise re-request it forever.
+fn assert_rejects_mismatch<S: Storage>(storage: S) {
+    let source = node(99);
+    let outsider = Ed25519Signer::from_bytes(&[100; 32]);
+    let config = TopicConfig {
+        initial_peers: [outsider.peer_id()].into(),
+        ..TopicConfig::default()
+    };
+    let home = source.create_topic::<Note>(config.clone()).unwrap();
+    let other = source.create_topic::<Note>(config).unwrap();
+    other
+        .publish(Note {
+            text: "other".into(),
+        })
+        .unwrap();
+    let home_ops = oplog::topological(source.storage(), &home.id()).unwrap();
+    let other_ops = oplog::topological(source.storage(), &other.id()).unwrap();
+    let (home_genesis, other_genesis, foreign) = (
+        home_ops[0].clone(),
+        other_ops[0].clone(),
+        other_ops[1].clone(),
+    );
+    let sign_waiter = |seq: u64, prev: Option<OpId>, dep: OpId, generation: u64, text: &str| {
+        Op::sign(
+            OpBody {
+                topic_id: home.id(),
+                author: outsider.peer_id(),
+                actor_id: actor_id_for(home.id(), outsider.peer_id()),
+                actor_seq: seq,
+                actor_prev: prev,
+                deps: [dep].into(),
+                generation,
+                payload: TopicPayload::Event(
+                    EventEnvelope::encode_event(&Note { text: text.into() }).unwrap(),
+                ),
+            },
+            &outsider,
+        )
+        .unwrap()
+    };
+    let root = sign_waiter(
+        1,
+        None,
+        foreign.id,
+        foreign.signed.body.generation + 1,
+        "root",
+    );
+    let child = sign_waiter(
+        2,
+        Some(root.id),
+        root.id,
+        root.signed.body.generation + 1,
+        "child",
+    );
+
+    let log = oplog::Oplog::with_storage(storage.clone());
+    for op in [&home_genesis, &child, &root] {
+        log.receive_ops_from_peer(Some(source.peer_id()), vec![op.clone()])
+            .unwrap();
+    }
+    assert_eq!(
+        storage.pending_missing_deps(&home.id()).unwrap(),
+        [root.id, foreign.id].into()
+    );
+
+    // Admitting the dependency under its real topic makes the root ready, and
+    // the mismatch it fails on is a property of the signed records.
+    let admitted = log
+        .receive_ops_from_peer(
+            Some(source.peer_id()),
+            vec![other_genesis.clone(), foreign.clone()],
+        )
+        .unwrap();
+
+    assert_eq!(admitted, [other_genesis.id, foreign.id].into());
+    assert!(storage.get_op(&root.id).unwrap().is_none());
+    assert!(storage.get_op(&child.id).unwrap().is_none());
+    assert!(storage.pending_waiters(&root.id).unwrap().is_empty());
+    assert!(storage.pending_waiters(&foreign.id).unwrap().is_empty());
+    assert!(storage.pending_missing_deps(&home.id()).unwrap().is_empty());
+    assert!(storage.ready_pending_ops().unwrap().is_empty());
+}
+
+#[test]
+fn memory_rejects_mismatch() {
+    assert_rejects_mismatch(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_rejects_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_rejects_mismatch(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}

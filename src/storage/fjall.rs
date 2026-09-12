@@ -201,6 +201,33 @@ impl FjallStorage {
         Ok(())
     }
 
+    /// Remove the transitive pending waiters of `dep_id`, never `dep_id` itself.
+    /// The visited set bounds the walk over a pending graph that may name the
+    /// same dependency from several waiters.
+    fn tx_purge_waiters(
+        tx: &mut fjall::OptimisticWriteTx,
+        records: &fjall::OptimisticTxKeyspace,
+        dep_id: &OpId,
+    ) -> Result<usize> {
+        let mut frontier = vec![*dep_id];
+        let mut seen = BTreeSet::new();
+        while let Some(dep) = frontier.pop() {
+            let prefix = [b"pw".as_slice(), dep.as_ref()].concat();
+            let mut waiters = Vec::new();
+            for item in fjall::Readable::prefix(tx, records, prefix) {
+                let (key, _) = item.into_inner()?;
+                waiters.push(Self::op_id_from_key(key.as_ref(), 2 + OpId::LEN)?);
+            }
+            for op_id in waiters {
+                if seen.insert(op_id) {
+                    Self::tx_remove_pending_op(tx, records, &op_id)?;
+                    frontier.push(op_id);
+                }
+            }
+        }
+        Ok(seen.len())
+    }
+
     /// One key per id set: an ordinary target coalesces into the bare
     /// peer/topic key and an explicit repair want keys on its ids alone, so a
     /// repeat raises the stored watermark instead of adding a record.
@@ -1101,24 +1128,19 @@ impl Storage for FjallStorage {
         self.transaction(|tx| Self::tx_remove_pending_op(tx, &self.records, op_id))
     }
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
+        self.transaction(|tx| Self::tx_purge_waiters(tx, &self.records, dep_id))
+    }
+    fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize> {
         self.transaction(|tx| {
-            let mut frontier = vec![*dep_id];
-            let mut seen = BTreeSet::new();
-            while let Some(dep) = frontier.pop() {
-                let prefix = [b"pw".as_slice(), dep.as_ref()].concat();
-                let mut waiters = Vec::new();
-                for item in fjall::Readable::prefix(tx, &self.records, prefix) {
-                    let (key, _) = item.into_inner()?;
-                    waiters.push(Self::op_id_from_key(key.as_ref(), 2 + OpId::LEN)?);
-                }
-                for op_id in waiters {
-                    if seen.insert(op_id) {
-                        Self::tx_remove_pending_op(tx, &self.records, &op_id)?;
-                        frontier.push(op_id);
-                    }
-                }
+            // The root and its closure share one transaction, so no reader sees
+            // the root gone while its waiters still hold quota against it.
+            if Self::tx_get::<(PeerId, Op, OpMeta)>(tx, &self.records, Self::key_id(b"po", op_id))?
+                .is_none()
+            {
+                return Ok(0);
             }
-            Ok(seen.len())
+            Self::tx_remove_pending_op(tx, &self.records, op_id)?;
+            Ok(1 + Self::tx_purge_waiters(tx, &self.records, op_id)?)
         })
     }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
