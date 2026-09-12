@@ -1305,11 +1305,6 @@ impl<S: Storage> IrohNet<S> {
             };
             if !group.is_empty()
                 && (group_bytes.saturating_add(bytes) > MAX_SYNC_STREAM_BYTES
-                    || (group.len() + 1).saturating_mul(96 * 1024 * 1024) > MAX_SYNC_STREAM_BYTES
-                    || group_responses
-                        .saturating_add(planned.estimated_responses)
-                        .saturating_mul(MAX_FRAME_LEN + 4)
-                        > MAX_SYNC_STREAM_BYTES
                     || group_messages + planned.messages.len() > MAX_BATCH_STREAM_MESSAGES
                     || group_responses + planned.estimated_responses > MAX_BATCH_STREAM_MESSAGES)
             {
