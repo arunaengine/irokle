@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -46,6 +46,57 @@ const RESYNC_PROGRESS_TURN: Duration = Duration::from_millis(50);
 /// it reports what it reached. Bounds the caller's wait instead of paging on
 /// until the peer stops publishing.
 const MAX_SYNC_NOW_PAGES: usize = 64;
+
+/// Result of [`IrohNet::shutdown_with_timeout`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownOutcome {
+    /// Every task the net spawned has ended.
+    Complete,
+    /// Tasks were still running at the timeout; the net keeps owning them.
+    Incomplete { running: usize },
+}
+
+/// Counts the tasks a net spawned that have not ended yet.
+#[derive(Default)]
+struct TaskTracker {
+    running: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl TaskTracker {
+    /// Taken before a task is spawned and moved into its future.
+    fn track(self: &Arc<Self>) -> TaskGuard {
+        self.running.fetch_add(1, Ordering::SeqCst);
+        TaskGuard(Arc::clone(self))
+    }
+
+    fn running(&self) -> usize {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.running() == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+/// Owned by a spawned task future, so the count drops when the task really ends.
+struct TaskGuard(Arc<TaskTracker>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if self.0.running.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IrohRuntimeConfig {
@@ -621,6 +672,7 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
     resync_started: AtomicBool,
     outbound_streams: AtomicU64,
     shutdown: tokio::sync::watch::Sender<bool>,
+    tasks: Arc<TaskTracker>,
     // Optional sink for genesis tie-break evictions produced while admitting
     // remote sync data. The embedder consumes these to re-emit the discarded
     // payloads under the winning genesis; when unset they are recovered from
@@ -689,6 +741,7 @@ impl<S: Storage> IrohNet<S> {
             resync_started: AtomicBool::new(false),
             outbound_streams: AtomicU64::new(0),
             shutdown,
+            tasks: Arc::default(),
             eviction_sink,
         })
     }
@@ -742,6 +795,20 @@ impl<S: Storage> IrohNet<S> {
         // loop started afterwards still sees the terminal state.
         self.shutdown.send_replace(true);
         self.endpoint().close().await;
+        // Returns only once the loops and every task they spawned have ended.
+        // Awaiting this from inside such a task would wait for itself.
+        self.tasks.wait_idle().await;
+    }
+
+    /// Like [`Self::shutdown`], but gives up waiting after `timeout` and
+    /// reports how many owned tasks are still running.
+    pub async fn shutdown_with_timeout(&self, timeout: Duration) -> ShutdownOutcome {
+        match tokio::time::timeout(timeout, self.shutdown()).await {
+            Ok(()) => ShutdownOutcome::Complete,
+            Err(_) => ShutdownOutcome::Incomplete {
+                running: self.tasks.running(),
+            },
+        }
     }
 
     fn is_shutdown(&self) -> bool {
@@ -806,9 +873,12 @@ impl<S: Storage> IrohNet<S> {
             net: Weak::clone(&net),
             latch: |net| &net.accept_started,
         };
+        let tracker = Arc::clone(&self.tasks);
+        let task = tracker.track();
         let endpoint = self.endpoint().clone();
         let mut shutdown = self.shutdown.subscribe();
         Ok(Some(handle.spawn(async move {
+            let _task = task;
             let _running = running;
             let mut connections = tokio::task::JoinSet::new();
             let mut handshakes =
@@ -874,7 +944,9 @@ impl<S: Storage> IrohNet<S> {
                                 *peer_count += 1;
                                 let connection_net = Weak::clone(&net);
                                 let connection_shutdown = shutdown.clone();
+                                let owned = tracker.track();
                                 let task = connections.spawn(async move {
+                                    let _task = owned;
                                     handle_connection(
                                         connection_net,
                                         connection_shutdown,
@@ -933,7 +1005,9 @@ impl<S: Storage> IrohNet<S> {
                     tracing::warn!("refusing inbound iroh connection: handshakes are saturated");
                     continue;
                 }
+                let task = tracker.track();
                 handshakes.spawn(async move {
+                    let _task = task;
                     tokio::time::timeout(connect_timeout, incoming)
                         .await
                         .map_err(|_| timed_out("iroh accept timed out"))
@@ -978,7 +1052,9 @@ impl<S: Storage> IrohNet<S> {
             net: Weak::clone(&net),
             latch: |net| &net.resync_started,
         };
+        let task = self.tasks.track();
         Ok(Some(handle.spawn(async move {
+            let _task = task;
             let _running = running;
             let mut sweep_pending = net.upgrade().is_some_and(|current| {
                 current.schedule_startup_resync().inspect_err(|error| {
@@ -2700,7 +2776,9 @@ fn dispatch_due_resyncs<S: Storage>(
             .resync_scheduler
             .lease(targets, runtime.resync_interval);
         let peer_net = Arc::clone(&current);
+        let task = current.tasks.track();
         syncs.spawn(async move {
+            let _task = task;
             peer_net
                 .sync_peer_batch_with_runtime(peer_id, lease, runtime)
                 .await;
@@ -2784,7 +2862,9 @@ async fn handle_connection<S: Storage>(
                 if current.is_shutdown() {
                     break;
                 }
+                let task = current.tasks.track();
                 tasks.spawn(async move {
+                    let _task = task;
                     if let Err(error) = current.handle_stream(peer, recv, send).await {
                         tracing::warn!(%peer, %error, "failed to handle iroh sync stream");
                     } else {

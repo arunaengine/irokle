@@ -1385,3 +1385,83 @@ async fn wrong_peer_ack() {
             .is_none()
     );
 }
+
+/// Shutdown owns the stream tasks it spawned: while one is held inside a
+/// storage read the timed variant reports it running, and once released the
+/// plain shutdown completes and stays complete.
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_awaits_tasks() {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_iroh_secret_key(alice_endpoint.secret_key()),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let bob = Irokle::with_storage(
+        MemoryStorage::new(),
+        NodeConfig {
+            signer: Ed25519Signer::from_iroh_secret_key(bob_endpoint.secret_key()),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let topic_id = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap()
+        .id();
+    let alice_net = Arc::new(net::IrohNet::new(alice_endpoint, alice.clone()).unwrap());
+    alice_net.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice_net.endpoint()).await;
+    let bob_net = Arc::new(net::IrohNet::new(bob_endpoint, bob.clone()).unwrap());
+
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    storage.arm_read(GatePoint::View(topic_id), Arc::clone(&gate));
+    let open = vec![sync::SyncMessage::Open(bob.sync_open(topic_id))];
+    let requester = Arc::clone(&bob_net);
+    let request = tokio::spawn(async move { requester.sync_with(alice_addr, &open).await });
+    let arrival = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || arrival.wait_arrival())
+        .await
+        .unwrap();
+
+    // The held task cannot end, so the timed shutdown must report it.
+    let outcome = alice_net
+        .shutdown_with_timeout(std::time::Duration::from_millis(200))
+        .await;
+    assert!(
+        matches!(outcome, net::ShutdownOutcome::Incomplete { running } if running >= 1),
+        "{outcome:?}"
+    );
+
+    drop(release);
+    tokio::time::timeout(std::time::Duration::from_secs(60), alice_net.shutdown())
+        .await
+        .expect("shutdown completes once the held task ends");
+    assert_eq!(
+        alice_net
+            .shutdown_with_timeout(std::time::Duration::from_secs(60))
+            .await,
+        net::ShutdownOutcome::Complete
+    );
+    request.abort();
+    let _ = request.await;
+    bob_net.shutdown().await;
+}
