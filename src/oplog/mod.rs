@@ -851,6 +851,18 @@ impl<S: Storage> Oplog<S> {
         effects: Option<ReceiveEffects<'_>>,
     ) -> Result<(BTreeSet<crate::OpId>, Option<TopicEviction>)> {
         let has_genesis = ops.iter().any(is_structural_genesis);
+        // Signatures are immutable, so each is checked once for the whole job
+        // rather than again on every retry.
+        let mut checked = BTreeSet::new();
+        for op in &ops {
+            if !verified.contains(&op.id) {
+                #[cfg(feature = "iroh")]
+                op.validate_frame()?;
+                op.validate()?;
+            }
+            checked.insert(op.id);
+        }
+        let verified = &checked;
         for _ in 0..MAX_ADMISSION_RETRIES {
             let (ops_to_admit, reset, rejected_genesis) = if has_genesis {
                 self.resolve_genesis_collision(ops.clone(), verified)?
@@ -1376,8 +1388,16 @@ impl<S: Storage> Oplog<S> {
     where
         F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
     {
+        let mut signed = None;
         for _ in 0..MAX_ADMISSION_RETRIES {
-            match self.try_local_effects(topic_id, actor_id, payload.clone(), signer, &effects) {
+            match self.try_local_effects(
+                topic_id,
+                actor_id,
+                payload.clone(),
+                signer,
+                &mut signed,
+                &effects,
+            ) {
                 Err(err) if is_local_admission_race(&err) => continue,
                 result => return result,
             }
@@ -1391,6 +1411,7 @@ impl<S: Storage> Oplog<S> {
         actor_id: ActorId,
         payload: TopicPayload,
         signer: &impl Signer,
+        signed: &mut Option<Op>,
         effects: &F,
     ) -> Result<(Op, OpMeta)>
     where
@@ -1401,10 +1422,16 @@ impl<S: Storage> Oplog<S> {
         }
         let expected_heads = self.storage.heads(&topic_id)?;
         let expected_state = self.storage.topic_state(&topic_id)?;
-        let op = self.next_local_op(topic_id, actor_id, expected_heads.clone(), payload, signer)?;
+        let op = self.next_local_op(
+            topic_id,
+            actor_id,
+            expected_heads.clone(),
+            payload,
+            signer,
+            signed,
+        )?;
         #[cfg(feature = "iroh")]
         op.validate_frame()?;
-        op.validate()?;
         self.validate_op(&op)?;
         let meta = self.meta_for(&op)?;
         self.commit_admission(
@@ -1437,10 +1464,10 @@ impl<S: Storage> Oplog<S> {
             expected_heads.clone(),
             TopicPayload::Genesis(genesis),
             signer,
+            &mut None,
         )?;
         #[cfg(feature = "iroh")]
         genesis_op.validate_frame()?;
-        genesis_op.validate()?;
         self.validate_op(&genesis_op)?;
         let genesis_meta = self.meta_for(&genesis_op)?;
 
@@ -1518,6 +1545,7 @@ impl<S: Storage> Oplog<S> {
         mut deps: BTreeSet<crate::OpId>,
         payload: TopicPayload,
         signer: &impl Signer,
+        previous: &mut Option<Op>,
     ) -> Result<Op> {
         let tip = self.storage.actor_tip(&topic_id, &actor_id)?;
         let (actor_seq, actor_prev) = match tip {
@@ -1539,19 +1567,24 @@ impl<S: Storage> Oplog<S> {
                 .checked_add(1)
                 .ok_or(Error::InvalidOpId)?
         };
-        Op::sign(
-            OpBody {
-                topic_id,
-                author: signer.peer_id(),
-                actor_id,
-                actor_seq,
-                actor_prev,
-                deps,
-                generation,
-                payload,
-            },
-            signer,
-        )
+        let body = OpBody {
+            topic_id,
+            author: signer.peer_id(),
+            actor_id,
+            actor_seq,
+            actor_prev,
+            deps,
+            generation,
+            payload,
+        };
+        // A retry whose body did not change reuses the op signed before.
+        if let Some(op) = previous.as_ref().filter(|op| op.signed.body == body) {
+            return Ok(op.clone());
+        }
+        let op = Op::sign(body, signer)?;
+        op.validate()?;
+        *previous = Some(op.clone());
+        Ok(op)
     }
 
     fn validate_op(&self, op: &Op) -> Result<()> {

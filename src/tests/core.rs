@@ -479,3 +479,68 @@ fn fjall_rejects_impossible() {
     let dir = tempfile::tempdir().unwrap();
     assert_rejects_impossible(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
+
+/// Signer that counts the signatures it makes.
+struct CountingSigner {
+    inner: Ed25519Signer,
+    signs: std::sync::atomic::AtomicUsize,
+}
+
+impl Signer for CountingSigner {
+    fn peer_id(&self) -> PeerId {
+        self.inner.peer_id()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<ed25519_dalek::Signature, Error> {
+        self.signs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.sign(message)
+    }
+}
+
+fn verifications() -> usize {
+    crate::op::VERIFICATIONS.with(std::cell::Cell::get)
+}
+
+/// A retried admission checks each received signature once, and a retried
+/// local write signs and checks its unchanged op once.
+#[test]
+fn retry_reuses_signatures() {
+    let signer = CountingSigner {
+        inner: Ed25519Signer::from_bytes(&[62; 32]),
+        signs: Default::default(),
+    };
+    let (_source, topic_id, ops) = chain_source(61, signer.peer_id());
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let log = oplog::Oplog::with_storage(storage.clone());
+
+    storage.conflict_writes(1);
+    let before = verifications();
+    let accepted = log.receive_ops(ops.clone()).unwrap();
+    assert_eq!(accepted.len(), ops.len());
+    assert_eq!(
+        storage.conflicts.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(verifications() - before, ops.len());
+
+    storage.conflict_writes(1);
+    let before = verifications();
+    let op = log
+        .create_event_op(
+            topic_id,
+            actor_id_for(topic_id, signer.peer_id()),
+            EventEnvelope::encode_event(&Note {
+                text: "retried".into(),
+            })
+            .unwrap(),
+            &signer,
+        )
+        .unwrap();
+    assert!(storage.get_op(&op.id).unwrap().is_some());
+    assert_eq!(
+        storage.conflicts.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(signer.signs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(verifications() - before, 1);
+}

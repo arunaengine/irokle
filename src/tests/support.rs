@@ -205,6 +205,7 @@ pub(crate) struct StaleReadStorage {
     pub(crate) obligation_gate: Arc<std::sync::Mutex<Option<Arc<Rendezvous>>>>,
     pub(crate) failed_heads: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
     pub(crate) read_gate: Arc<std::sync::Mutex<Option<ArmedGate>>>,
+    pub(crate) conflicts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StaleReadStorage {
@@ -220,12 +221,19 @@ impl StaleReadStorage {
             obligation_gate: Arc::default(),
             failed_heads: Arc::default(),
             read_gate: Arc::default(),
+            conflicts: Arc::default(),
         }
     }
 
     /// Pause the next read at `point` on `gate`, once.
     pub(crate) fn arm_read(&self, point: GatePoint, gate: Arc<Gate>) {
         *self.read_gate.lock().unwrap() = Some((point, gate));
+    }
+
+    /// Make the next `count` admission writes lose to a concurrent commit.
+    pub(crate) fn conflict_writes(&self, count: usize) {
+        self.conflicts
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Drop a gate no reader took, so the test's own reads pass freely.
@@ -273,6 +281,14 @@ impl Storage for StaleReadStorage {
     fn put_admitted_batch(&self, batch: crate::storage::AdmittedBatch) -> Result<(), Error> {
         if self.failed_writes.lock().unwrap().contains(&batch.topic_id) {
             return Err(Error::Storage("injected admission write failure".into()));
+        }
+        let lost = self.conflicts.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |left| left.checked_sub(1),
+        );
+        if lost.is_ok() {
+            return Err(Error::AdmissionConflict);
         }
         self.inner.put_admitted_batch(batch)
     }

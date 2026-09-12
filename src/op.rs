@@ -33,6 +33,12 @@ fn op_signing_message(body: &OpBody) -> Result<Vec<u8>> {
     Ok(msg)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Op signatures this thread verified, for tests that bound repeated checks.
+    pub(crate) static VERIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedOp {
     pub body: OpBody,
@@ -49,6 +55,8 @@ impl SignedOp {
     }
 
     pub fn verify(&self) -> Result<()> {
+        #[cfg(test)]
+        VERIFICATIONS.with(|count| count.set(count.get() + 1));
         verify(
             self.body.author,
             &op_signing_message(&self.body)?,
