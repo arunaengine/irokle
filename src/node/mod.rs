@@ -1083,7 +1083,6 @@ impl<S: Storage> Irokle<S> {
     /// attempts, Blocked and Failed as failed ones. Peer health is left to
     /// the caller, which knows whether a failure was a reachability failure.
     #[cfg(any(feature = "iroh", test))]
-    #[cfg_attr(not(test), allow(dead_code, reason = "the transport calls it next"))]
     pub(crate) fn record_attempt_result(
         &self,
         peer_id: PeerId,
@@ -1120,7 +1119,7 @@ impl<S: Storage> Irokle<S> {
         )
     }
 
-    #[cfg(any(feature = "iroh", test))]
+    #[cfg(test)]
     pub(crate) fn record_sync_result(
         &self,
         peer_id: PeerId,

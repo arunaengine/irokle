@@ -752,6 +752,8 @@ pub struct SharedNet<S: Storage> {
     tasks: Arc<TaskTracker>,
     control_lane: Arc<tokio::sync::Semaphore>,
     bulk_lane: Arc<tokio::sync::Semaphore>,
+    /// Durable epoch of this net's start; attempts are `(epoch, sequence)`.
+    attempt_epoch: u64,
     // Optional sink for genesis tie-break evictions produced while admitting
     // remote sync data. The embedder consumes these to re-emit the discarded
     // payloads under the winning genesis; when unset they are recovered from
@@ -826,6 +828,7 @@ impl<S: Storage> IrohNet<S> {
         if !alpns.is_empty() {
             endpoint.set_alpns(alpns);
         }
+        let attempt_epoch = node.storage().next_attempt_epoch().map_err(invalid_data)?;
         let (shutdown, _) = tokio::sync::watch::channel(false);
         Ok(Self {
             pool: ConnectionPool::new(endpoint),
@@ -843,6 +846,7 @@ impl<S: Storage> IrohNet<S> {
                 tasks: Arc::default(),
                 control_lane: Arc::new(tokio::sync::Semaphore::new(CONTROL_JOBS)),
                 bulk_lane: Arc::new(tokio::sync::Semaphore::new(BULK_JOBS)),
+                attempt_epoch,
                 eviction_sink,
             }),
         })
@@ -1633,6 +1637,7 @@ impl<S: Storage> IrohNet<S> {
         topic_id: crate::TopicId,
     ) -> io::Result<()> {
         let _task = self.tasks.track();
+        let attempt = self.attempt_identity(None);
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
         let endpoint_id = peer.id;
         // A bounded page is not the goal: keep paging while the exchange really
@@ -1648,6 +1653,8 @@ impl<S: Storage> IrohNet<S> {
                 break;
             }
         }
+        // An exhausted budget is progress, not an unreachable peer.
+        let outcome = attempt_outcome(result.as_ref().copied(), advancing);
         // Work still outstanding after the page budget is not a completed sync.
         if result.is_ok() && advancing {
             result = Err(io::Error::new(
@@ -1659,21 +1666,28 @@ impl<S: Storage> IrohNet<S> {
             // Drops the pooled connection only when it is already closed.
             let _ = self.pool.get(&endpoint_id);
         }
-        self.note_outcome(remote_peer_id, [result.as_ref().copied()]);
-        // An exhausted budget is progress, not an unreachable peer.
-        let record_result = match &result {
-            Err(error) if !advancing => Err(error),
-            _ => Ok(()),
-        };
-        let _ = self
-            .node
-            .record_sync_result(remote_peer_id, topic_id, record_result);
-        // A manual sync holds no claim, so it reports evidence instead of
-        // completing an attempt the resync loop may own.
-        if advancing {
-            self.resync_scheduler.reconsider(remote_peer_id, topic_id);
-        } else {
-            self.reconsider_target(remote_peer_id, topic_id);
+        let noted = copy_result(&result);
+        let finished = self
+            .run_job(Lane::Control, move |shared| {
+                shared.note_outcome(remote_peer_id, [noted.as_ref().copied()]);
+                if let Err(error) =
+                    shared
+                        .node
+                        .record_attempt_result(remote_peer_id, topic_id, attempt, &outcome)
+                {
+                    tracing::warn!(%remote_peer_id, %topic_id, %error, "failed to record sync attempt");
+                }
+                // A manual sync holds no claim, so it reports evidence instead of
+                // completing an attempt the resync loop may own.
+                if advancing {
+                    shared.resync_scheduler.reconsider(remote_peer_id, topic_id);
+                } else {
+                    shared.reconsider_target(remote_peer_id, topic_id);
+                }
+            })
+            .await;
+        if let Err(error) = finished {
+            tracing::warn!(%remote_peer_id, %topic_id, %error, "failed to finish manual sync");
         }
         result
     }
@@ -1691,36 +1705,62 @@ impl<S: Storage> IrohNet<S> {
                 .connect_timeout
                 .saturating_add(runtime.sync_io_timeout)
                 .saturating_mul(4);
+        let claimed = lease.targets();
+        let fail_all = |error: &io::Error| {
+            claimed
+                .iter()
+                .map(|target| (target.key.topic_id, Err(clone_error(error)), false))
+                .collect::<Vec<_>>()
+        };
         let addr = match peer_id_to_endpoint_addr(peer_id) {
             Ok(addr) => addr,
             Err(error) => {
-                for claim in lease.drain_claims() {
-                    self.finish_resync_attempt(claim, Err(&error), runtime, false);
-                }
+                self.publish_results(peer_id, fail_all(&error), &mut lease, runtime)
+                    .await;
                 return;
             }
         };
-        let claimed = lease.targets();
-        let mut topics = Vec::with_capacity(claimed.len());
-        for target in claimed {
-            let topic_id = target.key.topic_id;
-            match self.should_attempt_resync_target(target) {
-                Ok(true) => topics.push(topic_id),
+        let targets = claimed.clone();
+        let decided = self
+            .run_job(Lane::Control, move |shared| {
+                targets
+                    .into_iter()
+                    .map(|target| {
+                        let topic_id = target.key.topic_id;
+                        let decision = shared.should_attempt_resync_target(target);
+                        if matches!(decision, Ok(false))
+                            && let Err(error) = shared.gc_stale_obligations(peer_id, topic_id)
+                        {
+                            tracing::warn!(%peer_id, %topic_id, %error, "failed to gc stale sync obligations");
+                        }
+                        (target, decision)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        let decided = match decided {
+            Ok(decided) => decided,
+            Err(error) => {
+                self.publish_results(peer_id, fail_all(&error), &mut lease, runtime)
+                    .await;
+                return;
+            }
+        };
+        let mut topics = Vec::with_capacity(decided.len());
+        let mut failed = Vec::new();
+        for (target, decision) in decided {
+            match decision {
+                Ok(true) => topics.push(target.key.topic_id),
                 Ok(false) => {
-                    if let Err(error) = self.gc_stale_obligations(peer_id, topic_id) {
-                        tracing::warn!(%peer_id, %topic_id, %error, "failed to gc stale sync obligations");
-                    }
                     if let Some(claim) = lease.take_claim(&target.key) {
                         self.resync_scheduler.complete_clean(claim.settle());
                     }
                 }
-                Err(error) => {
-                    if let Some(claim) = lease.take_claim(&target.key) {
-                        self.finish_resync_attempt(claim, Err(&error), runtime, false);
-                    }
-                }
+                Err(error) => failed.push((target.key.topic_id, Err(error), false)),
             }
         }
+        self.publish_results(peer_id, failed, &mut lease, runtime)
+            .await;
         for chunk in topics.chunks(MAX_TOPICS_PER_RESYNC_BATCH) {
             if tokio::time::timeout_at(
                 deadline,
@@ -1732,12 +1772,26 @@ impl<S: Storage> IrohNet<S> {
                 // Only the claims this batch never finished belong to the
                 // timeout; a released chunk keeps its recorded result.
                 let error = timed_out("peer sync batch timed out");
-                self.note_outcome(peer_id, [Err(&error)]);
-                for claim in lease.drain_claims() {
-                    let _ =
-                        self.node
-                            .record_sync_result(peer_id, claim.key().topic_id, Err(&error));
-                    self.finish_resync_attempt(claim, Err(&error), runtime, false);
+                let results = lease
+                    .drain_claims()
+                    .into_iter()
+                    .map(|claim| {
+                        (
+                            claim.key().topic_id,
+                            Err(clone_error(&error)),
+                            false,
+                            Some(claim),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let recorded = self
+                    .run_job(Lane::Control, move |shared| {
+                        shared.note_outcome(peer_id, [Err(&error)]);
+                        shared.record_results(peer_id, results, runtime);
+                    })
+                    .await;
+                if let Err(error) = recorded {
+                    tracing::warn!(%peer_id, %error, "failed to record timed out sync batch");
                 }
                 return;
             }
@@ -1785,15 +1839,25 @@ impl<S: Storage> IrohNet<S> {
         let outcomes = self
             .run_topic_batch(peer, topic_ids, Some((lease, runtime)))
             .await;
-        self.note_outcome(
-            remote_peer_id,
-            outcomes
-                .results
-                .values()
-                .map(|result| result.as_ref().copied()),
-        );
+        let noted = outcomes
+            .results
+            .values()
+            .map(copy_result)
+            .collect::<Vec<_>>();
+        let health = self
+            .run_job(Lane::Control, move |shared| {
+                shared.note_outcome(
+                    remote_peer_id,
+                    noted.iter().map(|result| result.as_ref().copied()),
+                );
+            })
+            .await;
+        if let Err(error) = health {
+            tracing::warn!(peer_id = %remote_peer_id, %error, "failed to record peer health");
+        }
         let mut failures = 0_usize;
         let mut first_error = None;
+        let mut unsettled = Vec::new();
         for (topic_id, outcome) in &outcomes.results {
             if let Err(error) = outcome {
                 failures += 1;
@@ -1804,16 +1868,15 @@ impl<S: Storage> IrohNet<S> {
             // Outcomes decided before any exchange ran, such as a planning
             // failure, are the only ones left to publish here.
             if !outcomes.settled.contains(topic_id) {
-                self.publish_topic_result(
-                    remote_peer_id,
+                unsettled.push((
                     *topic_id,
-                    outcome,
+                    copy_result(outcome),
                     outcomes.advanced.contains(topic_id),
-                    lease,
-                    runtime,
-                );
+                ));
             }
         }
+        self.publish_results(remote_peer_id, unsettled, lease, runtime)
+            .await;
         if let Some(error) = first_error {
             // Drops the pooled connection only when it is already closed.
             let _ = self.pool.get(&endpoint_id);
@@ -1823,6 +1886,61 @@ impl<S: Storage> IrohNet<S> {
                 %error,
                 "failed to resync topics with peer"
             );
+        }
+    }
+
+    /// Publishes every decided outcome this batch has not published yet:
+    /// records it and releases the claim the batch owns for it. Called between
+    /// exchanges, so ownership of finished work is handed back immediately.
+    async fn settle_known_results(
+        &self,
+        remote_peer_id: PeerId,
+        outcomes: &BTreeMap<crate::TopicId, io::Result<()>>,
+        advanced: &BTreeSet<crate::TopicId>,
+        settled: &mut BTreeSet<crate::TopicId>,
+        lease: &mut ResyncLease,
+        runtime: IrohRuntimeConfig,
+    ) {
+        let results = outcomes
+            .iter()
+            .filter(|(topic_id, _)| settled.insert(**topic_id))
+            .map(|(topic_id, outcome)| {
+                (*topic_id, copy_result(outcome), advanced.contains(topic_id))
+            })
+            .collect();
+        self.publish_results(remote_peer_id, results, lease, runtime)
+            .await;
+    }
+
+    /// Takes this batch's claims for `results` and records them in a control
+    /// job. A job that never runs drops the claims, which releases them.
+    async fn publish_results(
+        &self,
+        remote_peer_id: PeerId,
+        results: Vec<(crate::TopicId, io::Result<()>, bool)>,
+        lease: &mut ResyncLease,
+        runtime: IrohRuntimeConfig,
+    ) {
+        if results.is_empty() {
+            return;
+        }
+        let results = results
+            .into_iter()
+            .map(|(topic_id, result, advanced)| {
+                let key = ResyncTargetKey {
+                    peer_id: remote_peer_id,
+                    topic_id,
+                };
+                (topic_id, result, advanced, lease.take_claim(&key))
+            })
+            .collect::<Vec<_>>();
+        let published = self
+            .run_job(Lane::Control, move |shared| {
+                shared.record_results(remote_peer_id, results, runtime);
+            })
+            .await;
+        if let Err(error) = published {
+            tracing::warn!(peer_id = %remote_peer_id, %error, "failed to publish sync results");
         }
     }
 
@@ -2055,7 +2173,8 @@ impl<S: Storage> IrohNet<S> {
                         &mut settled,
                         lease,
                         *runtime,
-                    );
+                    )
+                    .await;
                 }
                 group_messages = 0;
                 group_responses = 0;
@@ -2084,7 +2203,8 @@ impl<S: Storage> IrohNet<S> {
                 &mut settled,
                 lease,
                 *runtime,
-            );
+            )
+            .await;
         }
         BatchOutcomes::new(outcomes, advanced, settled)
     }
@@ -2659,54 +2779,35 @@ impl<S: Storage> SharedNet<S> {
         }
     }
 
-    /// Publishes every decided outcome this batch has not published yet:
-    /// records it and releases the claim the batch owns for it. Called between
-    /// exchanges, so ownership of finished work is handed back immediately.
-    fn settle_known_results(
+    /// Records each topic's attempt under the identity its claim started
+    /// with, then completes the claim. Topics without a claim take a new one.
+    fn record_results(
         &self,
         remote_peer_id: PeerId,
-        outcomes: &BTreeMap<crate::TopicId, io::Result<()>>,
-        advanced: &BTreeSet<crate::TopicId>,
-        settled: &mut BTreeSet<crate::TopicId>,
-        lease: &mut ResyncLease,
+        results: Vec<TopicResult>,
         runtime: IrohRuntimeConfig,
     ) {
-        for (topic_id, outcome) in outcomes {
-            if !settled.insert(*topic_id) {
-                continue;
+        for (topic_id, result, advanced, claim) in results {
+            let attempt =
+                self.attempt_identity(claim.as_ref().map(|claim| claim.expect_claim().attempt));
+            let outcome = attempt_outcome(result.as_ref().copied(), advanced);
+            if let Err(error) =
+                self.node
+                    .record_attempt_result(remote_peer_id, topic_id, attempt, &outcome)
+            {
+                tracing::warn!(%remote_peer_id, %topic_id, %error, "failed to record sync attempt");
             }
-            self.publish_topic_result(
-                remote_peer_id,
-                *topic_id,
-                outcome,
-                advanced.contains(topic_id),
-                lease,
-                runtime,
-            );
+            if let Some(claim) = claim {
+                self.finish_resync_attempt(claim, result.as_ref().copied(), runtime, advanced);
+            }
         }
     }
 
-    /// Records one topic's attempt and completes the claim this batch holds for
-    /// it, if any.
-    fn publish_topic_result(
-        &self,
-        remote_peer_id: PeerId,
-        topic_id: crate::TopicId,
-        outcome: &io::Result<()>,
-        advanced: bool,
-        lease: &mut ResyncLease,
-        runtime: IrohRuntimeConfig,
-    ) {
-        let record_result = outcome.as_ref().copied();
-        let _ = self
-            .node
-            .record_sync_result(remote_peer_id, topic_id, record_result);
-        if let Some(claim) = lease.take_claim(&ResyncTargetKey {
-            peer_id: remote_peer_id,
-            topic_id,
-        }) {
-            self.finish_resync_attempt(claim, record_result, runtime, advanced);
-        }
+    /// `(epoch, sequence)` of an attempt started under scheduler id `attempt`,
+    /// or of a new attempt.
+    fn attempt_identity(&self, attempt: Option<AttemptId>) -> (u64, u64) {
+        let sequence = attempt.or_else(next_attempt_id).map_or(u64::MAX, |id| id.0);
+        (self.attempt_epoch, sequence)
     }
 
     /// How far the topic has come toward `goal`: local positions covered of the
@@ -3587,8 +3688,13 @@ async fn handle_connection<S: Storage>(
                     let _task = task;
                     if let Err(error) = current.handle_stream(peer, recv, send).await {
                         tracing::warn!(%peer, %error, "failed to handle iroh sync stream");
-                    } else {
-                                                current.note_peer_reachable(peer_id_from_endpoint_id(peer));
+                    } else if let Err(error) = current
+                        .run_job(Lane::Control, move |shared| {
+                            shared.note_peer_reachable(peer_id_from_endpoint_id(peer));
+                        })
+                        .await
+                    {
+                        tracing::warn!(%peer, %error, "failed to record a reachable peer");
                     }
                 });
             }
@@ -3734,6 +3840,31 @@ fn message_topic_id(message: &SyncMessage) -> Option<crate::TopicId> {
         SyncMessage::Page(page) => Some(page.topic_id),
         SyncMessage::Receipt(receipt) => Some(receipt.topic_id),
     }
+}
+
+/// One topic's result, whether it advanced, and the claim held for it.
+type TopicResult = (crate::TopicId, io::Result<()>, bool, Option<ClaimGuard>);
+
+/// The typed outcome of one topic attempt: an exchange that stopped without
+/// moving toward its goal is blocked, any other error failed it.
+fn attempt_outcome(
+    result: std::result::Result<(), &io::Error>,
+    advanced: bool,
+) -> crate::AttemptOutcome {
+    match result {
+        Ok(()) if advanced => crate::AttemptOutcome::Advanced,
+        Ok(()) => crate::AttemptOutcome::Complete,
+        Err(error)
+            if error.kind() == io::ErrorKind::InvalidData && error.to_string() == NO_PROGRESS =>
+        {
+            crate::AttemptOutcome::Blocked(error.to_string())
+        }
+        Err(error) => crate::AttemptOutcome::Failed(error.to_string()),
+    }
+}
+
+fn copy_result(result: &io::Result<()>) -> io::Result<()> {
+    result.as_ref().copied().map_err(clone_error)
 }
 
 fn topic_failed(failure: &crate::sync::SyncFailure) -> io::Error {
@@ -4230,7 +4361,13 @@ mod tests {
             .without_auto_accept()
             .build()
             .unwrap();
-        (Arc::new(IrohNet::new(endpoint, node).unwrap()), storage)
+        // A peer that went away fails a dial quickly; nothing here measures it.
+        let runtime = IrohRuntimeConfig {
+            connect_timeout: Duration::from_secs(2),
+            ..IrohRuntimeConfig::default()
+        };
+        let net = IrohNet::new_with_config(endpoint, node, runtime).unwrap();
+        (Arc::new(net), storage)
     }
 
     /// On a one-worker runtime, a control job completes while every bulk permit
@@ -4368,6 +4505,79 @@ mod tests {
             ops.len(),
             "the job committed after its requester left"
         );
+    }
+
+    /// End to end, a manual attempt that started first but finishes last
+    /// cannot overwrite the status of a newer attempt that already finished,
+    /// though its failure still counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_attempt_loses() {
+        use crate::tests::support::{Gate, GatePoint, Note};
+        use futures::StreamExt;
+        use iroh::Watcher;
+
+        let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let alice = Irokle::builder()
+            .with_iroh_secret_key(alice_endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        let alice_net = Arc::new(IrohNet::new(alice_endpoint, alice.clone()).unwrap());
+        alice_net.start_accept_loop().unwrap();
+        let mut alice_addr = alice_net.endpoint().addr();
+        let mut addrs = alice_net.endpoint().watch_addr().stream();
+        while alice_addr.addrs.is_empty() {
+            alice_addr = tokio::time::timeout(Duration::from_secs(60), addrs.next())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let (bob_net, storage) = stale_net().await;
+        let topic = alice
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [bob_net.node.peer_id()].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap();
+        topic.publish(Note { text: "one".into() }).unwrap();
+        let topic_id = topic.id();
+        let ops = crate::oplog::topological(alice.storage(), &topic_id).unwrap();
+        bob_net
+            .node
+            .receive_sync_data_from(alice.peer_id(), crate::sync::SyncData { topic_id, ops })
+            .unwrap();
+
+        // The older attempt pauses while preparing its fingerprints.
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::View(topic_id), Arc::clone(&gate));
+        let older = {
+            let net = Arc::clone(&bob_net);
+            let addr = alice_addr.clone();
+            tokio::spawn(async move { net.sync_now(addr, topic_id).await })
+        };
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+
+        bob_net.sync_now(alice_addr, topic_id).await.unwrap();
+        let newer = bob_net.node.sync_status(topic_id).unwrap().remove(0);
+        assert_eq!(newer.state, crate::SyncPeerState::Healthy);
+
+        // The older attempt now fails against a peer that has gone away.
+        alice_net.shutdown().await;
+        drop(release);
+        assert!(older.await.unwrap().is_err());
+        let status = bob_net.node.sync_status(topic_id).unwrap().remove(0);
+        assert_eq!(status.state, crate::SyncPeerState::Healthy, "{status:?}");
+        assert_eq!(status.latest_attempt, newer.latest_attempt);
+        assert_eq!((status.successful_attempts, status.failed_attempts), (1, 1));
+        bob_net.shutdown().await;
     }
 
     /// Shutdown before any loop subscribes must still be recorded. The watch
