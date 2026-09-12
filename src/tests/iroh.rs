@@ -729,6 +729,7 @@ async fn handle_messages_accepts_ack_heads_that_arrive_before_data() {
     let mut ack = sync::SyncAck {
         topic_id: topic.id(),
         peer_id: bob.peer_id(),
+        genesis: genesis_of(bob.storage(), &topic.id()),
         accepted: [alice_record.meta.op_id].into(),
         heads: bob.storage().heads(&topic.id()).unwrap(),
         clock: bob.storage().actor_clock(&topic.id()).unwrap(),
@@ -1065,6 +1066,7 @@ async fn bad_ack_spares_other_topics() {
     let mut bad = sync::SyncAck {
         topic_id: poisoned,
         peer_id: bob.peer_id(),
+        genesis: genesis_of(bob.storage(), &poisoned),
         accepted: BTreeSet::new(),
         heads: BTreeSet::new(),
         clock: ahead,
@@ -1074,6 +1076,7 @@ async fn bad_ack_spares_other_topics() {
     let mut good = sync::SyncAck {
         topic_id: healthy,
         peer_id: bob.peer_id(),
+        genesis: genesis_of(alice.storage(), &healthy),
         accepted: BTreeSet::new(),
         heads: alice.storage().heads(&healthy).unwrap(),
         clock: alice.storage().actor_clock(&healthy).unwrap(),
@@ -1349,6 +1352,7 @@ async fn wrong_peer_ack() {
     let mut stray = sync::SyncAck {
         topic_id: unbound,
         peer_id: carol.peer_id(),
+        genesis: genesis_of(alice.storage(), &unbound),
         accepted: BTreeSet::new(),
         heads: alice.storage().heads(&unbound).unwrap(),
         clock: alice.storage().actor_clock(&unbound).unwrap(),
@@ -1358,6 +1362,7 @@ async fn wrong_peer_ack() {
     let mut good = sync::SyncAck {
         topic_id: healthy,
         peer_id: bob.peer_id(),
+        genesis: genesis_of(alice.storage(), &healthy),
         accepted: BTreeSet::new(),
         heads: alice.storage().heads(&healthy).unwrap(),
         clock: alice.storage().actor_clock(&healthy).unwrap(),

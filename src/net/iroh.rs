@@ -3016,6 +3016,11 @@ mod tests {
         let mut ack = crate::sync::SyncAck {
             topic_id: topic.id(),
             peer_id: bob.peer_id(),
+            genesis: alice
+                .storage()
+                .topic_state(&topic.id())
+                .unwrap()
+                .map(|state| state.genesis),
             accepted: BTreeSet::new(),
             heads: BTreeSet::new(),
             clock: crate::ActorClock::new(),

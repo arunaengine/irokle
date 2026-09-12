@@ -841,6 +841,9 @@ fn receive_schedules_forwarding_only_for_missing_selected_peers() {
         .apply_peer_ack(crate_storage::PeerAck {
             peer_id: charlie.peer_id(),
             topic_id: topic.id(),
+            // The branch bob is about to adopt: evidence names the incarnation
+            // it certifies, so it starts counting once that branch is local.
+            genesis: genesis_of(alice.storage(), &topic.id()),
             heads: [record.meta.op_id].into(),
             clock,
         })

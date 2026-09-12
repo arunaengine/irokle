@@ -62,6 +62,12 @@ pub struct TopicState {
 pub struct PeerAck {
     pub peer_id: PeerId,
     pub topic_id: TopicId,
+    /// Genesis of the incarnation this evidence was signed against. `None` is
+    /// a record migrated from a schema that did not identify its branch; it is
+    /// retained but certifies nothing, because genesis replacement reuses the
+    /// same actor ids and sequence numbers on the new branch.
+    #[serde(default)]
+    pub genesis: Option<OpId>,
     pub heads: BTreeSet<OpId>,
     pub clock: ActorClock,
 }
@@ -200,16 +206,24 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// Backends must perform both writes in one durable operation so a crash
     /// between them cannot leave the ack visible while obligations remain,
     /// or vice-versa. Returns the number of cleared obligations.
+    ///
+    /// The topic's current identity and membership must be read in that same
+    /// operation and the write conditioned on them, so evidence validated
+    /// before a concurrent reset or peer removal cannot still commit. Evidence
+    /// naming another incarnation is refused with
+    /// [`crate::Error::StaleIncarnation`]; a removed peer's with
+    /// [`crate::Error::NotTopicMember`].
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize>;
     /// Apply many peer acks in order, equivalent to calling
     /// [`Storage::apply_peer_ack`] per ack. Backends may batch all writes into
-    /// one durable operation. Returns the total number of cleared obligations.
-    fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<usize> {
-        let mut cleared = 0;
-        for ack in acks {
-            cleared += self.apply_peer_ack(ack)?;
-        }
-        Ok(cleared)
+    /// one durable operation. Returns one result per input ack, in order, so a
+    /// single uncertifiable record neither commits nor discards the rest. The
+    /// outer error is reserved for a backend failure covering the whole batch.
+    fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<Vec<Result<usize>>> {
+        Ok(acks
+            .into_iter()
+            .map(|ack| self.apply_peer_ack(ack))
+            .collect())
     }
     fn sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId)
     -> Result<Vec<SyncObligation>>;
@@ -300,22 +314,26 @@ pub trait Storage: Clone + Send + Sync + 'static {
         let Some(meta) = self.get_meta(op_id)? else {
             return Ok(false);
         };
+        let Some(genesis) = self.topic_state(&meta.topic_id)?.map(|state| state.genesis) else {
+            return Ok(false);
+        };
         let Some(ack) = self.peer_ack(peer_id, &meta.topic_id)? else {
             return Ok(false);
         };
-        Ok(ack.heads.contains(op_id) || ack.clock.get(&meta.actor_id) >= meta.actor_seq)
+        Ok(ack_reached_op(&ack, genesis, &meta))
     }
 
     fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>> {
         let Some(meta) = self.get_meta(op_id)? else {
             return Ok(Vec::new());
         };
+        let Some(genesis) = self.topic_state(&meta.topic_id)?.map(|state| state.genesis) else {
+            return Ok(Vec::new());
+        };
         let mut peers = self
             .peer_acks(&meta.topic_id)?
             .into_iter()
-            .filter(|ack| {
-                ack.heads.contains(op_id) || ack.clock.get(&meta.actor_id) >= meta.actor_seq
-            })
+            .filter(|ack| ack_reached_op(ack, genesis, &meta))
             .map(|ack| ack.peer_id)
             .collect::<Vec<_>>();
         peers.sort();
@@ -490,10 +508,53 @@ pub(super) fn journalled_eviction(
         .map(|eviction| (eviction.key(), eviction))
 }
 
+/// Whether `ack` proves the peer holds the operation `meta` describes. Only
+/// evidence certified against the topic's current genesis counts: a record from
+/// a replaced branch names the same actor sequences without covering them.
+fn ack_reached_op(ack: &PeerAck, genesis: OpId, meta: &OpMeta) -> bool {
+    ack.genesis == Some(genesis)
+        && (ack.heads.contains(&meta.id) || ack.clock.get(&meta.actor_id) >= meta.actor_seq)
+}
+
+/// What one acknowledgement may do to stored state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AckCommit {
+    /// The record proves the current branch: store it and clear what it covers.
+    Certify,
+    /// The record is kept under the genesis it names but proves nothing here,
+    /// because no local topic holds that branch yet.
+    Retain,
+}
+
+/// How to commit `ack` given `state`, which backends must read in the same
+/// transaction that writes it. Evidence proves something about one branch and
+/// one member, so a replaced genesis or a removed peer makes it uncertifiable
+/// rather than merely stale, and only a matching branch may clear obligations.
+pub(super) fn ack_commit(state: Option<&TopicState>, ack: &PeerAck) -> Result<AckCommit> {
+    let Some(state) = state else {
+        return Ok(AckCommit::Retain);
+    };
+    if ack.genesis != Some(state.genesis) {
+        return Err(crate::Error::StaleIncarnation);
+    }
+    if !state.members.contains(&ack.peer_id) {
+        return Err(crate::Error::NotTopicMember);
+    }
+    Ok(AckCommit::Certify)
+}
+
 pub(super) fn stored_ack_dominates(existing: &PeerAck, incoming: &PeerAck) -> bool {
+    same_incarnation(existing, incoming) && existing.clock.dominates(&incoming.clock)
+}
+
+/// Whether two records describe the same peer, topic, and certified branch. A
+/// pair with no certified genesis is never the same incarnation: an unidentified
+/// record must not lend its clock to a certified one.
+fn same_incarnation(existing: &PeerAck, incoming: &PeerAck) -> bool {
     existing.peer_id == incoming.peer_id
         && existing.topic_id == incoming.topic_id
-        && existing.clock.dominates(&incoming.clock)
+        && existing.genesis.is_some()
+        && existing.genesis == incoming.genesis
 }
 
 /// The ack to store once `incoming` is not covered by `existing`. Clock
@@ -502,7 +563,7 @@ pub(super) fn stored_ack_dominates(existing: &PeerAck, incoming: &PeerAck) -> bo
 /// frontier follows the newer ack: its clock still carries the older heads.
 pub(super) fn merged_peer_ack(existing: &PeerAck, incoming: &PeerAck) -> PeerAck {
     let mut merged = incoming.clone();
-    if existing.peer_id == incoming.peer_id && existing.topic_id == incoming.topic_id {
+    if same_incarnation(existing, incoming) {
         merged.clock.merge(&existing.clock);
     }
     merged

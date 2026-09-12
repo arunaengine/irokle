@@ -413,6 +413,16 @@ pub(crate) fn holed_store<S: Corrupt>(
     (source, topic_id, ops)
 }
 
+/// Genesis of `topic_id` as `storage` currently holds it. Signed
+/// acknowledgements name the incarnation they certify, so tests read it here
+/// rather than repeating the topic-state lookup.
+pub(crate) fn genesis_of<S: Storage>(storage: &S, topic_id: &TopicId) -> Option<OpId> {
+    storage
+        .topic_state(topic_id)
+        .unwrap()
+        .map(|state| state.genesis)
+}
+
 pub(crate) fn node(seed: u8) -> Irokle {
     Irokle::new(NodeConfig {
         signer: Ed25519Signer::from_bytes(&[seed; 32]),

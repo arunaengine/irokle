@@ -11,11 +11,12 @@ use crate::{
 };
 
 use super::{
-    AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
-    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
-    SyncPeerStatus, SyncStatusUpdate, TopicState, apply_status_update, ensure_deps_resolvable,
-    journalled_eviction, merged_peer_ack, new_peer_status, stored_ack_dominates,
-    sync_obligation_satisfied, topic_fingerprint_for, validate_batch, validate_heads,
+    AckCommit, AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS,
+    MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta,
+    PeerAck, Storage, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, ack_commit,
+    apply_status_update, ensure_deps_resolvable, journalled_eviction, merged_peer_ack,
+    new_peer_status, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
+    validate_batch, validate_heads,
 };
 
 #[cfg(feature = "fjall")]
@@ -27,7 +28,7 @@ pub struct FjallStorage {
 }
 
 #[cfg(feature = "fjall")]
-const FJALL_SCHEMA_VERSION: u32 = 1;
+const FJALL_SCHEMA_VERSION: u32 = 2;
 /// Eviction journal records. No other keyspace begins with `e`, so this is the
 /// whole prefix: unlike `ob`, it cannot be shadowed by a single-letter prefix.
 #[cfg(feature = "fjall")]
@@ -36,6 +37,22 @@ const EVICTION_PREFIX: &[u8] = b"ev";
 const SEALED_TOPIC_PREFIX: &[u8] = b"se";
 #[cfg(feature = "fjall")]
 const FJALL_SCHEMA_VERSION_KEY: &[u8] = b"sv";
+/// Stored acknowledgements. `ac`, `as`, and `at` differ in the second byte and
+/// no single-letter `a` prefix exists, so this is the whole prefix.
+#[cfg(feature = "fjall")]
+const PEER_ACK_PREFIX: &[u8] = b"ak";
+
+/// Schema 1 layout of a stored acknowledgement, which did not name the branch
+/// it certified. Kept only to read those records during the upgrade; postcard
+/// is not self-describing, so the old bytes need the old field order.
+#[cfg(feature = "fjall")]
+#[derive(Deserialize)]
+struct LegacyPeerAck {
+    peer_id: PeerId,
+    topic_id: TopicId,
+    heads: BTreeSet<OpId>,
+    clock: ActorClock,
+}
 
 #[cfg(feature = "fjall")]
 impl FjallStorage {
@@ -84,11 +101,48 @@ impl FjallStorage {
     fn ensure_schema_version(&self) -> Result<()> {
         match self.get::<u32>(FJALL_SCHEMA_VERSION_KEY)? {
             Some(FJALL_SCHEMA_VERSION) => Ok(()),
+            Some(1) => self.migrate_peer_acks(),
             Some(version) => Err(Error::Storage(format!(
                 "unsupported fjall schema version {version}"
             ))),
             None => self.put(FJALL_SCHEMA_VERSION_KEY, &FJALL_SCHEMA_VERSION),
         }
+    }
+
+    /// Rewrite schema 1 acknowledgements into the current layout, which names
+    /// the incarnation each one certifies. Their branch was never recorded, so
+    /// they migrate as uncertified: the records and their clocks are preserved,
+    /// but they prove nothing until the peer acknowledges the current branch.
+    /// One transaction carries every rewrite and the version bump, so an
+    /// interrupted upgrade reopens at schema 1 and retries from the start.
+    fn migrate_peer_acks(&self) -> Result<()> {
+        self.transaction(|tx| {
+            let mut migrated = Vec::new();
+            for item in fjall::Readable::prefix(tx, &self.records, PEER_ACK_PREFIX) {
+                let (key, value) = item.into_inner()?;
+                let legacy: LegacyPeerAck = postcard::from_bytes(value.as_ref())?;
+                migrated.push((
+                    key.to_vec(),
+                    PeerAck {
+                        peer_id: legacy.peer_id,
+                        topic_id: legacy.topic_id,
+                        genesis: None,
+                        heads: legacy.heads,
+                        clock: legacy.clock,
+                    },
+                ));
+            }
+            for (key, ack) in &migrated {
+                Self::tx_put(tx, &self.records, key, ack)?;
+            }
+            Self::tx_put(
+                tx,
+                &self.records,
+                FJALL_SCHEMA_VERSION_KEY,
+                &FJALL_SCHEMA_VERSION,
+            )?;
+            Ok(())
+        })
     }
 
     fn transaction<R>(
@@ -292,10 +346,24 @@ impl FjallStorage {
             .transpose()?)
     }
 
+    /// How `ack` may commit against the topic as this transaction sees it. The
+    /// outer result is a backend failure; the inner one is the per-ack verdict,
+    /// which a batch records without abandoning the other acks.
+    fn tx_ack_commit(
+        tx: &mut fjall::OptimisticWriteTx,
+        records: &fjall::OptimisticTxKeyspace,
+        ack: &PeerAck,
+    ) -> Result<Result<AckCommit>> {
+        let state: Option<TopicState> =
+            Self::tx_get(tx, records, Self::key_id(b"ts", &ack.topic_id))?;
+        Ok(ack_commit(state.as_ref(), ack))
+    }
+
     fn tx_apply_peer_ack(
         tx: &mut fjall::OptimisticWriteTx,
         records: &fjall::OptimisticTxKeyspace,
         ack: &PeerAck,
+        commit: AckCommit,
     ) -> Result<usize> {
         let ack_key = [
             b"ak".as_slice(),
@@ -315,6 +383,9 @@ impl FjallStorage {
                 ack.clone()
             }
         };
+        if commit == AckCommit::Retain {
+            return Ok(0);
+        }
         clear_satisfied_tx(tx, records, &effective_ack)
     }
 
@@ -747,7 +818,7 @@ impl FjallStorage {
         // `<peer><topic><digest>`, so the topic is not a scan prefix; filter
         // by the decoded record instead.
         let mut ak_keys = Vec::new();
-        for item in fjall::Readable::prefix(tx, &self.records, b"ak".as_slice()) {
+        for item in fjall::Readable::prefix(tx, &self.records, PEER_ACK_PREFIX) {
             let (key, value) = item.into_inner()?;
             let ack: PeerAck = postcard::from_bytes(value.as_ref())?;
             if ack.topic_id == *topic_id {
@@ -1176,19 +1247,27 @@ impl Storage for FjallStorage {
     }
 
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {
-        self.transaction(|tx| Self::tx_apply_peer_ack(tx, &self.records, &ack))
+        self.transaction(|tx| {
+            let commit = Self::tx_ack_commit(tx, &self.records, &ack)??;
+            Self::tx_apply_peer_ack(tx, &self.records, &ack, commit)
+        })
     }
 
-    fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<usize> {
+    fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<Vec<Result<usize>>> {
         if acks.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         self.transaction(|tx| {
-            let mut cleared = 0;
+            let mut results = Vec::with_capacity(acks.len());
             for ack in &acks {
-                cleared += Self::tx_apply_peer_ack(tx, &self.records, ack)?;
+                match Self::tx_ack_commit(tx, &self.records, ack)? {
+                    Ok(commit) => {
+                        results.push(Self::tx_apply_peer_ack(tx, &self.records, ack, commit));
+                    }
+                    Err(rejected) => results.push(Err(rejected)),
+                }
             }
-            Ok(cleared)
+            Ok(results)
         })
     }
 

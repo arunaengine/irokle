@@ -9,11 +9,12 @@ use crate::{
 };
 
 use super::{
-    AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
-    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
-    SyncPeerStatus, SyncStatusUpdate, TopicState, apply_status_update, ensure_deps_resolvable,
-    journalled_eviction, merged_peer_ack, new_peer_status, stored_ack_dominates,
-    sync_obligation_satisfied, topic_fingerprint_for, validate_batch, validate_heads,
+    AckCommit, AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS,
+    MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta,
+    PeerAck, Storage, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, ack_commit,
+    apply_status_update, ensure_deps_resolvable, journalled_eviction, merged_peer_ack,
+    new_peer_status, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
+    validate_batch, validate_heads,
 };
 
 #[derive(Clone, Default)]
@@ -370,16 +371,15 @@ impl Storage for MemoryStorage {
 
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {
         let mut inner = self.lock()?;
-        Ok(apply_peer_ack_locked(&mut inner, ack))
+        apply_peer_ack_locked(&mut inner, ack)
     }
 
-    fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<usize> {
+    fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<Vec<Result<usize>>> {
         let mut inner = self.lock()?;
-        let mut cleared = 0;
-        for ack in acks {
-            cleared += apply_peer_ack_locked(&mut inner, ack);
-        }
-        Ok(cleared)
+        Ok(acks
+            .into_iter()
+            .map(|ack| apply_peer_ack_locked(&mut inner, ack))
+            .collect())
     }
 
     fn sync_obligations(
@@ -742,7 +742,8 @@ fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> usize {
     removed
 }
 
-fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> usize {
+fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> Result<usize> {
+    let commit = ack_commit(inner.topics.get(&ack.topic_id), &ack)?;
     let key = (ack.peer_id, ack.topic_id);
     let effective_ack = match inner.peer_acks.get(&key) {
         Some(existing) if stored_ack_dominates(existing, &ack) => existing.clone(),
@@ -756,7 +757,10 @@ fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> usize {
             ack
         }
     };
-    clear_satisfied_locked(inner, &effective_ack)
+    if commit == AckCommit::Retain {
+        return Ok(0);
+    }
+    Ok(clear_satisfied_locked(inner, &effective_ack))
 }
 
 /// One record per id set, so an ordinary target coalesces into the empty-id

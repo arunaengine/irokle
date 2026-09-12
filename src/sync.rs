@@ -14,7 +14,12 @@ use crate::{
     canonical_bytes, verify,
 };
 
-const SYNC_ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/1";
+const SYNC_ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/2";
+
+/// Wire contract this build speaks. Version 2 binds every acknowledgement to
+/// the topic incarnation it certifies, so a version 1 peer is refused at the
+/// transport rather than connecting and sending evidence that names no branch.
+pub const SYNC_PROTOCOL: &str = "irokle/sync/2";
 
 /// Maximum number of sequences a single ActorRangeHint may span. Caps both the
 /// hint a peer can construct via `needed_actor_ranges` and the work
@@ -86,6 +91,12 @@ pub struct SyncData {
 pub struct SyncAck {
     pub topic_id: TopicId,
     pub peer_id: PeerId,
+    /// Genesis of the incarnation this acknowledgement certifies. Signed, so a
+    /// proof cannot be moved to a branch that replaced the one it was made on.
+    /// `None` is an acknowledgement from a peer that predates this contract, or
+    /// one whose sender could not read a coherent view; it certifies nothing.
+    #[serde(default)]
+    pub genesis: Option<OpId>,
     pub accepted: BTreeSet<OpId>,
     pub heads: BTreeSet<OpId>,
     pub clock: ActorClock,
@@ -97,6 +108,7 @@ pub struct SyncAck {
 struct SyncAckToSign<'a> {
     topic_id: TopicId,
     peer_id: PeerId,
+    genesis: &'a Option<OpId>,
     accepted: &'a BTreeSet<OpId>,
     heads: &'a BTreeSet<OpId>,
     clock: &'a ActorClock,
@@ -122,6 +134,7 @@ impl SyncAck {
         bytes.extend_from_slice(&canonical_bytes(&SyncAckToSign {
             topic_id: self.topic_id,
             peer_id: self.peer_id,
+            genesis: &self.genesis,
             accepted: &self.accepted,
             heads: &self.heads,
             clock: &self.clock,
@@ -191,7 +204,7 @@ impl<S: Storage> SyncEngine<S> {
     }
     pub fn open(topic_id: TopicId, peer_id: PeerId, event_type_id: Option<String>) -> SyncOpen {
         SyncOpen {
-            protocol: "irokle/sync/1".into(),
+            protocol: SYNC_PROTOCOL.into(),
             topic_id,
             peer_id,
             event_type_id,
@@ -560,6 +573,7 @@ impl<S: Storage> SyncEngine<S> {
         let mut ack = SyncAck {
             topic_id: data.topic_id,
             peer_id: ack_peer_id,
+            genesis: None,
             accepted: admitted
                 .accepted
                 .iter()
@@ -592,7 +606,8 @@ impl<S: Storage> SyncEngine<S> {
             });
         }
         match frontier {
-            Ok((heads, clock)) => {
+            Ok((genesis, heads, clock)) => {
+                ack.genesis = Some(genesis);
                 ack.heads = heads;
                 ack.clock = clock;
                 Ok((ack, admitted.evictions))
@@ -609,12 +624,19 @@ impl<S: Storage> SyncEngine<S> {
     /// cannot resolve is unable to replay the history those values name, so it
     /// certifies nothing until repair completes: the source keeps its retry
     /// obligation and this node stays visibly behind instead of going quiet.
-    fn ack_frontier(&self, topic_id: &TopicId) -> Result<(BTreeSet<OpId>, ActorClock)> {
+    fn ack_frontier(&self, topic_id: &TopicId) -> Result<(OpId, BTreeSet<OpId>, ActorClock)> {
+        let genesis = self
+            .oplog
+            .storage()
+            .topic_state(topic_id)?
+            .ok_or(Error::TopicNotFound)?
+            .genesis;
         if !self.oplog.topic_unresolved(topic_id)?.is_empty() {
             tracing::debug!(%topic_id, "withholding ack frontier for an incomplete topic");
-            return Ok((BTreeSet::new(), ActorClock::new()));
+            return Ok((genesis, BTreeSet::new(), ActorClock::new()));
         }
         Ok((
+            genesis,
             self.oplog.storage().heads(topic_id)?,
             self.oplog.storage().actor_clock(topic_id)?,
         ))
@@ -623,13 +645,11 @@ impl<S: Storage> SyncEngine<S> {
     pub fn apply_ack(&self, ack: &SyncAck) -> Result<()> {
         ack.verify_signature()?;
         self.validate_ack(ack)?;
-        let peer_ack = PeerAck {
-            peer_id: ack.peer_id,
-            topic_id: ack.topic_id,
-            heads: ack.heads.clone(),
-            clock: ack.clock.clone(),
-        };
-        self.oplog.storage().apply_peer_ack(peer_ack)?;
+        // Storage repeats the identity and membership checks in the writing
+        // transaction, so a reset or removal in between refuses the commit.
+        self.oplog
+            .storage()
+            .apply_peer_ack(Self::peer_ack_for(ack))?;
         Ok(())
     }
 
@@ -644,23 +664,30 @@ impl<S: Storage> SyncEngine<S> {
             match ack.verify_signature().and_then(|()| self.validate_ack(ack)) {
                 Ok(()) => {
                     validated.push(index);
-                    peer_acks.push(PeerAck {
-                        peer_id: ack.peer_id,
-                        topic_id: ack.topic_id,
-                        heads: ack.heads.clone(),
-                        clock: ack.clock.clone(),
-                    });
+                    peer_acks.push(Self::peer_ack_for(ack));
                     results.push(Ok(()));
                 }
                 Err(err) => results.push(Err(err)),
             }
         }
-        if !peer_acks.is_empty()
-            && let Err(err) = self.oplog.storage().apply_peer_acks(peer_acks)
-        {
-            let message = err.to_string();
-            for index in validated {
-                results[index] = Err(Error::Storage(message.clone()));
+        if peer_acks.is_empty() {
+            return results;
+        }
+        // One uncertifiable record is reported against its own ack; only a
+        // backend failure covering the whole batch fails the rest.
+        match self.oplog.storage().apply_peer_acks(peer_acks) {
+            Ok(applied) => {
+                for (index, outcome) in validated.into_iter().zip(applied) {
+                    if let Err(err) = outcome {
+                        results[index] = Err(err);
+                    }
+                }
+            }
+            Err(err) => {
+                let message = err.to_string();
+                for index in validated {
+                    results[index] = Err(Error::Storage(message.clone()));
+                }
             }
         }
         results
@@ -675,10 +702,11 @@ impl<S: Storage> SyncEngine<S> {
         if !state.members.contains(&peer_id) {
             return Err(Error::NotTopicMember);
         }
-        let (heads, clock) = self.ack_frontier(&topic_id)?;
+        let (genesis, heads, clock) = self.ack_frontier(&topic_id)?;
         let peer_ack = PeerAck {
             peer_id,
             topic_id,
+            genesis: Some(genesis),
             heads,
             clock,
         };
@@ -701,13 +729,14 @@ impl<S: Storage> SyncEngine<S> {
         if !state.members.contains(&peer_id) {
             return Err(Error::NotTopicMember);
         }
-        let (heads, clock) = self.ack_frontier(&topic_id)?;
+        let (genesis, heads, clock) = self.ack_frontier(&topic_id)?;
         if crate::storage::topic_fingerprint_for(&heads, &clock)? != fingerprint {
             return Ok(false);
         }
         self.oplog.storage().apply_peer_ack(PeerAck {
             peer_id,
             topic_id,
+            genesis: Some(genesis),
             heads,
             clock,
         })?;
@@ -720,6 +749,15 @@ impl<S: Storage> SyncEngine<S> {
             .storage()
             .topic_state(&ack.topic_id)?
             .ok_or(Error::TopicNotFound)?;
+        match ack.genesis {
+            Some(genesis) if genesis == state.genesis => {}
+            Some(_) => return Err(Error::StaleIncarnation),
+            None => {
+                return Err(Error::InvalidSyncAck(
+                    "acknowledgement does not name the topic incarnation it certifies".into(),
+                ));
+            }
+        }
         if !state.members.contains(&ack.peer_id) {
             return Err(Error::NotTopicMember);
         }
@@ -755,6 +793,18 @@ impl<S: Storage> SyncEngine<S> {
             }
         }
         Ok(())
+    }
+
+    /// The stored record for a validated acknowledgement. One constructor means
+    /// no evidence path can forget the incarnation the proof was signed for.
+    fn peer_ack_for(ack: &SyncAck) -> PeerAck {
+        PeerAck {
+            peer_id: ack.peer_id,
+            topic_id: ack.topic_id,
+            genesis: ack.genesis,
+            heads: ack.heads.clone(),
+            clock: ack.clock.clone(),
+        }
     }
 
     pub fn put_obligation(

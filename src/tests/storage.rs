@@ -252,6 +252,7 @@ fn assert_reset_topic_clears_everything<S: Storage>(storage: S) {
         .apply_peer_ack(crate_storage::PeerAck {
             peer_id: other_peer,
             topic_id,
+            genesis: Some(genesis_id),
             heads: storage.heads(&topic_id).unwrap(),
             clock: ack_clock,
         })
@@ -1168,6 +1169,8 @@ fn assert_vacuous_obligation<S: Storage>(storage: S) {
     let peer = PeerId::hash(b"vacuous-peer");
     let topic_id = TopicId::hash(b"vacuous-topic");
     let actor = actor_id_for(topic_id, peer);
+    let (_log, _signer, seeded, _event) =
+        forked_side(storage.clone(), topic_id, 81, [peer], "vacuous");
     let mut target_clock = ActorClock::new();
     target_clock.observe(actor, 4);
     storage
@@ -1184,6 +1187,7 @@ fn assert_vacuous_obligation<S: Storage>(storage: S) {
         .apply_peer_ack(crate_storage::PeerAck {
             peer_id: peer,
             topic_id,
+            genesis: Some(seeded.id),
             heads: BTreeSet::new(),
             clock: ActorClock::new(),
         })
@@ -1197,6 +1201,7 @@ fn assert_vacuous_obligation<S: Storage>(storage: S) {
         .apply_peer_ack(crate_storage::PeerAck {
             peer_id: peer,
             topic_id,
+            genesis: Some(seeded.id),
             heads: BTreeSet::new(),
             clock: proof,
         })
@@ -1225,6 +1230,8 @@ fn fjall_vacuous_obligation() {
 fn assert_merged_acks<S: Storage>(storage: S) {
     let peer = PeerId::hash(b"merge-peer");
     let topic_id = TopicId::hash(b"merge-topic");
+    let (_log, _signer, seeded, _event) =
+        forked_side(storage.clone(), topic_id, 82, [peer], "merge");
     let first_actor = actor_id_for(topic_id, PeerId::hash(b"merge-actor-one"));
     let second_actor = actor_id_for(topic_id, PeerId::hash(b"merge-actor-two"));
     let mut target_clock = ActorClock::new();
@@ -1244,6 +1251,7 @@ fn assert_merged_acks<S: Storage>(storage: S) {
     let first_ack = crate_storage::PeerAck {
         peer_id: peer,
         topic_id,
+        genesis: Some(seeded.id),
         heads: BTreeSet::new(),
         clock: first_clock,
     };
@@ -1254,6 +1262,7 @@ fn assert_merged_acks<S: Storage>(storage: S) {
     let second_ack = crate_storage::PeerAck {
         peer_id: peer,
         topic_id,
+        genesis: Some(seeded.id),
         heads: BTreeSet::new(),
         clock: second_clock,
     };
@@ -1404,6 +1413,8 @@ fn assert_coalesced_targets<S: Storage>(storage: S) {
     let peer = PeerId::hash(b"coalesce-peer");
     let other = PeerId::hash(b"coalesce-other");
     let topic_id = TopicId::hash(b"coalesce-topic");
+    let (_log, _signer, seeded, _event) =
+        forked_side(storage.clone(), topic_id, 83, [peer, other], "coalesce");
     let actor = actor_id_for(topic_id, peer);
 
     for rounds in [8_u64, 16] {
@@ -1455,6 +1466,7 @@ fn assert_coalesced_targets<S: Storage>(storage: S) {
         .apply_peer_ack(crate_storage::PeerAck {
             peer_id: peer,
             topic_id,
+            genesis: Some(seeded.id),
             heads: BTreeSet::new(),
             clock: proof,
         })

@@ -8,7 +8,7 @@ use super::invalid_data;
 
 pub(super) const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 pub const MAX_SYNC_DATA_OPS_PER_MESSAGE: usize = 256;
-pub const IROKLE_SYNC_ALPN: &[u8] = b"irokle/sync/1";
+pub const IROKLE_SYNC_ALPN: &[u8] = crate::sync::SYNC_PROTOCOL.as_bytes();
 
 pub fn encode_sync_message(message: &SyncMessage) -> io::Result<Vec<u8>> {
     postcard::to_allocvec(message).map_err(invalid_data)

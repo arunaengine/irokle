@@ -43,6 +43,12 @@ pub enum Error {
     #[error("invalid sync acknowledgement: {0}")]
     InvalidSyncAck(String),
 
+    /// Evidence that names a topic incarnation other than the current one.
+    /// Genesis replacement makes the discarded branch's proofs uncertifiable:
+    /// the actor identities and sequence numbers repeat on the new branch.
+    #[error("sync evidence belongs to a replaced topic incarnation")]
+    StaleIncarnation,
+
     #[error("async replication requires a configured transport")]
     ReplicationUnavailable,
 

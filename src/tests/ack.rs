@@ -49,6 +49,7 @@ fn assert_clears_satisfied<S: Storage>(storage: S) {
     let mut ack = sync::SyncAck {
         topic_id: topic.id(),
         peer_id: peer,
+        genesis: genesis_of(irokle.storage(), &topic.id()),
         accepted: BTreeSet::new(),
         heads: [satisfied.meta.op_id].into(),
         clock,
@@ -103,6 +104,7 @@ fn assert_stale_ack_ignored<S: Storage>(storage: S) {
     let mut fresh = sync::SyncAck {
         topic_id: topic.id(),
         peer_id: peer,
+        genesis: genesis_of(alice.storage(), &topic.id()),
         accepted: BTreeSet::new(),
         heads: [second.meta.op_id].into(),
         clock: fresh_clock,
@@ -116,6 +118,7 @@ fn assert_stale_ack_ignored<S: Storage>(storage: S) {
     let mut stale = sync::SyncAck {
         topic_id: topic.id(),
         peer_id: peer,
+        genesis: genesis_of(alice.storage(), &topic.id()),
         accepted: BTreeSet::new(),
         heads: [first.meta.op_id].into(),
         clock: stale_clock,
@@ -153,6 +156,7 @@ fn unsigned_ack_keeps_obligation() {
         .apply_sync_ack(&sync::SyncAck {
             topic_id: topic.id(),
             peer_id: bob.peer_id(),
+            genesis: genesis_of(alice.storage(), &topic.id()),
             accepted: BTreeSet::new(),
             heads: [record.meta.op_id].into(),
             clock: ActorClock::new(),
@@ -196,6 +200,7 @@ fn clock_clears_obligation() {
     let mut ack = sync::SyncAck {
         topic_id: topic.id(),
         peer_id: peer,
+        genesis: genesis_of(alice.storage(), &topic.id()),
         accepted: BTreeSet::new(),
         heads: BTreeSet::new(),
         clock,
@@ -238,6 +243,7 @@ fn rejects_future_clock() {
     let mut ack = sync::SyncAck {
         topic_id: topic.id(),
         peer_id: peer,
+        genesis: genesis_of(alice.storage(), &topic.id()),
         accepted: BTreeSet::new(),
         heads: BTreeSet::new(),
         clock,
@@ -280,6 +286,7 @@ fn accepts_unknown_heads() {
     let mut ack = sync::SyncAck {
         topic_id: topic.id(),
         peer_id: peer,
+        genesis: genesis_of(alice.storage(), &topic.id()),
         accepted: BTreeSet::new(),
         heads: [OpId::hash(b"unknown-head")].into(),
         clock: ActorClock::new(),
@@ -472,6 +479,7 @@ fn batch_ack_fixture<S: Storage>(
         let mut ack = sync::SyncAck {
             topic_id,
             peer_id: peer,
+            genesis: genesis_of(irokle.storage(), &topic_id),
             accepted: BTreeSet::new(),
             heads: [event_op.id].into(),
             clock,
@@ -645,6 +653,7 @@ fn fjall_clear_persists() {
         let mut ack = sync::SyncAck {
             topic_id: topic.id(),
             peer_id: peer,
+            genesis: genesis_of(irokle.storage(), &topic.id()),
             accepted: BTreeSet::new(),
             heads: [satisfied.meta.op_id].into(),
             clock,
