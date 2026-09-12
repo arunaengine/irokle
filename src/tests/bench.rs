@@ -8,10 +8,10 @@ use std::time::Instant;
 use super::support::*;
 use crate::oplog::Oplog;
 use crate::storage::{
-    AdmissionEffects, AdmittedBatch, FjallStorage, OpMeta, PeerAck, SyncObligation,
+    AdmissionEffects, AdmittedBatch, FjallStorage, OpMeta, PeerAck, StagedTopic, SyncObligation,
     SyncStatusUpdate, TopicState, TopicView,
 };
-use crate::sync::{SyncData, SyncEngine};
+use crate::sync::{PageBudget, SyncData, SyncEngine};
 use crate::{EvictionKey, SyncPeerStatus, TopicEviction, TopicInfo};
 
 const REPS: usize = 3;
@@ -147,6 +147,12 @@ impl<S: Storage> Storage for Counting<S> {
         clear_eviction(key: &EvictionKey) -> ();
         peer_reached_op(peer: &PeerId, id: &OpId) -> bool;
         peers_reached_op(id: &OpId) -> Vec<PeerId>;
+        next_attempt_epoch() -> u64;
+        stage_bootstrap_ops(source: PeerId, topic: TopicId, ops: Vec<Op>, now_ms: u64) -> StagedTopic;
+        staged_bootstrap_ops(source: &PeerId, topic: &TopicId) -> Vec<Op>;
+        promote_bootstrap(batch: AdmittedBatch) -> ();
+        discard_bootstrap(source: &PeerId, topic: &TopicId) -> usize;
+        expire_bootstrap(older_than_ms: u64) -> usize;
     }
 }
 
@@ -438,7 +444,9 @@ fn serve_page<S: Storage>(
     request.wants.clear();
     let before = storage.snapshot();
     let started = Instant::now();
-    let page = responder.response_page(reader, &request).unwrap();
+    let page = responder
+        .response_page(reader, &request, PageBudget::from_credit(request.credit))
+        .unwrap();
     let ms = millis(started);
     let after = storage.snapshot();
     (page.ops, ms, std::array::from_fn(|i| after[i] - before[i]))
