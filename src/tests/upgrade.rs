@@ -153,6 +153,7 @@ fn check_upgrade(name: &str, certified: bool) {
             last_attempt_ms: Some(1_700_000_000_000),
             last_success_ms: Some(1_699_999_999_000),
             last_error: Some("fixture error".into()),
+            ..SyncPeerStatus::default()
         }]
     );
 
