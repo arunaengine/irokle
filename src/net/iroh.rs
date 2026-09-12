@@ -5055,4 +5055,128 @@ mod tests {
             let _ = client.await;
         }
     }
+
+    /// Aborting the resync loop does not orphan the storage job its batch
+    /// started: the job stays owned, shutdown reports it until it ends, and
+    /// the target is not left owned by the aborted batch.
+    #[tokio::test]
+    async fn parent_abort_owns_child() {
+        use crate::tests::support::{Gate, GatePoint, Note, node};
+
+        let (net, storage) = stale_net().await;
+        let remote = node(71).peer_id();
+        let topic_id = net
+            .node
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [remote].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::View(topic_id), Arc::clone(&gate));
+        let resync = net
+            .spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("loop starts");
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+
+        resync.abort();
+        assert!(resync.await.unwrap_err().is_cancelled());
+        assert!(!net.resync_started.load(Ordering::SeqCst));
+        assert!(net.tasks.running() >= 1, "the held job lost its owner");
+        let outcome = net.shutdown_with_timeout(Duration::from_millis(200)).await;
+        assert!(
+            matches!(outcome, ShutdownOutcome::Incomplete { running } if running >= 1),
+            "{outcome:?}"
+        );
+
+        drop(release);
+        assert_eq!(
+            net.shutdown_with_timeout(Duration::from_secs(60)).await,
+            ShutdownOutcome::Complete
+        );
+        assert_eq!(net.tasks.running(), 0);
+        assert!(
+            net.resync_scheduler
+                .target_state(remote, topic_id)
+                .is_none_or(|(active, _, _)| active.is_none()),
+            "the aborted batch still owns its target"
+        );
+    }
+
+    /// Loops that end without shutdown, because the endpoint closed, clear
+    /// their latches and leave no owned task, so they can be started again.
+    #[tokio::test]
+    async fn restart_after_exit() {
+        let net = test_net().await;
+        let accept = net
+            .spawn_accept_loop()
+            .unwrap()
+            .expect("accept loop starts");
+        let resync = net
+            .spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("resync loop starts");
+
+        net.endpoint().close().await;
+        net.resync_scheduler.notifier().notify_one();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            accept.await.unwrap();
+            resync.await.unwrap();
+        })
+        .await
+        .expect("loops did not exit after the endpoint closed");
+        assert!(!net.is_shutdown());
+        tokio::time::timeout(Duration::from_secs(60), net.tasks.wait_idle())
+            .await
+            .expect("a task outlived its loop");
+
+        for replacement in [
+            net.spawn_accept_loop().unwrap(),
+            net.spawn_resync_loop(BACKOFF).unwrap(),
+        ] {
+            let replacement = replacement.expect("an exited loop can be started again");
+            replacement.await.unwrap();
+        }
+    }
+
+    /// A loop that panics clears its latch on unwind and leaves no owned
+    /// task, so it can be started again.
+    #[tokio::test]
+    async fn restart_after_panic() {
+        let net = test_net().await;
+        // A poisoned scheduler makes the loop's next dispatch panic.
+        let scheduler = net.resync_scheduler.clone();
+        let poisoned = std::thread::spawn(move || {
+            let _held = scheduler.inner.lock().unwrap();
+            panic!("poison the resync scheduler");
+        });
+        assert!(poisoned.join().is_err());
+
+        let resync = net
+            .spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("loop starts");
+        let ended = tokio::time::timeout(Duration::from_secs(60), resync)
+            .await
+            .expect("the loop did not reach its dispatch");
+        assert!(ended.unwrap_err().is_panic());
+        assert!(!net.resync_started.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(60), net.tasks.wait_idle())
+            .await
+            .expect("a task outlived the panicked loop");
+
+        let replacement = net
+            .spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("a panicked loop can be started again");
+        replacement.abort();
+        let _ = replacement.await;
+        net.shutdown().await;
+    }
 }
