@@ -818,19 +818,32 @@ impl<S: Storage> Irokle<S> {
         }
         let now_ms = now_millis()?;
         storage.expire_bootstrap(now_ms.saturating_sub(MAX_STAGED_IDLE_MS))?;
-        let staged =
-            match storage.stage_bootstrap_ops(source_peer_id, topic_id, data.ops.clone(), now_ms) {
-                Err(Error::AdmissionConflict) => return self.bootstrap_raced(topic_id),
-                staged => staged?,
-            };
-        let history = storage.staged_bootstrap_ops(&source_peer_id, &topic_id)?;
+        // Data that already completes the proof is promoted without a staging write.
+        let mut history = storage.staged_bootstrap_ops(&source_peer_id, &topic_id)?;
+        let known = history.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+        history.extend(
+            data.ops
+                .iter()
+                .filter(|op| !known.contains(&op.id))
+                .cloned(),
+        );
         let batch =
             match self
                 .oplog
                 .bootstrap_batch(self.peer_id(), source_peer_id, history, Some(forward))
             {
                 Ok(Some(batch)) => batch,
-                Ok(None) => return Ok(Bootstrap::Staged(staged)),
+                Ok(None) => {
+                    return match storage.stage_bootstrap_ops(
+                        source_peer_id,
+                        topic_id,
+                        data.ops.clone(),
+                        now_ms,
+                    ) {
+                        Err(Error::AdmissionConflict) => self.bootstrap_raced(topic_id),
+                        staged => Ok(Bootstrap::Staged(staged?)),
+                    };
+                }
                 Err(error) => {
                     // Invalid signed history never becomes valid; drop the session.
                     if !is_backend_failure(&error) {
