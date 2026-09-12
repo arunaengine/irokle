@@ -1021,6 +1021,11 @@ fn fjall_migrates_legacy() {
         let legacy =
             postcard::to_allocvec(&(peer, topic_id, BTreeSet::from([op_id]), clock)).unwrap();
         let mut tx = db.write_tx().unwrap();
+        // A schema 1 file has only the legacy key, never the current one.
+        tx.remove(
+            &records,
+            [b"ak".as_slice(), topic_id.as_ref(), peer.as_ref()].concat(),
+        );
         tx.insert(
             &records,
             [b"ak".as_slice(), peer.as_ref(), topic_id.as_ref()].concat(),
@@ -1105,9 +1110,9 @@ fn fjall_batch_rolls_back() {
             &records,
             [
                 b"ob".as_slice(),
-                peer.as_ref(),
                 topics[1].as_ref(),
-                &[0xff; 32],
+                peer.as_ref(),
+                b"r".as_slice(),
             ]
             .concat(),
             vec![0xff; 3],

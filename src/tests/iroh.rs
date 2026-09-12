@@ -1,22 +1,5 @@
 use super::support::*;
 
-/// Ordinary obligations coalesce into one clock-only target per peer and topic,
-/// so an operation is proven either by an explicit want or by its actor position.
-#[cfg(feature = "iroh")]
-fn obligation_covers(
-    storage: &impl crate::storage::Storage,
-    obligations: &[crate::storage::SyncObligation],
-    op_id: &OpId,
-) -> bool {
-    let Some(meta) = storage.get_meta(op_id).unwrap() else {
-        return false;
-    };
-    obligations.iter().any(|obligation| {
-        obligation.op_ids.contains(op_id)
-            || obligation.target_clock.get(&meta.actor_id) >= meta.actor_seq
-    })
-}
-
 #[cfg(feature = "iroh")]
 #[tokio::test]
 async fn builder_sets_net() {

@@ -13,11 +13,11 @@ use crate::{
 use super::{
     AckCommit, AdmittedBatch, MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL,
     MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
-    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
-    SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers,
-    ack_reached_op, apply_status_update, ensure_deps_resolvable, journalled_eviction,
-    merged_peer_ack, new_peer_status, pending_op_bytes, stored_ack_dominates,
-    sync_obligation_satisfied, topic_fingerprint_for, validate_batch, validate_heads,
+    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, ObligationTarget, OpMeta, PeerAck, Storage,
+    SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit,
+    ack_covers, ack_reached_op, apply_status_update, ensure_deps_resolvable, journalled_eviction,
+    merged_obligation, merged_peer_ack, new_peer_status, pending_op_bytes, settled_obligation,
+    stored_ack_dominates, topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[cfg(feature = "fjall")]
@@ -29,7 +29,7 @@ pub struct FjallStorage {
 }
 
 #[cfg(feature = "fjall")]
-const FJALL_SCHEMA_VERSION: u32 = 2;
+const FJALL_SCHEMA_VERSION: u32 = 3;
 /// Eviction journal records. No other keyspace begins with `e`, so this is the
 /// whole prefix: unlike `ob`, it cannot be shadowed by a single-letter prefix.
 #[cfg(feature = "fjall")]
@@ -38,10 +38,17 @@ const EVICTION_PREFIX: &[u8] = b"ev";
 const SEALED_TOPIC_PREFIX: &[u8] = b"se";
 #[cfg(feature = "fjall")]
 const FJALL_SCHEMA_VERSION_KEY: &[u8] = b"sv";
-/// Stored acknowledgements. `ac`, `as`, and `at` differ in the second byte and
-/// no single-letter `a` prefix exists, so this is the whole prefix.
+/// Stored acknowledgements, keyed on `ak<topic><peer>` since schema 3. No
+/// other key starts with `ak`, so this is the whole prefix.
 #[cfg(feature = "fjall")]
 const PEER_ACK_PREFIX: &[u8] = b"ak";
+/// Sync obligations, keyed on `ob<topic><peer><kind>` since schema 3. An op
+/// key `o<id>` with an id starting with `b` shares the prefix, so bare scans
+/// check the key length.
+#[cfg(feature = "fjall")]
+const OBLIGATION_PREFIX: &[u8] = b"ob";
+#[cfg(feature = "fjall")]
+const OBLIGATION_KEY_LEN: usize = 2 + TopicId::LEN + PeerId::LEN + 1;
 /// Buffered pending payload bytes, in total and per authenticated source.
 #[cfg(feature = "fjall")]
 const PENDING_BYTES_KEY: &[u8] = b"pb";
@@ -65,6 +72,17 @@ struct LegacyPeerAck {
     topic_id: TopicId,
     heads: BTreeSet<OpId>,
     clock: ActorClock,
+}
+
+/// Schema 1 and 2 layout of a sync obligation, which kept resolved and
+/// unresolved wants in one shape told apart only by empty fields.
+#[cfg(feature = "fjall")]
+#[derive(Deserialize)]
+struct LegacyObligation {
+    peer_id: PeerId,
+    topic_id: TopicId,
+    op_ids: BTreeSet<OpId>,
+    target_clock: ActorClock,
 }
 
 #[cfg(feature = "fjall")]
@@ -114,7 +132,11 @@ impl FjallStorage {
     fn ensure_schema_version(&self) -> Result<()> {
         match self.get::<u32>(FJALL_SCHEMA_VERSION_KEY)? {
             Some(FJALL_SCHEMA_VERSION) => Ok(()),
-            Some(1) => self.migrate_to_schema_two(),
+            Some(1) => {
+                self.migrate_to_schema_two()?;
+                self.migrate_to_schema_three()
+            }
+            Some(2) => self.migrate_to_schema_three(),
             Some(version) => Err(Error::Storage(format!(
                 "unsupported fjall schema version {version}"
             ))),
@@ -137,6 +159,10 @@ impl FjallStorage {
     /// interrupted upgrade reopens at schema 1 and retries from the start.
     fn migrate_to_schema_two(&self) -> Result<()> {
         self.transaction(|tx| {
+            // A concurrent facade may have finished the upgrade already.
+            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(1) {
+                return Ok(());
+            }
             let mut migrated = Vec::new();
             for item in fjall::Readable::prefix(tx, &self.records, PEER_ACK_PREFIX) {
                 let (key, value) = item.into_inner()?;
@@ -169,6 +195,100 @@ impl FjallStorage {
                 total_bytes = total_bytes.saturating_add(bytes);
                 *source_bytes.entry(source_peer).or_default() += bytes;
             }
+            if total_bytes > 0 {
+                Self::tx_put(tx, &self.records, PENDING_BYTES_KEY, &total_bytes)?;
+            }
+            for (source_peer, bytes) in source_bytes {
+                Self::tx_put(
+                    tx,
+                    &self.records,
+                    [PENDING_SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat(),
+                    &bytes,
+                )?;
+            }
+
+            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &2_u32)?;
+            Ok(())
+        })
+    }
+
+    /// Upgrade schema 2 in one transaction that rechecks the version. Acks and
+    /// obligations move to topic-first keys; a legacy clock becomes a clock
+    /// target, ids alone a repair want, and a record with neither is dropped.
+    fn migrate_to_schema_three(&self) -> Result<()> {
+        self.transaction(|tx| {
+            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(2) {
+                return Ok(());
+            }
+            let mut acks = Vec::new();
+            for item in fjall::Readable::prefix(tx, &self.records, PEER_ACK_PREFIX) {
+                let (key, value) = item.into_inner()?;
+                acks.push((
+                    key.to_vec(),
+                    postcard::from_bytes::<PeerAck>(value.as_ref())?,
+                ));
+            }
+            for (key, ack) in acks {
+                tx.remove(&self.records, key);
+                Self::tx_put(
+                    tx,
+                    &self.records,
+                    Self::ack_key(&ack.topic_id, &ack.peer_id),
+                    &ack,
+                )?;
+            }
+
+            let mut obligations = BTreeMap::<Vec<u8>, SyncObligation>::new();
+            let mut legacy_keys = Vec::new();
+            for item in fjall::Readable::prefix(tx, &self.records, OBLIGATION_PREFIX) {
+                let (key, value) = item.into_inner()?;
+                if Self::is_op_record_key(key.as_ref()) {
+                    continue;
+                }
+                legacy_keys.push(key.to_vec());
+                let legacy: LegacyObligation = postcard::from_bytes(value.as_ref())?;
+                let obligation = if !legacy.target_clock.is_empty() {
+                    SyncObligation::clock(legacy.peer_id, legacy.topic_id, legacy.target_clock)
+                } else if !legacy.op_ids.is_empty() {
+                    SyncObligation::repair(legacy.peer_id, legacy.topic_id, legacy.op_ids)
+                } else {
+                    continue;
+                };
+                // Legacy wants are kept whole even past the repair limit.
+                let key = Self::obligation_key(&obligation);
+                let merged = match (obligations.remove(&key), &obligation.target) {
+                    (Some(mut stored), ObligationTarget::Repair(ids)) => {
+                        if let ObligationTarget::Repair(stored_ids) = &mut stored.target {
+                            stored_ids.extend(ids.iter().copied());
+                        }
+                        stored
+                    }
+                    (stored, _) => merged_obligation(stored, &obligation)?,
+                };
+                obligations.insert(key, merged);
+            }
+            for key in legacy_keys {
+                tx.remove(&self.records, key);
+            }
+            for (key, obligation) in obligations {
+                Self::tx_put(tx, &self.records, key, &obligation)?;
+            }
+
+            let mut total_bytes = 0_u64;
+            let mut source_bytes: BTreeMap<PeerId, u64> = BTreeMap::new();
+            for item in fjall::Readable::prefix(tx, &self.records, PENDING_OP_PREFIX) {
+                let (key, value) = item.into_inner()?;
+                if key.len() != PENDING_OP_PREFIX.len() + OpId::LEN {
+                    continue;
+                }
+                let (source_peer, op, _) =
+                    postcard::from_bytes::<(PeerId, Op, OpMeta)>(value.as_ref())?;
+                let bytes = pending_op_bytes(&op)? as u64;
+                total_bytes += bytes;
+                *source_bytes.entry(source_peer).or_default() += bytes;
+            }
+            Self::tx_remove_prefix(tx, &self.records, PENDING_SOURCE_BYTES_PREFIX)?;
+            tx.remove(&self.records, PENDING_BYTES_KEY.to_vec());
             if total_bytes > 0 {
                 Self::tx_put(tx, &self.records, PENDING_BYTES_KEY, &total_bytes)?;
             }
@@ -356,37 +476,42 @@ impl FjallStorage {
         Ok(seen.len())
     }
 
-    /// One key per id set: an ordinary target coalesces into the bare
-    /// peer/topic key and an explicit repair want keys on its ids alone, so a
-    /// repeat raises the stored watermark instead of adding a record.
-    fn sync_obligation_key(obligation: &SyncObligation) -> Result<Vec<u8>> {
-        let mut key = [
-            b"ob".as_slice(),
-            obligation.peer_id.as_ref(),
-            obligation.topic_id.as_ref(),
-        ]
-        .concat();
-        if !obligation.op_ids.is_empty() {
-            let digest = blake3::hash(&postcard::to_allocvec(&obligation.op_ids)?);
-            key.extend_from_slice(digest.as_bytes());
-        }
-        Ok(key)
+    fn ack_key(topic_id: &TopicId, peer_id: &PeerId) -> Vec<u8> {
+        [PEER_ACK_PREFIX, topic_id.as_ref(), peer_id.as_ref()].concat()
     }
 
-    /// Key an earlier release wrote for the same want, digesting the ids
-    /// together with the target clock.
-    fn superseded_obligation_key(obligation: &SyncObligation) -> Result<Vec<u8>> {
-        let digest = blake3::hash(&postcard::to_allocvec(&(
-            &obligation.op_ids,
-            &obligation.target_clock,
-        ))?);
-        Ok([
-            b"ob".as_slice(),
-            obligation.peer_id.as_ref(),
-            obligation.topic_id.as_ref(),
-            digest.as_bytes(),
-        ]
-        .concat())
+    /// Obligations of one peer on one topic share this prefix.
+    fn obligation_prefix(topic_id: &TopicId, peer_id: &PeerId) -> Vec<u8> {
+        [OBLIGATION_PREFIX, topic_id.as_ref(), peer_id.as_ref()].concat()
+    }
+
+    /// One key per kind: an ordinary target coalesces into the clock record
+    /// and explicit repair wants into the repair record.
+    fn obligation_key(obligation: &SyncObligation) -> Vec<u8> {
+        let kind = match obligation.target {
+            ObligationTarget::Clock(_) => b'c',
+            ObligationTarget::Repair(_) => b'r',
+        };
+        let mut key = Self::obligation_prefix(&obligation.topic_id, &obligation.peer_id);
+        key.push(kind);
+        key
+    }
+
+    /// Delete every key under `prefix` and report how many there were.
+    fn tx_remove_prefix(
+        tx: &mut fjall::OptimisticWriteTx,
+        records: &fjall::OptimisticTxKeyspace,
+        prefix: &[u8],
+    ) -> Result<usize> {
+        let mut keys = Vec::new();
+        for item in fjall::Readable::prefix(tx, records, prefix) {
+            keys.push(item.key()?.to_vec());
+        }
+        let removed = keys.len();
+        for key in keys {
+            tx.remove(records, key);
+        }
+        Ok(removed)
     }
 
     fn tx_put_obligation(
@@ -394,24 +519,18 @@ impl FjallStorage {
         records: &fjall::OptimisticTxKeyspace,
         obligation: &SyncObligation,
     ) -> Result<()> {
-        let key = Self::sync_obligation_key(obligation)?;
-        let mut merged = obligation.clone();
-        if let Some(existing) = Self::tx_get::<SyncObligation>(tx, records, key.as_slice())? {
-            if existing.target_clock.dominates(&merged.target_clock) {
-                return Ok(());
-            }
-            merged.target_clock.merge(&existing.target_clock);
-        } else if !merged.op_ids.is_empty() {
-            let superseded = Self::superseded_obligation_key(obligation)?;
-            if let Some(existing) =
-                Self::tx_get::<SyncObligation>(tx, records, superseded.as_slice())?
-            {
-                merged.target_clock.merge(&existing.target_clock);
-                tx.remove(records, superseded);
-            }
+        if obligation.is_empty() {
+            return Ok(());
+        }
+        let key = Self::obligation_key(obligation);
+        let existing = Self::tx_get::<SyncObligation>(tx, records, key.as_slice())?;
+        let merged = merged_obligation(existing.clone(), obligation)?;
+        if existing.as_ref() == Some(&merged) {
+            return Ok(());
         }
         Self::tx_put(tx, records, key, &merged)
     }
+
     fn get<T: for<'de> Deserialize<'de>>(&self, key: impl AsRef<[u8]>) -> Result<Option<T>> {
         Ok(self
             .records
@@ -439,12 +558,7 @@ impl FjallStorage {
         ack: &PeerAck,
         commit: AckCommit,
     ) -> Result<usize> {
-        let ack_key = [
-            b"ak".as_slice(),
-            ack.peer_id.as_ref(),
-            ack.topic_id.as_ref(),
-        ]
-        .concat();
+        let ack_key = Self::ack_key(&ack.topic_id, &ack.peer_id);
         let effective_ack = match Self::tx_get::<PeerAck>(tx, records, ack_key.as_slice())? {
             Some(existing) if stored_ack_dominates(&existing, ack) => existing,
             Some(existing) => {
@@ -696,15 +810,13 @@ impl FjallStorage {
                 .or(expected_topic_state.as_ref())
                 .map(|state| state.genesis);
             for obligation in &effects.sync_obligations {
+                if obligation.topic_id != topic_id {
+                    return Err(Error::TopicMismatch);
+                }
                 let ack: Option<PeerAck> = Self::tx_get(
                     tx,
                     &self.records,
-                    [
-                        PEER_ACK_PREFIX,
-                        obligation.peer_id.as_ref(),
-                        topic_id.as_ref(),
-                    ]
-                    .concat(),
+                    Self::ack_key(&topic_id, &obligation.peer_id),
                 )?;
                 if !ack_covers(ack.as_ref(), genesis, obligation) {
                     Self::tx_put_obligation(tx, &self.records, obligation)?;
@@ -712,23 +824,16 @@ impl FjallStorage {
             }
             if let (Some(previous), Some(state)) = (expected_topic_state, topic_state) {
                 for peer in previous.members.difference(&state.members) {
-                    let prefix = [b"ob".as_slice(), peer.as_ref(), topic_id.as_ref()].concat();
-                    let mut keys = Vec::new();
-                    for item in fjall::Readable::prefix(tx, &self.records, prefix) {
-                        let (key, _) = item.into_inner()?;
-                        keys.push(key.to_vec());
-                    }
-                    for key in keys {
-                        tx.remove(&self.records, key);
-                    }
+                    Self::tx_remove_prefix(
+                        tx,
+                        &self.records,
+                        &Self::obligation_prefix(&topic_id, peer),
+                    )?;
                     tx.remove(
                         &self.records,
                         [b"ss".as_slice(), topic_id.as_ref(), peer.as_ref()].concat(),
                     );
-                    tx.remove(
-                        &self.records,
-                        [b"ak".as_slice(), peer.as_ref(), topic_id.as_ref()].concat(),
-                    );
+                    tx.remove(&self.records, Self::ack_key(&topic_id, peer));
                 }
             }
             Ok(())
@@ -839,18 +944,10 @@ impl FjallStorage {
         };
         let (ack, owed) = match peer_id {
             Some(peer_id) => (
-                Self::tx_get(
-                    tx,
-                    records,
-                    [PEER_ACK_PREFIX, peer_id.as_ref(), topic_id.as_ref()].concat(),
-                )?,
-                fjall::Readable::prefix(
-                    tx,
-                    records,
-                    [b"ob".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat(),
-                )
-                .next()
-                .is_some(),
+                Self::tx_get(tx, records, Self::ack_key(topic_id, peer_id))?,
+                fjall::Readable::prefix(tx, records, Self::obligation_prefix(topic_id, peer_id))
+                    .next()
+                    .is_some(),
             ),
             None => (None, false),
         };
@@ -973,34 +1070,17 @@ impl FjallStorage {
                 tx.remove(&self.records, key);
             }
         }
-        // Peer acks key on `<peer><topic>` and obligations on
-        // `<peer><topic><digest>`, so the topic is not a scan prefix; filter
-        // by the decoded record instead.
-        let mut ak_keys = Vec::new();
-        for item in fjall::Readable::prefix(tx, &self.records, PEER_ACK_PREFIX) {
-            let (key, value) = item.into_inner()?;
-            let ack: PeerAck = postcard::from_bytes(value.as_ref())?;
-            if ack.topic_id == *topic_id {
-                ak_keys.push(key.to_vec());
-            }
-        }
-        for key in ak_keys {
-            tx.remove(&self.records, key);
-        }
-        let mut ob_keys = Vec::new();
-        for item in fjall::Readable::prefix(tx, &self.records, b"ob".as_slice()) {
-            let (key, value) = item.into_inner()?;
-            if Self::is_op_record_key(key.as_ref()) {
-                continue;
-            }
-            let obligation: SyncObligation = postcard::from_bytes(value.as_ref())?;
-            if obligation.topic_id == *topic_id {
-                ob_keys.push(key.to_vec());
-            }
-        }
-        for key in ob_keys {
-            tx.remove(&self.records, key);
-        }
+        // Acks and obligations key topic first, so both are prefix deletes.
+        Self::tx_remove_prefix(
+            tx,
+            &self.records,
+            &[PEER_ACK_PREFIX, topic_id.as_ref()].concat(),
+        )?;
+        Self::tx_remove_prefix(
+            tx,
+            &self.records,
+            &[OBLIGATION_PREFIX, topic_id.as_ref()].concat(),
+        )?;
         // Pending ops key on op id; the topic lives in the stored meta.
         let mut pending_ids = Vec::new();
         for item in fjall::Readable::prefix(tx, &self.records, b"po".as_slice()) {
@@ -1227,7 +1307,7 @@ impl Storage for FjallStorage {
         let ack: Option<PeerAck> = Self::tx_get(
             &read_tx,
             &self.records,
-            [PEER_ACK_PREFIX, peer_id.as_ref(), meta.topic_id.as_ref()].concat(),
+            Self::ack_key(&meta.topic_id, peer_id),
         )?;
         Ok(ack.is_some_and(|ack| ack_reached_op(&ack, genesis, &meta)))
     }
@@ -1237,10 +1317,11 @@ impl Storage for FjallStorage {
             return Ok(Vec::new());
         };
         let mut peers = Vec::new();
-        for item in fjall::Readable::prefix(&read_tx, &self.records, PEER_ACK_PREFIX) {
+        let prefix = [PEER_ACK_PREFIX, meta.topic_id.as_ref()].concat();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
             let value = item.value()?;
             let ack: PeerAck = postcard::from_bytes(value.as_ref())?;
-            if ack.topic_id == meta.topic_id && ack_reached_op(&ack, genesis, &meta) {
+            if ack_reached_op(&ack, genesis, &meta) {
                 peers.push(ack.peer_id);
             }
         }
@@ -1420,17 +1501,14 @@ impl Storage for FjallStorage {
         })
     }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
-        self.get([b"ak".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat())
+        self.get(Self::ack_key(topic_id, peer_id))
     }
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>> {
         let mut out = Vec::new();
         let read_tx = self.db.read_tx();
-        for item in fjall::Readable::prefix(&read_tx, &self.records, b"ak".as_slice()) {
-            let value = item.value()?;
-            let ack: PeerAck = postcard::from_bytes(value.as_ref())?;
-            if ack.topic_id == *topic_id {
-                out.push(ack);
-            }
+        let prefix = [PEER_ACK_PREFIX, topic_id.as_ref()].concat();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
+            out.push(postcard::from_bytes(item.value()?.as_ref())?);
         }
         Ok(out)
     }
@@ -1441,9 +1519,9 @@ impl Storage for FjallStorage {
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>> {
         let mut out = Vec::new();
         let read_tx = self.db.read_tx();
-        for item in fjall::Readable::prefix(&read_tx, &self.records, b"ob".as_slice()) {
+        for item in fjall::Readable::prefix(&read_tx, &self.records, OBLIGATION_PREFIX) {
             let (key, value) = item.into_inner()?;
-            if Self::is_op_record_key(key.as_ref()) {
+            if key.len() != OBLIGATION_KEY_LEN {
                 continue;
             }
             out.push(postcard::from_bytes(value.as_ref())?);
@@ -1484,7 +1562,7 @@ impl Storage for FjallStorage {
         peer_id: &PeerId,
         topic_id: &TopicId,
     ) -> Result<Vec<SyncObligation>> {
-        let prefix = [b"ob".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat();
+        let prefix = Self::obligation_prefix(topic_id, peer_id);
         let mut out = Vec::new();
         let read_tx = self.db.read_tx();
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
@@ -1495,7 +1573,7 @@ impl Storage for FjallStorage {
     }
 
     fn has_sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<bool> {
-        let prefix = [b"ob".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat();
+        let prefix = Self::obligation_prefix(topic_id, peer_id);
         let read_tx = self.db.read_tx();
         Ok(fjall::Readable::prefix(&read_tx, &self.records, prefix)
             .next()
@@ -1535,21 +1613,13 @@ impl Storage for FjallStorage {
     fn topic_obligation_counts(&self, topic_id: &TopicId) -> Result<BTreeMap<PeerId, usize>> {
         let mut counts = BTreeMap::new();
         let read_tx = self.db.read_tx();
-        for item in fjall::Readable::prefix(&read_tx, &self.records, b"ob".as_slice()) {
-            let (key, _) = item.into_inner()?;
-            let key = key.as_ref();
-            if Self::is_op_record_key(key) {
-                continue;
-            }
-            let (peer_bytes, rest) = key
-                .get(b"ob".len()..)
-                .and_then(|rest| rest.split_at_checked(PeerId::LEN))
+        let prefix = [OBLIGATION_PREFIX, topic_id.as_ref()].concat();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
+            let key = item.key()?;
+            let peer = key
+                .get(2 + TopicId::LEN..2 + TopicId::LEN + PeerId::LEN)
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
                 .ok_or_else(|| Error::Storage("corrupt fjall obligation key".into()))?;
-            if !rest.starts_with(topic_id.as_ref()) {
-                continue;
-            }
-            let mut peer = [0_u8; PeerId::LEN];
-            peer.copy_from_slice(peer_bytes);
             *counts.entry(PeerId::from_bytes(peer)).or_default() += 1;
         }
         Ok(counts)
@@ -1557,24 +1627,16 @@ impl Storage for FjallStorage {
 
     fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize> {
         self.transaction(|tx| {
-            let prefix = [b"ob".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat();
-            let mut keys = Vec::new();
-            for item in fjall::Readable::prefix(tx, &self.records, prefix) {
-                let (key, _) = item.into_inner()?;
-                keys.push(key.to_vec());
-            }
-            let cleared = keys.len();
-            for key in keys {
-                tx.remove(&self.records, key);
-            }
+            let cleared = Self::tx_remove_prefix(
+                tx,
+                &self.records,
+                &Self::obligation_prefix(topic_id, peer_id),
+            )?;
             tx.remove(
                 &self.records,
                 [b"ss".as_slice(), topic_id.as_ref(), peer_id.as_ref()].concat(),
             );
-            tx.remove(
-                &self.records,
-                [b"ak".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat(),
-            );
+            tx.remove(&self.records, Self::ack_key(topic_id, peer_id));
             Ok(cleared)
         })
     }
@@ -1601,23 +1663,28 @@ fn clear_satisfied_tx(
     records: &fjall::OptimisticTxKeyspace,
     ack: &PeerAck,
 ) -> Result<usize> {
-    let prefix = [
-        b"ob".as_slice(),
-        ack.peer_id.as_ref(),
-        ack.topic_id.as_ref(),
-    ]
-    .concat();
-    let mut keys = Vec::new();
+    let prefix = FjallStorage::obligation_prefix(&ack.topic_id, &ack.peer_id);
+    let mut stored = Vec::new();
     for item in fjall::Readable::prefix(tx, records, prefix) {
         let (key, value) = item.into_inner()?;
-        let obligation: SyncObligation = postcard::from_bytes(value.as_ref())?;
-        if sync_obligation_satisfied(&obligation, ack) {
-            keys.push(key.to_vec());
-        }
+        stored.push((
+            key.to_vec(),
+            postcard::from_bytes::<SyncObligation>(value.as_ref())?,
+        ));
     }
-    let cleared = keys.len();
-    for key in keys {
-        tx.remove(records, key);
+    let mut cleared = 0;
+    for (key, obligation) in stored {
+        let rest = settled_obligation(&obligation, ack, |id| {
+            FjallStorage::tx_get(tx, records, FjallStorage::key_id(b"m", id))
+        })?;
+        match rest {
+            Some(rest) if rest == obligation => {}
+            Some(rest) => FjallStorage::tx_put(tx, records, key, &rest)?,
+            None => {
+                tx.remove(records, key);
+                cleared += 1;
+            }
+        }
     }
     Ok(cleared)
 }
@@ -1636,12 +1703,11 @@ mod tests {
             .put(FjallStorage::key_id(b"o", &OpId::from_bytes(op_id)), &())
             .unwrap();
 
-        let obligation = SyncObligation {
-            peer_id: PeerId::hash(b"collision-peer"),
-            topic_id: TopicId::hash(b"collision-topic"),
-            op_ids: [OpId::hash(b"collision-op")].into(),
-            target_clock: ActorClock::new(),
-        };
+        let obligation = SyncObligation::repair(
+            PeerId::hash(b"collision-peer"),
+            TopicId::hash(b"collision-topic"),
+            [OpId::hash(b"collision-op")].into(),
+        );
         storage.put_sync_obligation(obligation.clone()).unwrap();
 
         assert_eq!(
