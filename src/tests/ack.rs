@@ -1083,3 +1083,65 @@ fn fjall_migrates_legacy() {
     );
     assert!(storage.peer_reached_op(&peer, &op_id).unwrap());
 }
+
+/// A backend failure after one acknowledgement's writes are staged must abort
+/// the whole batch. Otherwise its ack row commits while clearing its work
+/// failed, and the caller is told the ack was not applied.
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_batch_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (acks, topics, peer) = {
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        let (_, acks, topics, peer) = batch_ack_fixture(storage);
+        (acks, topics, peer)
+    };
+    // An obligation record nothing can decode makes the clearing step fail
+    // after the ack row of the middle topic was staged.
+    {
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .open()
+            .unwrap();
+        let records = db
+            .keyspace("records", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut tx = db.write_tx().unwrap();
+        tx.insert(
+            &records,
+            [
+                b"ob".as_slice(),
+                peer.as_ref(),
+                topics[1].as_ref(),
+                &[0xff; 32],
+            ]
+            .concat(),
+            vec![0xff; 3],
+        );
+        tx.commit().unwrap().unwrap();
+    }
+
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    let irokle = Irokle::with_storage(
+        storage,
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[87; 32]),
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let results = irokle.apply_sync_acks(&acks);
+    assert!(
+        results.iter().all(Result::is_err),
+        "a backend failure fails every ack of the batch"
+    );
+    for topic_id in &topics {
+        assert!(
+            irokle
+                .storage()
+                .peer_ack(&peer, topic_id)
+                .unwrap()
+                .is_none(),
+            "no ack row of the failed batch may commit"
+        );
+    }
+}

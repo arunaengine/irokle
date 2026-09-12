@@ -224,8 +224,10 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// Apply many peer acks in order, equivalent to calling
     /// [`Storage::apply_peer_ack`] per ack. Backends may batch all writes into
     /// one durable operation. Returns one result per input ack, in order, so a
-    /// single uncertifiable record neither commits nor discards the rest. The
-    /// outer error is reserved for a backend failure covering the whole batch.
+    /// single uncertifiable record neither commits nor discards the rest. A
+    /// reported failure must never leave that ack's writes committed: a backend
+    /// that batches returns a backend failure as the outer error and commits
+    /// nothing of the batch.
     fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<Vec<Result<usize>>> {
         Ok(acks
             .into_iter()

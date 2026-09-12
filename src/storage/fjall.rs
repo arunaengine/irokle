@@ -1324,8 +1324,11 @@ impl Storage for FjallStorage {
             let mut results = Vec::with_capacity(acks.len());
             for ack in &acks {
                 match Self::tx_ack_commit(tx, &self.records, ack)? {
+                    // A backend failure after this ack's writes were staged
+                    // aborts the transaction, so none of the batch commits.
                     Ok(commit) => {
-                        results.push(Self::tx_apply_peer_ack(tx, &self.records, ack, commit));
+                        let cleared = Self::tx_apply_peer_ack(tx, &self.records, ack, commit)?;
+                        results.push(Ok(cleared));
                     }
                     Err(rejected) => results.push(Err(rejected)),
                 }
