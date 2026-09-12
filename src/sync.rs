@@ -480,6 +480,19 @@ impl<S: Storage> SyncEngine<S> {
             need.extend(repair);
         }
         let actor_range_hints = self.needed_actor_ranges(remote, need.len())?;
+        // A page request reaches a remote head through its actor's range; only
+        // a head no range covers stays an explicit want.
+        #[cfg(feature = "iroh")]
+        if matches!(send_set, SendSet::Page(_)) {
+            need.retain(|id| {
+                !remote.actor_tips.iter().any(|(actor_id, (seq, tip))| {
+                    tip == id
+                        && actor_range_hints
+                            .iter()
+                            .any(|hint| hint.actor_id == *actor_id && hint.to_inclusive >= *seq)
+                })
+            });
+        }
         Ok(SyncPlan {
             topic_id: remote.topic_id,
             common,
