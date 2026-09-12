@@ -1671,3 +1671,126 @@ fn forwards_without_bookkeeping() {
         );
     }
 }
+
+#[test]
+fn request_skips_bodies() {
+    // Request planning discards the send list, so it must not load op bodies
+    // for the closure the remote is missing.
+    let holder = Ed25519Signer::from_bytes(&[171; 32]);
+    let (source, topic_id, ops) = chain_source(170, holder.peer_id());
+    // A member that holds nothing yet: every local op is missing for it.
+    let remote = crate_sync::SyncSummary {
+        topic_id,
+        event_type_id: None,
+        fingerprint: [0; 32],
+        heads: BTreeSet::new(),
+        actor_clock: ActorClock::new(),
+        actor_tips: std::collections::BTreeMap::new(),
+    };
+    // Each side gets its own store so both measurements start from the same
+    // cached state; a second call on one store would not rescan for holes.
+    let counted_engine = || {
+        let storage = StaleReadStorage::new(MemoryStorage::new());
+        let log = oplog::Oplog::with_storage(storage.clone());
+        log.receive_ops_from_peer(Some(source.peer_id()), ops.clone())
+            .unwrap();
+        let engine = crate_sync::SyncEngine::new(log, holder.peer_id());
+        (engine, storage)
+    };
+    let reads_since = |storage: &StaleReadStorage, before: usize| {
+        storage.op_reads.load(std::sync::atomic::Ordering::Relaxed) - before
+    };
+
+    let (engine, storage) = counted_engine();
+    let before = storage.op_reads.load(std::sync::atomic::Ordering::Relaxed);
+    let request = engine.plan_request(source.peer_id(), &remote).unwrap();
+    let request_reads = reads_since(&storage, before);
+
+    let (engine, storage) = counted_engine();
+    let before = storage.op_reads.load(std::sync::atomic::Ordering::Relaxed);
+    let plan = engine.negotiate(source.peer_id(), &remote).unwrap();
+    let full_reads = reads_since(&storage, before);
+
+    assert_eq!(request.topic_id, topic_id);
+    assert_eq!(plan.send.len(), ops.len());
+    // Full negotiation loads every missing body and probes its resolvability;
+    // request planning needs neither.
+    assert_eq!(full_reads - request_reads, 2 * ops.len());
+}
+
+#[test]
+fn request_matches_negotiation() {
+    // The request-only path must stay byte-identical to the request the full
+    // negotiation produced, for a plain chain and for a fork that merged.
+    let alice = node(172);
+    let bob = node(173);
+    let same_request = |peer, remote: &crate_sync::SyncSummary| {
+        let plan = alice.negotiate_sync(peer, remote).unwrap();
+        let request = alice.plan_sync_request(peer, remote).unwrap();
+        let expected = crate_sync::SyncRequest {
+            topic_id: plan.topic_id,
+            known: plan.common,
+            wants: plan.need,
+            actor_range_hints: plan.actor_range_hints,
+        };
+        assert_eq!(request, expected);
+        assert_eq!(
+            crate::canonical_bytes(&request).unwrap(),
+            crate::canonical_bytes(&expected).unwrap()
+        );
+        request
+    };
+
+    let chain = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    chain.publish(Note { text: "one".into() }).unwrap();
+    chain.publish(Note { text: "two".into() }).unwrap();
+    same_request(bob.peer_id(), &bob.sync_summary(chain.id()).unwrap());
+
+    let forked = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    forked
+        .publish(Note {
+            text: "base".into(),
+        })
+        .unwrap();
+    let data = alice
+        .plan_sync_data(bob.peer_id(), &bob.sync_summary(forked.id()).unwrap())
+        .unwrap();
+    bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+    let bob_forked = bob.open_topic::<Note>(forked.id()).unwrap();
+    // Concurrent publishes fork the topic; alice then merges both sides.
+    bob_forked.publish(Note { text: "bob".into() }).unwrap();
+    forked
+        .publish(Note {
+            text: "alice".into(),
+        })
+        .unwrap();
+    let data = bob
+        .plan_sync_data(alice.peer_id(), &alice.sync_summary(forked.id()).unwrap())
+        .unwrap();
+    alice.receive_sync_data_from(bob.peer_id(), data).unwrap();
+    forked
+        .publish(Note {
+            text: "merge".into(),
+        })
+        .unwrap();
+    bob_forked
+        .publish(Note {
+            text: "later".into(),
+        })
+        .unwrap();
+
+    let request = same_request(bob.peer_id(), &bob.sync_summary(forked.id()).unwrap());
+    assert!(!request.known.is_empty());
+    assert!(!request.wants.is_empty());
+    assert!(!request.actor_range_hints.is_empty());
+}

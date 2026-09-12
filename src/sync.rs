@@ -175,6 +175,16 @@ pub struct SyncEngine<S> {
     peer_id: PeerId,
 }
 
+/// Which operation bodies a negotiation materializes into `SyncPlan::send`.
+#[derive(Clone, Copy)]
+enum SendSet {
+    Closure,
+    #[cfg(feature = "iroh")]
+    Page,
+    /// Nothing: the caller only needs the plan's id sets.
+    Empty,
+}
+
 impl<S: Storage> SyncEngine<S> {
     pub fn new(oplog: Oplog<S>, peer_id: PeerId) -> Self {
         Self { oplog, peer_id }
@@ -227,20 +237,25 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     pub fn negotiate(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
-        self.negotiate_inner(peer_id, remote, false)
+        self.negotiate_inner(peer_id, remote, SendSet::Closure)
     }
 
     /// Plan a causal prefix; repeat negotiation with the receiver's updated summary.
     #[cfg(feature = "iroh")]
     pub(crate) fn negotiate_page(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
-        self.negotiate_inner(peer_id, remote, true)
+        self.negotiate_inner(peer_id, remote, SendSet::Page)
+    }
+
+    /// Negotiate the id sets only. The returned plan's `send` is always empty.
+    fn negotiate_request(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
+        self.negotiate_inner(peer_id, remote, SendSet::Empty)
     }
 
     fn negotiate_inner(
         &self,
         peer_id: PeerId,
         remote: &SyncSummary,
-        paged: bool,
+        send_set: SendSet,
     ) -> Result<SyncPlan> {
         // If we don't know this topic locally, the remote's heads are
         // unauthenticated claims. We must not surface them as `need`
@@ -293,15 +308,16 @@ impl<S: Storage> SyncEngine<S> {
         }
 
         let (common, dangling) = self.survey_local(remote)?;
-        let send = if paged {
-            self.collect_page(
+        let send = match send_set {
+            SendSet::Closure => self.missing_closure(remote)?,
+            #[cfg(feature = "iroh")]
+            SendSet::Page => self.collect_page(
                 &remote.topic_id,
                 local_heads.clone(),
                 &BTreeSet::new(),
                 Some(remote),
-            )?
-        } else {
-            self.missing_closure(remote)?
+            )?,
+            SendSet::Empty => Vec::new(),
         };
         let mut need = BTreeSet::new();
         for id in &remote.heads {
@@ -415,7 +431,7 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     pub fn plan_request(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncRequest> {
-        let plan = self.negotiate(peer_id, remote)?;
+        let plan = self.negotiate_request(peer_id, remote)?;
         Ok(SyncRequest {
             topic_id: plan.topic_id,
             known: plan.common,
