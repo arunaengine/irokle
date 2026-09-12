@@ -556,7 +556,8 @@ fn receive_forwarding_obligates_other_selected_peers() {
         .unwrap()
         .into_iter()
         .filter(|obligation| {
-            obligation.topic_id == topic.id() && obligation.op_ids.contains(&record.meta.op_id)
+            obligation.topic_id == topic.id()
+                && obligation.target_clock.get(&record.meta.actor_id) >= record.meta.actor_seq
         })
         .map(|obligation| obligation.peer_id)
         .collect::<BTreeSet<_>>();
@@ -845,7 +846,7 @@ fn receive_schedules_forwarding_only_for_missing_selected_peers() {
             // it certifies, so it starts counting once that branch is local.
             genesis: genesis_of(alice.storage(), &topic.id()),
             heads: [record.meta.op_id].into(),
-            clock,
+            clock: clock.clone(),
         })
         .unwrap();
 
@@ -873,8 +874,11 @@ fn receive_schedules_forwarding_only_for_missing_selected_peers() {
         .storage()
         .sync_obligations(&dana.peer_id(), &topic.id())
         .unwrap();
+    // Forwarded work coalesces into one clock target covering every accepted op.
     assert_eq!(dana_obligations.len(), 1);
-    assert_eq!(dana_obligations[0].op_ids, ack.accepted);
+    assert!(dana_obligations[0].op_ids.is_empty());
+    assert!(ack.accepted.contains(&record.meta.op_id));
+    assert!(dana_obligations[0].target_clock.dominates(&clock));
 }
 
 #[test]

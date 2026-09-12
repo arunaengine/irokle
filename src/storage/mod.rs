@@ -439,6 +439,21 @@ pub(crate) fn topic_fingerprint_for(
     Ok(*blake3::hash(&canonical_bytes(&(heads, clock))?).as_bytes())
 }
 
+/// Whether stored evidence certified for `genesis` already covers an ordinary
+/// target, so writing it would only create work that is already done.
+pub(super) fn ack_covers(
+    ack: Option<&PeerAck>,
+    genesis: Option<OpId>,
+    obligation: &SyncObligation,
+) -> bool {
+    obligation.op_ids.is_empty()
+        && !obligation.target_clock.is_empty()
+        && genesis.is_some()
+        && ack.is_some_and(|ack| {
+            ack.genesis == genesis && ack.clock.dominates(&obligation.target_clock)
+        })
+}
+
 pub(super) fn sync_obligation_satisfied(obligation: &SyncObligation, ack: &PeerAck) -> bool {
     // An empty id set proves nothing: without this guard it is a subset of
     // every frontier, so any ack would clear a target clock it never reached.

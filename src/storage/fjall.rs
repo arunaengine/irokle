@@ -14,10 +14,10 @@ use super::{
     AckCommit, AdmittedBatch, MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL,
     MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
     MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
-    SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_reached_op,
-    apply_status_update, ensure_deps_resolvable, journalled_eviction, merged_peer_ack,
-    new_peer_status, pending_op_bytes, stored_ack_dominates, sync_obligation_satisfied,
-    topic_fingerprint_for, validate_batch, validate_heads,
+    SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers,
+    ack_reached_op, apply_status_update, ensure_deps_resolvable, journalled_eviction,
+    merged_peer_ack, new_peer_status, pending_op_bytes, stored_ack_dominates,
+    sync_obligation_satisfied, topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[cfg(feature = "fjall")]
@@ -691,8 +691,24 @@ impl FjallStorage {
                     state,
                 )?;
             }
+            let genesis = topic_state
+                .as_ref()
+                .or(expected_topic_state.as_ref())
+                .map(|state| state.genesis);
             for obligation in &effects.sync_obligations {
-                Self::tx_put_obligation(tx, &self.records, obligation)?;
+                let ack: Option<PeerAck> = Self::tx_get(
+                    tx,
+                    &self.records,
+                    [
+                        PEER_ACK_PREFIX,
+                        obligation.peer_id.as_ref(),
+                        topic_id.as_ref(),
+                    ]
+                    .concat(),
+                )?;
+                if !ack_covers(ack.as_ref(), genesis, obligation) {
+                    Self::tx_put_obligation(tx, &self.records, obligation)?;
+                }
             }
             if let (Some(previous), Some(state)) = (expected_topic_state, topic_state) {
                 for peer in previous.members.difference(&state.members) {

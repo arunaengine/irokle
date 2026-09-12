@@ -7,7 +7,7 @@ use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::oplog::{Oplog, TopicEviction, topological_subset};
+use crate::oplog::{Oplog, ReceiveEffects, TopicEviction, topological_subset};
 use crate::storage::{PeerAck, Storage, SyncObligation, TopicState, TopicView};
 use crate::{
     ActorClock, ActorId, Error, Op, OpId, PeerId, Result, Signer, TopicId, actor_id_for,
@@ -561,7 +561,7 @@ impl<S: Storage> SyncEngine<S> {
         ack_peer_id: PeerId,
         data: SyncData,
     ) -> Result<(SyncAck, Vec<TopicEviction>)> {
-        self.receive_data_preverified(source_peer_id, ack_peer_id, data, &BTreeSet::new())
+        self.receive_data_preverified(source_peer_id, ack_peer_id, data, &BTreeSet::new(), None)
     }
 
     /// Like [`Self::receive_data`], but skips signature verification for ops whose
@@ -573,6 +573,7 @@ impl<S: Storage> SyncEngine<S> {
         ack_peer_id: PeerId,
         data: SyncData,
         verified: &BTreeSet<OpId>,
+        effects: Option<ReceiveEffects<'_>>,
     ) -> Result<(SyncAck, Vec<TopicEviction>)> {
         let mut data_op_ids = BTreeSet::new();
         for op in &data.ops {
@@ -585,6 +586,7 @@ impl<S: Storage> SyncEngine<S> {
             Some(source_peer_id),
             data.ops,
             verified,
+            effects,
         ) {
             Ok(admitted) => (admitted, None),
             Err(Error::AdmissionCommitted { admitted, source }) => (*admitted, Some(source)),

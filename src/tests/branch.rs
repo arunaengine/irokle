@@ -191,6 +191,64 @@ fn reached_keeps_branch() {
     }
 }
 
+/// Forwarding work for received data must not be written after a reset
+/// discarded that data, or the store owes a peer ops that no longer exist.
+#[test]
+fn forward_keeps_branch() {
+    let branches = branches(170);
+    let topic_id = branches.topic_id;
+    let author = branches.author.peer_id();
+    let third = branches.third.peer_id();
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let node = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: branches.member.clone(),
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    node.receive_sync_data_from(
+        author,
+        SyncData {
+            topic_id,
+            ops: vec![branches.old.0.clone()],
+        },
+    )
+    .unwrap();
+
+    let gate = Arc::new(Gate::default());
+    let _release = gate.releaser();
+    storage.arm_read(GatePoint::PeerAck(third), Arc::clone(&gate));
+    let receiving = thread::spawn({
+        let node = node.clone();
+        let gate = Arc::clone(&gate);
+        let event = branches.old.1.clone();
+        move || {
+            let received = node.receive_sync_data_from(
+                author,
+                SyncData {
+                    topic_id,
+                    ops: vec![event],
+                },
+            );
+            gate.skip();
+            received.map(drop)
+        }
+    });
+    gate.wait_arrival();
+    storage.disarm_read();
+    reset_to_new(&storage, &branches);
+    gate.release();
+    let _ = receiving.join().unwrap();
+
+    let rows = storage.sync_obligations(&third, &topic_id).unwrap();
+    assert!(
+        rows.is_empty(),
+        "forwarding work survived the reset that discarded its ops: {rows:?}"
+    );
+}
+
 /// The data epoch moves with every reset of a topic and never with an append,
 /// so caches keyed by genesis and epoch expire exactly when data is discarded.
 fn assert_epoch_tracks_resets<S: Storage>(storage: S) {

@@ -12,10 +12,10 @@ use super::{
     AckCommit, AdmittedBatch, MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL,
     MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
     MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
-    SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_reached_op,
-    apply_status_update, ensure_deps_resolvable, journalled_eviction, merged_peer_ack,
-    new_peer_status, pending_op_bytes, stored_ack_dominates, sync_obligation_satisfied,
-    topic_fingerprint_for, validate_batch, validate_heads,
+    SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers,
+    ack_reached_op, apply_status_update, ensure_deps_resolvable, journalled_eviction,
+    merged_peer_ack, new_peer_status, pending_op_bytes, stored_ack_dominates,
+    sync_obligation_satisfied, topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[derive(Clone, Default)]
@@ -799,8 +799,12 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
     if let Some(state) = topic_state {
         inner.topics.insert(state.topic_id, state);
     }
+    let genesis = inner.topics.get(&topic_id).map(|state| state.genesis);
     for obligation in effects.sync_obligations {
-        put_obligation_locked(inner, obligation);
+        let ack = inner.peer_acks.get(&(obligation.peer_id, topic_id));
+        if !ack_covers(ack, genesis, &obligation) {
+            put_obligation_locked(inner, obligation);
+        }
     }
     for peer_id in removed_peers {
         inner.obligations.remove(&(peer_id, topic_id));

@@ -587,12 +587,30 @@ impl<S: Storage> Irokle<S> {
             verified.insert(op.id);
         }
         self.check_unknown_topic(source_peer_id, &data, &verified)?;
-        let (mut ack, evictions) = match self.sync.receive_data_preverified(
+        let forwarded = std::cell::RefCell::new(BTreeSet::new());
+        let forward = |source: Option<PeerId>, entries: &[(Op, OpMeta)], state: &TopicState| {
+            forwarded.borrow_mut().insert(state.topic_id);
+            self.forward_effects(source, entries, state)
+        };
+        let received = self.sync.receive_data_preverified(
             source_peer_id,
             self.peer_id(),
             data,
             &verified,
-        ) {
+            Some(&forward),
+        );
+        #[cfg(feature = "iroh")]
+        if let Some(net) = &self.net {
+            for topic_id in forwarded.borrow().iter() {
+                if let Err(error) = net.schedule_topic_recheck(*topic_id) {
+                    tracing::warn!(%topic_id, %error, "forwarded replication wake failed");
+                }
+            }
+        }
+        for topic_id in forwarded.borrow().iter() {
+            self.note_forwarded(source_peer_id, *topic_id);
+        }
+        let (mut ack, evictions) = match received {
             Ok(received) => received,
             Err(error) => {
                 #[cfg(feature = "iroh")]
@@ -607,11 +625,7 @@ impl<S: Storage> Irokle<S> {
                 return Err(error);
             }
         };
-        let result = (|| -> Result<()> {
-            self.put_receive_forward_obligations(source_peer_id, ack.topic_id, &ack.accepted)?;
-            ack.sign(&self.config.signer)
-        })();
-        if let Err(source) = result {
+        if let Err(source) = ack.sign(&self.config.signer) {
             #[cfg(feature = "iroh")]
             if let Some(net) = &self.net {
                 net.schedule_resync(source_peer_id, ack.topic_id);
@@ -748,6 +762,7 @@ impl<S: Storage> Irokle<S> {
             Some(source_peer_id),
             data.ops.clone(),
             verified,
+            None,
         )?;
         let Some(state) = dry_storage.topic_state(&data.topic_id)? else {
             return Err(Error::InvalidGenesis);
@@ -780,39 +795,54 @@ impl<S: Storage> Irokle<S> {
         Ok(())
     }
 
-    fn put_receive_forward_obligations(
+    /// Forwarding work a received batch commits with its ops: one coalesced
+    /// clock target per selected peer other than the source and this node.
+    /// Storage skips a peer whose certified ack already covers the target.
+    fn forward_effects(
         &self,
-        source_peer_id: PeerId,
-        topic_id: TopicId,
-        accepted: &BTreeSet<OpId>,
-    ) -> Result<()> {
-        if accepted.is_empty() {
-            return Ok(());
+        source: Option<PeerId>,
+        entries: &[(Op, OpMeta)],
+        state: &TopicState,
+    ) -> Result<AdmissionEffects> {
+        let mut target_clock = ActorClock::new();
+        for (_, meta) in entries {
+            target_clock.observe(meta.actor_id, meta.actor_seq);
         }
-        let state = self
-            .storage()
-            .topic_state(&topic_id)?
-            .ok_or(Error::TopicNotFound)?;
-        for peer_id in self.sync_peers(topic_id, &state) {
-            if peer_id == source_peer_id || peer_id == self.peer_id() {
-                continue;
-            }
-            let mut missing = BTreeSet::new();
-            for op_id in accepted {
-                if !self.peer_reached_op(peer_id, *op_id)? {
-                    missing.insert(*op_id);
+        Ok(AdmissionEffects {
+            sync_obligations: self
+                .sync_peers(state.topic_id, state)
+                .into_iter()
+                .filter(|peer_id| Some(*peer_id) != source && *peer_id != self.peer_id())
+                .map(|peer_id| SyncObligation {
+                    peer_id,
+                    topic_id: state.topic_id,
+                    op_ids: BTreeSet::new(),
+                    target_clock: target_clock.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Status bookkeeping for peers owed forwarded work on `topic_id`. Its
+    /// failure must not fail the receive that already committed the work.
+    fn note_forwarded(&self, source_peer_id: PeerId, topic_id: TopicId) {
+        let result = (|| -> Result<()> {
+            let Some(state) = self.storage().topic_state(&topic_id)? else {
+                return Ok(());
+            };
+            for peer_id in self.sync_peers(topic_id, &state) {
+                if peer_id != source_peer_id
+                    && peer_id != self.peer_id()
+                    && self.storage().has_sync_obligations(&peer_id, &topic_id)?
+                {
+                    self.record_replication_scheduled(peer_id, topic_id)?;
                 }
             }
-            if !missing.is_empty() {
-                self.put_sync_obligation(peer_id, topic_id, missing)?;
-                // Status is bookkeeping: its failure must not drop the
-                // obligations the remaining peers still need.
-                if let Err(error) = self.record_replication_scheduled(peer_id, topic_id) {
-                    tracing::warn!(%topic_id, %peer_id, %error, "forward replication bookkeeping failed");
-                }
-            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(%topic_id, %error, "forward replication bookkeeping failed");
         }
-        Ok(())
     }
 
     fn validate_concern(&self, concern: &WriteConcern) -> Result<()> {

@@ -138,6 +138,7 @@ pub(crate) type ArmedGate = (GatePoint, Arc<Gate>);
 pub(crate) enum GatePoint {
     View(TopicId),
     Meta(OpId),
+    PeerAck(PeerId),
 }
 
 impl Gate {
@@ -382,6 +383,7 @@ impl Storage for StaleReadStorage {
         peer_id: &PeerId,
         topic_id: &TopicId,
     ) -> Result<Option<crate::storage::PeerAck>, Error> {
+        self.gate_read(GatePoint::PeerAck(*peer_id));
         self.inner.peer_ack(peer_id, topic_id)
     }
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<crate::storage::PeerAck>, Error> {

@@ -62,6 +62,11 @@ enum StoredOp {
 
 type GenesisResolution = (Vec<Op>, Option<ResetPlan>, Option<OpId>);
 
+/// Effects a received batch must commit together with its ops, computed from
+/// the batch's source, its entries and the topic state it produces.
+pub(crate) type ReceiveEffects<'a> =
+    &'a dyn Fn(Option<PeerId>, &[(Op, OpMeta)], &TopicState) -> Result<AdmissionEffects>;
+
 /// The reset an admission must fold into its own storage transaction: the state
 /// that must still be current for it to proceed, and the record of the payloads
 /// it discards. Pairing them keeps the record inseparable from the removal.
@@ -376,7 +381,7 @@ impl<S: Storage> Oplog<S> {
                 expected_state: state,
                 eviction: eviction.clone(),
             };
-            match self.admit_ops_batch(None, survivors, &BTreeSet::new(), Some(reset)) {
+            match self.admit_ops_batch(None, survivors, &BTreeSet::new(), Some(reset), None) {
                 Err(Error::AdmissionConflict) => continue,
                 Err(err) => return Err(err),
                 Ok(_) => {}
@@ -620,7 +625,7 @@ impl<S: Storage> Oplog<S> {
         ops: Vec<Op>,
     ) -> Result<BTreeSet<crate::OpId>> {
         Ok(self
-            .receive_ops_admission(source_peer, ops, &BTreeSet::new())?
+            .receive_ops_admission(source_peer, ops, &BTreeSet::new(), None)?
             .accepted)
     }
 
@@ -631,25 +636,27 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
     ) -> Result<Admitted> {
-        self.receive_ops_admission(source_peer, ops, &BTreeSet::new())
+        self.receive_ops_admission(source_peer, ops, &BTreeSet::new(), None)
     }
 
     /// Like [`Self::receive_ops_from_peer_evicting`], but skips signature
     /// verification for ops whose id is in `verified`. The caller must have run
     /// [`Op::validate`] on those exact ops; op ids are content-addressed over
-    /// the signed envelope, so a verified id proves the signature.
+    /// the signed envelope, so a verified id proves the signature. `effects`
+    /// computes what each admitted batch commits alongside its ops.
     pub(crate) fn receive_ops_from_peer_preverified(
         &self,
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
+        effects: Option<ReceiveEffects<'_>>,
     ) -> Result<Admitted> {
-        self.receive_ops_admission(source_peer, ops, verified)
+        self.receive_ops_admission(source_peer, ops, verified, effects)
     }
 
     pub fn reconcile_pending_ops(&self) -> Result<BTreeSet<crate::OpId>> {
         Ok(self
-            .receive_ops_admission(None, Vec::new(), &BTreeSet::new())?
+            .receive_ops_admission(None, Vec::new(), &BTreeSet::new(), None)?
             .accepted)
     }
 
@@ -664,6 +671,7 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
+        effects: Option<ReceiveEffects<'_>>,
     ) -> Result<Admitted> {
         let mut admitted = Admitted::default();
         let result = (|| -> Result<()> {
@@ -697,6 +705,7 @@ impl<S: Storage> Oplog<S> {
                     batch_source_peer,
                     ops,
                     verified,
+                    effects,
                 ) {
                     Ok(outcome) => outcome,
                     Err(err) if from_pending && is_permanent_rejection(&err) => {
@@ -777,6 +786,7 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
+        effects: Option<ReceiveEffects<'_>>,
     ) -> Result<(BTreeSet<crate::OpId>, Option<TopicEviction>)> {
         let has_genesis = ops.iter().any(is_structural_genesis);
         let _genesis_guard = if has_genesis {
@@ -801,7 +811,7 @@ impl<S: Storage> Oplog<S> {
             // A won foreign genesis discards the local chain: admit the winner
             // batch against a fresh topic and fold the reset into the same
             // storage transaction as its admission (`reset_topic_and_admit`).
-            match self.admit_ops_batch(source_peer, ops_to_admit, verified, reset) {
+            match self.admit_ops_batch(source_peer, ops_to_admit, verified, reset, effects) {
                 Err(Error::AdmissionConflict) => continue,
                 Ok(accepted) => return Ok((accepted, eviction)),
                 Err(err) => return Err(err),
@@ -958,6 +968,7 @@ impl<S: Storage> Oplog<S> {
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
         reset_plan: Option<ResetPlan>,
+        receive_effects: Option<ReceiveEffects<'_>>,
     ) -> Result<BTreeSet<crate::OpId>> {
         let ops = topological_ops(ops)?;
         let mut accepted = BTreeSet::new();
@@ -1199,6 +1210,14 @@ impl<S: Storage> Oplog<S> {
             entries.push((op, meta));
         }
 
+        // Effects commit with the entries under the same expected state, so a
+        // reset cannot slip between the ops and the work they create.
+        let effects = match (receive_effects, state.as_ref()) {
+            (Some(compute), Some(state)) if !entries.is_empty() => {
+                compute(source_peer, &entries, state)?
+            }
+            _ => AdmissionEffects::default(),
+        };
         if let Some(plan) = &reset_plan {
             // Reset, winner admission, and the record of the discarded payloads
             // share one storage transaction, so a crash never leaves the topic
@@ -1213,7 +1232,7 @@ impl<S: Storage> Oplog<S> {
                     entries,
                     heads,
                     topic_state: topic_state_changed.then(|| state.clone()).flatten(),
-                    effects: AdmissionEffects::default(),
+                    effects,
                 },
                 Some(&plan.eviction),
             )?;
@@ -1228,7 +1247,7 @@ impl<S: Storage> Oplog<S> {
                 entries,
                 heads,
                 topic_state: topic_state_changed.then(|| state.clone()).flatten(),
-                effects: AdmissionEffects::default(),
+                effects,
             })?;
         }
 
