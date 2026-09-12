@@ -33,6 +33,13 @@ pub const MAX_REJECTED_PER_TOPIC: usize = 4096;
 /// only bounds a store whose consumer stopped draining; the reset that would
 /// exceed it is refused rather than discarding a payload nothing else holds.
 pub const MAX_PENDING_EVICTIONS: usize = 1024;
+/// Limits of bootstrap staging: data for a topic this node does not hold yet,
+/// kept per source and topic until its history proves membership.
+pub const MAX_STAGED_BYTES_TOTAL: u64 = 64 * 1024 * 1024;
+pub const MAX_STAGED_BYTES_PER_SESSION: u64 = 32 * 1024 * 1024;
+pub const MAX_STAGED_OPS_PER_SESSION: u64 = 65536;
+pub const MAX_STAGED_SESSIONS: usize = 64;
+pub const MAX_STAGED_SESSIONS_PER_SOURCE: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpMeta {
@@ -182,6 +189,16 @@ pub struct AdmittedBatch {
     pub heads: BTreeSet<OpId>,
     pub topic_state: Option<TopicState>,
     pub effects: AdmissionEffects,
+}
+
+/// What one bootstrap staging session holds. It is a receipt, not an ack: it
+/// certifies nothing about an active topic and clears no obligation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StagedTopic {
+    /// Highest contiguous sequence staged per actor.
+    pub clock: ActorClock,
+    pub ops: u64,
+    pub bytes: u64,
 }
 
 /// Explicit repair ids one peer may owe for one topic.
@@ -495,6 +512,29 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// Every peer [`Storage::peer_reached_op`] would confirm, sorted, read
     /// from one view.
     fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>>;
+
+    /// Keep verified `ops` for a topic this store does not hold, apart from
+    /// every active query, in the session of `source` and `topic_id`.
+    /// Duplicates are free; a call past a staging limit stores nothing. A
+    /// topic that exists is refused with [`crate::Error::AdmissionConflict`].
+    fn stage_bootstrap_ops(
+        &self,
+        source: PeerId,
+        topic_id: TopicId,
+        ops: Vec<Op>,
+        now_ms: u64,
+    ) -> Result<StagedTopic>;
+    /// Every op of the session, ordered by actor and sequence.
+    fn staged_bootstrap_ops(&self, source: &PeerId, topic_id: &TopicId) -> Result<Vec<Op>>;
+    /// In one transaction: refuse with [`crate::Error::AdmissionConflict`]
+    /// once the topic exists, otherwise admit `batch` against a fresh topic
+    /// and drop every staging session of the topic.
+    fn promote_bootstrap(&self, batch: AdmittedBatch) -> Result<()>;
+    /// Drop one session. Returns the number of staged ops removed.
+    fn discard_bootstrap(&self, source: &PeerId, topic_id: &TopicId) -> Result<usize>;
+    /// Drop sessions last written before `older_than_ms`. Returns the number
+    /// of sessions removed.
+    fn expire_bootstrap(&self, older_than_ms: u64) -> Result<usize>;
 }
 
 mod memory;
@@ -504,6 +544,8 @@ pub use memory::MemoryStorage;
 mod fjall;
 #[cfg(feature = "fjall")]
 mod fjall_pending;
+#[cfg(feature = "fjall")]
+mod fjall_staging;
 #[cfg(feature = "fjall")]
 pub use fjall::FjallStorage;
 
@@ -636,6 +678,65 @@ pub(super) fn check_pending_quota(
         return refuse("pending byte quota exceeded for topic");
     }
     Ok(())
+}
+
+/// Usage and last write of one bootstrap staging session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct StagedSession {
+    pub(super) ops: u64,
+    pub(super) bytes: u64,
+    pub(super) updated_ms: u64,
+}
+
+/// Refuse a new session past the total or per-source session limit.
+pub(super) fn check_staged_session(sessions: usize, source_sessions: usize) -> Result<()> {
+    if sessions >= MAX_STAGED_SESSIONS {
+        return Err(crate::Error::Storage(
+            "bootstrap staging sessions are full".into(),
+        ));
+    }
+    if source_sessions >= MAX_STAGED_SESSIONS_PER_SOURCE {
+        return Err(crate::Error::Storage(
+            "bootstrap staging session quota exceeded for source".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a staged op of `charge` bytes past the session or total limits.
+pub(super) fn check_staged_op(
+    total_bytes: u64,
+    session: &StagedSession,
+    charge: u64,
+) -> Result<()> {
+    if session.ops >= MAX_STAGED_OPS_PER_SESSION {
+        return Err(crate::Error::Storage(
+            "bootstrap staging op quota exceeded".into(),
+        ));
+    }
+    if session.bytes + charge > MAX_STAGED_BYTES_PER_SESSION {
+        return Err(crate::Error::Storage(
+            "bootstrap staging byte quota exceeded".into(),
+        ));
+    }
+    if total_bytes + charge > MAX_STAGED_BYTES_TOTAL {
+        return Err(crate::Error::Storage(
+            "bootstrap staging byte budget is full".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Highest contiguous sequence per actor of `slots`, sorted by actor then
+/// sequence.
+pub(super) fn staged_clock(slots: impl IntoIterator<Item = (ActorId, u64)>) -> ActorClock {
+    let mut clock = ActorClock::new();
+    for (actor_id, seq) in slots {
+        if clock.get(&actor_id) + 1 == seq {
+            clock.observe(actor_id, seq);
+        }
+    }
+    clock
 }
 
 pub(crate) fn topic_fingerprint_for(

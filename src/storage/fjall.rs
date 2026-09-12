@@ -12,11 +12,12 @@ use crate::{
 
 use super::{
     AckCommit, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS, ObligationTarget, OpMeta,
-    PeerAck, Storage, StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate,
-    TopicState, TopicView, ack_commit, ack_covers, ack_reached_op, apply_status_update,
-    branch_matches, ensure_deps_resolvable, journalled_eviction, merged_obligation,
-    merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes, settled_obligation,
-    stored_ack_dominates, topic_fingerprint_for, validate_batch, validate_heads,
+    PeerAck, StagedTopic, Storage, StorageCounters, SyncObligation, SyncPeerStatus,
+    SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers, ack_reached_op,
+    apply_status_update, branch_matches, ensure_deps_resolvable, journalled_eviction,
+    merged_obligation, merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes,
+    settled_obligation, stored_ack_dominates, topic_fingerprint_for, validate_batch,
+    validate_heads,
 };
 
 #[cfg(feature = "fjall")]
@@ -1528,6 +1529,52 @@ impl Storage for FjallStorage {
 
     fn reset_topic(&self, topic_id: &TopicId) -> Result<usize> {
         self.transaction(|tx| self.tx_reset_topic(tx, topic_id))
+    }
+
+    fn stage_bootstrap_ops(
+        &self,
+        source: PeerId,
+        topic_id: TopicId,
+        ops: Vec<Op>,
+        now_ms: u64,
+    ) -> Result<StagedTopic> {
+        let charges = Self::staged_charges(&topic_id, &ops)?;
+        self.transaction(|tx| {
+            Self::tx_stage_ops(
+                tx,
+                &self.records,
+                (source, topic_id),
+                &ops,
+                &charges,
+                now_ms,
+            )
+        })
+    }
+
+    fn staged_bootstrap_ops(&self, source: &PeerId, topic_id: &TopicId) -> Result<Vec<Op>> {
+        self.read_staged_ops(source, topic_id)
+    }
+
+    fn promote_bootstrap(&self, batch: AdmittedBatch) -> Result<()> {
+        self.transaction(|tx| {
+            if fjall::Readable::contains_key(
+                tx,
+                &self.records,
+                Self::key_id(b"ts", &batch.topic_id),
+            )? {
+                return Err(Error::AdmissionConflict);
+            }
+            self.tx_admit_batch(tx, &batch)?;
+            Self::tx_discard_topic(tx, &self.records, &batch.topic_id)
+        })
+    }
+
+    fn discard_bootstrap(&self, source: &PeerId, topic_id: &TopicId) -> Result<usize> {
+        self.transaction(|tx| Self::tx_discard_session(tx, &self.records, source, topic_id))
+    }
+
+    fn expire_bootstrap(&self, older_than_ms: u64) -> Result<usize> {
+        self.transaction(|tx| Self::tx_expire_sessions(tx, &self.records, older_than_ms))
     }
 }
 

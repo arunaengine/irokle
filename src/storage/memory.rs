@@ -11,12 +11,13 @@ use crate::{
 use super::{
     AckCommit, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS,
     MAX_PENDING_WAITERS_PER_DEP, MAX_REJECTED_PER_TOPIC, ObligationTarget, OpMeta, PeerAck,
-    PendingRecord, PendingUsage, Storage, StorageCounters, SyncObligation, SyncPeerStatus,
-    SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers, ack_reached_op,
-    apply_status_update, branch_matches, check_pending_quota, ensure_deps_resolvable,
-    journalled_eviction, merged_obligation, merged_peer_ack, new_peer_status, peer_departed,
-    pending_op_bytes, settled_obligation, stored_ack_dominates, topic_fingerprint_for,
-    validate_batch, validate_heads,
+    PendingRecord, PendingUsage, StagedSession, StagedTopic, Storage, StorageCounters,
+    SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit,
+    ack_covers, ack_reached_op, apply_status_update, branch_matches, check_pending_quota,
+    check_staged_op, check_staged_session, ensure_deps_resolvable, journalled_eviction,
+    merged_obligation, merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes,
+    settled_obligation, staged_clock, stored_ack_dominates, topic_fingerprint_for, validate_batch,
+    validate_heads,
 };
 
 #[derive(Clone, Default)]
@@ -54,6 +55,14 @@ struct MemoryInner {
     sealed_topics: BTreeSet<TopicId>,
     /// Destructive data epochs; a reset keeps and advances them.
     topic_epochs: BTreeMap<TopicId, u64>,
+    /// Bootstrap staging sessions, invisible to every topic query.
+    staged: BTreeMap<(PeerId, TopicId), StagedOps>,
+}
+
+#[derive(Clone, Default)]
+struct StagedOps {
+    session: StagedSession,
+    ops: BTreeMap<(ActorId, u64, OpId), Op>,
 }
 
 /// Rejected ids of one topic, bounded by dropping the oldest.
@@ -730,6 +739,104 @@ impl Storage for MemoryStorage {
     fn clear_eviction(&self, key: &EvictionKey) -> Result<()> {
         self.lock()?.evictions.remove(key);
         Ok(())
+    }
+
+    fn stage_bootstrap_ops(
+        &self,
+        source: PeerId,
+        topic_id: TopicId,
+        ops: Vec<Op>,
+        now_ms: u64,
+    ) -> Result<StagedTopic> {
+        let mut charges = Vec::with_capacity(ops.len());
+        for op in &ops {
+            if op.signed.body.topic_id != topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            charges.push(pending_op_bytes(op)? as u64);
+        }
+        let mut inner = self.lock()?;
+        if inner.topics.contains_key(&topic_id) {
+            return Err(Error::AdmissionConflict);
+        }
+        let key = (source, topic_id);
+        let current = inner.staged.get(&key);
+        if current.is_none() {
+            if ops.is_empty() {
+                return Ok(StagedTopic::default());
+            }
+            let source_sessions = inner.staged.keys().filter(|(peer, _)| *peer == source);
+            check_staged_session(inner.staged.len(), source_sessions.count())?;
+        }
+        let mut total_bytes = inner.staged.values().map(|s| s.session.bytes).sum::<u64>();
+        let mut session = current.map(|staged| staged.session).unwrap_or_default();
+        let mut fresh = BTreeMap::new();
+        for (op, charge) in ops.into_iter().zip(charges) {
+            let slot = (op.signed.body.actor_id, op.signed.body.actor_seq, op.id);
+            if fresh.contains_key(&slot)
+                || current.is_some_and(|staged| staged.ops.contains_key(&slot))
+            {
+                continue;
+            }
+            check_staged_op(total_bytes, &session, charge)?;
+            session.ops += 1;
+            session.bytes += charge;
+            total_bytes += charge;
+            fresh.insert(slot, op);
+        }
+        session.updated_ms = session.updated_ms.max(now_ms);
+        let staged = inner.staged.entry(key).or_default();
+        staged.session = session;
+        staged.ops.extend(fresh);
+        Ok(StagedTopic {
+            clock: staged_clock(
+                staged
+                    .ops
+                    .keys()
+                    .map(|(actor_id, seq, _)| (*actor_id, *seq)),
+            ),
+            ops: session.ops,
+            bytes: session.bytes,
+        })
+    }
+
+    fn staged_bootstrap_ops(&self, source: &PeerId, topic_id: &TopicId) -> Result<Vec<Op>> {
+        Ok(self
+            .lock()?
+            .staged
+            .get(&(*source, *topic_id))
+            .map(|staged| staged.ops.values().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    fn promote_bootstrap(&self, batch: AdmittedBatch) -> Result<()> {
+        let topic_id = batch.topic_id;
+        let mut inner = self.lock()?;
+        if inner.topics.contains_key(&topic_id) {
+            return Err(Error::AdmissionConflict);
+        }
+        admit_batch_locked(&mut inner, batch)?;
+        inner
+            .staged
+            .retain(|(_, staged_topic), _| *staged_topic != topic_id);
+        Ok(())
+    }
+
+    fn discard_bootstrap(&self, source: &PeerId, topic_id: &TopicId) -> Result<usize> {
+        Ok(self
+            .lock()?
+            .staged
+            .remove(&(*source, *topic_id))
+            .map_or(0, |staged| staged.ops.len()))
+    }
+
+    fn expire_bootstrap(&self, older_than_ms: u64) -> Result<usize> {
+        let mut inner = self.lock()?;
+        let before = inner.staged.len();
+        inner
+            .staged
+            .retain(|_, staged| staged.session.updated_ms >= older_than_ms);
+        Ok(before - inner.staged.len())
     }
 }
 
