@@ -1,4 +1,5 @@
 mod ack;
+mod bootstrap;
 mod branch;
 mod core;
 #[cfg(feature = "iroh")]
