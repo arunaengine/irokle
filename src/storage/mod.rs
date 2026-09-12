@@ -267,6 +267,19 @@ pub enum SyncPeerState {
     Failed,
 }
 
+/// How one sync attempt ended, measured against the goal it captured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttemptOutcome {
+    /// The captured goal was reached.
+    Complete,
+    /// Moved toward the goal without reaching it, such as a partial pull.
+    Advanced,
+    /// Could not move toward the goal, for the given reason.
+    Blocked(String),
+    /// The exchange failed, for the given reason.
+    Failed(String),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncPeerStatus {
     pub peer_id: PeerId,

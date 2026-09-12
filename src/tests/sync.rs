@@ -2045,3 +2045,79 @@ fn fjall_forwards_coalesce() {
     let counters = storage.clone();
     assert_forwards_coalesce(storage, move || counters.counters());
 }
+
+/// Status state follows the typed attempt outcome, so a partial pull with
+/// nothing owed outbound stays behind, and an older attempt changes nothing.
+fn assert_outcome_states<S: Storage>(storage: S) {
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[176; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let peer = Ed25519Signer::from_bytes(&[177; 32]).peer_id();
+    let topic_id = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap()
+        .id();
+    let epoch = storage.next_attempt_epoch().unwrap();
+    let steps = [
+        (
+            crate::AttemptOutcome::Advanced,
+            crate_storage::SyncPeerState::Behind,
+            None,
+        ),
+        (
+            crate::AttemptOutcome::Blocked("credit spent".into()),
+            crate_storage::SyncPeerState::Behind,
+            Some("credit spent"),
+        ),
+        (
+            crate::AttemptOutcome::Failed("dial failed".into()),
+            crate_storage::SyncPeerState::Failed,
+            Some("dial failed"),
+        ),
+        (
+            crate::AttemptOutcome::Complete,
+            crate_storage::SyncPeerState::Healthy,
+            None,
+        ),
+    ];
+    for (sequence, (outcome, state, error)) in (1..).zip(steps) {
+        alice
+            .record_attempt_result(peer, topic_id, (epoch, sequence), &outcome)
+            .unwrap();
+        let status = alice.sync_status(topic_id).unwrap().remove(0);
+        assert_eq!(status.pending_obligations, 0);
+        assert_eq!(status.state, state, "{outcome:?}");
+        assert_eq!(status.last_error.as_deref(), error, "{outcome:?}");
+    }
+    let old = alice
+        .record_attempt_result(
+            peer,
+            topic_id,
+            (epoch, 2),
+            &crate::AttemptOutcome::Failed("late".into()),
+        )
+        .unwrap();
+    assert_eq!(old.state, crate_storage::SyncPeerState::Healthy);
+    assert_eq!((old.successful_attempts, old.failed_attempts), (2, 2));
+}
+
+#[test]
+fn memory_outcome_states() {
+    assert_outcome_states(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_outcome_states() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_outcome_states(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}

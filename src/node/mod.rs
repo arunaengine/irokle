@@ -1077,6 +1077,49 @@ impl<S: Storage> Irokle<S> {
         }
     }
 
+    /// Record how attempt `(epoch, sequence)` ended. The state follows the
+    /// outcome, not the pending count: a partial pull stays `Behind` even when
+    /// nothing is owed outbound. Complete and Advanced count as successful
+    /// attempts, Blocked and Failed as failed ones. Peer health is left to
+    /// the caller, which knows whether a failure was a reachability failure.
+    #[cfg(any(feature = "iroh", test))]
+    #[cfg_attr(not(test), allow(dead_code, reason = "the transport calls it next"))]
+    pub(crate) fn record_attempt_result(
+        &self,
+        peer_id: PeerId,
+        topic_id: TopicId,
+        attempt: (u64, u64),
+        outcome: &crate::AttemptOutcome,
+    ) -> Result<SyncPeerStatus> {
+        let attempt_ms = now_millis()?;
+        let pending = self.storage().sync_obligation_count(&peer_id, &topic_id)?;
+        let (state, error) = match outcome {
+            crate::AttemptOutcome::Complete => (SyncPeerState::Healthy, None),
+            crate::AttemptOutcome::Advanced => (SyncPeerState::Behind, None),
+            crate::AttemptOutcome::Blocked(reason) => (SyncPeerState::Behind, Some(reason.clone())),
+            crate::AttemptOutcome::Failed(reason) => (SyncPeerState::Failed, Some(reason.clone())),
+        };
+        let advanced = matches!(
+            outcome,
+            crate::AttemptOutcome::Complete | crate::AttemptOutcome::Advanced
+        );
+        self.storage().update_sync_status(
+            &peer_id,
+            &topic_id,
+            &SyncStatusUpdate {
+                successful_attempts: u64::from(advanced),
+                failed_attempts: u64::from(!advanced),
+                state: SyncStateUpdate::Set(state),
+                pending_obligations: Some(pending),
+                last_attempt_ms: Some(attempt_ms),
+                last_success_ms: advanced.then_some(attempt_ms),
+                last_error: Some(error),
+                attempt: Some(attempt),
+                ..SyncStatusUpdate::default()
+            },
+        )
+    }
+
     #[cfg(any(feature = "iroh", test))]
     pub(crate) fn record_sync_result(
         &self,
