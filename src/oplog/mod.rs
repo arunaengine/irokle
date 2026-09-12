@@ -103,6 +103,16 @@ struct BatchOverlay<'a> {
     reset: bool,
 }
 
+/// A validated admission not yet committed, with what follows its commit.
+struct BuiltBatch {
+    accepted: BTreeSet<OpId>,
+    batch: AdmittedBatch,
+    pending: Vec<(Op, BTreeSet<OpId>)>,
+    projection_epoch: Arc<()>,
+    projections: BTreeMap<OpId, Arc<TopicState>>,
+    projection_tips: BTreeSet<OpId>,
+}
+
 /// A single op removed from the losing side of a genesis collision, carrying
 /// enough for the application to re-emit it under the winning genesis.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1027,18 +1037,20 @@ impl<S: Storage> Oplog<S> {
         Ok(evicted)
     }
 
-    fn admit_ops_batch(
+    /// Validate `ops` against the stored topic, or against a fresh topic when
+    /// `reset`, and build the batch admission would commit, without writing.
+    fn build_batch(
         &self,
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
-        reset_plan: Option<ResetPlan>,
+        reset: bool,
         receive_effects: Option<ReceiveEffects<'_>>,
-    ) -> Result<BTreeSet<crate::OpId>> {
+    ) -> Result<Option<BuiltBatch>> {
         let ops = topological_ops(ops)?;
         let mut accepted = BTreeSet::new();
         let Some(topic_id) = ops.first().map(|op| op.signed.body.topic_id) else {
-            return Ok(accepted);
+            return Ok(None);
         };
         if ops.iter().any(|op| op.signed.body.topic_id != topic_id) {
             return Err(Error::TopicMismatch);
@@ -1046,8 +1058,7 @@ impl<S: Storage> Oplog<S> {
 
         // On the reset path the local topic is wiped and the winner batch is
         // self-contained, so validate and admit it against a fresh topic; the
-        // reset is applied atomically with these writes below.
-        let reset = reset_plan.is_some();
+        // reset is applied atomically with these writes.
         // Heads and state come from one read: a membership verdict taken from a
         // state newer than the heads would reject an authorized op for good.
         let (expected_heads, expected_state) = if reset {
@@ -1071,10 +1082,7 @@ impl<S: Storage> Oplog<S> {
         let mut pending = Vec::new();
         // Reuse immutable causal states only within the current genesis.
         let (projection_epoch, mut projections) = {
-            let mut cache = self.membership_cache()?;
-            if reset {
-                *cache = MembershipCache::default();
-            }
+            let cache = self.membership_cache()?;
             let projections = cache
                 .states
                 .iter()
@@ -1287,29 +1295,9 @@ impl<S: Storage> Oplog<S> {
             }
             _ => AdmissionEffects::default(),
         };
-        if let Some(plan) = &reset_plan {
-            // Reset, winner admission, and the record of the discarded payloads
-            // share one storage transaction, so a crash never leaves the topic
-            // empty with the winner uninstalled or the payloads unrecorded.
-            self.storage.reset_topic_and_admit(
-                &topic_id,
-                &plan.expected_state,
-                AdmittedBatch {
-                    topic_id,
-                    expected_heads,
-                    expected_topic_state: expected_state,
-                    entries,
-                    heads,
-                    topic_state: topic_state_changed.then(|| state.clone()).flatten(),
-                    effects,
-                },
-                Some(&plan.eviction),
-            )?;
-            if let Ok(mut cache) = self.membership_cache() {
-                *cache = MembershipCache::default();
-            }
-        } else if !entries.is_empty() {
-            self.storage.put_admitted_batch(AdmittedBatch {
+        Ok(Some(BuiltBatch {
+            accepted,
+            batch: AdmittedBatch {
                 topic_id,
                 expected_heads,
                 expected_topic_state: expected_state,
@@ -1317,7 +1305,58 @@ impl<S: Storage> Oplog<S> {
                 heads,
                 topic_state: topic_state_changed.then(|| state.clone()).flatten(),
                 effects,
-            })?;
+            },
+            pending,
+            projection_epoch,
+            projections,
+            projection_tips,
+        }))
+    }
+
+    fn admit_ops_batch(
+        &self,
+        source_peer: Option<crate::PeerId>,
+        ops: Vec<Op>,
+        verified: &BTreeSet<crate::OpId>,
+        reset_plan: Option<ResetPlan>,
+        receive_effects: Option<ReceiveEffects<'_>>,
+    ) -> Result<BTreeSet<crate::OpId>> {
+        if reset_plan.is_some() {
+            *self.membership_cache()? = MembershipCache::default();
+        }
+        let Some(BuiltBatch {
+            accepted,
+            batch,
+            pending,
+            projection_epoch,
+            projections,
+            projection_tips,
+        }) = self.build_batch(
+            source_peer,
+            ops,
+            verified,
+            reset_plan.is_some(),
+            receive_effects,
+        )?
+        else {
+            return Ok(BTreeSet::new());
+        };
+        let topic_id = batch.topic_id;
+        if let Some(plan) = &reset_plan {
+            // Reset, winner admission, and the record of the discarded payloads
+            // share one storage transaction, so a crash never leaves the topic
+            // empty with the winner uninstalled or the payloads unrecorded.
+            self.storage.reset_topic_and_admit(
+                &topic_id,
+                &plan.expected_state,
+                batch,
+                Some(&plan.eviction),
+            )?;
+            if let Ok(mut cache) = self.membership_cache() {
+                *cache = MembershipCache::default();
+            }
+        } else if !batch.entries.is_empty() {
+            self.storage.put_admitted_batch(batch)?;
         }
 
         // Buffer not-yet-ready ops last: on the reset path the reset above wipes
