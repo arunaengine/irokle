@@ -15,7 +15,16 @@ pub fn encode_sync_message(message: &SyncMessage) -> io::Result<Vec<u8>> {
 }
 
 pub fn decode_sync_message(bytes: &[u8]) -> io::Result<SyncMessage> {
-    postcard::from_bytes(bytes).map_err(invalid_data)
+    let (message, remainder) = postcard::take_from_bytes(bytes).map_err(invalid_data)?;
+    if !remainder.is_empty() {
+        return Err(invalid_data("trailing bytes in sync message"));
+    }
+    if let SyncMessage::Data(data) = &message
+        && data.ops.len() > MAX_SYNC_DATA_OPS_PER_MESSAGE
+    {
+        return Err(invalid_data("sync data exceeds maximum operation count"));
+    }
+    Ok(message)
 }
 
 pub fn encode_frame(payload: &[u8]) -> io::Result<Vec<u8>> {

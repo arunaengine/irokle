@@ -43,6 +43,28 @@ pub enum Error {
     #[error("invalid sync acknowledgement: {0}")]
     InvalidSyncAck(String),
 
+    #[error("async replication requires a configured transport")]
+    ReplicationUnavailable,
+
+    #[cfg(feature = "iroh")]
+    #[error("operation exceeds sync frame size limit")]
+    OpTooLarge,
+
+    #[error("admission committed but completion failed: {source}")]
+    AdmissionCommitted {
+        admitted: Box<crate::oplog::Admitted>,
+        #[source]
+        source: Box<Error>,
+    },
+
+    #[error("receive committed but completion failed: {source}")]
+    ReceiveCommitted {
+        ack: Box<crate::sync::SyncAck>,
+        evictions: Vec<crate::oplog::TopicEviction>,
+        #[source]
+        source: Box<Error>,
+    },
+
     #[error("actor sequence gap: expected {expected}, got {actual}")]
     ActorSeqGap { expected: u64, actual: u64 },
 

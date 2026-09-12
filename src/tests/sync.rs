@@ -299,7 +299,7 @@ fn batches_preserve_order() {
     assert!(data.ops.len() > net::MAX_SYNC_DATA_OPS_PER_MESSAGE);
 
     let expected_ids = data.ops.iter().map(|op| op.id).collect::<Vec<_>>();
-    let batches = net::sync_data_messages(data.topic_id, data.ops);
+    let batches = net::sync_data_messages(data.topic_id, data.ops).unwrap();
     assert!(batches.len() > 1);
     let mut actual_ids = Vec::new();
     for batch in batches {

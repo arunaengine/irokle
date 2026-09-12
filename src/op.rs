@@ -77,6 +77,11 @@ impl Op {
         Ok(OpId::hash(canonical_bytes(signed)?))
     }
 
+    #[cfg(feature = "iroh")]
+    pub(crate) fn validate_frame(&self) -> Result<()> {
+        crate::net::validate_op(self)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.id != Self::derive_id(&self.signed)? {
             return Err(Error::InvalidOpId);
