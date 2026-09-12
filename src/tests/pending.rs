@@ -232,7 +232,14 @@ fn retains_unproven_author() {
 /// Buffered ops of `count` distinct authors waiting on one missing op of
 /// `topic_id`, each charged to `source`.
 fn fill_waiters<S: Storage>(storage: &S, m: &Members, source: PeerId, count: u8, seed: u8) {
-    let missing = event_op(&m.bob, m.topic_id, 1, None, &[&m.genesis], "fill-missing");
+    let missing = event_op(
+        &m.bob,
+        m.topic_id,
+        1,
+        None,
+        &[&m.genesis],
+        &format!("fill-missing-{seed}"),
+    );
     for index in 0..count {
         let author = Ed25519Signer::from_bytes(&[
             seed, index, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
@@ -533,4 +540,120 @@ fn fjall_exact_accounting() {
             crate::storage::FjallStorage::open(&path).unwrap()
         },
     );
+}
+
+/// With the pending pool and the bootstrap staging sessions saturated, a
+/// healthy topic still admits data and clears work by ack, and every counter
+/// returns exactly after rejection, expiry and reset.
+#[test]
+fn saturated_pools_serve_healthy() {
+    let storage = MemoryStorage::new();
+    let busy = [members(2), members(6)];
+    let healthy = members(10);
+    let log = Oplog::with_storage(storage.clone());
+    for m in busy.iter().chain([&healthy]) {
+        log.receive_ops_from_peer(Some(m.alice.peer_id()), vec![m.genesis.clone()])
+            .unwrap();
+    }
+    let sources = [20_u8, 21, 22, 23].map(|seed| Ed25519Signer::from_bytes(&[seed; 32]).peer_id());
+    for (index, source) in sources.iter().enumerate() {
+        let m = &busy[index / 2];
+        for batch in 0..4_u8 {
+            fill_waiters(&storage, m, *source, 255, index as u8 * 8 + batch);
+        }
+        fill_waiters(&storage, m, *source, 4, index as u8 * 8 + 4);
+    }
+    assert_eq!(
+        storage.pending_usage(&sources[0]).0,
+        4096,
+        "the pool is full"
+    );
+    let staging_source = Ed25519Signer::from_bytes(&[30; 32]).peer_id();
+    for session in 0..crate::storage::MAX_STAGED_SESSIONS_PER_SOURCE {
+        let other = members(40 + session as u8 * 4);
+        storage
+            .stage_bootstrap_ops(
+                staging_source,
+                other.topic_id,
+                vec![other.genesis.clone()],
+                1,
+            )
+            .unwrap();
+    }
+    let refused = members(200);
+    assert!(
+        storage
+            .stage_bootstrap_ops(
+                staging_source,
+                refused.topic_id,
+                vec![refused.genesis.clone()],
+                1
+            )
+            .is_err()
+    );
+
+    // The healthy topic is unaffected: an event is admitted and its ack clears
+    // the work owed for it.
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[10; 32]),
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let event = event_op(
+        &healthy.bob,
+        healthy.topic_id,
+        1,
+        None,
+        &[&healthy.genesis],
+        "healthy",
+    );
+    assert_eq!(
+        log.receive_ops_from_peer(Some(healthy.bob.peer_id()), vec![event.clone()])
+            .unwrap(),
+        [event.id].into()
+    );
+    alice
+        .put_sync_obligation(healthy.carol.peer_id(), healthy.topic_id, [event.id].into())
+        .unwrap();
+    let mut clock = ActorClock::new();
+    clock.observe(event.signed.body.actor_id, 1);
+    storage
+        .apply_peer_ack(crate::storage::PeerAck {
+            peer_id: healthy.carol.peer_id(),
+            topic_id: healthy.topic_id,
+            genesis: Some(healthy.genesis.id),
+            heads: [event.id].into(),
+            clock,
+        })
+        .unwrap();
+    assert!(
+        !storage
+            .has_sync_obligations(&healthy.carol.peer_id(), &healthy.topic_id)
+            .unwrap()
+    );
+
+    // Counters come back exactly: a reset frees one topic's share, expiry
+    // frees the staging sessions.
+    let before = storage.pending_usage(&sources[0]);
+    storage.reset_topic(&busy[0].topic_id).unwrap();
+    let after = storage.pending_usage(&sources[0]);
+    assert_eq!(after.0, before.0 - 2048);
+    assert_eq!((after.2, after.3), (0, 0));
+    assert_eq!(
+        storage.expire_bootstrap(2).unwrap(),
+        crate::storage::MAX_STAGED_SESSIONS_PER_SOURCE
+    );
+    storage
+        .stage_bootstrap_ops(
+            staging_source,
+            refused.topic_id,
+            vec![refused.genesis.clone()],
+            3,
+        )
+        .unwrap();
+    storage.reset_topic(&busy[1].topic_id).unwrap();
+    assert_eq!(storage.pending_usage(&sources[2]), (0, 0, 0, 0));
 }
