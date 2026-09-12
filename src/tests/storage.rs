@@ -1318,11 +1318,28 @@ fn assert_status_counters<S: Storage>(storage: S) {
         .update_sync_status(&peer, &topic_id, &failure)
         .unwrap();
     assert_eq!(second.successful_attempts, 1);
+    // The attempt still counts even though it describes an older moment.
     assert_eq!(second.failed_attempts, 1);
-    assert_eq!(second.state, crate_storage::SyncPeerState::Failed);
+    // A failure that finished before the recorded success must not replace it.
+    assert_eq!(second.state, crate_storage::SyncPeerState::Healthy);
+    assert_eq!(second.last_error, None);
     // A late attempt timestamp cannot rewind the record.
     assert_eq!(second.last_attempt_ms, Some(20));
     assert_eq!(second.last_success_ms, Some(20));
+
+    // A failure that really is newer does take the record.
+    let newer_failure = crate_storage::SyncStatusUpdate {
+        failed_attempts: 1,
+        last_attempt_ms: Some(30),
+        last_error: Some(Some("dial failed".into())),
+        state: crate_storage::SyncStateUpdate::Set(crate_storage::SyncPeerState::Failed),
+        ..crate_storage::SyncStatusUpdate::default()
+    };
+    let third = storage
+        .update_sync_status(&peer, &topic_id, &newer_failure)
+        .unwrap();
+    assert_eq!(third.failed_attempts, 2);
+    assert_eq!(third.state, crate_storage::SyncPeerState::Failed);
 
     // The guard drops an update whose attempt context is already superseded.
     let stale = crate_storage::SyncStatusUpdate {
@@ -1334,6 +1351,7 @@ fn assert_status_counters<S: Storage>(storage: S) {
         .update_sync_status(&peer, &topic_id, &stale)
         .unwrap();
     assert_eq!(guarded.state, crate_storage::SyncPeerState::Failed);
+    assert_eq!(guarded.failed_attempts, 2, "the guard carries no attempt");
     assert_eq!(
         storage.sync_statuses(&topic_id).unwrap()[0].state,
         crate_storage::SyncPeerState::Failed
@@ -1383,7 +1401,9 @@ fn assert_status_counters<S: Storage>(storage: S) {
         .find(|status| status.peer_id == peer)
         .unwrap();
     assert_eq!(status.successful_attempts, rounds + 1);
-    assert_eq!(status.failed_attempts, rounds + 1);
+    // Two failures were recorded before the concurrent rounds: the stale one,
+    // whose attempt still counts, and the newer one that took the record.
+    assert_eq!(status.failed_attempts, rounds + 2);
 }
 
 #[test]
@@ -1769,4 +1789,66 @@ fn memory_rejects_mismatch() {
 fn fjall_rejects_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     assert_rejects_mismatch(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// A terminal result that finished earlier must not install its state over a
+/// newer one, in either arrival order, while both attempts still count.
+fn assert_status_ordering<S: Storage>(storage: S) {
+    let peer = PeerId::hash(b"ordering-peer");
+    let topic_id = TopicId::hash(b"ordering-topic");
+    let failure = |at: u64| crate_storage::SyncStatusUpdate {
+        failed_attempts: 1,
+        last_attempt_ms: Some(at),
+        last_error: Some(Some("dial failed".into())),
+        state: crate_storage::SyncStateUpdate::Set(crate_storage::SyncPeerState::Failed),
+        ..crate_storage::SyncStatusUpdate::default()
+    };
+    let success = |at: u64| crate_storage::SyncStatusUpdate {
+        successful_attempts: 1,
+        last_attempt_ms: Some(at),
+        last_success_ms: Some(at),
+        last_error: Some(None),
+        state: crate_storage::SyncStateUpdate::Set(crate_storage::SyncPeerState::Healthy),
+        ..crate_storage::SyncStatusUpdate::default()
+    };
+
+    // A newer failure, then a late older success.
+    storage
+        .update_sync_status(&peer, &topic_id, &failure(30))
+        .unwrap();
+    let late = storage
+        .update_sync_status(&peer, &topic_id, &success(20))
+        .unwrap();
+    assert_eq!(
+        late.state,
+        crate_storage::SyncPeerState::Failed,
+        "an older success must not replace the newer failure"
+    );
+    assert_eq!(late.successful_attempts, 1, "its attempt still counts");
+    assert_eq!(late.failed_attempts, 1);
+    assert_eq!(late.last_error, Some("dial failed".into()));
+
+    // On an equal timestamp the success is kept over a concurrent failure.
+    let other = PeerId::hash(b"ordering-peer-tie");
+    storage
+        .update_sync_status(&other, &topic_id, &success(40))
+        .unwrap();
+    let tied = storage
+        .update_sync_status(&other, &topic_id, &failure(40))
+        .unwrap();
+    assert_eq!(tied.state, crate_storage::SyncPeerState::Healthy);
+    assert_eq!(tied.failed_attempts, 1);
+    assert_eq!(tied.successful_attempts, 1);
+}
+
+#[test]
+fn memory_status_ordering() {
+    assert_status_ordering(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_status_ordering() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_status_ordering(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }

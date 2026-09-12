@@ -424,33 +424,41 @@ pub(super) fn sync_obligation_satisfied(obligation: &SyncObligation, ack: &PeerA
     !obligation.target_clock.is_empty() && ack.clock.dominates(&obligation.target_clock)
 }
 
-/// Fold one status update into `status`, reporting whether the guard admitted
-/// it. Counters accumulate and timestamps only advance, so two concurrent
-/// outcomes keep both increments and a late one cannot rewind the record.
+/// Fold one status update into `status`, reporting whether the record changed
+/// and must be persisted. Counters accumulate and timestamps only advance, so
+/// two concurrent outcomes keep both increments and a late one cannot rewind
+/// the record.
+///
+/// A stale update still counts its attempt: the attempt did happen, and losing
+/// the increment would undercount work. Only the state, error and pending gauge
+/// it would install are dropped, because those describe a moment that has since
+/// passed. A failure no newer than the stored success is stale in that sense; on
+/// an equal timestamp the success is kept, since `Failed` is the stronger claim
+/// and a genuinely failing peer is marked again by its next attempt.
 pub(super) fn apply_status_update(status: &mut SyncPeerStatus, update: &SyncStatusUpdate) -> bool {
     let attempts = status
         .successful_attempts
         .saturating_add(status.failed_attempts);
-    if update
-        .expected_attempts
-        .is_some_and(|want| want != attempts)
-    {
-        return false;
-    }
+    let current = update.expected_attempts.is_none_or(|want| want == attempts)
+        && !stale_outcome(status, update);
+    let counted = update.successful_attempts > 0 || update.failed_attempts > 0;
     status.successful_attempts = status
         .successful_attempts
         .saturating_add(update.successful_attempts);
     status.failed_attempts = status
         .failed_attempts
         .saturating_add(update.failed_attempts);
-    if let Some(pending) = update.pending_obligations {
-        status.pending_obligations = pending;
-    }
     if let Some(attempt_ms) = update.last_attempt_ms {
         status.last_attempt_ms = Some(status.last_attempt_ms.unwrap_or(attempt_ms).max(attempt_ms));
     }
     if let Some(success_ms) = update.last_success_ms {
         status.last_success_ms = Some(status.last_success_ms.unwrap_or(success_ms).max(success_ms));
+    }
+    if !current {
+        return counted;
+    }
+    if let Some(pending) = update.pending_obligations {
+        status.pending_obligations = pending;
     }
     if let Some(error) = &update.last_error {
         status.last_error = error.clone();
@@ -465,6 +473,27 @@ pub(super) fn apply_status_update(status: &mut SyncPeerStatus, update: &SyncStat
         }
     }
     true
+}
+
+/// Whether `update` describes an attempt older than the record's newest, in
+/// either direction. Its counters still apply; only the state, error and
+/// pending gauge it would install are dropped.
+fn stale_outcome(status: &SyncPeerStatus, update: &SyncStatusUpdate) -> bool {
+    let Some(attempt_ms) = update.last_attempt_ms else {
+        return false;
+    };
+    if status
+        .last_attempt_ms
+        .is_some_and(|newest| attempt_ms < newest)
+    {
+        return true;
+    }
+    // Same millisecond as a recorded success: keep the success, because
+    // `Failed` is the stronger claim and the next attempt re-marks a peer that
+    // really is failing.
+    update.failed_attempts > 0
+        && update.successful_attempts == 0
+        && status.last_success_ms.is_some_and(|ok| attempt_ms <= ok)
 }
 
 /// The status a backend starts from when a peer has no record yet.
