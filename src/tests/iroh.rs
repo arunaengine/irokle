@@ -205,6 +205,41 @@ async fn resync_and_accept_loops_start_once() {
     net.shutdown().await;
 }
 
+#[cfg(feature = "iroh")]
+#[tokio::test]
+async fn abort_allows_replacement() {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let runtime = net::IrohRuntimeConfig {
+        connect_timeout: std::time::Duration::from_millis(20),
+        sync_io_timeout: std::time::Duration::from_millis(20),
+        resync_interval: std::time::Duration::from_secs(60),
+        ..net::IrohRuntimeConfig::default()
+    };
+    let node = Irokle::builder()
+        .with_iroh_secret_key(endpoint.secret_key())
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let net = Arc::new(net::IrohNet::new_with_config(endpoint, node, runtime).unwrap());
+
+    let first = net
+        .spawn_resync_loop(runtime.resync_interval)
+        .unwrap()
+        .expect("the first resync loop starts");
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    // The start-once latch clears on actual task exit, so the aborted loop can
+    // be replaced instead of leaving the node without one.
+    let replacement = net.spawn_resync_loop(runtime.resync_interval).unwrap();
+
+    assert!(replacement.is_some());
+    net.shutdown().await;
+}
+
 #[cfg(all(feature = "iroh", feature = "fjall"))]
 #[tokio::test]
 async fn builder_selects_fjall() {

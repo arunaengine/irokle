@@ -28,7 +28,6 @@ const EMPTY_RESYNC_SLEEP: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 const MAX_ACCEPT_CONNECTIONS: usize = 128;
 const MAX_ACCEPT_CONNECTIONS_PER_PEER: usize = 4;
 const MAX_RESYNC_PEER_CONCURRENCY: usize = 8;
-const MAX_RESYNC_TARGETS_PER_PEER_PASS: usize = 16 * 1024;
 const MAX_TOPICS_PER_RESYNC_BATCH: usize = 1024;
 const MAX_SYNC_MESSAGES_PER_STREAM: usize = 4096;
 // Keep batched streams at half the per-stream message cap so the responder's
@@ -67,18 +66,42 @@ struct ResyncTargetKey {
     topic_id: crate::TopicId,
 }
 
+/// Identifies one resync attempt for the lifetime of the process. Ids are never
+/// reused, so a completion from a finished attempt cannot match a live one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct AttemptId(u64);
+
+/// Hands out the next attempt id. Exhaustion permanently refuses new claims
+/// instead of wrapping into an id a stale completion could match.
+fn next_attempt_id() -> Option<AttemptId> {
+    static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+    NEXT_ATTEMPT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .map(AttemptId)
+}
+
+/// One claimed target: the attempt that owns it plus the requested work
+/// revision and force request that attempt covers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ResyncTarget {
     key: ResyncTargetKey,
-    force: bool,
+    attempt: AttemptId,
+    covered: u64,
+    force: Option<u64>,
 }
 
 #[derive(Debug)]
 struct ScheduledResync {
     next_due: tokio::time::Instant,
     failures: u32,
-    in_flight: bool,
-    force: bool,
+    /// Bumped by every work invalidation, including during an attempt.
+    requested: u64,
+    active: Option<AttemptId>,
+    /// Requested revision of the newest force request still to be covered.
+    force: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -96,6 +119,8 @@ impl ResyncScheduler {
         self.schedule_after(peer_id, topic_id, Duration::ZERO, force);
     }
 
+    /// Records new work for a target. A claimed target keeps its attempt and
+    /// only gains the new revision, so its completion cannot erase this request.
     fn schedule_after(
         &self,
         peer_id: PeerId,
@@ -108,13 +133,16 @@ impl ResyncScheduler {
         let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
         match targets.get_mut(&key) {
             Some(target) => {
-                if !target.in_flight
+                target.requested = target.requested.saturating_add(1);
+                if target.active.is_none()
                     && (target.failures == 0 || force)
                     && next_due < target.next_due
                 {
                     target.next_due = next_due;
                 }
-                target.force |= force;
+                if force {
+                    target.force = Some(target.requested);
+                }
             }
             None => {
                 targets.insert(
@@ -122,8 +150,41 @@ impl ResyncScheduler {
                     ScheduledResync {
                         next_due,
                         failures: 0,
-                        in_flight: false,
-                        force,
+                        requested: 1,
+                        active: None,
+                        force: force.then_some(1),
+                    },
+                );
+            }
+        }
+        drop(targets);
+        self.notify.notify_one();
+    }
+
+    /// Re-arms a target after peer evidence changed what it needs. A claimed
+    /// target is left to its owner, and the failure backoff is preserved.
+    fn reconsider(&self, peer_id: PeerId, topic_id: crate::TopicId) {
+        let key = ResyncTargetKey { peer_id, topic_id };
+        let now = tokio::time::Instant::now();
+        let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
+        match targets.get_mut(&key) {
+            Some(target) => {
+                if target.active.is_some() {
+                    return;
+                }
+                if target.failures == 0 && now < target.next_due {
+                    target.next_due = now;
+                }
+            }
+            None => {
+                targets.insert(
+                    key,
+                    ScheduledResync {
+                        next_due: now,
+                        failures: 0,
+                        requested: 1,
+                        active: None,
+                        force: None,
                     },
                 );
             }
@@ -140,9 +201,12 @@ impl ResyncScheduler {
         let now = tokio::time::Instant::now();
         let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
         let mut due: BTreeMap<PeerId, Vec<ResyncTargetKey>> = BTreeMap::new();
+        let busy = busy_peers(&targets);
         let mut ready: Vec<_> = targets
             .iter()
-            .filter(|(_, target)| !target.in_flight && target.next_due <= now)
+            .filter(|(key, target)| {
+                target.active.is_none() && target.next_due <= now && !busy.contains(&key.peer_id)
+            })
             .map(|(key, target)| (target.next_due, *key))
             .collect();
         ready.sort_unstable();
@@ -161,53 +225,91 @@ impl ResyncScheduler {
             }
         }
         let mut out = Vec::with_capacity(due.len());
+        let mut exhausted = false;
         for (peer_id, keys) in due {
             let mut batch = Vec::with_capacity(keys.len());
             for key in keys {
-                if let Some(target) = targets.get_mut(&key) {
-                    target.in_flight = true;
-                    batch.push(ResyncTarget {
-                        key,
-                        force: target.force,
-                    });
-                }
+                let Some(target) = targets.get_mut(&key) else {
+                    continue;
+                };
+                let Some(attempt) = next_attempt_id() else {
+                    exhausted = true;
+                    break;
+                };
+                target.active = Some(attempt);
+                batch.push(ResyncTarget {
+                    key,
+                    attempt,
+                    covered: target.requested,
+                    force: target.force,
+                });
             }
-            out.push((peer_id, batch));
+            if !batch.is_empty() {
+                out.push((peer_id, batch));
+            }
+            if exhausted {
+                break;
+            }
+        }
+        if exhausted {
+            tracing::error!("resync attempt ids are exhausted; refusing new claims");
         }
         out
     }
 
+    /// The next wake deadline. A peer taking its turn is skipped so an expired
+    /// deadline behind that turn cannot spin the loop.
     fn next_due(&self) -> Option<tokio::time::Instant> {
-        self.inner
-            .lock()
-            .expect("resync scheduler lock poisoned")
-            .values()
-            .filter(|target| !target.in_flight)
-            .map(|target| target.next_due)
+        let targets = self.inner.lock().expect("resync scheduler lock poisoned");
+        let busy = busy_peers(&targets);
+        targets
+            .iter()
+            .filter(|(key, target)| target.active.is_none() && !busy.contains(&key.peer_id))
+            .map(|(_, target)| target.next_due)
             .min()
     }
 
-    fn complete_clean(&self, peer_id: PeerId, topic_id: crate::TopicId) {
-        self.inner
-            .lock()
-            .expect("resync scheduler lock poisoned")
-            .remove(&ResyncTargetKey { peer_id, topic_id });
+    /// Deletes the entry only when the finished attempt covered the newest
+    /// requested work, so work that arrived mid-attempt survives.
+    fn complete_clean(&self, claim: ResyncTarget) {
+        let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
+        let Some(target) = targets.get_mut(&claim.key) else {
+            return;
+        };
+        if target.active != Some(claim.attempt) {
+            return;
+        }
+        target.active = None;
+        if target.requested != claim.covered || target.force != claim.force {
+            target.failures = 0;
+            target.next_due = tokio::time::Instant::now();
+            drop(targets);
+            self.notify.notify_one();
+            return;
+        }
+        targets.remove(&claim.key);
     }
 
-    fn complete_dirty(&self, peer_id: PeerId, topic_id: crate::TopicId, after: Duration) {
-        let key = ResyncTargetKey { peer_id, topic_id };
-        let next_due = tokio::time::Instant::now() + after;
+    fn complete_dirty(&self, claim: ResyncTarget, after: Duration) {
+        let now = tokio::time::Instant::now();
         let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
-        let target = targets.entry(key).or_insert_with(|| ScheduledResync {
-            next_due,
-            failures: 0,
-            in_flight: false,
-            force: false,
-        });
-        target.next_due = next_due;
+        let Some(target) = targets.get_mut(&claim.key) else {
+            return;
+        };
+        if target.active != Some(claim.attempt) {
+            return;
+        }
+        target.active = None;
         target.failures = 0;
-        target.in_flight = false;
-        target.force = false;
+        target.next_due = if target.requested == claim.covered {
+            now + after
+        } else {
+            now
+        };
+        // Only the force request this attempt covered is served; a newer one waits.
+        if target.force == claim.force {
+            target.force = None;
+        }
         drop(targets);
         self.notify.notify_one();
     }
@@ -219,7 +321,7 @@ impl ResyncScheduler {
         for (key, target) in targets.iter_mut() {
             if key.peer_id == peer_id && target.failures > 0 {
                 target.failures = 0;
-                if !target.in_flight && target.next_due > now {
+                if target.active.is_none() && target.next_due > now {
                     target.next_due = now;
                 }
                 changed = true;
@@ -233,28 +335,130 @@ impl ResyncScheduler {
 
     fn complete_failed(
         &self,
-        peer_id: PeerId,
-        topic_id: crate::TopicId,
+        claim: ResyncTarget,
         initial_backoff: Duration,
         max_backoff: Duration,
     ) {
-        let key = ResyncTargetKey { peer_id, topic_id };
         let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
-        let target = targets.entry(key).or_insert_with(|| ScheduledResync {
-            next_due: tokio::time::Instant::now(),
-            failures: 0,
-            in_flight: false,
-            force: false,
-        });
+        let Some(target) = targets.get_mut(&claim.key) else {
+            return;
+        };
+        if target.active != Some(claim.attempt) {
+            return;
+        }
         target.failures = target.failures.saturating_add(1);
         let shift = target.failures.saturating_sub(1).min(20);
         let multiplier = 1_u32 << shift;
         let backoff = initial_backoff.saturating_mul(multiplier).min(max_backoff);
         target.next_due = tokio::time::Instant::now() + backoff;
-        target.in_flight = false;
-        target.force = true;
+        target.active = None;
+        // A failed exchange retries even when local evidence reads clean.
+        target.force = Some(target.requested);
         drop(targets);
         self.notify.notify_one();
+    }
+
+    /// Hands a claim back without judging the peer. Runs from `Drop`, so it
+    /// must not panic, await or touch storage.
+    fn release_claim(&self, claim: ResyncTarget, after: Duration) {
+        let Ok(mut targets) = self.inner.lock() else {
+            return;
+        };
+        let Some(target) = targets.get_mut(&claim.key) else {
+            return;
+        };
+        if target.active != Some(claim.attempt) {
+            return;
+        }
+        target.active = None;
+        target.next_due = tokio::time::Instant::now() + after;
+        drop(targets);
+        self.notify.notify_one();
+    }
+
+    /// Reclaims every outstanding claim, for a loop start that must reconcile
+    /// what a previous loop left behind.
+    fn release_all(&self, after: Duration) {
+        let Ok(mut targets) = self.inner.lock() else {
+            return;
+        };
+        let now = tokio::time::Instant::now();
+        let mut released = false;
+        for target in targets.values_mut() {
+            if target.active.take().is_some() {
+                target.next_due = now + after;
+                released = true;
+            }
+        }
+        drop(targets);
+        if released {
+            self.notify.notify_one();
+        }
+    }
+
+    fn lease(&self, claims: Vec<ResyncTarget>, retry_after: Duration) -> ResyncLease {
+        ResyncLease {
+            scheduler: self.clone(),
+            retry_after,
+            claims: claims.into_iter().map(|claim| (claim.key, claim)).collect(),
+        }
+    }
+
+    /// Test-only view of a target's ownership, backoff and pending force.
+    #[cfg(test)]
+    fn target_state(
+        &self,
+        peer_id: PeerId,
+        topic_id: crate::TopicId,
+    ) -> Option<(Option<AttemptId>, u32, Option<u64>)> {
+        self.inner
+            .lock()
+            .expect("resync scheduler lock poisoned")
+            .get(&ResyncTargetKey { peer_id, topic_id })
+            .map(|target| (target.active, target.failures, target.force))
+    }
+}
+
+/// Peers that already own a claimed target. A peer takes one turn at a time, so
+/// the rest of its work waits for the next one.
+fn busy_peers(targets: &BTreeMap<ResyncTargetKey, ScheduledResync>) -> BTreeSet<PeerId> {
+    targets
+        .iter()
+        .filter(|(_, target)| target.active.is_some())
+        .map(|(key, _)| key.peer_id)
+        .collect()
+}
+
+/// The claims one batch task owns. Dropping the lease releases exactly the
+/// claims it still holds, so a panicking, aborted or timed-out task cannot
+/// leave a target in flight forever.
+struct ResyncLease {
+    scheduler: ResyncScheduler,
+    retry_after: Duration,
+    claims: BTreeMap<ResyncTargetKey, ResyncTarget>,
+}
+
+impl ResyncLease {
+    fn targets(&self) -> Vec<ResyncTarget> {
+        self.claims.values().copied().collect()
+    }
+
+    /// Takes a claim out of the lease so its own result is recorded once.
+    fn take_claim(&mut self, key: &ResyncTargetKey) -> Option<ResyncTarget> {
+        self.claims.remove(key)
+    }
+
+    /// The claims whose result was never recorded, for a timeout to consume.
+    fn drain_claims(&mut self) -> Vec<ResyncTarget> {
+        std::mem::take(&mut self.claims).into_values().collect()
+    }
+}
+
+impl Drop for ResyncLease {
+    fn drop(&mut self) {
+        for (_, claim) in std::mem::take(&mut self.claims) {
+            self.scheduler.release_claim(claim, self.retry_after);
+        }
     }
 }
 
@@ -491,24 +695,8 @@ impl<S: Storage> IrohNet<S> {
     }
 
     pub async fn sync_peer_now(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<()> {
-        self.sync_peer_now_with_runtime(peer_id, topic_id, self.runtime)
+        self.sync_now(peer_id_to_endpoint_addr(peer_id)?, topic_id)
             .await
-    }
-
-    async fn sync_peer_now_with_runtime(
-        &self,
-        peer_id: PeerId,
-        topic_id: crate::TopicId,
-        runtime: IrohRuntimeConfig,
-    ) -> io::Result<()> {
-        let addr = match peer_id_to_endpoint_addr(peer_id) {
-            Ok(addr) => addr,
-            Err(error) => {
-                self.finish_resync_attempt(peer_id, topic_id, Err(&error), runtime);
-                return Err(error);
-            }
-        };
-        self.sync_now_with_runtime(addr, topic_id, runtime).await
     }
 
     pub fn schedule_resync(&self, peer_id: PeerId, topic_id: crate::TopicId) {
@@ -542,12 +730,8 @@ impl<S: Storage> IrohNet<S> {
         endpoint_id: iroh::EndpointId,
         topic_id: crate::TopicId,
     ) -> io::Result<()> {
-        self.sync_now_with_runtime(
-            iroh::EndpointAddr::from(endpoint_id),
-            topic_id,
-            self.runtime,
-        )
-        .await
+        self.sync_now(iroh::EndpointAddr::from(endpoint_id), topic_id)
+            .await
     }
 
     pub fn start_accept_loop(self: &Arc<Self>) -> io::Result<()> {
@@ -712,7 +896,18 @@ impl<S: Storage> IrohNet<S> {
             ..self.runtime
         };
         let mut shutdown = self.shutdown.subscribe();
+        // Captured before the first poll so that aborting a loop that never ran
+        // still clears the latch.
+        let running = ResyncLoopGuard {
+            net: Weak::clone(&net),
+        };
         Ok(Some(handle.spawn(async move {
+            let _running = running;
+            // Claims from a loop that already exited have no owner left, so
+            // hand them back before this loop dispatches.
+            if let Some(current) = net.upgrade() {
+                current.resync_scheduler.release_all(Duration::ZERO);
+            }
             let mut sweep_pending = net.upgrade().is_some_and(|current| {
                 current.schedule_startup_resync().inspect_err(|error| {
                     tracing::warn!(%error, "failed to schedule startup resync sweep");
@@ -724,13 +919,14 @@ impl<S: Storage> IrohNet<S> {
             } else {
                 next_full_sweep_deadline(runtime.full_sweep_interval, runtime.full_sweep_time_of_day)
             }));
+            let mut syncs = tokio::task::JoinSet::new();
             loop {
-                if !run_due_resyncs(&net, &mut shutdown, runtime).await {
+                if !dispatch_due_resyncs(&net, &mut syncs, runtime) {
                     break;
                 }
                 let next_due = net
                     .upgrade()
-                    .and_then(|current| current.resync_scheduler.next_due())
+                    .map(|current| next_resync_wake(&current.resync_scheduler, syncs.len()))
                     .unwrap_or_else(|| tokio::time::Instant::now() + EMPTY_RESYNC_SLEEP);
                 let due_sleep = tokio::time::sleep_until(next_due);
                 tokio::pin!(due_sleep);
@@ -758,20 +954,31 @@ impl<S: Storage> IrohNet<S> {
                         };
                         full_sweep.as_mut().reset(tokio::time::Instant::now() + delay);
                     }
+                    Some(result) = syncs.join_next(), if !syncs.is_empty() => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "resync batch task failed");
+                        }
+                    }
                     _ = notify.notified() => {}
                     _ = &mut due_sleep => {}
                 }
             }
+            syncs.abort_all();
+            // Draining lets every aborted batch release its own claims before a
+            // replacement loop may start.
+            while syncs.join_next().await.is_some() {}
         })))
     }
 
+    /// Completes one owned attempt. Only the holder of the claim may call this.
     fn finish_resync_attempt(
         &self,
-        peer_id: PeerId,
-        topic_id: crate::TopicId,
+        claim: ResyncTarget,
         result: std::result::Result<(), &io::Error>,
         runtime: IrohRuntimeConfig,
     ) {
+        let peer_id = claim.key.peer_id;
+        let topic_id = claim.key.topic_id;
         let needs_sync = match self.target_needs_sync(peer_id, topic_id) {
             Ok(needs_sync) => needs_sync,
             Err(error) => {
@@ -781,26 +988,39 @@ impl<S: Storage> IrohNet<S> {
         };
 
         if !needs_sync && result.is_ok() {
-            self.resync_scheduler.complete_clean(peer_id, topic_id);
+            self.resync_scheduler.complete_clean(claim);
             return;
         }
 
         match result {
-            Ok(()) => {
-                self.resync_scheduler
-                    .complete_dirty(peer_id, topic_id, runtime.resync_interval)
-            }
+            Ok(()) => self
+                .resync_scheduler
+                .complete_dirty(claim, runtime.resync_interval),
             Err(_) => self.resync_scheduler.complete_failed(
-                peer_id,
-                topic_id,
+                claim,
                 runtime.resync_initial_backoff,
                 runtime.resync_max_backoff,
             ),
         }
     }
 
+    /// Reevaluates a target after peer evidence changed. Evidence may re-arm a
+    /// target, but never completes or deletes an attempt it does not own.
+    fn reconsider_target(&self, peer_id: PeerId, topic_id: crate::TopicId) {
+        let needs_sync = match self.target_needs_sync(peer_id, topic_id) {
+            Ok(needs_sync) => needs_sync,
+            Err(error) => {
+                tracing::warn!(%peer_id, %topic_id, %error, "failed to reevaluate resync target");
+                true
+            }
+        };
+        if needs_sync {
+            self.resync_scheduler.reconsider(peer_id, topic_id);
+        }
+    }
+
     fn should_attempt_resync_target(&self, target: ResyncTarget) -> io::Result<bool> {
-        if target.force {
+        if target.force.is_some() {
             return self.target_is_selected(target.key.peer_id, target.key.topic_id);
         }
         self.target_needs_sync(target.key.peer_id, target.key.topic_id)
@@ -1020,16 +1240,6 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         topic_id: crate::TopicId,
     ) -> io::Result<()> {
-        self.sync_now_with_runtime(peer, topic_id, self.runtime)
-            .await
-    }
-
-    async fn sync_now_with_runtime(
-        &self,
-        peer: iroh::EndpointAddr,
-        topic_id: crate::TopicId,
-        runtime: IrohRuntimeConfig,
-    ) -> io::Result<()> {
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
         let endpoint_id = peer.id;
         let mut outcomes = self.run_topic_batch(peer, &[topic_id]).await;
@@ -1045,7 +1255,9 @@ impl<S: Storage> IrohNet<S> {
         let _ = self
             .node
             .record_sync_result(remote_peer_id, topic_id, record_result);
-        self.finish_resync_attempt(remote_peer_id, topic_id, record_result, runtime);
+        // A manual sync holds no claim, so it reports evidence instead of
+        // completing an attempt the resync loop may own.
+        self.reconsider_target(remote_peer_id, topic_id);
         result
     }
 
@@ -1054,20 +1266,26 @@ impl<S: Storage> IrohNet<S> {
     async fn sync_peer_batch_with_runtime(
         &self,
         peer_id: PeerId,
-        targets: Vec<ResyncTarget>,
+        mut lease: ResyncLease,
         runtime: IrohRuntimeConfig,
     ) {
+        let deadline = tokio::time::Instant::now()
+            + runtime
+                .connect_timeout
+                .saturating_add(runtime.sync_io_timeout)
+                .saturating_mul(4);
         let addr = match peer_id_to_endpoint_addr(peer_id) {
             Ok(addr) => addr,
             Err(error) => {
-                for target in targets {
-                    self.finish_resync_attempt(peer_id, target.key.topic_id, Err(&error), runtime);
+                for claim in lease.drain_claims() {
+                    self.finish_resync_attempt(claim, Err(&error), runtime);
                 }
                 return;
             }
         };
-        let mut topics = Vec::with_capacity(targets.len());
-        for target in targets {
+        let claimed = lease.targets();
+        let mut topics = Vec::with_capacity(claimed.len());
+        for target in claimed {
             let topic_id = target.key.topic_id;
             match self.should_attempt_resync_target(target) {
                 Ok(true) => topics.push(topic_id),
@@ -1075,13 +1293,36 @@ impl<S: Storage> IrohNet<S> {
                     if let Err(error) = self.gc_stale_obligations(peer_id, topic_id) {
                         tracing::warn!(%peer_id, %topic_id, %error, "failed to gc stale sync obligations");
                     }
-                    self.resync_scheduler.complete_clean(peer_id, topic_id);
+                    if let Some(claim) = lease.take_claim(&target.key) {
+                        self.resync_scheduler.complete_clean(claim);
+                    }
                 }
-                Err(error) => self.finish_resync_attempt(peer_id, topic_id, Err(&error), runtime),
+                Err(error) => {
+                    if let Some(claim) = lease.take_claim(&target.key) {
+                        self.finish_resync_attempt(claim, Err(&error), runtime);
+                    }
+                }
             }
         }
         for chunk in topics.chunks(MAX_TOPICS_PER_RESYNC_BATCH) {
-            self.sync_topic_chunk(addr.clone(), chunk, runtime).await;
+            if tokio::time::timeout_at(
+                deadline,
+                self.sync_topic_chunk(addr.clone(), chunk, &mut lease, runtime),
+            )
+            .await
+            .is_err()
+            {
+                // Only the claims this batch never finished belong to the
+                // timeout; a released chunk keeps its recorded result.
+                let error = timed_out("peer sync batch timed out");
+                for claim in lease.drain_claims() {
+                    let _ = self
+                        .node
+                        .record_sync_result(peer_id, claim.key.topic_id, Err(&error));
+                    self.finish_resync_attempt(claim, Err(&error), runtime);
+                }
+                return;
+            }
         }
     }
 
@@ -1122,6 +1363,7 @@ impl<S: Storage> IrohNet<S> {
         &self,
         peer: iroh::EndpointAddr,
         topic_ids: &[crate::TopicId],
+        lease: &mut ResyncLease,
         runtime: IrohRuntimeConfig,
     ) {
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
@@ -1143,7 +1385,12 @@ impl<S: Storage> IrohNet<S> {
             let _ = self
                 .node
                 .record_sync_result(remote_peer_id, topic_id, record_result);
-            self.finish_resync_attempt(remote_peer_id, topic_id, record_result, runtime);
+            if let Some(claim) = lease.take_claim(&ResyncTargetKey {
+                peer_id: remote_peer_id,
+                topic_id,
+            }) {
+                self.finish_resync_attempt(claim, record_result, runtime);
+            }
         }
         if let Some(error) = first_error {
             // Drops the pooled connection only when it is already closed.
@@ -1839,12 +2086,7 @@ impl<S: Storage> IrohNet<S> {
                             .map_err(invalid_data)?)
                 {
                     if state.members.contains(&peer_id) {
-                        self.finish_resync_attempt(
-                            peer_id,
-                            fingerprint.topic_id,
-                            Ok(()),
-                            self.runtime,
-                        );
+                        self.reconsider_target(peer_id, fingerprint.topic_id);
                     }
                     Ok(vec![SyncMessage::Fingerprint(local)])
                 } else {
@@ -2079,7 +2321,7 @@ impl SyncSession {
         }
         for (ack, result) in bound.iter().zip(net.node.apply_sync_acks(&bound)) {
             match result {
-                Ok(()) => net.finish_resync_attempt(peer_id, ack.topic_id, Ok(()), net.runtime),
+                Ok(()) => net.reconsider_target(peer_id, ack.topic_id),
                 Err(error) => {
                     let topic_id = ack.topic_id;
                     tracing::warn!(%topic_id, %error, "skipping rejected sync ack");
@@ -2130,9 +2372,36 @@ fn push_responses(
     Ok(())
 }
 
-async fn run_due_resyncs<S: Storage>(
+/// Clears the resync start latch when the loop task actually ends, including on
+/// abort, so a replacement loop can be started.
+struct ResyncLoopGuard<S: Storage> {
+    net: Weak<IrohNet<S>>,
+}
+
+impl<S: Storage> Drop for ResyncLoopGuard<S> {
+    fn drop(&mut self) {
+        if let Some(current) = self.net.upgrade() {
+            current.resync_started.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The loop's next wake deadline. With every slot taken there is nothing to
+/// dispatch, so no due deadline is armed and an expired one cannot spin.
+fn next_resync_wake(scheduler: &ResyncScheduler, in_flight: usize) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    if in_flight >= MAX_RESYNC_PEER_CONCURRENCY {
+        return now + EMPTY_RESYNC_SLEEP;
+    }
+    scheduler.next_due().unwrap_or(now + EMPTY_RESYNC_SLEEP)
+}
+
+/// Fills the free peer slots from the due queue and returns false when the loop
+/// must stop. Claims are taken here, one turn per peer, so a slow peer cannot
+/// hold capacity another due peer could use.
+fn dispatch_due_resyncs<S: Storage>(
     net: &Weak<IrohNet<S>>,
-    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    syncs: &mut tokio::task::JoinSet<()>,
     runtime: IrohRuntimeConfig,
 ) -> bool {
     let Some(current) = net.upgrade() else {
@@ -2141,64 +2410,25 @@ async fn run_due_resyncs<S: Storage>(
     if current.is_shutdown() || current.endpoint().is_closed() {
         return false;
     }
-    let due = current.resync_scheduler.due_targets_by_peer(
-        MAX_RESYNC_PEER_CONCURRENCY,
-        MAX_RESYNC_TARGETS_PER_PEER_PASS,
-    );
-    drop(current);
-    if due.is_empty() {
+    let free = MAX_RESYNC_PEER_CONCURRENCY.saturating_sub(syncs.len());
+    if free == 0 {
         return true;
     }
-
-    let mut syncs = tokio::task::JoinSet::new();
+    let due = current
+        .resync_scheduler
+        .due_targets_by_peer(free, MAX_TOPICS_PER_RESYNC_BATCH);
     for (peer_id, targets) in due {
-        let Some(current) = net.upgrade() else {
-            return false;
-        };
-        if current.is_shutdown() {
-            return false;
-        }
+        // The lease owns the claims before the task is spawned, so an abort
+        // releases them instead of wedging the targets in flight.
+        let lease = current
+            .resync_scheduler
+            .lease(targets, runtime.resync_interval);
+        let peer_net = Arc::clone(&current);
         syncs.spawn(async move {
-            let topics = targets
-                .iter()
-                .map(|target| target.key.topic_id)
-                .collect::<Vec<_>>();
-            if tokio::time::timeout(
-                runtime
-                    .connect_timeout
-                    .saturating_add(runtime.sync_io_timeout)
-                    .saturating_mul(4),
-                current.sync_peer_batch_with_runtime(peer_id, targets, runtime),
-            )
-            .await
-            .is_err()
-            {
-                let error = timed_out("peer sync batch timed out");
-                for topic_id in topics {
-                    let _ = current
-                        .node
-                        .record_sync_result(peer_id, topic_id, Err(&error));
-                    current.finish_resync_attempt(peer_id, topic_id, Err(&error), runtime);
-                }
-            }
+            peer_net
+                .sync_peer_batch_with_runtime(peer_id, lease, runtime)
+                .await;
         });
-    }
-
-    while !syncs.is_empty() {
-        tokio::select! {
-            Some(result) = syncs.join_next() => {
-                if let Err(error) = result {
-                    tracing::warn!(%error, "resync batch task failed");
-                }
-            }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    syncs.abort_all();
-                    while syncs.join_next().await.is_some() {}
-                    return false;
-                }
-            }
-        }
     }
     true
 }
@@ -2449,6 +2679,17 @@ mod tests {
     use super::*;
     use crate::TopicId;
 
+    /// Wide enough that the second backoff step cannot be mistaken for the
+    /// first on a slow machine.
+    const BACKOFF: Duration = Duration::from_secs(60);
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Ping;
+
+    impl crate::Event for Ping {
+        const TYPE_ID: &'static str = "test.ping";
+    }
+
     fn peer(byte: u8) -> PeerId {
         PeerId::from_bytes([byte; 32])
     }
@@ -2470,7 +2711,7 @@ mod tests {
         assert_eq!(*peer_id, peer(1));
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].key.topic_id, topic(2));
-        scheduler.complete_clean(peer(1), topic(2));
+        scheduler.complete_clean(targets[0]);
         assert!(scheduler.next_due().is_none());
     }
 
@@ -2492,8 +2733,9 @@ mod tests {
         assert_eq!(*second_peer, peer(2));
         assert_eq!(second_targets.len(), 1);
 
-        // Targets handed out stay in flight until completed.
-        assert!(scheduler.due_targets_by_peer(8, 8).len() == 1);
+        // Targets handed out stay in flight until completed, and a peer taking
+        // its turn is not given a second one.
+        assert!(scheduler.due_targets_by_peer(8, 8).is_empty());
     }
 
     #[test]
@@ -2502,11 +2744,11 @@ mod tests {
         let peer_id = peer(3);
         let topic_id = topic(4);
         scheduler.schedule_now(peer_id, topic_id, false);
-        assert_eq!(scheduler.due_targets_by_peer(8, 8).len(), 1);
+        let mut due = scheduler.due_targets_by_peer(8, 8);
+        assert_eq!(due.len(), 1);
 
         scheduler.complete_failed(
-            peer_id,
-            topic_id,
+            due.remove(0).1[0],
             Duration::from_secs(1),
             Duration::from_secs(600),
         );
@@ -2517,9 +2759,12 @@ mod tests {
         assert!(first_delay <= Duration::from_secs(1));
 
         for _ in 0..16 {
+            // Each failure needs its own claim: a completion must own one.
+            scheduler.schedule_now(peer_id, topic_id, true);
+            let mut due = scheduler.due_targets_by_peer(8, 8);
+            assert_eq!(due.len(), 1);
             scheduler.complete_failed(
-                peer_id,
-                topic_id,
+                due.remove(0).1[0],
                 Duration::from_secs(1),
                 Duration::from_secs(600),
             );
@@ -2529,5 +2774,286 @@ mod tests {
             .unwrap()
             .saturating_duration_since(tokio::time::Instant::now());
         assert!(capped_delay <= Duration::from_secs(600));
+    }
+
+    /// A claim for the single due target of one peer.
+    fn one_claim(scheduler: &ResyncScheduler) -> ResyncTarget {
+        let mut due = scheduler.due_targets_by_peer(8, 8);
+        assert_eq!(due.len(), 1);
+        let targets = due.remove(0).1;
+        assert_eq!(targets.len(), 1);
+        targets[0]
+    }
+
+    #[test]
+    fn keeps_force_request() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(5), topic(6), false);
+        let claim = one_claim(&scheduler);
+
+        // A force request that arrives during the attempt is not covered by it.
+        scheduler.schedule_now(peer(5), topic(6), true);
+        scheduler.complete_clean(claim);
+
+        assert!(scheduler.next_due().is_some());
+        let (active, _, force) = scheduler.target_state(peer(5), topic(6)).unwrap();
+        assert_eq!(active, None);
+        assert!(force.is_some());
+    }
+
+    #[test]
+    fn ignores_stale_failure() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(7), topic(8), false);
+        let claim = one_claim(&scheduler);
+
+        scheduler.complete_clean(claim);
+        scheduler.complete_failed(claim, Duration::from_secs(1), Duration::from_secs(600));
+
+        assert!(scheduler.next_due().is_none());
+        assert_eq!(scheduler.target_state(peer(7), topic(8)), None);
+    }
+
+    #[test]
+    fn ignores_stale_completion() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(9), topic(10), false);
+        let stale = one_claim(&scheduler);
+        scheduler.complete_clean(stale);
+        scheduler.schedule_now(peer(9), topic(10), true);
+        let live = one_claim(&scheduler);
+
+        scheduler.complete_dirty(stale, Duration::from_secs(5));
+        scheduler.complete_clean(stale);
+        scheduler.complete_failed(stale, Duration::from_secs(1), Duration::from_secs(600));
+
+        assert!(scheduler.due_targets_by_peer(8, 8).is_empty());
+        assert!(scheduler.next_due().is_none());
+        let (active, failures, force) = scheduler.target_state(peer(9), topic(10)).unwrap();
+        assert_eq!(active, Some(live.attempt));
+        assert_eq!(failures, 0);
+        assert_eq!(force, live.force);
+    }
+
+    #[test]
+    fn release_all_reclaims() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(16), topic(17), false);
+        let stale = one_claim(&scheduler);
+
+        scheduler.release_all(Duration::ZERO);
+
+        let reclaimed = one_claim(&scheduler);
+        assert_ne!(reclaimed.attempt, stale.attempt);
+        scheduler.complete_clean(stale);
+        assert_eq!(
+            scheduler.target_state(peer(16), topic(17)).unwrap().0,
+            Some(reclaimed.attempt)
+        );
+    }
+
+    #[test]
+    fn panic_releases_lease() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(13), topic(14), false);
+        let claim = one_claim(&scheduler);
+        let lease = scheduler.lease(vec![claim], Duration::ZERO);
+
+        let batch = std::thread::spawn(move || {
+            let _lease = lease;
+            panic!("batch task panicked");
+        });
+        assert!(batch.join().is_err());
+
+        let released = one_claim(&scheduler);
+        assert_ne!(released.attempt, claim.attempt);
+    }
+
+    #[test]
+    fn timeout_spares_completed() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(15), topic(1), false);
+        scheduler.schedule_now(peer(15), topic(2), false);
+        let mut due = scheduler.due_targets_by_peer(8, 8);
+        assert_eq!(due.len(), 1);
+        let mut lease = scheduler.lease(due.remove(0).1, Duration::ZERO);
+        let done = lease
+            .take_claim(&ResyncTargetKey {
+                peer_id: peer(15),
+                topic_id: topic(1),
+            })
+            .unwrap();
+        scheduler.complete_clean(done);
+
+        let unfinished = lease.drain_claims();
+
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].key.topic_id, topic(2));
+        for claim in unfinished {
+            scheduler.complete_failed(claim, Duration::from_secs(1), Duration::from_secs(600));
+        }
+        assert_eq!(scheduler.target_state(peer(15), topic(1)), None);
+        let (active, failures, _) = scheduler.target_state(peer(15), topic(2)).unwrap();
+        assert_eq!(active, None);
+        assert_eq!(failures, 1);
+    }
+
+    /// A node whose iroh endpoint matches its signer, for the scheduler paths
+    /// that need a real `IrohNet`.
+    async fn test_net() -> Arc<IrohNet<MemoryStorage>> {
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let node = Irokle::builder()
+            .with_iroh_secret_key(endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        Arc::new(IrohNet::new(endpoint, node).unwrap())
+    }
+
+    #[tokio::test]
+    async fn refills_free_slots() {
+        let net = test_net().await;
+        let weak = Arc::downgrade(&net);
+        let mut syncs = tokio::task::JoinSet::new();
+        net.resync_scheduler.schedule_now(peer(20), topic(1), false);
+        net.resync_scheduler.schedule_now(peer(21), topic(1), false);
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, net.runtime));
+        assert_eq!(syncs.len(), 2);
+
+        // A peer that becomes due while other turns run takes a free slot now.
+        net.resync_scheduler.schedule_now(peer(22), topic(1), false);
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, net.runtime));
+
+        assert_eq!(syncs.len(), 3);
+        let (active, _, _) = net
+            .resync_scheduler
+            .target_state(peer(22), topic(1))
+            .unwrap();
+        assert!(active.is_some());
+    }
+
+    #[test]
+    fn full_slots_park() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(24), topic(1), false);
+
+        let armed = next_resync_wake(&scheduler, MAX_RESYNC_PEER_CONCURRENCY - 1);
+        let parked = next_resync_wake(&scheduler, MAX_RESYNC_PEER_CONCURRENCY);
+
+        assert!(armed <= tokio::time::Instant::now());
+        assert!(parked > tokio::time::Instant::now() + Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn skips_busy_peers() {
+        let net = test_net().await;
+        let weak = Arc::downgrade(&net);
+        let mut syncs = tokio::task::JoinSet::new();
+        net.resync_scheduler.schedule_now(peer(23), topic(1), false);
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, net.runtime));
+        assert_eq!(syncs.len(), 1);
+
+        // More work for a peer mid-turn waits for its next turn instead of
+        // opening a second exchange or spinning on its expired deadline.
+        net.resync_scheduler.schedule_now(peer(23), topic(2), false);
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, net.runtime));
+
+        assert_eq!(syncs.len(), 1);
+        let (active, _, _) = net
+            .resync_scheduler
+            .target_state(peer(23), topic(2))
+            .unwrap();
+        assert_eq!(active, None);
+        assert!(net.resync_scheduler.next_due().is_none());
+    }
+
+    #[tokio::test]
+    async fn ack_preserves_claim() {
+        let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let alice = Irokle::builder()
+            .with_iroh_secret_key(alice_endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        let bob = Irokle::builder()
+            .with_iroh_secret_key(bob_endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        let net = IrohNet::new(alice_endpoint, alice.clone()).unwrap();
+        let topic = alice
+            .create_topic::<Ping>(crate::TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap();
+        net.resync_scheduler
+            .schedule_now(bob.peer_id(), topic.id(), false);
+        let failed = one_claim(&net.resync_scheduler);
+        net.resync_scheduler
+            .complete_failed(failed, BACKOFF, Duration::from_secs(600));
+        net.resync_scheduler
+            .schedule_now(bob.peer_id(), topic.id(), true);
+        let claim = one_claim(&net.resync_scheduler);
+
+        let mut ack = crate::sync::SyncAck {
+            topic_id: topic.id(),
+            peer_id: bob.peer_id(),
+            accepted: BTreeSet::new(),
+            heads: BTreeSet::new(),
+            clock: crate::ActorClock::new(),
+            signature: None,
+        };
+        ack.sign(bob.signer()).unwrap();
+        net.handle_messages(
+            bob_endpoint.id(),
+            vec![
+                SyncMessage::Open(crate::sync::SyncEngine::<MemoryStorage>::open(
+                    topic.id(),
+                    bob.peer_id(),
+                    Some(<Ping as crate::Event>::TYPE_ID.into()),
+                )),
+                SyncMessage::Ack(ack),
+            ],
+        )
+        .unwrap();
+
+        assert!(net.resync_scheduler.due_targets_by_peer(8, 8).is_empty());
+        assert_eq!(
+            net.resync_scheduler.target_state(bob.peer_id(), topic.id()),
+            Some((Some(claim.attempt), 1, claim.force))
+        );
+        net.resync_scheduler
+            .complete_failed(claim, BACKOFF, Duration::from_secs(600));
+        let delay = net
+            .resync_scheduler
+            .next_due()
+            .expect("the target stays scheduled")
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(delay > BACKOFF, "peer evidence reset the failure backoff");
+    }
+
+    #[tokio::test]
+    async fn notify_keeps_permit() {
+        let scheduler = ResyncScheduler::default();
+        let notify = scheduler.notifier();
+        assert!(scheduler.due_targets_by_peer(8, 8).is_empty());
+
+        scheduler.schedule_now(peer(11), topic(12), false);
+        tokio::time::timeout(Duration::from_secs(60), notify.notified())
+            .await
+            .expect("a schedule after an empty scan must leave a wake permit");
+
+        assert_eq!(scheduler.due_targets_by_peer(8, 8).len(), 1);
     }
 }
