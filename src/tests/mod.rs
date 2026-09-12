@@ -1,6 +1,8 @@
 mod ack;
 #[cfg(all(feature = "fjall", feature = "iroh"))]
 mod bench;
+#[cfg(all(feature = "fjall", feature = "iroh"))]
+mod bench_net;
 mod bootstrap;
 mod branch;
 #[cfg(feature = "iroh")]
