@@ -928,3 +928,96 @@ fn fjall_quarantines_orphan() {
     let dir = tempfile::tempdir().unwrap();
     assert_quarantines_orphan(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
+
+/// Evidence signed on a branch that genesis replacement discarded must not
+/// certify the replacement branch, even though the actor keeps its identity and
+/// reaches the same sequence numbers there.
+#[test]
+fn rejects_stale_incarnation() {
+    let topic_id = TopicId::hash(b"genesis-fork-topic");
+    let (oplog_a, signer_a, g_a, e_a) = seed_side(topic_id, 1, 2, "a-branch");
+    let (oplog_b, signer_b, g_b, e_b) = seed_side(topic_id, 2, 1, "b-branch");
+
+    // The loser is the side whose genesis loses the tie-break and resets.
+    let a_won = g_a.id < g_b.id;
+    let (loser_oplog, loser_signer, loser_genesis, loser_event, winner_signer, winner_ops) =
+        if a_won {
+            (oplog_b, signer_b, g_b, e_b, signer_a, vec![g_a, e_a])
+        } else {
+            (oplog_a, signer_a, g_a, e_a, signer_b, vec![g_b, e_b])
+        };
+    let loser_peer = loser_signer.peer_id();
+    let winner_peer = winner_signer.peer_id();
+    let loser_actor = actor_id_for(topic_id, loser_peer);
+
+    // The winner acknowledges the loser's old branch at actor sequence two.
+    let mut old_clock = ActorClock::new();
+    old_clock.observe(loser_actor, 2);
+    let mut stale_ack = sync::SyncAck {
+        topic_id,
+        peer_id: winner_peer,
+        genesis: Some(loser_genesis.id),
+        accepted: BTreeSet::new(),
+        heads: [loser_event.id].into(),
+        clock: old_clock,
+        signature: None,
+    };
+    stale_ack.sign(&winner_signer).unwrap();
+
+    // Genesis replacement discards that branch.
+    let sync_loser = SyncEngine::new(loser_oplog.clone(), loser_peer);
+    loser_oplog
+        .receive_ops_from_peer_evicting(Some(winner_peer), winner_ops)
+        .unwrap();
+    assert_ne!(
+        loser_oplog
+            .storage()
+            .topic_state(&topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis,
+        loser_genesis.id
+    );
+
+    // The loser reaches actor sequence two again on the replacement branch.
+    let mut replacement = Vec::new();
+    for text in ["new-one", "new-two"] {
+        replacement.push(
+            loser_oplog
+                .create_event_op(
+                    topic_id,
+                    loser_actor,
+                    EventEnvelope::encode_event(&Note { text: text.into() }).unwrap(),
+                    &loser_signer,
+                )
+                .unwrap(),
+        );
+    }
+    let newest = replacement.last().unwrap().id;
+    assert_eq!(
+        loser_oplog
+            .storage()
+            .actor_clock(&topic_id)
+            .unwrap()
+            .get(&loser_actor),
+        2
+    );
+    sync_loser
+        .put_obligation(winner_peer, topic_id, [newest].into())
+        .unwrap();
+
+    // Replaying the old-branch acknowledgement must not satisfy that work.
+    let replayed = sync_loser.apply_ack(&stale_ack);
+    assert!(
+        replayed.is_err(),
+        "old-branch ack was accepted on the replacement branch"
+    );
+    let obligations = loser_oplog.storage().all_sync_obligations().unwrap();
+    assert!(
+        obligations
+            .iter()
+            .any(|obligation| obligation.peer_id == winner_peer
+                && obligation.op_ids.contains(&newest)),
+        "replayed old-branch ack cleared work owed on the replacement branch"
+    );
+}

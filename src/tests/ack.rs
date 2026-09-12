@@ -748,3 +748,338 @@ fn ack_needs_closure() {
             .unwrap()
     );
 }
+
+/// An acknowledgement that names no incarnation certifies nothing. Genesis
+/// replacement reuses actor ids and sequence numbers, so evidence that does not
+/// say which branch it covers cannot be attributed to one.
+#[test]
+fn legacy_ack_rejected() {
+    let alice = node(120);
+    let ack_signer = Ed25519Signer::from_bytes(&[121; 32]);
+    let peer = ack_signer.peer_id();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let record = topic
+        .publish(Note {
+            text: "unidentified".into(),
+        })
+        .unwrap();
+    alice
+        .put_sync_obligation(peer, topic.id(), [record.meta.op_id].into())
+        .unwrap();
+
+    let mut clock = ActorClock::new();
+    clock.observe(record.meta.actor_id, record.meta.actor_seq);
+    let mut ack = sync::SyncAck {
+        topic_id: topic.id(),
+        peer_id: peer,
+        genesis: None,
+        accepted: BTreeSet::new(),
+        heads: [record.meta.op_id].into(),
+        clock,
+        signature: None,
+    };
+    ack.sign(&ack_signer).unwrap();
+
+    assert!(matches!(
+        alice.apply_sync_ack(&ack),
+        Err(Error::InvalidSyncAck(_))
+    ));
+    assert_eq!(
+        alice
+            .storage()
+            .sync_obligations(&peer, &topic.id())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        alice
+            .storage()
+            .peer_ack(&peer, &topic.id())
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A batch reports one verdict per acknowledgement: a record naming a replaced
+/// branch is refused on its own without discarding the valid ones beside it.
+fn assert_batch_isolates_stale<S: Storage>(storage: S) {
+    let (irokle, mut acks, topics, peer) = batch_ack_fixture(storage);
+    let ack_signer = Ed25519Signer::from_bytes(&[88; 32]);
+    acks[1].genesis = Some(OpId::hash(b"some-other-branch"));
+    acks[1].sign(&ack_signer).unwrap();
+
+    let results = irokle.apply_sync_acks(&acks);
+    assert!(results[0].is_ok());
+    assert!(matches!(results[1], Err(Error::StaleIncarnation)));
+    assert!(results[2].is_ok());
+
+    // Only the refused topic keeps its work and stores no evidence.
+    for (index, topic_id) in topics.iter().enumerate() {
+        let obligations = irokle.storage().sync_obligations(&peer, topic_id).unwrap();
+        let stored = irokle.storage().peer_ack(&peer, topic_id).unwrap();
+        if index == 1 {
+            assert_eq!(obligations.len(), 1);
+            assert!(stored.is_none());
+        } else {
+            assert!(obligations.is_empty());
+            assert!(stored.is_some());
+        }
+    }
+}
+
+#[test]
+fn memory_batch_isolates_stale() {
+    assert_batch_isolates_stale(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_batch_isolates_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_batch_isolates_stale(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// Evidence proving an earlier frontier of the current branch stays valid while
+/// the author keeps publishing. Only the newer work remains outstanding.
+#[test]
+fn accepts_older_evidence() {
+    let alice = node(122);
+    let ack_signer = Ed25519Signer::from_bytes(&[123; 32]);
+    let peer = ack_signer.peer_id();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let early = topic
+        .publish(Note {
+            text: "early".into(),
+        })
+        .unwrap();
+    alice
+        .put_sync_obligation(peer, topic.id(), [early.meta.op_id].into())
+        .unwrap();
+
+    let mut clock = ActorClock::new();
+    clock.observe(early.meta.actor_id, early.meta.actor_seq);
+    let mut ack = sync::SyncAck {
+        topic_id: topic.id(),
+        peer_id: peer,
+        genesis: genesis_of(alice.storage(), &topic.id()),
+        accepted: BTreeSet::new(),
+        heads: [early.meta.op_id].into(),
+        clock,
+        signature: None,
+    };
+    ack.sign(&ack_signer).unwrap();
+
+    // Publishing continues before the acknowledgement is applied.
+    let late = topic
+        .publish(Note {
+            text: "late".into(),
+        })
+        .unwrap();
+    alice
+        .put_sync_obligation(peer, topic.id(), [late.meta.op_id].into())
+        .unwrap();
+
+    alice.apply_sync_ack(&ack).unwrap();
+    assert!(
+        alice
+            .storage()
+            .peer_reached_op(&peer, &early.meta.op_id)
+            .unwrap()
+    );
+    assert!(
+        !alice
+            .storage()
+            .peer_reached_op(&peer, &late.meta.op_id)
+            .unwrap()
+    );
+    let remaining = alice
+        .storage()
+        .sync_obligations(&peer, &topic.id())
+        .unwrap();
+    assert!(
+        remaining
+            .iter()
+            .any(|obligation| obligation.op_ids.contains(&late.meta.op_id)),
+        "later work must stay outstanding"
+    );
+    assert!(
+        !remaining
+            .iter()
+            .any(|obligation| obligation.op_ids.contains(&early.meta.op_id)),
+        "the proven earlier frontier must be cleared"
+    );
+}
+
+/// Removing the peer between validation and the write must make the validated
+/// evidence ineffective: the storage commit repeats the authorization check.
+#[test]
+fn removal_defeats_evidence() {
+    let alice = node(124);
+    let ack_signer = Ed25519Signer::from_bytes(&[125; 32]);
+    let peer = ack_signer.peer_id();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let record = topic
+        .publish(Note {
+            text: "raced".into(),
+        })
+        .unwrap();
+    let mut clock = ActorClock::new();
+    clock.observe(record.meta.actor_id, record.meta.actor_seq);
+    let validated = crate::storage::PeerAck {
+        peer_id: peer,
+        topic_id: topic.id(),
+        genesis: genesis_of(alice.storage(), &topic.id()),
+        heads: [record.meta.op_id].into(),
+        clock,
+    };
+    alice
+        .put_sync_obligation(peer, topic.id(), [record.meta.op_id].into())
+        .unwrap();
+
+    // Stands in for the removal that commits after validation read the topic.
+    topic.remove_peer(peer).unwrap();
+    assert!(matches!(
+        alice.storage().apply_peer_ack(validated),
+        Err(Error::NotTopicMember)
+    ));
+    assert!(
+        !alice
+            .storage()
+            .peer_reached_op(&peer, &record.meta.op_id)
+            .unwrap()
+    );
+}
+
+/// A schema 1 database stored acknowledgements without naming the branch they
+/// certified. Upgrading keeps those records and their clocks but treats them as
+/// uncertified, so none of them silently proves the current incarnation.
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_migrates_legacy() {
+    let dir = tempfile::tempdir().unwrap();
+    let ack_signer = Ed25519Signer::from_bytes(&[127; 32]);
+    let peer = ack_signer.peer_id();
+
+    let (topic_id, op_id, actor_id, actor_seq) = {
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        let irokle = Irokle::with_storage(storage, NodeConfig::default()).unwrap();
+        let topic = irokle
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let record = topic
+            .publish(Note {
+                text: "aged".into(),
+            })
+            .unwrap();
+        let mut clock = ActorClock::new();
+        clock.observe(record.meta.actor_id, record.meta.actor_seq);
+        let mut ack = sync::SyncAck {
+            topic_id: topic.id(),
+            peer_id: peer,
+            genesis: genesis_of(irokle.storage(), &topic.id()),
+            accepted: BTreeSet::new(),
+            heads: [record.meta.op_id].into(),
+            clock,
+            signature: None,
+        };
+        ack.sign(&ack_signer).unwrap();
+        irokle.apply_sync_ack(&ack).unwrap();
+        (
+            topic.id(),
+            record.meta.op_id,
+            record.meta.actor_id,
+            record.meta.actor_seq,
+        )
+    };
+
+    // Rewrite the stored record in the schema 1 layout, which had no genesis
+    // field, and mark the database as schema 1 again.
+    {
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .open()
+            .unwrap();
+        let records = db
+            .keyspace("records", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut clock = ActorClock::new();
+        clock.observe(actor_id, actor_seq);
+        let legacy =
+            postcard::to_allocvec(&(peer, topic_id, BTreeSet::from([op_id]), clock)).unwrap();
+        let mut tx = db.write_tx().unwrap();
+        tx.insert(
+            &records,
+            [b"ak".as_slice(), peer.as_ref(), topic_id.as_ref()].concat(),
+            legacy,
+        );
+        tx.insert(
+            &records,
+            b"sv".to_vec(),
+            postcard::to_allocvec(&1u32).unwrap(),
+        );
+        tx.commit().unwrap().unwrap();
+    }
+
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    let migrated = storage.peer_ack(&peer, &topic_id).unwrap().unwrap();
+    assert_eq!(
+        migrated.genesis, None,
+        "legacy evidence must stay uncertified"
+    );
+    assert_eq!(
+        migrated.clock.get(&actor_id),
+        actor_seq,
+        "clock is preserved"
+    );
+    assert!(migrated.heads.contains(&op_id), "frontier is preserved");
+    assert!(
+        !storage.peer_reached_op(&peer, &op_id).unwrap(),
+        "uncertified evidence must not prove the current branch"
+    );
+
+    // Work owed to that peer stays outstanding until it acknowledges again.
+    storage
+        .put_sync_obligation(crate_storage::SyncObligation {
+            peer_id: peer,
+            topic_id,
+            op_ids: [op_id].into(),
+            target_clock: ActorClock::new(),
+        })
+        .unwrap();
+    assert_eq!(storage.sync_obligations(&peer, &topic_id).unwrap().len(), 1);
+
+    // A fresh acknowledgement naming the current branch clears it.
+    let mut clock = ActorClock::new();
+    clock.observe(actor_id, actor_seq);
+    assert_eq!(
+        storage
+            .apply_peer_ack(crate_storage::PeerAck {
+                peer_id: peer,
+                topic_id,
+                genesis: genesis_of(&storage, &topic_id),
+                heads: [op_id].into(),
+                clock,
+            })
+            .unwrap(),
+        1
+    );
+    assert!(storage.peer_reached_op(&peer, &op_id).unwrap());
+}
