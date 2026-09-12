@@ -1852,3 +1852,113 @@ fn fjall_status_ordering() {
     let dir = tempfile::tempdir().unwrap();
     assert_status_ordering(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
+
+/// Buffered pending payloads are bounded by bytes, not only by record count: a
+/// count budget multiplied by the frame limit is far more memory than a node
+/// should hold. The charge is released again when the record goes.
+fn assert_pending_byte_budget<S: Storage>(storage: S) {
+    let signer = Ed25519Signer::from_bytes(&[170; 32]);
+    let source = signer.peer_id();
+    let topic_id = TopicId::hash(b"pending-bytes-topic");
+    let actor_id = actor_id_for(topic_id, source);
+    let missing = OpId::hash(b"pending-bytes-missing");
+    // Five of these exceed the per-source byte quota; four do not.
+    let chunk = crate_storage::MAX_PENDING_BYTES_PER_SOURCE / 4;
+
+    let buffer = |index: usize| {
+        let op = Op::sign(
+            OpBody {
+                topic_id,
+                author: source,
+                actor_id,
+                actor_seq: index as u64 + 1,
+                actor_prev: Some(missing),
+                deps: [missing].into(),
+                generation: 9,
+                payload: TopicPayload::Event(
+                    EventEnvelope::encode_event(&Note {
+                        text: format!("{index}{}", "x".repeat(chunk)),
+                    })
+                    .unwrap(),
+                ),
+            },
+            &signer,
+        )
+        .unwrap();
+        let meta = crate_storage::OpMeta {
+            id: op.id,
+            topic_id,
+            author: source,
+            actor_id,
+            actor_seq: index as u64 + 1,
+            actor_prev: Some(missing),
+            deps: [missing].into(),
+            generation: 9,
+            observed_clock: ActorClock::new(),
+            ready: false,
+            missing_deps: [missing].into(),
+        };
+        (op.id, op, meta)
+    };
+
+    let mut buffered = Vec::new();
+    let mut refused = None;
+    for index in 0..8 {
+        let (op_id, op, meta) = buffer(index);
+        match storage.put_pending_op(source, op, meta) {
+            Ok(()) => buffered.push(op_id),
+            Err(error) => {
+                refused = Some(error);
+                break;
+            }
+        }
+    }
+    let refused = refused.expect("the byte quota must refuse a pending pool this large");
+    assert!(
+        refused.to_string().contains("byte"),
+        "the refusal must name the byte budget, got {refused}"
+    );
+    assert!(
+        !buffered.is_empty() && buffered.len() < 8,
+        "some records fit and the rest were refused, buffered {}",
+        buffered.len()
+    );
+
+    // Removing one record releases its charge, so one more fits again.
+    storage.remove_pending_op(&buffered[0]).unwrap();
+    let (retry_id, retry_op, retry_meta) = buffer(100);
+    storage
+        .put_pending_op(source, retry_op, retry_meta)
+        .expect("a released charge must be reusable");
+
+    // A different source has its own quota and is unaffected.
+    let other_signer = Ed25519Signer::from_bytes(&[171; 32]);
+    let other = other_signer.peer_id();
+    let (_, other_op, mut other_meta) = buffer(200);
+    other_meta.id = other_op.id;
+    storage
+        .put_pending_op(other, other_op, other_meta)
+        .expect("a second source is charged separately");
+
+    // Dropping everything for the first source frees its whole charge.
+    storage.remove_pending_op(&retry_id).unwrap();
+    for op_id in buffered.iter().skip(1) {
+        storage.remove_pending_op(op_id).unwrap();
+    }
+    let (_, again, again_meta) = buffer(300);
+    storage
+        .put_pending_op(source, again, again_meta)
+        .expect("the source quota is fully released");
+}
+
+#[test]
+fn memory_pending_byte_budget() {
+    assert_pending_byte_budget(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_pending_byte_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_pending_byte_budget(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}

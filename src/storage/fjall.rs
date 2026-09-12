@@ -11,11 +11,12 @@ use crate::{
 };
 
 use super::{
-    AckCommit, AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS,
-    MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta,
-    PeerAck, Storage, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, ack_commit,
-    apply_status_update, ensure_deps_resolvable, journalled_eviction, merged_peer_ack,
-    new_peer_status, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
+    AckCommit, AdmittedBatch, MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL,
+    MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
+    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
+    SyncPeerStatus, SyncStatusUpdate, TopicState, ack_commit, apply_status_update,
+    ensure_deps_resolvable, journalled_eviction, merged_peer_ack, new_peer_status,
+    pending_op_bytes, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
     validate_batch, validate_heads,
 };
 
@@ -41,6 +42,14 @@ const FJALL_SCHEMA_VERSION_KEY: &[u8] = b"sv";
 /// no single-letter `a` prefix exists, so this is the whole prefix.
 #[cfg(feature = "fjall")]
 const PEER_ACK_PREFIX: &[u8] = b"ak";
+/// Buffered pending payload bytes, in total and per authenticated source.
+#[cfg(feature = "fjall")]
+const PENDING_BYTES_KEY: &[u8] = b"pb";
+#[cfg(feature = "fjall")]
+const PENDING_SOURCE_BYTES_PREFIX: &[u8] = b"pq";
+/// Pending payload records, keyed on `po<op id>`.
+#[cfg(feature = "fjall")]
+const PENDING_OP_PREFIX: &[u8] = b"po";
 
 /// Schema 1 layout of a stored acknowledgement, which did not name the branch
 /// it certified. Kept only to read those records during the upgrade; postcard
@@ -101,7 +110,7 @@ impl FjallStorage {
     fn ensure_schema_version(&self) -> Result<()> {
         match self.get::<u32>(FJALL_SCHEMA_VERSION_KEY)? {
             Some(FJALL_SCHEMA_VERSION) => Ok(()),
-            Some(1) => self.migrate_peer_acks(),
+            Some(1) => self.migrate_to_schema_two(),
             Some(version) => Err(Error::Storage(format!(
                 "unsupported fjall schema version {version}"
             ))),
@@ -109,13 +118,20 @@ impl FjallStorage {
         }
     }
 
-    /// Rewrite schema 1 acknowledgements into the current layout, which names
-    /// the incarnation each one certifies. Their branch was never recorded, so
-    /// they migrate as uncertified: the records and their clocks are preserved,
-    /// but they prove nothing until the peer acknowledges the current branch.
+    /// Upgrade a schema 1 database. Two things change:
+    ///
+    /// Acknowledgements move into the current layout, which names the
+    /// incarnation each one certifies. Their branch was never recorded, so they
+    /// migrate as uncertified: the records and their clocks are preserved, but
+    /// they prove nothing until the peer acknowledges the current branch.
+    ///
+    /// Buffered pending payloads gain byte counters, seeded by measuring the
+    /// records already stored so the budgets describe the whole pool rather
+    /// than only what arrives afterwards.
+    ///
     /// One transaction carries every rewrite and the version bump, so an
     /// interrupted upgrade reopens at schema 1 and retries from the start.
-    fn migrate_peer_acks(&self) -> Result<()> {
+    fn migrate_to_schema_two(&self) -> Result<()> {
         self.transaction(|tx| {
             let mut migrated = Vec::new();
             for item in fjall::Readable::prefix(tx, &self.records, PEER_ACK_PREFIX) {
@@ -135,6 +151,32 @@ impl FjallStorage {
             for (key, ack) in &migrated {
                 Self::tx_put(tx, &self.records, key, ack)?;
             }
+
+            let mut total_bytes = 0_u64;
+            let mut source_bytes: BTreeMap<PeerId, u64> = BTreeMap::new();
+            for item in fjall::Readable::prefix(tx, &self.records, PENDING_OP_PREFIX) {
+                let (key, value) = item.into_inner()?;
+                if key.len() != PENDING_OP_PREFIX.len() + OpId::LEN {
+                    continue;
+                }
+                let (source_peer, op, _) =
+                    postcard::from_bytes::<(PeerId, Op, OpMeta)>(value.as_ref())?;
+                let bytes = pending_op_bytes(&op)? as u64;
+                total_bytes = total_bytes.saturating_add(bytes);
+                *source_bytes.entry(source_peer).or_default() += bytes;
+            }
+            if total_bytes > 0 {
+                Self::tx_put(tx, &self.records, PENDING_BYTES_KEY, &total_bytes)?;
+            }
+            for (source_peer, bytes) in source_bytes {
+                Self::tx_put(
+                    tx,
+                    &self.records,
+                    [PENDING_SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat(),
+                    &bytes,
+                )?;
+            }
+
             Self::tx_put(
                 tx,
                 &self.records,
@@ -213,17 +255,45 @@ impl FjallStorage {
             .count()
     }
 
+    /// Refunds `bytes` on the total and per-source pending byte counters. Kept
+    /// in the transaction that removes the record, so the counters cannot drift
+    /// from the records they describe.
+    fn tx_release_pending_bytes(
+        tx: &mut fjall::OptimisticWriteTx,
+        records: &fjall::OptimisticTxKeyspace,
+        source_peer: PeerId,
+        bytes: usize,
+    ) -> Result<()> {
+        let total: u64 = Self::tx_get(tx, records, PENDING_BYTES_KEY)?.unwrap_or_default();
+        let next_total = total.saturating_sub(bytes as u64);
+        if next_total == 0 {
+            tx.remove(records, PENDING_BYTES_KEY.to_vec());
+        } else {
+            Self::tx_put(tx, records, PENDING_BYTES_KEY, &next_total)?;
+        }
+        let source_key = [PENDING_SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat();
+        let source: u64 = Self::tx_get(tx, records, source_key.as_slice())?.unwrap_or_default();
+        let next_source = source.saturating_sub(bytes as u64);
+        if next_source == 0 {
+            tx.remove(records, source_key);
+        } else {
+            Self::tx_put(tx, records, source_key.as_slice(), &next_source)?;
+        }
+        Ok(())
+    }
+
     fn tx_remove_pending_op(
         tx: &mut fjall::OptimisticWriteTx,
         records: &fjall::OptimisticTxKeyspace,
         op_id: &OpId,
     ) -> Result<()> {
-        let Some((source_peer, _, meta)) =
+        let Some((source_peer, op, meta)) =
             Self::tx_get::<(PeerId, Op, OpMeta)>(tx, records, Self::key_id(b"po", op_id))?
         else {
             return Ok(());
         };
         tx.remove(records, Self::key_id(b"po", op_id));
+        Self::tx_release_pending_bytes(tx, records, source_peer, pending_op_bytes(&op)?)?;
         for dep in &meta.missing_deps {
             let waiter_key = [b"pw".as_slice(), dep.as_ref(), op_id.as_ref()].concat();
             tx.remove(records, waiter_key);
@@ -588,45 +658,10 @@ impl FjallStorage {
                         &(meta.actor_seq, op.id),
                     )?;
                 }
-                if let Some((source_peer, _, pending_meta)) = Self::tx_get::<(PeerId, Op, OpMeta)>(
-                    tx,
-                    &self.records,
-                    Self::key_id(b"po", &op.id),
-                )? {
-                    tx.remove(&self.records, Self::key_id(b"po", &op.id));
-                    for dep in &pending_meta.missing_deps {
-                        tx.remove(
-                            &self.records,
-                            [b"pw".as_slice(), dep.as_ref(), op.id.as_ref()].concat(),
-                        );
-                        let count_key = [b"wn".as_slice(), dep.as_ref()].concat();
-                        let count: u64 = Self::tx_get(tx, &self.records, count_key.as_slice())?
-                            .unwrap_or_default();
-                        let next = count.saturating_sub(1);
-                        if next == 0 {
-                            tx.remove(&self.records, count_key);
-                        } else {
-                            Self::tx_put(tx, &self.records, count_key.as_slice(), &next)?;
-                        }
-                    }
-                    let total: u64 =
-                        Self::tx_get(tx, &self.records, b"pn".as_slice())?.unwrap_or_default();
-                    let next_total = total.saturating_sub(1);
-                    if next_total == 0 {
-                        tx.remove(&self.records, b"pn".as_slice());
-                    } else {
-                        Self::tx_put(tx, &self.records, b"pn".as_slice(), &next_total)?;
-                    }
-                    let source_key = [b"ps".as_slice(), source_peer.as_ref()].concat();
-                    let source_count: u64 =
-                        Self::tx_get(tx, &self.records, source_key.as_slice())?.unwrap_or_default();
-                    let next_source = source_count.saturating_sub(1);
-                    if next_source == 0 {
-                        tx.remove(&self.records, source_key);
-                    } else {
-                        Self::tx_put(tx, &self.records, source_key.as_slice(), &next_source)?;
-                    }
-                }
+                // Admission drops the buffered copy through the same funnel as
+                // every other removal, so the pending counts and byte budgets
+                // are released in exactly one place.
+                Self::tx_remove_pending_op(tx, &self.records, &op.id)?;
                 clock.observe(meta.actor_id, meta.actor_seq);
                 max_generation = max_generation.max(meta.generation);
             }
@@ -1092,6 +1127,22 @@ impl Storage for FjallStorage {
             if total_pending as usize >= MAX_PENDING_OPS_TOTAL {
                 return Err(Error::Storage("pending op buffer is full".into()));
             }
+            // A replaced record has already refunded its charge above, so these
+            // counters describe the space this insertion actually needs.
+            let charge = pending_op_bytes(&op)?;
+            let total_bytes: u64 =
+                Self::tx_get(tx, &self.records, PENDING_BYTES_KEY)?.unwrap_or_default();
+            if total_bytes.saturating_add(charge as u64) > MAX_PENDING_BYTES_TOTAL as u64 {
+                return Err(Error::Storage("pending byte budget is full".into()));
+            }
+            let bytes_key = [PENDING_SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat();
+            let source_bytes: u64 =
+                Self::tx_get(tx, &self.records, bytes_key.as_slice())?.unwrap_or_default();
+            if source_bytes.saturating_add(charge as u64) > MAX_PENDING_BYTES_PER_SOURCE as u64 {
+                return Err(Error::Storage(
+                    "pending byte quota exceeded for source".into(),
+                ));
+            }
             let source_key = [b"ps".as_slice(), source_peer.as_ref()].concat();
             let source_pending: u64 =
                 Self::tx_get(tx, &self.records, source_key.as_slice())?.unwrap_or_default();
@@ -1124,6 +1175,18 @@ impl Storage for FjallStorage {
                 )?;
             }
             Self::tx_put(tx, &self.records, b"pn".as_slice(), &(total_pending + 1))?;
+            Self::tx_put(
+                tx,
+                &self.records,
+                PENDING_BYTES_KEY,
+                &(total_bytes + charge as u64),
+            )?;
+            Self::tx_put(
+                tx,
+                &self.records,
+                bytes_key.as_slice(),
+                &(source_bytes + charge as u64),
+            )?;
             Self::tx_put(
                 tx,
                 &self.records,

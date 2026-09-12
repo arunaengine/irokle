@@ -9,11 +9,12 @@ use crate::{
 };
 
 use super::{
-    AckCommit, AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS,
-    MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta,
-    PeerAck, Storage, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, ack_commit,
-    apply_status_update, ensure_deps_resolvable, journalled_eviction, merged_peer_ack,
-    new_peer_status, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
+    AckCommit, AdmittedBatch, MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL,
+    MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
+    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
+    SyncPeerStatus, SyncStatusUpdate, TopicState, ack_commit, apply_status_update,
+    ensure_deps_resolvable, journalled_eviction, merged_peer_ack, new_peer_status,
+    pending_op_bytes, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
     validate_batch, validate_heads,
 };
 
@@ -43,6 +44,8 @@ struct MemoryInner {
     sync_statuses: BTreeMap<(TopicId, PeerId), SyncPeerStatus>,
     evictions: BTreeMap<EvictionKey, TopicEviction>,
     sealed_topics: BTreeSet<TopicId>,
+    pending_bytes: usize,
+    pending_source_bytes: BTreeMap<PeerId, usize>,
 }
 
 impl MemoryStorage {
@@ -231,7 +234,11 @@ impl Storage for MemoryStorage {
                     "pending op id collision with different op".into(),
                 ));
             }
-            Some((*source, pending_meta.missing_deps.clone()))
+            Some((
+                *source,
+                pending_meta.missing_deps.clone(),
+                pending_op_bytes(existing)?,
+            ))
         } else {
             None
         };
@@ -250,20 +257,46 @@ impl Storage for MemoryStorage {
         if replaced.is_none() && inner.pending_ops.len() >= MAX_PENDING_OPS_TOTAL {
             return Err(Error::Storage("pending op buffer is full".into()));
         }
+        // A replaced record refunds its own charge first, so the budget check
+        // sees the space this insertion actually needs.
+        let charge = pending_op_bytes(&op)?;
+        let replaced_bytes = replaced.as_ref().map_or(0, |(_, _, bytes)| *bytes);
+        if inner
+            .pending_bytes
+            .saturating_sub(replaced_bytes)
+            .saturating_add(charge)
+            > MAX_PENDING_BYTES_TOTAL
+        {
+            return Err(Error::Storage("pending byte budget is full".into()));
+        }
         let source_pending = inner
             .pending_by_source
             .get(&source_peer)
             .map_or(0, BTreeSet::len);
         let replaces_source = replaced
             .as_ref()
-            .is_some_and(|(source, _)| *source == source_peer);
+            .is_some_and(|(source, _, _)| *source == source_peer);
         if !replaces_source && source_pending >= MAX_PENDING_OPS_PER_SOURCE {
             return Err(Error::Storage("pending op source quota exceeded".into()));
+        }
+        let source_bytes = inner
+            .pending_source_bytes
+            .get(&source_peer)
+            .copied()
+            .unwrap_or(0);
+        if source_bytes
+            .saturating_sub(if replaces_source { replaced_bytes } else { 0 })
+            .saturating_add(charge)
+            > MAX_PENDING_BYTES_PER_SOURCE
+        {
+            return Err(Error::Storage(
+                "pending byte quota exceeded for source".into(),
+            ));
         }
         for dep in &meta.missing_deps {
             let replaces_waiter = replaced
                 .as_ref()
-                .is_some_and(|(_, missing)| missing.contains(dep));
+                .is_some_and(|(_, missing, _)| missing.contains(dep));
             if !replaces_waiter
                 && inner.pending_waiters.get(dep).map_or(0, BTreeSet::len)
                     >= MAX_PENDING_WAITERS_PER_DEP
@@ -282,6 +315,8 @@ impl Storage for MemoryStorage {
             .entry(source_peer)
             .or_default()
             .insert(op.id);
+        inner.pending_bytes = inner.pending_bytes.saturating_add(charge);
+        *inner.pending_source_bytes.entry(source_peer).or_default() += charge;
         inner.pending_ops.insert(op.id, (source_peer, op, meta));
         Ok(())
     }
@@ -817,9 +852,23 @@ fn purge_waiters_locked(inner: &mut MemoryInner, dep_id: &OpId) -> usize {
 }
 
 fn remove_pending_locked(inner: &mut MemoryInner, op_id: &OpId) {
-    let Some((source, _, meta)) = inner.pending_ops.remove(op_id) else {
+    let Some((source, op, meta)) = inner.pending_ops.remove(op_id) else {
         return;
     };
+    // The charge is recomputed from the same op, so it matches what insertion
+    // added. A record that could not be serialized was never charged.
+    let bytes = pending_op_bytes(&op).unwrap_or(0);
+    inner.pending_bytes = inner.pending_bytes.saturating_sub(bytes);
+    if let std::collections::btree_map::Entry::Occupied(mut entry) =
+        inner.pending_source_bytes.entry(source)
+    {
+        let left = entry.get().saturating_sub(bytes);
+        if left == 0 {
+            entry.remove();
+        } else {
+            *entry.get_mut() = left;
+        }
+    }
     for dep in meta.missing_deps {
         if let Some(waiters) = inner.pending_waiters.get_mut(&dep) {
             waiters.remove(op_id);

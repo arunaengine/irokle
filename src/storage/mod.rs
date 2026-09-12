@@ -14,6 +14,13 @@ use crate::{
 pub const MAX_PENDING_OPS_TOTAL: usize = 4096;
 pub const MAX_PENDING_OPS_PER_SOURCE: usize = 1024;
 pub const MAX_PENDING_WAITERS_PER_DEP: usize = 1024;
+/// Serialized bytes of buffered pending operations a store may hold, in total
+/// and per authenticated source. A count limit alone does not bound memory: one
+/// operation may be megabytes, so the count budget multiplied by the frame
+/// limit is far larger than any node should buffer. Enforced in core, because
+/// buffering happens with or without a transport feature.
+pub const MAX_PENDING_BYTES_TOTAL: usize = 64 * 1024 * 1024;
+pub const MAX_PENDING_BYTES_PER_SOURCE: usize = 16 * 1024 * 1024;
 pub const MAX_PENDING_MISSING_DEPS: usize = 128;
 /// Eviction records a store may hold unacknowledged. A healthy consumer
 /// acknowledges each record as soon as it owns the payloads durably, so this
@@ -406,6 +413,13 @@ pub(super) fn validate_heads(
         return Err(crate::Error::Storage("admitted frontier mismatch".into()));
     }
     Ok(())
+}
+
+/// Serialized size charged against the pending byte budgets. Deterministic for
+/// a given operation, so the charge on insertion and the refund on removal
+/// always match.
+pub(crate) fn pending_op_bytes(op: &Op) -> Result<usize> {
+    Ok(postcard::to_allocvec(op)?.len())
 }
 
 pub(crate) fn topic_fingerprint_for(
