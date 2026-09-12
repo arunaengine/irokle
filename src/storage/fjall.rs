@@ -1183,6 +1183,33 @@ impl Storage for FjallStorage {
             .concat(),
         )
     }
+    fn actor_range(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, OpId)>> {
+        let Some(start) = after.checked_add(1) else {
+            return Ok(Vec::new());
+        };
+        let prefix = [b"as".as_slice(), topic_id.as_ref(), actor_id.as_ref()].concat();
+        let from = [prefix.as_slice(), &start.to_be_bytes()].concat();
+        let to = [prefix.as_slice(), &u64::MAX.to_be_bytes()].concat();
+        let read_tx = self.db.read_tx();
+        let mut out = Vec::new();
+        for item in fjall::Readable::range(&read_tx, &self.records, from..=to).take(limit) {
+            let (key, value) = item.into_inner()?;
+            let seq = key
+                .get(prefix.len()..)
+                .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                .map(u64::from_be_bytes)
+                .ok_or_else(|| Error::Storage("corrupt fjall actor index key".into()))?;
+            out.push((seq, postcard::from_bytes(value.as_ref())?));
+        }
+        self.counters.count_index(out.len());
+        Ok(out)
+    }
     fn actor_clock(&self, topic_id: &TopicId) -> Result<ActorClock> {
         Ok(self.get(Self::key_id(b"ac", topic_id))?.unwrap_or_default())
     }

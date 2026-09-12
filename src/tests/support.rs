@@ -328,6 +328,15 @@ impl Storage for StaleReadStorage {
         }
         Ok(existing)
     }
+    fn actor_range(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, OpId)>, Error> {
+        self.inner.actor_range(topic_id, actor_id, after, limit)
+    }
     fn actor_clock(&self, topic_id: &TopicId) -> Result<ActorClock, Error> {
         self.inner.actor_clock(topic_id)
     }

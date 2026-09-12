@@ -30,6 +30,15 @@ impl ActorClock {
         *current = (*current).max(seq);
     }
 
+    /// Set `actor`'s counter, lowering it if needed; zero removes the entry.
+    pub fn set(&mut self, actor: ActorId, seq: u64) {
+        if seq == 0 {
+            self.entries.remove(&actor);
+        } else {
+            self.entries.insert(actor, seq);
+        }
+    }
+
     pub fn merge(&mut self, other: &Self) {
         for (actor, counter) in &other.entries {
             let current = self.entries.entry(*actor).or_default();

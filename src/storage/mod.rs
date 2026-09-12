@@ -91,6 +91,7 @@ pub struct PeerAck {
 pub struct StorageCounters {
     op_reads: std::sync::atomic::AtomicU64,
     meta_reads: std::sync::atomic::AtomicU64,
+    index_reads: std::sync::atomic::AtomicU64,
     pending_payload_reads: std::sync::atomic::AtomicU64,
 }
 
@@ -99,6 +100,7 @@ pub struct StorageCounters {
 pub struct CounterSnapshot {
     pub op_reads: u64,
     pub meta_reads: u64,
+    pub index_reads: u64,
     pub pending_payload_reads: u64,
 }
 
@@ -113,6 +115,11 @@ impl StorageCounters {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub(crate) fn count_index(&self, count: usize) {
+        self.index_reads
+            .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn count_payloads(&self, count: usize) {
         self.pending_payload_reads
             .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
@@ -125,6 +132,7 @@ impl StorageCounters {
         CounterSnapshot {
             op_reads: read(&self.op_reads),
             meta_reads: read(&self.meta_reads),
+            index_reads: read(&self.index_reads),
             pending_payload_reads: read(&self.pending_payload_reads),
         }
     }
@@ -288,6 +296,14 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn actor_tip(&self, topic_id: &TopicId, actor_id: &ActorId) -> Result<Option<(u64, OpId)>>;
     fn actor_index(&self, topic_id: &TopicId, actor_id: &ActorId, seq: u64)
     -> Result<Option<OpId>>;
+    /// Up to `limit` indexed positions of `actor_id` after `after`, ascending.
+    fn actor_range(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, OpId)>>;
     fn actor_clock(&self, topic_id: &TopicId) -> Result<ActorClock>;
     fn topic_fingerprint(&self, topic_id: &TopicId) -> Result<[u8; 32]>;
     fn max_generation(&self, topic_id: &TopicId) -> Result<u64>;

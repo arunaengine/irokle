@@ -218,6 +218,26 @@ impl Storage for MemoryStorage {
             .get(&(*topic_id, *actor_id, seq))
             .copied())
     }
+    fn actor_range(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, OpId)>> {
+        let Some(start) = after.checked_add(1) else {
+            return Ok(Vec::new());
+        };
+        let range = self
+            .lock()?
+            .actor_by_seq
+            .range((*topic_id, *actor_id, start)..=(*topic_id, *actor_id, u64::MAX))
+            .take(limit)
+            .map(|((_, _, seq), id)| (*seq, *id))
+            .collect::<Vec<_>>();
+        self.counters.count_index(range.len());
+        Ok(range)
+    }
     fn actor_clock(&self, topic_id: &TopicId) -> Result<ActorClock> {
         Ok(self
             .inner

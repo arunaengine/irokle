@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Transport-neutral sync messages, planning, acknowledgements, and reports.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,17 @@ pub const MAX_ACTOR_RANGE_HINT_SPAN: u64 = 65_536;
 const MAX_REQUEST_ITEMS: usize = 65_536;
 const MAX_PAGE_OPS: usize = 4096;
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
+/// Actors one page plan keeps range heads for; the rest wait for a later page.
+const MAX_PAGE_ACTORS: usize = 4096;
+
+/// A queued range position: generation, actor, sequence, id and range limit.
+type RangeHead = (u64, ActorId, u64, OpId, u64);
+
+/// One planned page and whether the goal still holds more after it.
+pub(crate) struct PlannedPage {
+    pub(crate) ops: Vec<Op>,
+    pub(crate) more: bool,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncOpen {
@@ -342,16 +354,24 @@ impl<S: Storage> SyncEngine<S> {
             });
         }
 
-        let (common, dangling) = self.survey_local(remote)?;
+        // A page plan needs no walk from the heads: the peer's clock says what
+        // it holds, and holes come from the integrity check above.
+        let (common, dangling) = match send_set {
+            SendSet::Closure | SendSet::Empty => self.survey_local(remote)?,
+            #[cfg(feature = "iroh")]
+            SendSet::Page => Default::default(),
+        };
         let send = match send_set {
             SendSet::Closure => self.missing_closure(remote)?,
             #[cfg(feature = "iroh")]
-            SendSet::Page => self.collect_page(
-                &remote.topic_id,
-                local_heads.clone(),
-                &BTreeSet::new(),
-                Some(remote),
-            )?,
+            SendSet::Page => {
+                let page =
+                    self.plan_page(&remote.topic_id, &view.clock, &remote.actor_clock, None)?;
+                if page.more {
+                    tracing::debug!(topic_id = %remote.topic_id, "planned a partial push page");
+                }
+                page.ops
+            }
             SendSet::Empty => Vec::new(),
         };
         let mut need = BTreeSet::new();
@@ -543,7 +563,33 @@ impl<S: Storage> SyncEngine<S> {
             }
         }
         let ops = if paged {
-            self.collect_page(&request.topic_id, wanted, &request.known, None)?
+            let mut peer_clock = local_clock.clone();
+            let mut goal = local_clock.clone();
+            for hint in &request.actor_range_hints {
+                if let Some((from, to)) =
+                    clamp_actor_range_hint(hint, local_clock.get(&hint.actor_id))
+                {
+                    peer_clock.set(hint.actor_id, from);
+                    goal.set(hint.actor_id, to);
+                }
+            }
+            let mut page = self.plan_repair(&request.topic_id, &request.wants, &peer_clock)?;
+            if page.len() < MAX_PAGE_OPS {
+                for op in &page {
+                    let body = &op.signed.body;
+                    if peer_clock.get(&body.actor_id) + 1 == body.actor_seq {
+                        peer_clock.set(body.actor_id, body.actor_seq);
+                    }
+                }
+                let planned =
+                    self.plan_page(&request.topic_id, &local_clock, &peer_clock, Some(&goal))?;
+                if planned.more {
+                    tracing::debug!(topic_id = %request.topic_id, "served a partial page");
+                }
+                page.extend(planned.ops);
+                page.truncate(MAX_PAGE_OPS);
+            }
+            page
         } else {
             let wanted_closure =
                 self.closure_excluding(&request.topic_id, wanted, &request.known)?;
@@ -899,77 +945,141 @@ impl<S: Storage> SyncEngine<S> {
             .collect())
     }
 
-    fn collect_page(
+    /// The next causal page of `topic_id` for a peer holding `peer`, from
+    /// forward actor ranges merged by generation. An op's generation is one
+    /// past its highest dependency, so the merge emits dependencies first, and
+    /// a dependency is satisfied once the peer's clock or this page covers it.
+    /// Work is proportional to the page and the number of actors behind, never
+    /// to the history the peer already holds.
+    pub(crate) fn plan_page(
         &self,
         topic_id: &TopicId,
-        roots: BTreeSet<OpId>,
-        known: &BTreeSet<OpId>,
-        remote: Option<&SyncSummary>,
-    ) -> Result<Vec<Op>> {
-        let mut stack = roots.iter().map(|id| (*id, false)).collect::<Vec<_>>();
-        let mut visiting = BTreeSet::new();
-        let mut finished = BTreeSet::new();
-        let mut available = BTreeSet::new();
-        let mut frontier = known.iter().copied().collect::<Vec<_>>();
-        while let Some(id) = frontier.pop() {
-            if available.contains(&id) {
+        local: &ActorClock,
+        peer: &ActorClock,
+        goal: Option<&ActorClock>,
+    ) -> Result<PlannedPage> {
+        let storage = self.oplog.storage();
+        let mut heads = BinaryHeap::new();
+        let mut metas = BTreeMap::new();
+        let mut more = false;
+        for (actor_id, local_seq) in local.iter() {
+            let limit = goal.map_or(*local_seq, |goal| goal.get(actor_id).min(*local_seq));
+            let after = peer.get(actor_id);
+            if limit <= after {
                 continue;
             }
-            let Some(meta) = self.oplog.storage().get_meta(&id)? else {
+            if heads.len() >= MAX_PAGE_ACTORS {
+                more = true;
                 continue;
-            };
-            if meta.topic_id == *topic_id {
-                available.insert(id);
-                frontier.extend(meta.deps.iter().copied());
             }
+            more |=
+                !self.push_range_head(topic_id, *actor_id, after, limit, &mut heads, &mut metas)?;
         }
-        // Explicit repair wants override ancestry implied by the known frontier.
-        available.retain(|id| !roots.contains(id));
+        let mut covered = peer.clone();
         let mut ops = Vec::new();
-        let mut bytes = 0usize;
-        while let Some((id, expanded)) = stack.pop() {
-            if available.contains(&id) || finished.contains(&id) {
-                continue;
-            }
-            let Some(meta) = self.oplog.storage().get_meta(&id)? else {
-                finished.insert(id);
-                continue;
-            };
-            if meta.topic_id != *topic_id {
-                finished.insert(id);
-                continue;
-            }
-            if remote.is_some_and(|summary| remote_contains(summary, &meta)) {
-                available.insert(id);
-                continue;
-            }
-            if !expanded {
-                if !visiting.insert(id) {
-                    return Err(Error::Storage("cycle in op graph".into()));
+        let mut bytes = 0_usize;
+        while let Some(Reverse((_, actor_id, seq, id, limit))) = heads.pop() {
+            let meta = metas.remove(&id).ok_or(Error::MissingDependency(id))?;
+            let mut blocked = false;
+            for dep in &meta.deps {
+                let dep_position = match metas.get(dep) {
+                    Some(dep_meta) => Some((dep_meta.actor_id, dep_meta.actor_seq)),
+                    None => storage
+                        .get_meta(dep)?
+                        .map(|dep_meta| (dep_meta.actor_id, dep_meta.actor_seq)),
+                };
+                if dep_position.is_none_or(|(actor, dep_seq)| covered.get(&actor) < dep_seq) {
+                    blocked = true;
+                    break;
                 }
-                stack.push((id, true));
-                stack.extend(meta.deps.iter().rev().map(|dep| (*dep, false)));
-                continue;
             }
-            visiting.remove(&id);
-            finished.insert(id);
-            if !meta.deps.iter().all(|dep| available.contains(dep)) {
-                continue;
-            }
-            let Some(op) = self.oplog.storage().get_op(&id)? else {
-                continue;
+            // A dependency behind a deferred actor or a hole cannot be sent yet.
+            let Some(op) = (!blocked)
+                .then(|| storage.get_op(&id))
+                .transpose()?
+                .flatten()
+            else {
+                more = true;
+                break;
             };
-            let size = canonical_bytes(&op)?.len();
+            let size = postcard::experimental::serialized_size(&op)?;
             if size > MAX_PAGE_BYTES {
                 return Err(Error::Storage("operation exceeds sync page budget".into()));
             }
-            if ops.len() == MAX_PAGE_OPS || bytes.saturating_add(size) > MAX_PAGE_BYTES {
+            if ops.len() == MAX_PAGE_OPS || bytes + size > MAX_PAGE_BYTES {
+                more = true;
                 break;
             }
             bytes += size;
-            available.insert(id);
+            covered.observe(actor_id, seq);
             ops.push(op);
+            if seq < limit {
+                more |= !self
+                    .push_range_head(topic_id, actor_id, seq, limit, &mut heads, &mut metas)?;
+            }
         }
+        Ok(PlannedPage {
+            ops,
+            more: more || !heads.is_empty(),
+        })
+    }
+
+    /// Queue the op after `after` on `actor_id`, up to `limit`. Returns false
+    /// when the index skips a position: the actor stops at that hole.
+    fn push_range_head(
+        &self,
+        topic_id: &TopicId,
+        actor_id: ActorId,
+        after: u64,
+        limit: u64,
+        heads: &mut BinaryHeap<Reverse<RangeHead>>,
+        metas: &mut BTreeMap<OpId, crate::storage::OpMeta>,
+    ) -> Result<bool> {
+        let storage = self.oplog.storage();
+        let Some((seq, id)) = storage.actor_range(topic_id, &actor_id, after, 1)?.pop() else {
+            return Ok(false);
+        };
+        if seq != after + 1 || seq > limit {
+            return Ok(seq > limit);
+        }
+        let Some(meta) = storage.get_meta(&id)? else {
+            return Ok(false);
+        };
+        heads.push(Reverse((meta.generation, actor_id, seq, id, limit)));
+        metas.insert(id, meta);
+        Ok(true)
+    }
+
+    /// Requested repair ids and the ancestry the peer's clock does not cover,
+    /// oldest first, bounded by the page.
+    fn plan_repair(
+        &self,
+        topic_id: &TopicId,
+        wants: &BTreeSet<OpId>,
+        peer: &ActorClock,
+    ) -> Result<Vec<Op>> {
+        let storage = self.oplog.storage();
+        let mut closure = BTreeSet::new();
+        let mut stack = wants.iter().copied().collect::<Vec<_>>();
+        while let Some(id) = stack.pop() {
+            if closure.len() >= MAX_PAGE_OPS || closure.contains(&id) {
+                continue;
+            }
+            let Some(meta) = storage.get_meta(&id)? else {
+                continue;
+            };
+            if meta.topic_id != *topic_id {
+                continue;
+            }
+            // An explicit want overrides what the clock implies; ancestry does not.
+            if !wants.contains(&id) && peer.get(&meta.actor_id) >= meta.actor_seq {
+                continue;
+            }
+            closure.insert(id);
+            stack.extend(meta.deps.iter().copied());
+        }
+        let mut ops = topological_subset(storage, &closure)?;
+        ops.truncate(MAX_PAGE_OPS);
         Ok(ops)
     }
 
