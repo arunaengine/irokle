@@ -75,12 +75,19 @@ struct AttemptId(u64);
 /// instead of wrapping into an id a stale completion could match.
 fn next_attempt_id() -> Option<AttemptId> {
     static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
-    NEXT_ATTEMPT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .ok()
-        .map(AttemptId)
+    let mut current = NEXT_ATTEMPT.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match NEXT_ATTEMPT.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(AttemptId(current)),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// One claimed target: the attempt that owns it plus the requested work
