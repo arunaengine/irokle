@@ -67,14 +67,14 @@ struct EventConfig {
 fn expand_event(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let config = parse_config(input)?;
     let ident = &input.ident;
+    let crate_path = &config.crate_path;
     let mut generics = input.generics.clone();
     generics
         .make_where_clause()
         .predicates
-        .push(parse_quote!(Self: ::serde::Serialize + ::serde::de::DeserializeOwned + Send + Sync + 'static));
+        .push(parse_quote!(Self: #crate_path::__serde::Serialize + #crate_path::__serde::de::DeserializeOwned + Send + Sync + 'static));
     let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
     let type_id = &config.type_id;
-    let crate_path = &config.crate_path;
 
     Ok(quote! {
         impl #impl_generics #crate_path::Event for #ident #type_generics #where_clause
@@ -126,6 +126,18 @@ fn parse_config(input: &DeriveInput) -> syn::Result<EventConfig> {
     }
 
     let ident = &input.ident;
+    if type_id.is_none()
+        && input
+            .generics
+            .params
+            .iter()
+            .any(|param| !matches!(param, syn::GenericParam::Lifetime(_)))
+    {
+        return Err(syn::Error::new_spanned(
+            &input.generics,
+            "generic events require an explicit irokle `type_id` attribute",
+        ));
+    }
     let type_id = type_id
         .map(|type_id| quote!(#type_id))
         .unwrap_or_else(|| quote!(concat!(module_path!(), "::", stringify!(#ident))));
