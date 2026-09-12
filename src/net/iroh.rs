@@ -395,26 +395,6 @@ impl ResyncScheduler {
         self.notify.notify_one();
     }
 
-    /// Reclaims every outstanding claim, for a loop start that must reconcile
-    /// what a previous loop left behind.
-    fn release_all(&self, after: Duration) {
-        let Ok(mut targets) = self.inner.lock() else {
-            return;
-        };
-        let now = tokio::time::Instant::now();
-        let mut released = false;
-        for target in targets.values_mut() {
-            if target.active.take().is_some() {
-                target.next_due = now + after;
-                released = true;
-            }
-        }
-        drop(targets);
-        if released {
-            self.notify.notify_one();
-        }
-    }
-
     fn lease(&self, claims: Vec<ResyncTarget>, retry_after: Duration) -> ResyncLease {
         ResyncLease {
             scheduler: self.clone(),
@@ -820,9 +800,16 @@ impl<S: Storage> IrohNet<S> {
             return Ok(None);
         }
         let net = Arc::downgrade(self);
+        // Created before spawning, so aborting a loop that never ran still
+        // clears the latch.
+        let running = LoopGuard {
+            net: Weak::clone(&net),
+            latch: |net| &net.accept_started,
+        };
         let endpoint = self.endpoint().clone();
         let mut shutdown = self.shutdown.subscribe();
         Ok(Some(handle.spawn(async move {
+            let _running = running;
             let mut connections = tokio::task::JoinSet::new();
             let mut handshakes =
                 tokio::task::JoinSet::<io::Result<iroh::endpoint::Connection>>::new();
@@ -987,16 +974,12 @@ impl<S: Storage> IrohNet<S> {
         let mut shutdown = self.shutdown.subscribe();
         // Captured before the first poll so that aborting a loop that never ran
         // still clears the latch.
-        let running = ResyncLoopGuard {
+        let running = LoopGuard {
             net: Weak::clone(&net),
+            latch: |net| &net.resync_started,
         };
         Ok(Some(handle.spawn(async move {
             let _running = running;
-            // Claims from a loop that already exited have no owner left, so
-            // hand them back before this loop dispatches.
-            if let Some(current) = net.upgrade() {
-                current.resync_scheduler.release_all(Duration::ZERO);
-            }
             let mut sweep_pending = net.upgrade().is_some_and(|current| {
                 current.schedule_startup_resync().inspect_err(|error| {
                     tracing::warn!(%error, "failed to schedule startup resync sweep");
@@ -2664,16 +2647,17 @@ fn push_responses(
     Ok(false)
 }
 
-/// Clears the resync start latch when the loop task actually ends, including on
+/// Clears a loop's start latch when the loop task actually ends, including on
 /// abort, so a replacement loop can be started.
-struct ResyncLoopGuard<S: Storage> {
+struct LoopGuard<S: Storage> {
     net: Weak<IrohNet<S>>,
+    latch: fn(&IrohNet<S>) -> &AtomicBool,
 }
 
-impl<S: Storage> Drop for ResyncLoopGuard<S> {
+impl<S: Storage> Drop for LoopGuard<S> {
     fn drop(&mut self) {
         if let Some(current) = self.net.upgrade() {
-            current.resync_started.store(false, Ordering::SeqCst);
+            (self.latch)(&current).store(false, Ordering::SeqCst);
         }
     }
 }
@@ -3367,23 +3351,6 @@ mod tests {
     }
 
     #[test]
-    fn release_all_reclaims() {
-        let scheduler = ResyncScheduler::default();
-        scheduler.schedule_now(peer(16), topic(17), false);
-        let stale = one_claim(&scheduler);
-
-        scheduler.release_all(Duration::ZERO);
-
-        let reclaimed = one_claim(&scheduler);
-        assert_ne!(reclaimed.attempt, stale.attempt);
-        scheduler.complete_clean(stale);
-        assert_eq!(
-            scheduler.target_state(peer(16), topic(17)).unwrap().0,
-            Some(reclaimed.attempt)
-        );
-    }
-
-    #[test]
     fn panic_releases_lease() {
         let scheduler = ResyncScheduler::default();
         scheduler.schedule_now(peer(13), topic(14), false);
@@ -3472,6 +3439,57 @@ mod tests {
             ),
             "a terminally closed net must not dispatch new work"
         );
+    }
+
+    /// A new resync loop must not take back a claim a live lease still holds.
+    #[tokio::test]
+    async fn restart_keeps_claims() {
+        let net = test_net().await;
+        let scheduler = &net.resync_scheduler;
+        scheduler.schedule_now(peer(16), topic(17), false);
+        let claim = one_claim(scheduler);
+        let _lease = scheduler.lease(vec![claim], Duration::ZERO);
+        // A second due target shows when the new loop has dispatched.
+        scheduler.schedule_now(peer(18), topic(17), false);
+        let idle = scheduler.target_state(peer(18), topic(17));
+
+        let resync = net
+            .spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("loop starts");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while scheduler.target_state(peer(18), topic(17)) == idle {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the new loop never dispatched");
+
+        assert_eq!(
+            scheduler
+                .target_state(peer(16), topic(17))
+                .map(|state| state.0),
+            Some(Some(claim.attempt)),
+            "the new loop took over a claim a live lease holds"
+        );
+        resync.abort();
+        let _ = resync.await;
+        net.shutdown().await;
+    }
+
+    /// Aborting the accept loop before its first poll still clears its latch.
+    #[tokio::test]
+    async fn accept_abort_replaces() {
+        let net = test_net().await;
+        let first = net
+            .spawn_accept_loop()
+            .unwrap()
+            .expect("the first accept loop starts");
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        assert!(net.spawn_accept_loop().unwrap().is_some());
+        net.shutdown().await;
     }
 
     #[tokio::test]
