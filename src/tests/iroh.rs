@@ -1,5 +1,22 @@
 use super::support::*;
 
+/// Ordinary obligations coalesce into one clock-only target per peer and topic,
+/// so an operation is proven either by an explicit want or by its actor position.
+#[cfg(feature = "iroh")]
+fn obligation_covers(
+    storage: &impl crate::storage::Storage,
+    obligations: &[crate::storage::SyncObligation],
+    op_id: &OpId,
+) -> bool {
+    let Some(meta) = storage.get_meta(op_id).unwrap() else {
+        return false;
+    };
+    obligations.iter().any(|obligation| {
+        obligation.op_ids.contains(op_id)
+            || obligation.target_clock.get(&meta.actor_id) >= meta.actor_seq
+    })
+}
+
 #[cfg(feature = "iroh")]
 #[tokio::test]
 async fn builder_sets_net() {
@@ -144,12 +161,11 @@ async fn iroh_defaults_to_async_replication() {
     let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
 
     let report = alice.sync_report(bob_peer, topic.id()).unwrap();
-    assert!(
-        report
-            .obligations
-            .iter()
-            .any(|obligation| obligation.op_ids.contains(&genesis.id))
-    );
+    assert!(obligation_covers(
+        alice.storage(),
+        &report.obligations,
+        &genesis.id
+    ));
 
     alice.shutdown_iroh().await;
     bob_endpoint.close().await;
@@ -361,10 +377,7 @@ async fn async_replication_schedules_genesis_and_control_obligations() {
 
     let report = alice.sync_report(bob.peer_id(), topic.id()).unwrap();
     assert!(
-        report
-            .obligations
-            .iter()
-            .any(|obligation| obligation.op_ids.contains(&genesis.id)),
+        obligation_covers(alice.storage(), &report.obligations, &genesis.id),
         "genesis op should be scheduled for async replication"
     );
 
@@ -379,10 +392,7 @@ async fn async_replication_schedules_genesis_and_control_obligations() {
 
     let report = alice.sync_report(bob.peer_id(), topic.id()).unwrap();
     assert!(
-        report
-            .obligations
-            .iter()
-            .any(|obligation| obligation.op_ids.contains(&control.id)),
+        obligation_covers(alice.storage(), &report.obligations, &control.id),
         "control op should be scheduled for async replication"
     );
 }
@@ -425,9 +435,7 @@ async fn async_replication_persists_genesis_obligation_with_fjall() {
     let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
     let obligations = storage.sync_obligations(&bob_peer, &topic_id).unwrap();
     assert!(
-        obligations
-            .iter()
-            .any(|obligation| obligation.op_ids.contains(&genesis_id)),
+        obligation_covers(&storage, &obligations, &genesis_id),
         "genesis obligation should be durably committed with the op"
     );
 }

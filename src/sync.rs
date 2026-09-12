@@ -747,23 +747,41 @@ impl<S: Storage> SyncEngine<S> {
         topic_id: TopicId,
         op_ids: BTreeSet<OpId>,
     ) -> Result<()> {
+        if op_ids.is_empty() {
+            return Ok(());
+        }
+        let mut resolved = BTreeSet::new();
+        let mut unresolved = BTreeSet::new();
         let mut target_clock = ActorClock::new();
         for op_id in &op_ids {
             if let Some(meta) = self.oplog.storage().get_meta(op_id)?
                 && meta.topic_id == topic_id
             {
                 target_clock.observe(meta.actor_id, meta.actor_seq);
+                resolved.insert(*op_id);
             } else {
-                target_clock = ActorClock::new();
-                break;
+                unresolved.insert(*op_id);
             }
         }
-        self.oplog.storage().put_sync_obligation(SyncObligation {
-            peer_id,
-            topic_id,
-            op_ids,
-            target_clock,
-        })
+        if !resolved.is_empty() {
+            self.oplog.storage().put_sync_obligation(SyncObligation {
+                peer_id,
+                topic_id,
+                op_ids: resolved,
+                target_clock,
+            })?;
+        }
+        // An id with no trustworthy actor position keeps its own record, so the
+        // positions that did resolve survive without certifying the rest.
+        if !unresolved.is_empty() {
+            self.oplog.storage().put_sync_obligation(SyncObligation {
+                peer_id,
+                topic_id,
+                op_ids: unresolved,
+                target_clock: ActorClock::new(),
+            })?;
+        }
+        Ok(())
     }
 
     pub fn report(&self, peer_id: PeerId, topic_id: TopicId) -> Result<SyncReport> {

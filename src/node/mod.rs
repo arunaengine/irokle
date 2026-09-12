@@ -18,7 +18,9 @@ use crate::history::{DagQuery, HistoryOrder, ordered};
 use crate::oplog::{Oplog, topological_subset_entries};
 use crate::reducer::EventRecord;
 use crate::storage::{AdmissionEffects, OpMeta, SyncObligation, TopicState};
-use crate::storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
+use crate::storage::{
+    MemoryStorage, Storage, SyncPeerState, SyncPeerStatus, SyncStateUpdate, SyncStatusUpdate,
+};
 use crate::sync::{
     SyncAck, SyncData, SyncEngine, SyncFingerprint, SyncOpen, SyncPlan, SyncReport, SyncRequest,
     SyncSummary,
@@ -253,10 +255,9 @@ impl<S: Storage> Irokle<S> {
             actor_id,
             genesis,
             &self.config.signer,
-            |op, meta, state| {
+            |_op, meta, state| {
                 self.replication_admission_effects(
                     topic_id,
-                    op.id,
                     meta,
                     state,
                     &self.config.default_write_concern,
@@ -298,10 +299,9 @@ impl<S: Storage> Irokle<S> {
             genesis,
             envelope,
             &self.config.signer,
-            |op, meta, state| {
+            |_op, meta, state| {
                 self.replication_admission_effects(
                     topic_id,
-                    op.id,
                     meta,
                     state,
                     &self.config.default_write_concern,
@@ -753,7 +753,11 @@ impl<S: Storage> Irokle<S> {
             }
             if !missing.is_empty() {
                 self.put_sync_obligation(peer_id, topic_id, missing)?;
-                self.record_replication_scheduled(peer_id, topic_id)?;
+                // Status is bookkeeping: its failure must not drop the
+                // obligations the remaining peers still need.
+                if let Err(error) = self.record_replication_scheduled(peer_id, topic_id) {
+                    tracing::warn!(%topic_id, %peer_id, %error, "forward replication bookkeeping failed");
+                }
             }
         }
         Ok(())
@@ -773,7 +777,6 @@ impl<S: Storage> Irokle<S> {
     fn replication_admission_effects(
         &self,
         topic_id: TopicId,
-        op_id: OpId,
         meta: &OpMeta,
         state: &TopicState,
         write_concern: &WriteConcern,
@@ -790,7 +793,7 @@ impl<S: Storage> Irokle<S> {
                 .map(|peer_id| SyncObligation {
                     peer_id,
                     topic_id,
-                    op_ids: [op_id].into(),
+                    op_ids: BTreeSet::new(),
                     target_clock: target_clock.clone(),
                 })
                 .collect(),
@@ -829,21 +832,22 @@ impl<S: Storage> Irokle<S> {
     }
 
     fn record_replication_scheduled(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
-        let mut status = self
-            .storage()
-            .sync_statuses(&topic_id)?
-            .into_iter()
-            .find(|status| status.peer_id == peer_id)
-            .unwrap_or(SyncPeerStatus {
-                peer_id,
-                topic_id,
-                ..SyncPeerStatus::default()
-            });
-        status.pending_obligations = self.storage().sync_obligations(&peer_id, &topic_id)?.len();
-        if status.pending_obligations > 0 && status.state != SyncPeerState::Failed {
-            status.state = SyncPeerState::Behind;
-        }
-        self.storage().put_sync_status(status)
+        let pending = self.storage().sync_obligations(&peer_id, &topic_id)?.len();
+        let state = if pending > 0 {
+            SyncStateUpdate::BehindUnlessFailed
+        } else {
+            SyncStateUpdate::Keep
+        };
+        self.storage().update_sync_status(
+            &peer_id,
+            &topic_id,
+            &SyncStatusUpdate {
+                pending_obligations: Some(pending),
+                state,
+                ..SyncStatusUpdate::default()
+            },
+        )?;
+        Ok(())
     }
 
     pub fn sync_report(&self, peer_id: PeerId, topic_id: TopicId) -> Result<SyncReport> {
@@ -861,21 +865,16 @@ impl<S: Storage> Irokle<S> {
             status.pending_obligations = 0;
         }
 
-        for obligation in self
-            .storage()
-            .all_sync_obligations()?
-            .into_iter()
-            .filter(|obligation| obligation.topic_id == topic_id)
-        {
+        for (peer_id, pending) in self.storage().topic_obligation_counts(&topic_id)? {
             by_peer
-                .entry(obligation.peer_id)
+                .entry(peer_id)
                 .or_insert_with(|| SyncPeerStatus {
-                    peer_id: obligation.peer_id,
+                    peer_id,
                     topic_id,
                     state: SyncPeerState::Behind,
                     ..SyncPeerStatus::default()
                 })
-                .pending_obligations += 1;
+                .pending_obligations = pending;
         }
 
         let mut statuses = by_peer.into_values().collect::<Vec<_>>();
@@ -902,36 +901,33 @@ impl<S: Storage> Irokle<S> {
         topic_id: TopicId,
         result: std::result::Result<(), &std::io::Error>,
     ) -> Result<()> {
-        let mut status = self
-            .storage()
-            .sync_statuses(&topic_id)?
-            .into_iter()
-            .find(|status| status.peer_id == peer_id)
-            .unwrap_or(SyncPeerStatus {
-                peer_id,
-                topic_id,
-                ..SyncPeerStatus::default()
-            });
-        status.last_attempt_ms = Some(now_millis()?);
-        status.pending_obligations = self.storage().sync_obligations(&peer_id, &topic_id)?.len();
+        let attempt_ms = now_millis()?;
+        let pending = self.storage().sync_obligations(&peer_id, &topic_id)?.len();
+        let mut update = SyncStatusUpdate {
+            pending_obligations: Some(pending),
+            last_attempt_ms: Some(attempt_ms),
+            ..SyncStatusUpdate::default()
+        };
         match result {
             Ok(()) => {
-                status.successful_attempts = status.successful_attempts.saturating_add(1);
-                status.last_success_ms = status.last_attempt_ms;
-                status.last_error = None;
-                status.state = if status.pending_obligations == 0 {
+                update.successful_attempts = 1;
+                update.last_success_ms = Some(attempt_ms);
+                update.last_error = Some(None);
+                update.state = SyncStateUpdate::Set(if pending == 0 {
                     SyncPeerState::Healthy
                 } else {
                     SyncPeerState::Behind
-                };
+                });
             }
             Err(error) => {
-                status.failed_attempts = status.failed_attempts.saturating_add(1);
-                status.last_error = Some(error.to_string());
-                status.state = SyncPeerState::Failed;
+                update.failed_attempts = 1;
+                update.last_error = Some(Some(error.to_string()));
+                update.state = SyncStateUpdate::Set(SyncPeerState::Failed);
             }
         }
-        self.storage().put_sync_status(status)
+        self.storage()
+            .update_sync_status(&peer_id, &topic_id, &update)?;
+        Ok(())
     }
 
     pub(crate) fn publish_event<E: Event>(
@@ -948,14 +944,8 @@ impl<S: Storage> Irokle<S> {
             actor_id,
             envelope,
             &self.config.signer,
-            |op, meta, state| {
-                self.replication_admission_effects(
-                    topic_id,
-                    op.id,
-                    meta,
-                    state,
-                    &options.write_concern,
-                )
+            |_op, meta, state| {
+                self.replication_admission_effects(topic_id, meta, state, &options.write_concern)
             },
         )?;
         let record = EventRecord::new(
@@ -988,10 +978,9 @@ impl<S: Storage> Irokle<S> {
             actor_id,
             control,
             &self.config.signer,
-            |op, meta, state| {
+            |_op, meta, state| {
                 self.replication_admission_effects(
                     topic_id,
-                    op.id,
                     meta,
                     state,
                     &self.config.default_write_concern,
