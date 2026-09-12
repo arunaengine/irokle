@@ -118,6 +118,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// its [`OpMeta`] in one atomic unit and must reject a batch whose entry
     /// depends on an op with no metadata, so a committed op can never reference
     /// a dependency the DAG cannot resolve.
+    /// The same transaction must clear sync state for members present in the
+    /// expected topic state but absent from the committed topic state.
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()>;
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;

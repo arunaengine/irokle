@@ -39,6 +39,28 @@ pub(crate) fn topological_subset_entries<S: Storage>(
     storage: &S,
     ids: &BTreeSet<crate::OpId>,
 ) -> Result<Vec<(Op, OpMeta)>> {
+    topological_meta(storage, ids)?
+        .into_iter()
+        .map(|meta| {
+            let op = storage
+                .get_op(&meta.id)?
+                .ok_or_else(|| Error::Storage(format!("missing op {}", meta.id)))?;
+            Ok((op, meta))
+        })
+        .collect()
+}
+
+pub(crate) fn topological_ids<S: Storage>(
+    storage: &S,
+    ids: &BTreeSet<crate::OpId>,
+) -> Result<Vec<crate::OpId>> {
+    Ok(topological_meta(storage, ids)?
+        .into_iter()
+        .map(|meta| meta.id)
+        .collect())
+}
+
+fn topological_meta<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) -> Result<Vec<OpMeta>> {
     let mut present = BTreeMap::new();
     let mut children: BTreeMap<crate::OpId, BTreeSet<crate::OpId>> = BTreeMap::new();
     let mut blocked = BTreeSet::new();
@@ -47,6 +69,10 @@ pub(crate) fn topological_subset_entries<S: Storage>(
             blocked.insert(*id);
             continue;
         };
+        if !storage.dep_resolvable(id)? {
+            blocked.insert(*id);
+            continue;
+        }
         let mut deps_in_set = 0_usize;
         let mut dangling = false;
         for dep in &meta.deps {
@@ -57,14 +83,10 @@ pub(crate) fn topological_subset_entries<S: Storage>(
                 dangling = true;
             }
         }
-        let Some(op) = storage.get_op(id)? else {
-            blocked.insert(*id);
-            continue;
-        };
         if dangling {
             blocked.insert(*id);
         } else {
-            present.insert(*id, (op, meta, deps_in_set));
+            present.insert(*id, (meta, deps_in_set));
         }
     }
 
@@ -86,17 +108,17 @@ pub(crate) fn topological_subset_entries<S: Storage>(
 
     let mut ready = present
         .iter()
-        .filter_map(|(id, (_, _, count))| (*count == 0).then_some(*id))
+        .filter_map(|(id, (_, count))| (*count == 0).then_some(*id))
         .collect::<VecDeque<_>>();
     let expected = present.len();
     let mut out = Vec::with_capacity(expected);
     while let Some(id) = ready.pop_front() {
-        let Some((op, meta, _)) = present.remove(&id) else {
+        let Some((meta, _)) = present.remove(&id) else {
             continue;
         };
-        out.push((op, meta));
+        out.push(meta);
         for child in children.get(&id).into_iter().flatten() {
-            if let Some((_, _, count)) = present.get_mut(child) {
+            if let Some((_, count)) = present.get_mut(child) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     ready.push_back(*child);

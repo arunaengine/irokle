@@ -535,16 +535,6 @@ impl<S: Storage> Irokle<S> {
             verified.insert(op.id);
         }
         self.check_unknown_topic(source_peer_id, &data, &verified)?;
-        let removals = data
-            .ops
-            .iter()
-            .filter_map(|op| match &op.signed.body.payload {
-                crate::TopicPayload::Control(TopicControl::RemovePeer { peer }) => {
-                    Some((op.id, *peer))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         let (mut ack, evictions) = match self.sync.receive_data_preverified(
             source_peer_id,
             self.peer_id(),
@@ -566,11 +556,6 @@ impl<S: Storage> Irokle<S> {
             }
         };
         let result = (|| -> Result<()> {
-            for (op_id, peer) in removals {
-                if peer != self.peer_id() && ack.accepted.contains(&op_id) {
-                    self.storage().clear_peer_sync_state(&peer, &ack.topic_id)?;
-                }
-            }
             self.put_receive_forward_obligations(source_peer_id, ack.topic_id, &ack.accepted)?;
             ack.sign(&self.config.signer)
         })();
@@ -662,8 +647,13 @@ impl<S: Storage> Irokle<S> {
     }
 
     #[cfg(feature = "iroh")]
-    pub(crate) fn record_peer_synced(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
-        self.sync.record_peer_synced(peer_id, topic_id)
+    pub(crate) fn record_fingerprint(
+        &self,
+        peer_id: PeerId,
+        topic_id: TopicId,
+        fingerprint: [u8; 32],
+    ) -> Result<bool> {
+        self.sync.record_fingerprint(peer_id, topic_id, fingerprint)
     }
 
     #[cfg(feature = "iroh")]
@@ -992,10 +982,6 @@ impl<S: Storage> Irokle<S> {
         control: TopicControl,
     ) -> Result<()> {
         self.validate_concern(&self.config.default_write_concern)?;
-        let removed_peer = match &control {
-            TopicControl::RemovePeer { peer } => Some(*peer),
-            _ => None,
-        };
         #[cfg(feature = "iroh")]
         let op = self.oplog.create_control_effects(
             topic_id,
@@ -1022,12 +1008,6 @@ impl<S: Storage> Irokle<S> {
             &self.config.default_write_concern,
             "topic control replication wake failed",
         );
-        if let Some(peer) = removed_peer
-            && peer != self.peer_id()
-            && let Err(error) = self.storage().clear_peer_sync_state(&peer, &topic_id)
-        {
-            tracing::warn!(%topic_id, %peer, %error, "committed removal cleanup failed");
-        }
         Ok(())
     }
 

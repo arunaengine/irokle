@@ -499,6 +499,18 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
                 == Some(&meta.id)
             || inner.children.contains_key(&meta.id))
     })?;
+    let removed_peers = batch
+        .expected_topic_state
+        .as_ref()
+        .zip(batch.topic_state.as_ref())
+        .map(|(expected, state)| {
+            expected
+                .members
+                .difference(&state.members)
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let AdmittedBatch {
         topic_id,
         entries,
@@ -634,6 +646,13 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
         if !inner.obligations.contains(&obligation) {
             inner.obligations.push(obligation);
         }
+    }
+    for peer_id in removed_peers {
+        inner
+            .obligations
+            .retain(|o| o.peer_id != peer_id || o.topic_id != topic_id);
+        inner.sync_statuses.remove(&(topic_id, peer_id));
+        inner.peer_acks.remove(&(peer_id, topic_id));
     }
     Ok(())
 }
