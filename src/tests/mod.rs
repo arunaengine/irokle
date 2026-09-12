@@ -1,6 +1,8 @@
 mod ack;
 mod bootstrap;
 mod branch;
+#[cfg(feature = "iroh")]
+mod combined;
 mod core;
 #[cfg(feature = "iroh")]
 mod exchange;
