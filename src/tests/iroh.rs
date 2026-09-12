@@ -1613,3 +1613,163 @@ async fn fjall_publishes_coalesce() {
     let dir = tempfile::tempdir().unwrap();
     assert_publishes_coalesce(crate::storage::FjallStorage::open(dir.path()).unwrap()).await;
 }
+/// An inviter net without background loops, and a receiver built with its net
+/// that trusts `whitelist`.
+async fn bootstrap_pair(
+    whitelist: bool,
+) -> (
+    Irokle,
+    Arc<net::IrohNet<MemoryStorage>>,
+    Irokle,
+    iroh::EndpointAddr,
+) {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .build()
+        .unwrap();
+    let alice_net = Arc::new(net::IrohNet::new(alice_endpoint, alice.clone()).unwrap());
+    let trusted = if whitelist {
+        vec![alice.peer_id()]
+    } else {
+        Vec::new()
+    };
+    let bob = Irokle::builder()
+        .with_peer_whitelist(trusted)
+        .with_net(bob_endpoint)
+        .build()
+        .unwrap();
+    let bob_addr = ready_addr(bob.endpoint().unwrap()).await;
+    (alice, alice_net, bob, bob_addr)
+}
+
+/// A topic of `alice` with `events` notes and then the invitation of `bob`.
+fn invite_last(alice: &Irokle, bob: PeerId, events: usize) -> (TopicId, Vec<Op>) {
+    let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
+    for index in 0..events {
+        topic
+            .publish(Note {
+                text: index.to_string(),
+            })
+            .unwrap();
+    }
+    topic.add_peer(bob).unwrap();
+    (
+        topic.id(),
+        oplog::topological(alice.storage(), &topic.id()).unwrap(),
+    )
+}
+
+/// The receiver holds the whole history and the inviter holds its certified ack.
+fn assert_bootstrapped(alice: &Irokle, bob: &Irokle, topic_id: TopicId) {
+    assert_eq!(
+        bob.storage().list_op_ids(&topic_id).unwrap(),
+        alice.storage().list_op_ids(&topic_id).unwrap()
+    );
+    let ack = alice
+        .storage()
+        .peer_ack(&bob.peer_id(), &topic_id)
+        .unwrap()
+        .expect("certified ack");
+    assert_eq!(ack.genesis, genesis_of(alice.storage(), &topic_id));
+    assert_eq!(ack.clock, alice.storage().actor_clock(&topic_id).unwrap());
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_spans_frames() {
+    let (alice, alice_net, bob, bob_addr) = bootstrap_pair(true).await;
+    let (topic_id, ops) = invite_last(&alice, bob.peer_id(), 300);
+    assert!(ops.len() > crate::net::MAX_SYNC_DATA_OPS_PER_MESSAGE);
+
+    // One data frame without the invitation is staged and only receipted.
+    let first = vec![
+        sync::SyncMessage::Open(alice.sync_open(topic_id)),
+        sync::SyncMessage::Data(sync::SyncData {
+            topic_id,
+            ops: ops[..crate::net::MAX_SYNC_DATA_OPS_PER_MESSAGE].to_vec(),
+        }),
+    ];
+    let responses = alice_net.sync_with(bob_addr.clone(), &first).await.unwrap();
+    let receipt = responses.iter().find_map(|response| match response {
+        sync::SyncMessage::Receipt(receipt) => Some(receipt.clock.clone()),
+        _ => None,
+    });
+    let actor = actor_id_for(topic_id, alice.peer_id());
+    assert_eq!(receipt.map(|clock| clock.get(&actor)), Some(256));
+    assert!(
+        !responses
+            .iter()
+            .any(|response| matches!(response, sync::SyncMessage::Ack(_)))
+    );
+    assert!(bob.storage().topic_state(&topic_id).unwrap().is_none());
+    assert!(
+        alice
+            .storage()
+            .peer_ack(&bob.peer_id(), &topic_id)
+            .unwrap()
+            .is_none()
+    );
+
+    alice_net.sync_now(bob_addr, topic_id).await.unwrap();
+    assert_bootstrapped(&alice, &bob, topic_id);
+    alice_net.shutdown().await;
+    bob.shutdown_iroh().await;
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_spans_pages() {
+    let (alice, alice_net, bob, bob_addr) = bootstrap_pair(true).await;
+    let (topic_id, _) = invite_last(&alice, bob.peer_id(), 4200);
+
+    // Each staged page is progress, so a manual sync either completes or asks
+    // to be called again; it never reports the staged pages as a failure.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        assert!(attempts <= 8, "bootstrap did not finish");
+        match alice_net.sync_now(bob_addr.clone(), topic_id).await {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("bootstrap sync failed: {error}"),
+        }
+    }
+    assert_bootstrapped(&alice, &bob, topic_id);
+    alice_net.shutdown().await;
+    bob.shutdown_iroh().await;
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlisted_never_stages() {
+    let (alice, alice_net, bob, bob_addr) = bootstrap_pair(false).await;
+    let (topic_id, _) = invite_last(&alice, bob.peer_id(), 3);
+
+    assert!(alice_net.sync_now(bob_addr, topic_id).await.is_err());
+    assert!(bob.storage().topic_state(&topic_id).unwrap().is_none());
+    assert!(
+        bob.storage()
+            .staged_bootstrap_ops(&alice.peer_id(), &topic_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        alice
+            .storage()
+            .peer_ack(&bob.peer_id(), &topic_id)
+            .unwrap()
+            .is_none()
+    );
+    alice_net.shutdown().await;
+    bob.shutdown_iroh().await;
+}
