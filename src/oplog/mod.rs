@@ -167,6 +167,19 @@ pub struct Admitted {
     pub ready_remaining: bool,
 }
 
+/// Spread retries of writers that keep losing the same optimistic race, with
+/// a short random pause that grows with the attempt. No lock is held here.
+fn conflict_pause(attempt: usize) {
+    if attempt < 4 {
+        return;
+    }
+    let mut jitter = [0_u8; 8];
+    let _ = getrandom::fill(&mut jitter);
+    let ceiling = 200_u64 << (attempt - 4).min(5);
+    let micros = u64::from_le_bytes(jitter) % ceiling;
+    std::thread::sleep(std::time::Duration::from_micros(micros));
+}
+
 fn is_structural_genesis(op: &Op) -> bool {
     let body = &op.signed.body;
     matches!(body.payload, TopicPayload::Genesis(_))
@@ -380,7 +393,8 @@ impl<S: Storage> Oplog<S> {
         }
         // The rebuild commits only if the topic still matches the planned
         // state, so a concurrent tie-break or append makes it replan.
-        for _ in 0..MAX_ADMISSION_RETRIES {
+        for attempt in 0..MAX_ADMISSION_RETRIES {
+            conflict_pause(attempt);
             let Some(plan) = self.plan_quarantine(topic_id)? else {
                 return Ok(None);
             };
@@ -547,7 +561,8 @@ impl<S: Storage> Oplog<S> {
             initial_peers: peers,
             ..genesis
         };
-        for _ in 0..MAX_ADMISSION_RETRIES {
+        for attempt in 0..MAX_ADMISSION_RETRIES {
+            conflict_pause(attempt);
             match self.try_genesis_effects(
                 topic_id,
                 actor_id,
@@ -873,7 +888,8 @@ impl<S: Storage> Oplog<S> {
             checked.insert(op.id);
         }
         let verified = &checked;
-        for _ in 0..MAX_ADMISSION_RETRIES {
+        for attempt in 0..MAX_ADMISSION_RETRIES {
+            conflict_pause(attempt);
             let (ops_to_admit, reset, rejected_genesis) = if has_genesis {
                 self.resolve_genesis_collision(ops.clone(), verified)?
             } else {
@@ -1458,7 +1474,8 @@ impl<S: Storage> Oplog<S> {
         F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
     {
         let mut signed = None;
-        for _ in 0..MAX_ADMISSION_RETRIES {
+        for attempt in 0..MAX_ADMISSION_RETRIES {
+            conflict_pause(attempt);
             match self.try_local_effects(
                 topic_id,
                 actor_id,
