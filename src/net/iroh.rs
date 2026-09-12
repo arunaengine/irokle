@@ -1769,62 +1769,70 @@ impl<S: Storage> IrohNet<S> {
         topic_id: crate::TopicId,
         summary: &SyncSummary,
     ) -> io::Result<Option<PlannedTopicSync>> {
-        let (mut plan, _) = self
+        let budget = crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default());
+        let (mut plan, mut push_more) = self
             .node
-            .negotiate_page(
-                remote_peer_id,
-                summary,
-                crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default()),
-            )
+            .negotiate_page(remote_peer_id, summary, budget)
             .map_err(invalid_data)?;
-        let mut terminal = false;
-        if let Some(state) = self
+        let view = self
             .node
             .storage()
-            .topic_state(&topic_id)
+            .topic_view(&topic_id, None)
             .map_err(invalid_data)?
-            && !state.members.contains(&self.node.peer_id())
-            && let Some(op_id) = self.local_leave_op(&state)?
+            .ok_or_else(|| invalid_data("topic disappeared while planning"))?;
+        // A peer outside the membership is owed nothing and serves nothing.
+        let member = view.state.members.contains(&remote_peer_id);
+        let mut goal = TopicGoal {
+            genesis: Some(view.state.genesis),
+            inbound: if member {
+                summary.actor_clock.clone()
+            } else {
+                Default::default()
+            },
+            outbound: if member {
+                view.clock.clone()
+            } else {
+                Default::default()
+            },
+        };
+        let mut terminal = false;
+        if !view.state.members.contains(&self.node.peer_id())
+            && let Some(op_id) = self.local_leave_op(&view.state)?
         {
             terminal = true;
-            plan.send = self
+            let leave = crate::sync::SyncRequest {
+                topic_id,
+                known: BTreeSet::new(),
+                wants: BTreeSet::from([op_id]),
+                actor_range_hints: Vec::new(),
+                genesis: None,
+                credit: crate::sync::SyncCredit::default(),
+            };
+            let page = self
                 .node
-                .response_page(
-                    remote_peer_id,
-                    &crate::sync::SyncRequest {
-                        topic_id,
-                        known: plan.common.clone(),
-                        wants: BTreeSet::from([op_id]),
-                        actor_range_hints: Vec::new(),
-                        genesis: None,
-                        credit: crate::sync::SyncCredit::default(),
-                    },
-                    crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default()),
-                )
-                .map_err(invalid_data)?
-                .ops;
+                .response_page(remote_peer_id, &leave, budget)
+                .map_err(invalid_data)?;
+            plan.send = page.ops;
+            push_more = page.more;
             plan.need.clear();
             plan.actor_range_hints.clear();
+            goal.inbound = crate::ActorClock::new();
+            goal.outbound = crate::ActorClock::new();
+            if let Some(meta) = self.node.storage().get_meta(&op_id).map_err(invalid_data)? {
+                goal.outbound.observe(meta.actor_id, meta.actor_seq);
+            }
         }
-        let request = crate::sync::SyncRequest {
-            topic_id: plan.topic_id,
-            known: plan.common,
-            wants: plan.need,
-            actor_range_hints: plan.actor_range_hints,
-            genesis: summary.genesis,
-            credit: crate::sync::SyncCredit::default(),
-        };
         let mut messages = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
-        messages.extend(sync_data_messages(plan.topic_id, plan.send)?);
-        let data_count = messages.len() - 1;
-        let wants = !request.wants.is_empty() || !request.actor_range_hints.is_empty();
-        let requested_ops = request.wants.len() as u64
-            + request
-                .actor_range_hints
-                .iter()
-                .map(|hint| hint.to_inclusive.saturating_sub(hint.from_exclusive))
-                .sum::<u64>();
+        messages.extend(sync_data_messages(
+            plan.topic_id,
+            std::mem::take(&mut plan.send),
+        )?);
+        let pushes = messages.len() > 1;
+        let wants = !plan.need.is_empty() || !plan.actor_range_hints.is_empty();
+        let mut credit_ops = 0;
         if wants {
+            let request = self.page_request(plan).map_err(invalid_data)?;
+            credit_ops = request.credit.ops as usize;
             messages.push(SyncMessage::Request(request));
         }
         if !terminal {
@@ -1832,25 +1840,49 @@ impl<S: Storage> IrohNet<S> {
                 self.node.sync_summary(topic_id).map_err(invalid_data)?,
             ));
         }
-        // One summary per open, one ack per data message we send, plus the
-        // data messages the peer may send for what we requested.
-        let estimated_responses = 1
-            + data_count
-            + if wants {
-                requested_ops.div_ceil(MAX_SYNC_DATA_OPS_PER_MESSAGE as u64) as usize + 1
-            } else {
-                0
-            };
+        // A summary for the open, one ack for the pushed data, the peer's own
+        // request, and at most one page of data frames plus its page result.
+        let estimated_responses = 3 + if wants {
+            credit_ops.div_ceil(MAX_SYNC_DATA_OPS_PER_MESSAGE) + 1
+        } else {
+            0
+        };
         Ok(Some(PlannedTopicSync {
             topic_id,
-            remote_clock: if terminal {
-                crate::ActorClock::new()
-            } else {
-                summary.actor_clock.clone()
-            },
+            goal,
+            pushes,
+            push_more,
             messages,
             estimated_responses,
         }))
+    }
+
+    /// The request for the next page of `plan`, sized to what it asks for.
+    fn page_request(&self, plan: crate::sync::SyncPlan) -> crate::Result<crate::sync::SyncRequest> {
+        let requested = plan.need.len() as u64
+            + plan
+                .actor_range_hints
+                .iter()
+                .map(|hint| hint.to_inclusive.saturating_sub(hint.from_exclusive))
+                .sum::<u64>();
+        let mut credit = crate::sync::SyncCredit::default();
+        credit.ops = credit
+            .ops
+            .min(u32::try_from(requested).unwrap_or(u32::MAX))
+            .max(1);
+        let genesis = self
+            .node
+            .storage()
+            .topic_state(&plan.topic_id)?
+            .map(|state| state.genesis);
+        Ok(crate::sync::SyncRequest {
+            topic_id: plan.topic_id,
+            known: plan.common,
+            wants: plan.need,
+            actor_range_hints: plan.actor_range_hints,
+            genesis,
+            credit,
+        })
     }
 
     async fn run_topic_batch_exchange(
@@ -1865,35 +1897,28 @@ impl<S: Storage> IrohNet<S> {
             .iter()
             .map(|planned| planned.topic_id)
             .collect::<BTreeSet<_>>();
-        let remote_clocks = group
-            .iter()
-            .map(|planned| (planned.topic_id, planned.remote_clock.clone()))
-            .collect::<BTreeMap<_, _>>();
-        // Progress is read from durable local state before the exchange. Bytes
-        // moved, repeated ids and unchanged cursors are not progress.
-        let before = group_topics
-            .iter()
-            .map(|topic_id| {
-                (
-                    *topic_id,
-                    self.topic_progress_mark(remote_peer_id, *topic_id),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut expected_acks = BTreeMap::<crate::TopicId, usize>::new();
-        let mut expected_data = BTreeSet::new();
+        // Progress is measured toward each topic's captured goal only. Bytes
+        // moved, repeated ids and unrelated local writes are not progress.
+        let mut goals = BTreeMap::new();
+        let mut owed_acks = BTreeSet::new();
+        let mut more = BTreeSet::new();
         let mut messages = Vec::new();
         for planned in group {
-            for message in &planned.messages {
-                match message {
-                    SyncMessage::Data(_) => {
-                        expected_acks.insert(planned.topic_id, 1);
-                    }
-                    SyncMessage::Request(_) => {
-                        expected_data.insert(planned.topic_id);
-                    }
-                    _ => {}
+            let before = self.goal_progress(remote_peer_id, planned.topic_id, &planned.goal);
+            match before {
+                Ok(before) => {
+                    goals.insert(planned.topic_id, (planned.goal, before));
                 }
+                Err(error) => {
+                    outcomes.insert(planned.topic_id, Err(error));
+                    continue;
+                }
+            }
+            if planned.pushes {
+                owed_acks.insert(planned.topic_id);
+            }
+            if planned.push_more {
+                more.insert(planned.topic_id);
             }
             messages.extend(planned.messages);
         }
@@ -1915,38 +1940,41 @@ impl<S: Storage> IrohNet<S> {
         let mut followups: BTreeMap<crate::TopicId, Vec<SyncMessage>> = BTreeMap::new();
         for response in responses {
             match response {
-                SyncMessage::Ack(ack) => {
+                SyncMessage::Ack(ack) if group_topics.contains(&ack.topic_id) => {
                     // An ack that is not validly bound fails its own topic; the
                     // other topics in the stream keep their valid work.
                     if ack.peer_id != remote_peer_id {
-                        let error = invalid_data("sync ack does not match remote peer");
-                        if group_topics.contains(&ack.topic_id) {
-                            outcomes.insert(ack.topic_id, Err(error));
-                        }
+                        outcomes.insert(
+                            ack.topic_id,
+                            Err(invalid_data("sync ack does not match remote peer")),
+                        );
                         continue;
                     }
-                    if !group_topics.contains(&ack.topic_id) {
-                        tracing::warn!(topic_id = %ack.topic_id, "ignoring ack outside the exchange");
-                        continue;
-                    }
-                    if let Some(remaining) = expected_acks.get_mut(&ack.topic_id) {
-                        *remaining = remaining.saturating_sub(1);
-                    }
+                    owed_acks.remove(&ack.topic_id);
                     acks.push(ack);
                 }
                 SyncMessage::Failure(failure) if group_topics.contains(&failure.topic_id) => {
                     outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
                 }
                 SyncMessage::Summary(summary) if group_topics.contains(&summary.topic_id) => {}
-                SyncMessage::Page(page) if group_topics.contains(&page.topic_id) => {}
+                SyncMessage::Page(page) if group_topics.contains(&page.topic_id) => {
+                    if page.more {
+                        more.insert(page.topic_id);
+                    }
+                }
                 SyncMessage::Request(request) if group_topics.contains(&request.topic_id) => {
                     let topic_id = request.topic_id;
+                    let budget = crate::sync::PageBudget::from_credit(request.credit);
                     match self
                         .node
-                                                .response_page(remote_peer_id, &request, crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default()))
+                        .response_page(remote_peer_id, &request, budget)
                         .map_err(invalid_data)
-                        .and_then(|data| sync_data_messages(topic_id, data.ops))
-                    {
+                        .and_then(|page| {
+                            if page.more {
+                                more.insert(topic_id);
+                            }
+                            sync_data_messages(topic_id, page.ops)
+                        }) {
                         Ok(messages) => followups.entry(topic_id).or_default().extend(messages),
                         Err(error) => {
                             outcomes.insert(topic_id, Err(error));
@@ -1955,9 +1983,6 @@ impl<S: Storage> IrohNet<S> {
                 }
                 SyncMessage::Data(data) if group_topics.contains(&data.topic_id) => {
                     let data_topic_id = data.topic_id;
-                    if !data.ops.is_empty() {
-                        expected_data.remove(&data_topic_id);
-                    }
                     match self
                         .node
                         .receive_sync_data_from_evicting(remote_peer_id, data)
@@ -1967,10 +1992,11 @@ impl<S: Storage> IrohNet<S> {
                             if let Err(error) = self.schedule_topic_recheck(data_topic_id) {
                                 tracing::warn!(%data_topic_id, %error, "failed to schedule received topic resync");
                             }
-                            followups
-                                .entry(data_topic_id)
-                                .or_default()
-                                .push(SyncMessage::Ack(ack));
+                            let replies = followups.entry(data_topic_id).or_default();
+                            // Only the newest frontier needs certifying; earlier
+                            // acks of this exchange are covered by it.
+                            replies.retain(|message| !matches!(message, SyncMessage::Ack(_)));
+                            replies.push(SyncMessage::Ack(ack));
                         }
                         Err(crate::Error::ReceiveCommitted {
                             evictions, source, ..
@@ -2001,43 +2027,80 @@ impl<S: Storage> IrohNet<S> {
                 outcomes.insert(ack.topic_id, Err(invalid_data(error)));
             }
         }
+        for topic_id in owed_acks {
+            outcomes
+                .entry(topic_id)
+                .or_insert_with(|| Err(invalid_data("peer omitted sync acknowledgement")));
+        }
+        self.send_followups(peer, remote_peer_id, followups, outcomes)
+            .await;
 
-        let mut followup_groups: Vec<(BTreeSet<crate::TopicId>, Vec<SyncMessage>)> = Vec::new();
-        let mut current_topics = BTreeSet::new();
-        let mut current_messages: Vec<SyncMessage> = Vec::new();
-        for (topic_id, topic_acks) in followups {
-            if matches!(outcomes.get(&topic_id), Some(Err(_))) {
+        for (topic_id, (goal, before)) in goals {
+            if outcomes.contains_key(&topic_id) {
                 continue;
             }
+            let outcome = match self.goal_progress(remote_peer_id, topic_id, &goal) {
+                Ok(after) if after.reached(&goal) && !more.contains(&topic_id) => Ok(()),
+                // A page that moved toward the goal is served again at the fair
+                // tail of the queue; it is not a failed attempt.
+                Ok(after) if after.advanced_from(&before) => {
+                    advanced.insert(topic_id);
+                    Ok(())
+                }
+                Ok(_) => Err(invalid_data("sync exchange made no progress")),
+                Err(error) => Err(error),
+            };
+            outcomes.insert(topic_id, outcome);
+        }
+    }
+
+    /// Send acks for received pages and data for the peer's requests, one
+    /// stream per group, and apply the peer's acks for that data.
+    async fn send_followups(
+        &self,
+        peer: iroh::EndpointAddr,
+        remote_peer_id: PeerId,
+        followups: BTreeMap<crate::TopicId, Vec<SyncMessage>>,
+        outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
+    ) {
+        let mut groups: Vec<(BTreeSet<crate::TopicId>, Vec<SyncMessage>)> = Vec::new();
+        let mut current_topics = BTreeSet::new();
+        let mut current_messages: Vec<SyncMessage> = Vec::new();
+        for (topic_id, replies) in followups {
+            if matches!(outcomes.get(&topic_id), Some(Err(_))) || replies.is_empty() {
+                continue;
+            }
+            let carries_data = |messages: &[SyncMessage]| {
+                messages
+                    .iter()
+                    .any(|message| matches!(message, SyncMessage::Data(_)))
+            };
             if !current_messages.is_empty()
-                && (current_messages.len() + topic_acks.len() + 1 > MAX_BATCH_STREAM_MESSAGES
-                    || topic_acks
-                        .iter()
-                        .any(|message| matches!(message, SyncMessage::Data(_)))
-                    || current_messages
-                        .iter()
-                        .any(|message| matches!(message, SyncMessage::Data(_))))
+                && (current_messages.len() + replies.len() + 1 > MAX_BATCH_STREAM_MESSAGES
+                    || carries_data(&replies)
+                    || carries_data(&current_messages))
             {
-                followup_groups.push((
+                groups.push((
                     std::mem::take(&mut current_topics),
                     std::mem::take(&mut current_messages),
                 ));
             }
             current_messages.push(SyncMessage::Open(self.node.sync_open(topic_id)));
-            current_messages.extend(topic_acks);
+            current_messages.extend(replies);
             current_topics.insert(topic_id);
         }
         if !current_messages.is_empty() {
-            followup_groups.push((current_topics, current_messages));
+            groups.push((current_topics, current_messages));
         }
-        for (topics, messages) in followup_groups {
+        for (topics, messages) in groups {
             let mut summaries = topics.clone();
-            let mut remaining = BTreeMap::<crate::TopicId, usize>::new();
-            for message in &messages {
-                if let SyncMessage::Data(data) = message {
-                    remaining.insert(data.topic_id, 1);
-                }
-            }
+            let mut owed_acks = messages
+                .iter()
+                .filter_map(|message| match message {
+                    SyncMessage::Data(data) => Some(data.topic_id),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
             match self.sync_with(peer.clone(), &messages).await {
                 Ok(responses) => {
                     for response in responses {
@@ -2051,16 +2114,13 @@ impl<S: Storage> IrohNet<S> {
                                         ack.topic_id,
                                         Err(invalid_data("sync ack does not match remote peer")),
                                     );
-                                } else {
-                                    if let Some(count) = remaining.get_mut(&ack.topic_id) {
-                                        *count = count.saturating_sub(1);
-                                    }
-                                    for result in
-                                        self.node.apply_sync_acks(std::slice::from_ref(&ack))
-                                    {
-                                        if let Err(error) = result {
-                                            outcomes.insert(ack.topic_id, Err(invalid_data(error)));
-                                        }
+                                    continue;
+                                }
+                                owed_acks.remove(&ack.topic_id);
+                                for result in self.node.apply_sync_acks(std::slice::from_ref(&ack))
+                                {
+                                    if let Err(error) = result {
+                                        outcomes.insert(ack.topic_id, Err(invalid_data(error)));
                                     }
                                 }
                             }
@@ -2087,63 +2147,15 @@ impl<S: Storage> IrohNet<S> {
                 }
             }
             for topic_id in summaries {
-                outcomes.insert(
-                    topic_id,
-                    Err(invalid_data("peer omitted sync acknowledgement summary")),
-                );
+                outcomes.entry(topic_id).or_insert_with(|| {
+                    Err(invalid_data("peer omitted sync acknowledgement summary"))
+                });
             }
-            for (topic_id, count) in remaining {
-                if count > 0 {
-                    outcomes.insert(
-                        topic_id,
-                        Err(invalid_data("peer omitted sync acknowledgement")),
-                    );
-                }
+            for topic_id in owed_acks {
+                outcomes
+                    .entry(topic_id)
+                    .or_insert_with(|| Err(invalid_data("peer omitted sync acknowledgement")));
             }
-        }
-
-        for topic_id in group_topics {
-            if outcomes.contains_key(&topic_id) {
-                continue;
-            }
-            let owes_more = (|| -> io::Result<bool> {
-                Ok(
-                    expected_acks.get(&topic_id).copied().unwrap_or_default() > 0
-                    || expected_data.contains(&topic_id)
-                    || !self
-                        .node
-                        .sync_summary(topic_id)
-                        .map_err(invalid_data)?
-                        .actor_clock
-                        .dominates(&remote_clocks[&topic_id])
-                    || !self.topic_is_whole(topic_id)
-                    // Only unsent obligations remain: a missing peer ack is not
-                    // this exchange's failure when it had nothing to push.
-                    || self
-                        .node
-                        .storage()
-                        .has_sync_obligations(&remote_peer_id, &topic_id)
-                        .map_err(invalid_data)?,
-                )
-            })();
-            let outcome = match owes_more {
-                Ok(false) => Ok(()),
-                Ok(true) => {
-                    self.schedule_resync(remote_peer_id, topic_id);
-                    if self.topic_progress_mark(remote_peer_id, topic_id) == before[&topic_id] {
-                        // Nothing durable moved, so retrying at once would spin.
-                        // Back off with an explicit reason instead.
-                        Err(invalid_data("sync exchange made no progress"))
-                    } else {
-                        // A bounded page that really advanced is served again
-                        // after a fair turn; it is not a failed attempt.
-                        advanced.insert(topic_id);
-                        Ok(())
-                    }
-                }
-                Err(error) => Err(error),
-            };
-            outcomes.insert(topic_id, outcome);
         }
     }
 
@@ -2197,22 +2209,39 @@ impl<S: Storage> IrohNet<S> {
         }
     }
 
-    /// Durable state a topic exchange can be judged against: the local clock,
-    /// whether the topic is whole, and whether work is still owed to this peer.
-    /// A change in any of these is real progress; an unchanged mark is not.
-    fn topic_progress_mark(
+    /// How far the topic has come toward `goal`: local positions covered of the
+    /// peer's clock, positions the peer certified of the local clock, and holes
+    /// left. Only this branch's certified evidence counts.
+    fn goal_progress(
         &self,
         peer_id: PeerId,
         topic_id: crate::TopicId,
-    ) -> (Option<crate::ActorClock>, bool, bool) {
-        (
-            self.node.storage().actor_clock(&topic_id).ok(),
-            self.topic_is_whole(topic_id),
-            self.node
-                .storage()
-                .has_sync_obligations(&peer_id, &topic_id)
-                .unwrap_or(true),
-        )
+        goal: &TopicGoal,
+    ) -> io::Result<GoalProgress> {
+        let view = self
+            .node
+            .storage()
+            .topic_view(&topic_id, Some(&peer_id))
+            .map_err(invalid_data)?
+            .ok_or_else(|| invalid_data("topic disappeared during sync"))?;
+        if goal.genesis != Some(view.state.genesis) {
+            return Err(invalid_data("topic branch changed during sync"));
+        }
+        let certified = view
+            .ack
+            .as_ref()
+            .filter(|ack| ack.genesis == Some(view.state.genesis))
+            .map(|ack| ack.clock.clone())
+            .unwrap_or_default();
+        Ok(GoalProgress {
+            inbound: covered(&view.clock, &goal.inbound),
+            outbound: covered(&certified, &goal.outbound),
+            holes: self
+                .node
+                .view_unresolved(&view)
+                .map_err(invalid_data)?
+                .len(),
+        })
     }
 
     pub async fn accept_one(&self) -> io::Result<Option<iroh::EndpointId>> {
@@ -2403,14 +2432,9 @@ impl<S: Storage> IrohNet<S> {
                 if plan.need.is_empty() && plan.actor_range_hints.is_empty() {
                     return Ok(Vec::new());
                 }
-                Ok(vec![SyncMessage::Request(crate::sync::SyncRequest {
-                    topic_id: plan.topic_id,
-                    known: plan.common,
-                    wants: plan.need,
-                    actor_range_hints: plan.actor_range_hints,
-                    genesis: summary.genesis,
-                    credit: crate::sync::SyncCredit::default(),
-                })])
+                Ok(vec![SyncMessage::Request(
+                    self.page_request(plan).map_err(invalid_data)?,
+                )])
             }
             SyncMessage::Request(_) => {
                 Err(invalid_data("sync request must be served by the session"))
@@ -2498,9 +2522,53 @@ impl BatchOutcomes {
 
 struct PlannedTopicSync {
     topic_id: crate::TopicId,
-    remote_clock: crate::ActorClock,
+    goal: TopicGoal,
+    /// Whether the stream carries data the peer must acknowledge.
+    pushes: bool,
+    /// Whether the push page left data behind for a later page.
+    push_more: bool,
     messages: Vec<SyncMessage>,
     estimated_responses: usize,
+}
+
+/// What one attempt set out to reach, captured when it was planned. Later
+/// appends on either side are later work, not a moving target.
+#[derive(Clone, Debug)]
+struct TopicGoal {
+    genesis: Option<crate::OpId>,
+    /// The peer's clock from its summary.
+    inbound: crate::ActorClock,
+    /// The local clock the peer should certify.
+    outbound: crate::ActorClock,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GoalProgress {
+    inbound: u64,
+    outbound: u64,
+    holes: usize,
+}
+
+impl GoalProgress {
+    fn reached(&self, goal: &TopicGoal) -> bool {
+        self.inbound == covered(&goal.inbound, &goal.inbound)
+            && self.outbound == covered(&goal.outbound, &goal.outbound)
+            && self.holes == 0
+    }
+
+    fn advanced_from(&self, before: &GoalProgress) -> bool {
+        self.inbound > before.inbound
+            || self.outbound > before.outbound
+            || self.holes < before.holes
+    }
+}
+
+/// Positions of `target` that `clock` covers, summed over actors.
+fn covered(clock: &crate::ActorClock, target: &crate::ActorClock) -> u64 {
+    target
+        .iter()
+        .map(|(actor_id, seq)| clock.get(actor_id).min(*seq))
+        .sum()
 }
 
 struct SyncSession {
