@@ -244,7 +244,7 @@ impl ResyncScheduler {
         let backoff = initial_backoff.saturating_mul(multiplier).min(max_backoff);
         target.next_due = tokio::time::Instant::now() + backoff;
         target.in_flight = false;
-        target.force = false;
+        target.force = true;
         drop(targets);
         self.notify.notify_waiters();
     }
@@ -254,6 +254,7 @@ impl ResyncScheduler {
 struct ConnectionPool {
     endpoint: iroh::Endpoint,
     connections: Arc<RwLock<HashMap<iroh::EndpointId, iroh::endpoint::Connection>>>,
+    dialing: Arc<Mutex<HashMap<iroh::EndpointId, Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 impl ConnectionPool {
@@ -261,6 +262,7 @@ impl ConnectionPool {
         Self {
             endpoint,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            dialing: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -277,11 +279,18 @@ impl ConnectionPool {
         Ok(peer)
     }
 
-    fn remove(&self, peer: &iroh::EndpointId) -> io::Result<()> {
-        self.connections
+    fn remove(&self, connection: &iroh::endpoint::Connection) -> io::Result<()> {
+        let mut connections = self
+            .connections
             .write()
-            .map_err(|_| io::Error::other("connection pool write lock poisoned"))?
-            .remove(peer);
+            .map_err(|_| io::Error::other("connection pool write lock poisoned"))?;
+        let peer = connection.remote_id();
+        if connections
+            .get(&peer)
+            .is_some_and(|pooled| pooled.stable_id() == connection.stable_id())
+        {
+            connections.remove(&peer);
+        }
         Ok(())
     }
 
@@ -305,6 +314,27 @@ impl ConnectionPool {
         peer: iroh::EndpointAddr,
         connect_timeout: Duration,
     ) -> io::Result<iroh::endpoint::Connection> {
+        if let Some(connection) = self.get(&peer.id)? {
+            return Ok(connection);
+        }
+        let dialing = {
+            let mut pending = self
+                .dialing
+                .lock()
+                .map_err(|_| io::Error::other("connection dial lock poisoned"))?;
+            pending.retain(|_, lock| lock.strong_count() > 0);
+            match pending.get(&peer.id).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    pending.insert(peer.id, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _dialing = tokio::time::timeout(connect_timeout, dialing.lock())
+            .await
+            .map_err(|_| timed_out("connection pool wait timed out"))?;
         if let Some(connection) = self.get(&peer.id)? {
             return Ok(connection);
         }
@@ -481,10 +511,10 @@ impl<S: Storage> IrohNet<S> {
         self.resync_scheduler.peer_reachable(peer_id);
     }
 
-    /// Registers an externally accepted connection in the connection pool so
-    /// future outbound syncs can reuse it instead of dialing by endpoint id.
+    /// Marks the peer on an externally accepted connection as reachable.
+    /// Outbound sync dials separately because reverse stream support is not guaranteed.
     pub fn register_connection(&self, connection: iroh::endpoint::Connection) -> io::Result<()> {
-        let peer = self.pool.insert(connection)?;
+        let peer = connection.remote_id();
         self.resync_scheduler
             .peer_reachable(peer_id_from_endpoint_id(peer));
         Ok(())
@@ -577,6 +607,7 @@ impl<S: Storage> IrohNet<S> {
                 if current.is_shutdown() {
                     break;
                 }
+                let connect_timeout = current.runtime.connect_timeout;
                 drop(current);
                 let accepted = tokio::select! {
                     changed = shutdown.changed() => {
@@ -585,10 +616,17 @@ impl<S: Storage> IrohNet<S> {
                         }
                         continue;
                     }
-                    accepted = incoming => accepted.map_err(other),
+                    accepted = tokio::time::timeout(connect_timeout, incoming) => {
+                        accepted.map_err(|_| timed_out("iroh accept timed out"))
+                            .and_then(|accepted| accepted.map_err(other))
+                    },
                 };
                 match accepted {
                     Ok(connection) => {
+                        if connection.alpn() != IROKLE_SYNC_ALPN {
+                            connection.close(0u32.into(), b"unsupported protocol");
+                            continue;
+                        }
                         let peer = connection.remote_id();
                         let connection_net = Weak::clone(&net);
                         let connection_shutdown = shutdown.clone();
@@ -639,14 +677,17 @@ impl<S: Storage> IrohNet<S> {
         };
         let mut shutdown = self.shutdown.subscribe();
         Ok(Some(handle.spawn(async move {
-            if let Some(current) = net.upgrade()
-                && let Err(error) = current.schedule_startup_resync() {
+            let mut sweep_pending = net.upgrade().is_some_and(|current| {
+                current.schedule_startup_resync().inspect_err(|error| {
                     tracing::warn!(%error, "failed to schedule startup resync sweep");
-                }
-            let mut full_sweep = Box::pin(tokio::time::sleep_until(next_full_sweep_deadline(
-                runtime.full_sweep_interval,
-                runtime.full_sweep_time_of_day,
-            )));
+                }).is_err()
+            });
+            let mut sweep_backoff = runtime.resync_initial_backoff.max(Duration::from_millis(1));
+            let mut full_sweep = Box::pin(tokio::time::sleep_until(if sweep_pending {
+                tokio::time::Instant::now() + sweep_backoff
+            } else {
+                next_full_sweep_deadline(runtime.full_sweep_interval, runtime.full_sweep_time_of_day)
+            }));
             loop {
                 if !run_due_resyncs(&net, &mut shutdown, runtime).await {
                     break;
@@ -666,12 +707,21 @@ impl<S: Storage> IrohNet<S> {
                     }
                     _ = notify.notified() => {}
                     _ = &mut due_sleep => {}
-                    _ = &mut full_sweep, if !runtime.full_sweep_interval.is_zero() => {
-                        if let Some(current) = net.upgrade()
-                            && let Err(error) = current.schedule_full_sweep_resync() {
+                    _ = &mut full_sweep, if sweep_pending || !runtime.full_sweep_interval.is_zero() => {
+                        sweep_pending = net.upgrade().is_some_and(|current| {
+                            current.schedule_full_sweep_resync().inspect_err(|error| {
                                 tracing::warn!(%error, "failed to schedule full resync sweep");
-                            }
-                        full_sweep.as_mut().reset(tokio::time::Instant::now() + runtime.full_sweep_interval);
+                            }).is_err()
+                        });
+                        let delay = if sweep_pending {
+                            sweep_backoff = sweep_backoff.saturating_mul(2)
+                                .min(runtime.resync_max_backoff.max(Duration::from_millis(1)));
+                            sweep_backoff
+                        } else {
+                            sweep_backoff = runtime.resync_initial_backoff.max(Duration::from_millis(1));
+                            runtime.full_sweep_interval
+                        };
+                        full_sweep.as_mut().reset(tokio::time::Instant::now() + delay);
                     }
                 }
             }
@@ -693,7 +743,7 @@ impl<S: Storage> IrohNet<S> {
             }
         };
 
-        if !needs_sync {
+        if !needs_sync && result.is_ok() {
             self.resync_scheduler.complete_clean(peer_id, topic_id);
             return;
         }
@@ -851,7 +901,6 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         messages: &[SyncMessage],
     ) -> io::Result<Vec<SyncMessage>> {
-        let peer_id = peer.id;
         let mut last_error = None;
         for _ in 0..2 {
             let connection = match self
@@ -873,7 +922,7 @@ impl<S: Storage> IrohNet<S> {
                     if connection.close_reason().is_some()
                         || error.kind() == io::ErrorKind::TimedOut
                     {
-                        let _ = self.pool.remove(&peer_id);
+                        let _ = self.pool.remove(&connection);
                     }
                     last_error = Some(error);
                 }
@@ -887,14 +936,14 @@ impl<S: Storage> IrohNet<S> {
         connection: iroh::endpoint::Connection,
         messages: &[SyncMessage],
     ) -> io::Result<Vec<SyncMessage>> {
-        let (mut send, mut recv) =
-            tokio::time::timeout(self.runtime.sync_io_timeout, connection.open_bi())
-                .await
-                .map_err(|_| timed_out("sync stream open timed out"))?
-                .map_err(other)?;
-        self.outbound_streams.fetch_add(1, Ordering::Relaxed);
-        write_sync_messages(&mut send, messages, self.runtime.sync_io_timeout).await?;
-        read_sync_messages(&mut recv, self.runtime.sync_io_timeout).await
+        tokio::time::timeout(self.runtime.sync_io_timeout, async {
+            let (mut send, mut recv) = connection.open_bi().await.map_err(other)?;
+            self.outbound_streams.fetch_add(1, Ordering::Relaxed);
+            write_sync_messages(&mut send, messages, self.runtime.sync_io_timeout).await?;
+            read_sync_messages(&mut recv, self.runtime.sync_io_timeout).await
+        })
+        .await
+        .map_err(|_| timed_out("sync exchange timed out"))?
     }
 
     pub async fn sync_now(
@@ -1385,9 +1434,20 @@ impl<S: Storage> IrohNet<S> {
         let Some(incoming) = self.endpoint().accept().await else {
             return Ok(None);
         };
-        let connection = incoming.await.map_err(other)?;
+        let connection = tokio::time::timeout(self.runtime.connect_timeout, incoming)
+            .await
+            .map_err(|_| timed_out("iroh accept timed out"))?
+            .map_err(other)?;
+        if connection.alpn() != IROKLE_SYNC_ALPN {
+            connection.close(0u32.into(), b"unsupported protocol");
+            return Err(invalid_data("unsupported sync protocol"));
+        }
         let peer = connection.remote_id();
-        let (send, recv) = connection.accept_bi().await.map_err(other)?;
+        let (send, recv) =
+            tokio::time::timeout(self.runtime.sync_io_timeout, connection.accept_bi())
+                .await
+                .map_err(|_| timed_out("sync stream accept timed out"))?
+                .map_err(other)?;
         self.handle_stream(peer, recv, send).await?;
         Ok(Some(peer))
     }
@@ -1760,54 +1820,72 @@ async fn run_due_resyncs<S: Storage>(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     runtime: IrohRuntimeConfig,
 ) -> bool {
-    loop {
+    let Some(current) = net.upgrade() else {
+        return false;
+    };
+    if current.is_shutdown() || current.endpoint().is_closed() {
+        return false;
+    }
+    let due = current.resync_scheduler.due_targets_by_peer(
+        MAX_RESYNC_PEER_CONCURRENCY,
+        MAX_RESYNC_TARGETS_PER_PEER_PASS,
+    );
+    drop(current);
+    if due.is_empty() {
+        return true;
+    }
+
+    let mut syncs = tokio::task::JoinSet::new();
+    for (peer_id, targets) in due {
         let Some(current) = net.upgrade() else {
             return false;
         };
-        if current.is_shutdown() || current.endpoint().is_closed() {
+        if current.is_shutdown() {
             return false;
         }
-        let due = current.resync_scheduler.due_targets_by_peer(
-            MAX_RESYNC_PEER_CONCURRENCY,
-            MAX_RESYNC_TARGETS_PER_PEER_PASS,
-        );
-        drop(current);
-        if due.is_empty() {
-            return true;
-        }
-
-        let mut syncs = tokio::task::JoinSet::new();
-        for (peer_id, targets) in due {
-            let Some(current) = net.upgrade() else {
-                return false;
-            };
-            if current.is_shutdown() {
-                return false;
-            }
-            syncs.spawn(async move {
-                current
-                    .sync_peer_batch_with_runtime(peer_id, targets, runtime)
-                    .await;
-            });
-        }
-
-        while !syncs.is_empty() {
-            tokio::select! {
-                Some(result) = syncs.join_next() => {
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "resync batch task failed");
-                    }
+        syncs.spawn(async move {
+            let topics = targets
+                .iter()
+                .map(|target| target.key.topic_id)
+                .collect::<Vec<_>>();
+            if tokio::time::timeout(
+                runtime
+                    .connect_timeout
+                    .saturating_add(runtime.sync_io_timeout)
+                    .saturating_mul(4),
+                current.sync_peer_batch_with_runtime(peer_id, targets, runtime),
+            )
+            .await
+            .is_err()
+            {
+                let error = timed_out("peer sync batch timed out");
+                for topic_id in topics {
+                    let _ = current
+                        .node
+                        .record_sync_result(peer_id, topic_id, Err(&error));
+                    current.finish_resync_attempt(peer_id, topic_id, Err(&error), runtime);
                 }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        syncs.abort_all();
-                        while syncs.join_next().await.is_some() {}
-                        return false;
-                    }
+            }
+        });
+    }
+
+    while !syncs.is_empty() {
+        tokio::select! {
+            Some(result) = syncs.join_next() => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "resync batch task failed");
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    syncs.abort_all();
+                    while syncs.join_next().await.is_some() {}
+                    return false;
                 }
             }
         }
     }
+    true
 }
 
 fn next_full_sweep_deadline(interval: Duration, time_of_day: Duration) -> tokio::time::Instant {
@@ -1849,38 +1927,57 @@ async fn handle_connection<S: Storage>(
     peer: iroh::EndpointId,
     connection: iroh::endpoint::Connection,
 ) {
-    if let Some(current) = net.upgrade() {
-        current
-            .resync_scheduler
-            .peer_reachable(peer_id_from_endpoint_id(peer));
-    }
+    let Some(current) = net.upgrade() else {
+        return;
+    };
+    let idle_timeout = current.runtime.sync_io_timeout;
+    drop(current);
+    let mut tasks = tokio::task::JoinSet::new();
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
     loop {
-        let streams = tokio::select! {
+        tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
-                continue;
             }
-            streams = connection.accept_bi() => streams,
-        };
-        let (send, recv) = match streams {
-            Ok(streams) => streams,
-            Err(error) => {
-                tracing::debug!(%peer, %error, "iroh connection stopped accepting streams");
-                break;
+            _ = &mut idle, if tasks.is_empty() => break,
+            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Err(error) = result {
+                    tracing::warn!(%peer, %error, "iroh sync stream task failed");
+                }
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
             }
-        };
-        let Some(current) = net.upgrade() else {
-            break;
-        };
-        if current.is_shutdown() {
-            break;
-        }
-        if let Err(error) = current.handle_stream(peer, recv, send).await {
-            tracing::warn!(%peer, %error, "failed to handle iroh sync stream");
+            streams = connection.accept_bi(), if tasks.len() < 8 => {
+                let (send, recv) = match streams {
+                    Ok(streams) => streams,
+                    Err(error) => {
+                        tracing::debug!(%peer, %error, "iroh connection stopped accepting streams");
+                        break;
+                    }
+                };
+                let Some(current) = net.upgrade() else {
+                    break;
+                };
+                if current.is_shutdown() {
+                    break;
+                }
+                tasks.spawn(async move {
+                    if let Err(error) = current.handle_stream(peer, recv, send).await {
+                        tracing::warn!(%peer, %error, "failed to handle iroh sync stream");
+                    } else {
+                        current
+                            .resync_scheduler
+                            .peer_reachable(peer_id_from_endpoint_id(peer));
+                    }
+                });
+            }
         }
     }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    connection.close(0u32.into(), b"sync connection idle or closed");
 }
 
 impl<S: Storage> Drop for IrohNet<S> {
