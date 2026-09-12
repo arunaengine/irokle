@@ -52,6 +52,7 @@ const MAX_BOOTSTRAP_RECEIPTS: usize = 1024;
 const CONTROL_JOBS: usize = 4;
 /// Storage jobs running at once for admission and page planning.
 const BULK_JOBS: usize = 2;
+const NO_PROGRESS: &str = "sync exchange made no progress";
 
 /// Bounds of one sync stream. Tests scale them down; everything else uses the
 /// defaults.
@@ -2237,14 +2238,38 @@ impl<S: Storage> IrohNet<S> {
             .iter()
             .map(|planned| planned.topic_id)
             .collect::<BTreeSet<_>>();
+        let fail_group = |outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
+                          error: &io::Error| {
+            for topic_id in &group_topics {
+                outcomes.insert(*topic_id, Err(clone_error(error)));
+            }
+        };
         // Progress is measured toward each topic's captured goal only. Bytes
         // moved, repeated ids and unrelated local writes are not progress.
+        let measured = self
+            .run_job(Lane::Control, move |shared| {
+                group
+                    .into_iter()
+                    .map(|planned| {
+                        let before =
+                            shared.goal_progress(remote_peer_id, planned.topic_id, &planned.goal);
+                        (planned, before)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        let measured = match measured {
+            Ok(measured) => measured,
+            Err(error) => {
+                fail_group(outcomes, &error);
+                return;
+            }
+        };
         let mut goals = BTreeMap::new();
         let mut owed_acks = BTreeSet::new();
         let mut more = BTreeSet::new();
         let mut messages = Vec::new();
-        for planned in group {
-            let before = self.goal_progress(remote_peer_id, planned.topic_id, &planned.goal);
+        for (planned, before) in measured {
             match before {
                 Ok(before) => {
                     goals.insert(planned.topic_id, (planned.goal, before));
@@ -2262,12 +2287,6 @@ impl<S: Storage> IrohNet<S> {
             }
             messages.extend(planned.messages);
         }
-        let fail_group = |outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
-                          error: &io::Error| {
-            for topic_id in &group_topics {
-                outcomes.insert(*topic_id, Err(clone_error(error)));
-            }
-        };
         let responses = match self.sync_with(peer.clone(), &messages).await {
             Ok(responses) => responses,
             Err(error) => {
@@ -2276,8 +2295,262 @@ impl<S: Storage> IrohNet<S> {
             }
         };
 
+        let topics = group_topics.clone();
+        let replies = self
+            .run_job(Lane::Bulk, move |shared| {
+                shared.batch_replies(remote_peer_id, &topics, responses, owed_acks, more)
+            })
+            .await;
+        let BatchReplies {
+            acks,
+            followups,
+            outcomes: replied,
+            owed_acks,
+            more,
+            unexpected,
+        } = match replies {
+            Ok(replies) => replies,
+            Err(error) => {
+                fail_group(outcomes, &error);
+                return;
+            }
+        };
+        outcomes.extend(replied);
+        if let Some(error) = unexpected {
+            fail_group(outcomes, &error);
+            return;
+        }
+        let applied = self
+            .run_job(Lane::Control, move |shared| {
+                let results = shared.node.apply_sync_acks(&acks);
+                (acks, results)
+            })
+            .await;
+        match applied {
+            Ok((acks, results)) => {
+                for (ack, result) in acks.iter().zip(results) {
+                    if let Err(error) = result {
+                        outcomes.insert(ack.topic_id, Err(invalid_data(error)));
+                    }
+                }
+            }
+            Err(error) => fail_group(outcomes, &error),
+        }
+        for topic_id in owed_acks {
+            outcomes
+                .entry(topic_id)
+                .or_insert_with(|| Err(invalid_data("peer omitted sync acknowledgement")));
+        }
+        self.send_followups(peer, remote_peer_id, followups, outcomes)
+            .await;
+
+        let goals = goals
+            .into_iter()
+            .filter(|(topic_id, _)| !outcomes.contains_key(topic_id))
+            .collect::<Vec<_>>();
+        let goal_topics = goals
+            .iter()
+            .map(|(topic_id, _)| *topic_id)
+            .collect::<Vec<_>>();
+        let measured = self
+            .run_job(Lane::Control, move |shared| {
+                goals
+                    .into_iter()
+                    .map(|(topic_id, (goal, before))| {
+                        let after = shared.goal_progress(remote_peer_id, topic_id, &goal);
+                        (topic_id, goal, before, after)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        let measured = match measured {
+            Ok(measured) => measured,
+            Err(error) => {
+                for topic_id in goal_topics {
+                    outcomes.insert(topic_id, Err(clone_error(&error)));
+                }
+                return;
+            }
+        };
+        for (topic_id, goal, before, after) in measured {
+            let outcome = match after {
+                Ok(after) if after.reached(&goal) && !more.contains(&topic_id) => Ok(()),
+                // A page that moved toward the goal is served again at the fair
+                // tail of the queue; it is not a failed attempt.
+                Ok(after) if after.advanced_from(&before) => {
+                    advanced.insert(topic_id);
+                    Ok(())
+                }
+                Ok(_) => Err(invalid_data(NO_PROGRESS)),
+                Err(error) => Err(error),
+            };
+            outcomes.insert(topic_id, outcome);
+        }
+    }
+
+    /// Send acks for received pages and data for the peer's requests, one
+    /// stream per group, and apply the peer's acks for that data.
+    async fn send_followups(
+        &self,
+        peer: iroh::EndpointAddr,
+        remote_peer_id: PeerId,
+        followups: BTreeMap<crate::TopicId, Vec<SyncMessage>>,
+        outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
+    ) {
+        let topics = followups
+            .iter()
+            .filter(|(topic_id, replies)| {
+                !matches!(outcomes.get(topic_id), Some(Err(_))) && !replies.is_empty()
+            })
+            .map(|(topic_id, _)| *topic_id)
+            .collect::<Vec<_>>();
+        let failed = topics.clone();
+        let opens = self
+            .run_job(Lane::Control, move |shared| {
+                topics
+                    .into_iter()
+                    .map(|topic_id| (topic_id, shared.node.sync_open(topic_id)))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .await;
+        let mut opens = match opens {
+            Ok(opens) => opens,
+            Err(error) => {
+                for topic_id in failed {
+                    outcomes.insert(topic_id, Err(clone_error(&error)));
+                }
+                return;
+            }
+        };
+        let mut groups: Vec<(BTreeSet<crate::TopicId>, Vec<SyncMessage>)> = Vec::new();
+        let mut current_topics = BTreeSet::new();
+        let mut current_messages: Vec<SyncMessage> = Vec::new();
+        for (topic_id, replies) in followups {
+            let Some(open) = opens.remove(&topic_id) else {
+                continue;
+            };
+            let carries_data = |messages: &[SyncMessage]| {
+                messages
+                    .iter()
+                    .any(|message| matches!(message, SyncMessage::Data(_)))
+            };
+            if !current_messages.is_empty()
+                && (current_messages.len() + replies.len() + 1 > self.limits.batch_messages
+                    || carries_data(&replies)
+                    || carries_data(&current_messages))
+            {
+                groups.push((
+                    std::mem::take(&mut current_topics),
+                    std::mem::take(&mut current_messages),
+                ));
+            }
+            current_messages.push(SyncMessage::Open(open));
+            current_messages.extend(replies);
+            current_topics.insert(topic_id);
+        }
+        if !current_messages.is_empty() {
+            groups.push((current_topics, current_messages));
+        }
+        for (topics, messages) in groups {
+            let mut summaries = topics.clone();
+            let mut owed_acks = messages
+                .iter()
+                .filter_map(|message| match message {
+                    SyncMessage::Data(data) => Some(data.topic_id),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let mut acks = Vec::new();
+            match self.sync_with(peer.clone(), &messages).await {
+                Ok(responses) => {
+                    for response in responses {
+                        match response {
+                            SyncMessage::Summary(summary) if topics.contains(&summary.topic_id) => {
+                                summaries.remove(&summary.topic_id);
+                            }
+                            SyncMessage::Ack(ack) if topics.contains(&ack.topic_id) => {
+                                if ack.peer_id != remote_peer_id {
+                                    outcomes.insert(
+                                        ack.topic_id,
+                                        Err(invalid_data("sync ack does not match remote peer")),
+                                    );
+                                    continue;
+                                }
+                                owed_acks.remove(&ack.topic_id);
+                                acks.push(ack);
+                            }
+                            SyncMessage::Failure(failure) if topics.contains(&failure.topic_id) => {
+                                outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
+                            }
+                            other => {
+                                let error = invalid_data(format!(
+                                    "unexpected sync ack response {}",
+                                    _message_type_name(&other)
+                                ));
+                                for topic_id in &topics {
+                                    outcomes.insert(*topic_id, Err(clone_error(&error)));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    for topic_id in &topics {
+                        outcomes.insert(*topic_id, Err(clone_error(&error)));
+                    }
+                }
+            }
+            if !acks.is_empty() {
+                let applied = self
+                    .run_job(Lane::Control, move |shared| {
+                        let results = shared.node.apply_sync_acks(&acks);
+                        (acks, results)
+                    })
+                    .await;
+                match applied {
+                    Ok((acks, results)) => {
+                        for (ack, result) in acks.iter().zip(results) {
+                            if let Err(error) = result {
+                                outcomes.insert(ack.topic_id, Err(invalid_data(error)));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        for topic_id in &topics {
+                            outcomes.insert(*topic_id, Err(clone_error(&error)));
+                        }
+                    }
+                }
+            }
+            for topic_id in summaries {
+                outcomes.entry(topic_id).or_insert_with(|| {
+                    Err(invalid_data("peer omitted sync acknowledgement summary"))
+                });
+            }
+            for topic_id in owed_acks {
+                outcomes
+                    .entry(topic_id)
+                    .or_insert_with(|| Err(invalid_data("peer omitted sync acknowledgement")));
+            }
+        }
+    }
+}
+
+impl<S: Storage> SharedNet<S> {
+    /// Fold the responses of one batch stream: admit received data, serve
+    /// requested pages and collect acks, per topic.
+    fn batch_replies(
+        &self,
+        remote_peer_id: PeerId,
+        group_topics: &BTreeSet<crate::TopicId>,
+        responses: Vec<SyncMessage>,
+        mut owed_acks: BTreeSet<crate::TopicId>,
+        mut more: BTreeSet<crate::TopicId>,
+    ) -> BatchReplies {
         let mut acks = Vec::new();
         let mut followups: BTreeMap<crate::TopicId, Vec<SyncMessage>> = BTreeMap::new();
+        let mut outcomes = BTreeMap::new();
         for response in responses {
             match response {
                 SyncMessage::Ack(ack) if group_topics.contains(&ack.topic_id) => {
@@ -2365,151 +2638,27 @@ impl<S: Storage> IrohNet<S> {
                         "unexpected sync response {}",
                         _message_type_name(&other)
                     ));
-                    fail_group(outcomes, &error);
-                    return;
+                    return BatchReplies {
+                        acks,
+                        followups,
+                        outcomes,
+                        owed_acks,
+                        more,
+                        unexpected: Some(error),
+                    };
                 }
             }
         }
-        let ack_results = self.node.apply_sync_acks(&acks);
-        for (ack, result) in acks.iter().zip(ack_results) {
-            if let Err(error) = result {
-                outcomes.insert(ack.topic_id, Err(invalid_data(error)));
-            }
-        }
-        for topic_id in owed_acks {
-            outcomes
-                .entry(topic_id)
-                .or_insert_with(|| Err(invalid_data("peer omitted sync acknowledgement")));
-        }
-        self.send_followups(peer, remote_peer_id, followups, outcomes)
-            .await;
-
-        for (topic_id, (goal, before)) in goals {
-            if outcomes.contains_key(&topic_id) {
-                continue;
-            }
-            let outcome = match self.goal_progress(remote_peer_id, topic_id, &goal) {
-                Ok(after) if after.reached(&goal) && !more.contains(&topic_id) => Ok(()),
-                // A page that moved toward the goal is served again at the fair
-                // tail of the queue; it is not a failed attempt.
-                Ok(after) if after.advanced_from(&before) => {
-                    advanced.insert(topic_id);
-                    Ok(())
-                }
-                Ok(_) => Err(invalid_data("sync exchange made no progress")),
-                Err(error) => Err(error),
-            };
-            outcomes.insert(topic_id, outcome);
+        BatchReplies {
+            acks,
+            followups,
+            outcomes,
+            owed_acks,
+            more,
+            unexpected: None,
         }
     }
 
-    /// Send acks for received pages and data for the peer's requests, one
-    /// stream per group, and apply the peer's acks for that data.
-    async fn send_followups(
-        &self,
-        peer: iroh::EndpointAddr,
-        remote_peer_id: PeerId,
-        followups: BTreeMap<crate::TopicId, Vec<SyncMessage>>,
-        outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
-    ) {
-        let mut groups: Vec<(BTreeSet<crate::TopicId>, Vec<SyncMessage>)> = Vec::new();
-        let mut current_topics = BTreeSet::new();
-        let mut current_messages: Vec<SyncMessage> = Vec::new();
-        for (topic_id, replies) in followups {
-            if matches!(outcomes.get(&topic_id), Some(Err(_))) || replies.is_empty() {
-                continue;
-            }
-            let carries_data = |messages: &[SyncMessage]| {
-                messages
-                    .iter()
-                    .any(|message| matches!(message, SyncMessage::Data(_)))
-            };
-            if !current_messages.is_empty()
-                && (current_messages.len() + replies.len() + 1 > self.limits.batch_messages
-                    || carries_data(&replies)
-                    || carries_data(&current_messages))
-            {
-                groups.push((
-                    std::mem::take(&mut current_topics),
-                    std::mem::take(&mut current_messages),
-                ));
-            }
-            current_messages.push(SyncMessage::Open(self.node.sync_open(topic_id)));
-            current_messages.extend(replies);
-            current_topics.insert(topic_id);
-        }
-        if !current_messages.is_empty() {
-            groups.push((current_topics, current_messages));
-        }
-        for (topics, messages) in groups {
-            let mut summaries = topics.clone();
-            let mut owed_acks = messages
-                .iter()
-                .filter_map(|message| match message {
-                    SyncMessage::Data(data) => Some(data.topic_id),
-                    _ => None,
-                })
-                .collect::<BTreeSet<_>>();
-            match self.sync_with(peer.clone(), &messages).await {
-                Ok(responses) => {
-                    for response in responses {
-                        match response {
-                            SyncMessage::Summary(summary) if topics.contains(&summary.topic_id) => {
-                                summaries.remove(&summary.topic_id);
-                            }
-                            SyncMessage::Ack(ack) if topics.contains(&ack.topic_id) => {
-                                if ack.peer_id != remote_peer_id {
-                                    outcomes.insert(
-                                        ack.topic_id,
-                                        Err(invalid_data("sync ack does not match remote peer")),
-                                    );
-                                    continue;
-                                }
-                                owed_acks.remove(&ack.topic_id);
-                                for result in self.node.apply_sync_acks(std::slice::from_ref(&ack))
-                                {
-                                    if let Err(error) = result {
-                                        outcomes.insert(ack.topic_id, Err(invalid_data(error)));
-                                    }
-                                }
-                            }
-                            SyncMessage::Failure(failure) if topics.contains(&failure.topic_id) => {
-                                outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
-                            }
-                            other => {
-                                let error = invalid_data(format!(
-                                    "unexpected sync ack response {}",
-                                    _message_type_name(&other)
-                                ));
-                                for topic_id in &topics {
-                                    outcomes.insert(*topic_id, Err(clone_error(&error)));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    for topic_id in &topics {
-                        outcomes.insert(*topic_id, Err(clone_error(&error)));
-                    }
-                }
-            }
-            for topic_id in summaries {
-                outcomes.entry(topic_id).or_insert_with(|| {
-                    Err(invalid_data("peer omitted sync acknowledgement summary"))
-                });
-            }
-            for topic_id in owed_acks {
-                outcomes
-                    .entry(topic_id)
-                    .or_insert_with(|| Err(invalid_data("peer omitted sync acknowledgement")));
-            }
-        }
-    }
-}
-
-impl<S: Storage> SharedNet<S> {
     /// Publishes every decided outcome this batch has not published yet:
     /// records it and releases the claim the batch owns for it. Called between
     /// exchanges, so ownership of finished work is handed back immediately.
@@ -2926,6 +3075,17 @@ impl BatchOutcomes {
             settled,
         }
     }
+}
+
+/// What the responses to one batch stream settled.
+struct BatchReplies {
+    acks: Vec<crate::sync::SyncAck>,
+    followups: BTreeMap<crate::TopicId, Vec<SyncMessage>>,
+    outcomes: BTreeMap<crate::TopicId, io::Result<()>>,
+    owed_acks: BTreeSet<crate::TopicId>,
+    more: BTreeSet<crate::TopicId>,
+    /// A response outside the protocol, which fails the whole group.
+    unexpected: Option<io::Error>,
 }
 
 struct PlannedTopicSync {
