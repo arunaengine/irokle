@@ -697,11 +697,14 @@ fn ack_needs_closure() {
     .unwrap();
     source
         .storage()
-        .put_sync_obligation(crate::storage::SyncObligation::clock(
-            holder.peer_id(),
-            topic_id,
-            source.storage().actor_clock(&topic_id).unwrap(),
-        ))
+        .put_sync_obligation(
+            crate::storage::SyncObligation::clock(
+                holder.peer_id(),
+                topic_id,
+                source.storage().actor_clock(&topic_id).unwrap(),
+            ),
+            genesis_of(source.storage(), &topic_id),
+        )
         .unwrap();
 
     let (damaged_ack, _) = holder
@@ -1058,11 +1061,10 @@ fn fjall_migrates_legacy() {
 
     // Work owed to that peer stays outstanding until it acknowledges again.
     storage
-        .put_sync_obligation(crate_storage::SyncObligation::repair(
-            peer,
-            topic_id,
-            [op_id].into(),
-        ))
+        .put_sync_obligation(
+            crate_storage::SyncObligation::repair(peer, topic_id, [op_id].into()),
+            genesis_of(&storage, &topic_id),
+        )
         .unwrap();
     assert_eq!(storage.sync_obligations(&peer, &topic_id).unwrap().len(), 1);
 

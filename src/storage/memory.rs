@@ -13,9 +13,10 @@ use super::{
     MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
     MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, ObligationTarget, OpMeta, PeerAck, Storage,
     SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit,
-    ack_covers, ack_reached_op, apply_status_update, ensure_deps_resolvable, journalled_eviction,
-    merged_obligation, merged_peer_ack, new_peer_status, pending_op_bytes, settled_obligation,
-    stored_ack_dominates, topic_fingerprint_for, validate_batch, validate_heads,
+    ack_covers, ack_reached_op, apply_status_update, branch_matches, ensure_deps_resolvable,
+    journalled_eviction, merged_obligation, merged_peer_ack, new_peer_status, peer_departed,
+    pending_op_bytes, settled_obligation, stored_ack_dominates, topic_fingerprint_for,
+    validate_batch, validate_heads,
 };
 
 #[derive(Clone, Default)]
@@ -467,8 +468,13 @@ impl Storage for MemoryStorage {
             .cloned()
             .collect())
     }
-    fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()> {
+    fn put_sync_obligation(
+        &self,
+        obligation: SyncObligation,
+        expected_genesis: Option<OpId>,
+    ) -> Result<()> {
         let mut inner = self.lock()?;
+        branch_matches(inner.topics.get(&obligation.topic_id), expected_genesis)?;
         let merged = merged_obligation_locked(&inner, &obligation)?;
         put_obligation_locked(&mut inner, merged);
         Ok(())
@@ -556,8 +562,16 @@ impl Storage for MemoryStorage {
         Ok(counts)
     }
 
-    fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize> {
+    fn clear_peer_sync_state(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+        expected_genesis: Option<OpId>,
+    ) -> Result<usize> {
         let mut inner = self.lock()?;
+        if !peer_departed(inner.topics.get(topic_id), peer_id, expected_genesis) {
+            return Ok(0);
+        }
         let cleared = inner
             .obligations
             .remove(&(*peer_id, *topic_id))

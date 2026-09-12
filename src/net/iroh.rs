@@ -1437,25 +1437,17 @@ impl<S: Storage> IrohNet<S> {
         {
             return Ok(());
         }
-        let stale = match self
+        // Storage repeats the branch and membership check in its transaction.
+        let genesis = self
             .node
             .storage()
             .topic_state(&topic_id)
             .map_err(invalid_data)?
-        {
-            Some(state) => {
-                !state.members.contains(&peer_id)
-                    || (!state.members.contains(&self.node.peer_id())
-                        && self.local_leave_op(&state)?.is_none())
-            }
-            None => true,
-        };
-        if stale {
-            self.node
-                .storage()
-                .clear_peer_sync_state(&peer_id, &topic_id)
-                .map_err(invalid_data)?;
-        }
+            .map(|state| state.genesis);
+        self.node
+            .storage()
+            .clear_peer_sync_state(&peer_id, &topic_id, genesis)
+            .map_err(invalid_data)?;
         Ok(())
     }
 

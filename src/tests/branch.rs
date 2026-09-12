@@ -58,7 +58,11 @@ fn branches(seed: u8) -> Branches {
 
 /// Replace the old branch in `storage` with the new one.
 fn reset_to_new<S: Storage>(storage: &S, branches: &Branches) {
-    let admitted = Oplog::with_storage(storage.clone())
+    let log = Oplog::with_storage(storage.clone());
+    if storage.topic_state(&branches.topic_id).unwrap().is_none() {
+        log.receive_ops(vec![branches.old.0.clone()]).unwrap();
+    }
+    let admitted = log
         .receive_ops_from_peer_evicting(
             Some(branches.author.peer_id()),
             vec![branches.new.0.clone(), branches.new.1.clone()],
@@ -296,4 +300,107 @@ fn memory_epoch_tracks_resets() {
 fn fjall_epoch_tracks_resets() {
     let dir = tempfile::tempdir().unwrap();
     assert_epoch_tracks_resets(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// Obligation ids resolved against one branch must not be written once a reset
+/// replaced it: the write is conditioned on the genesis the ids were read from.
+#[test]
+fn obligation_keeps_branch() {
+    let branches = branches(190);
+    let topic_id = branches.topic_id;
+    let third = branches.third.peer_id();
+    let old_event = branches.old.1.id;
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let log = Oplog::with_storage(storage.clone());
+    log.receive_ops_from_peer(
+        Some(branches.author.peer_id()),
+        vec![branches.old.0.clone(), branches.old.1.clone()],
+    )
+    .unwrap();
+    let sync = SyncEngine::new(log, branches.member.peer_id());
+
+    let gate = Arc::new(Gate::default());
+    let _release = gate.releaser();
+    storage.arm_read(GatePoint::Meta(old_event), Arc::clone(&gate));
+    let writing = thread::spawn({
+        let gate = Arc::clone(&gate);
+        move || {
+            let written = sync.put_obligation(third, topic_id, [old_event].into());
+            gate.skip();
+            written
+        }
+    });
+    gate.wait_arrival();
+    storage.disarm_read();
+    reset_to_new(&storage, &branches);
+    gate.release();
+    assert!(matches!(
+        writing.join().unwrap(),
+        Err(Error::StaleIncarnation)
+    ));
+    assert!(
+        storage
+            .sync_obligations(&third, &topic_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Sync state is dropped only for a peer that is still absent from the branch
+/// the caller judged, never for a member of a replacement branch.
+fn assert_clear_keeps_branch<S: Storage>(storage: S) {
+    let branches = branches(200);
+    let topic_id = branches.topic_id;
+    let third = branches.third.peer_id();
+    let outsider = Ed25519Signer::from_bytes(&[209; 32]).peer_id();
+    reset_to_new(&storage, &branches);
+    let genesis = Some(branches.new.0.id);
+    let clock = storage.actor_clock(&topic_id).unwrap();
+    for peer in [third, outsider] {
+        storage
+            .put_sync_obligation(
+                crate::storage::SyncObligation::clock(peer, topic_id, clock.clone()),
+                genesis,
+            )
+            .unwrap();
+    }
+    let stale = Some(branches.old.0.id);
+    assert_eq!(
+        storage
+            .clear_peer_sync_state(&outsider, &topic_id, stale)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        storage
+            .clear_peer_sync_state(&third, &topic_id, genesis)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        storage
+            .clear_peer_sync_state(&outsider, &topic_id, genesis)
+            .unwrap(),
+        1
+    );
+    assert!(storage.has_sync_obligations(&third, &topic_id).unwrap());
+    assert!(matches!(
+        storage.put_sync_obligation(
+            crate::storage::SyncObligation::clock(third, topic_id, clock),
+            stale,
+        ),
+        Err(Error::StaleIncarnation)
+    ));
+}
+
+#[test]
+fn memory_clear_keeps_branch() {
+    assert_clear_keeps_branch(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_clear_keeps_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_clear_keeps_branch(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }

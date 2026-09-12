@@ -826,6 +826,12 @@ impl<S: Storage> SyncEngine<S> {
         if op_ids.is_empty() {
             return Ok(());
         }
+        // Ids are resolved against this branch, so the writes are conditioned on it.
+        let genesis = self
+            .oplog
+            .storage()
+            .topic_state(&topic_id)?
+            .map(|state| state.genesis);
         let mut resolved = BTreeSet::new();
         let mut unresolved = BTreeSet::new();
         let mut target_clock = ActorClock::new();
@@ -840,16 +846,18 @@ impl<S: Storage> SyncEngine<S> {
             }
         }
         if !resolved.is_empty() {
-            self.oplog
-                .storage()
-                .put_sync_obligation(SyncObligation::clock(peer_id, topic_id, target_clock))?;
+            self.oplog.storage().put_sync_obligation(
+                SyncObligation::clock(peer_id, topic_id, target_clock),
+                genesis,
+            )?;
         }
         // An id with no trustworthy actor position becomes an explicit repair
         // want, so the positions that did resolve still coalesce by clock.
         if !unresolved.is_empty() {
-            self.oplog
-                .storage()
-                .put_sync_obligation(SyncObligation::repair(peer_id, topic_id, unresolved))?;
+            self.oplog.storage().put_sync_obligation(
+                SyncObligation::repair(peer_id, topic_id, unresolved),
+                genesis,
+            )?;
         }
         Ok(())
     }

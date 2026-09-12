@@ -273,7 +273,14 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>>;
-    fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()>;
+    /// Merge `obligation` into the stored record of its kind, conditioned in
+    /// the writing transaction on the topic's genesis still being
+    /// `expected_genesis` (`None`: no topic); otherwise [`crate::Error::StaleIncarnation`].
+    fn put_sync_obligation(
+        &self,
+        obligation: SyncObligation,
+        expected_genesis: Option<OpId>,
+    ) -> Result<()>;
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>>;
     /// Atomically persist `ack` and clear any obligations satisfied by it.
     /// Backends must perform both writes in one durable operation so a crash
@@ -323,9 +330,15 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// this instead of every stored obligation; a record count is a count of
     /// outstanding targets, not of missing operations.
     fn topic_obligation_counts(&self, topic_id: &TopicId) -> Result<BTreeMap<PeerId, usize>>;
-    /// Drop obligations, sync status, and the stored ack for a peer that left
-    /// a topic. Returns the number of cleared obligations.
-    fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize>;
+    /// Drop obligations, sync status and the ack of a peer that left the topic,
+    /// only if the genesis is still `expected_genesis` and the peer is not a
+    /// member, checked in the writing transaction. Returns cleared obligations.
+    fn clear_peer_sync_state(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+        expected_genesis: Option<OpId>,
+    ) -> Result<usize>;
 
     /// Atomically remove every local record for `topic_id`: topic/genesis
     /// registration, all ops and their metadata, actor indexes/tips, heads,
@@ -475,6 +488,25 @@ pub(crate) fn topic_fingerprint_for(
     clock: &ActorClock,
 ) -> Result<[u8; 32]> {
     Ok(*blake3::hash(&canonical_bytes(&(heads, clock))?).as_bytes())
+}
+
+/// Whether a write expecting `expected` may proceed against topic `state`.
+pub(super) fn branch_matches(state: Option<&TopicState>, expected: Option<OpId>) -> Result<()> {
+    if state.map(|state| state.genesis) == expected {
+        Ok(())
+    } else {
+        Err(crate::Error::StaleIncarnation)
+    }
+}
+
+/// Whether sync state of `peer_id` may be dropped from topic `state`.
+pub(super) fn peer_departed(
+    state: Option<&TopicState>,
+    peer_id: &PeerId,
+    expected: Option<OpId>,
+) -> bool {
+    branch_matches(state, expected).is_ok()
+        && state.is_none_or(|state| !state.members.contains(peer_id))
 }
 
 /// Whether stored evidence certified for `genesis` already covers an ordinary

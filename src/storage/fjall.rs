@@ -15,9 +15,10 @@ use super::{
     MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
     MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, ObligationTarget, OpMeta, PeerAck, Storage,
     SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit,
-    ack_covers, ack_reached_op, apply_status_update, ensure_deps_resolvable, journalled_eviction,
-    merged_obligation, merged_peer_ack, new_peer_status, pending_op_bytes, settled_obligation,
-    stored_ack_dominates, topic_fingerprint_for, validate_batch, validate_heads,
+    ack_covers, ack_reached_op, apply_status_update, branch_matches, ensure_deps_resolvable,
+    journalled_eviction, merged_obligation, merged_peer_ack, new_peer_status, peer_departed,
+    pending_op_bytes, settled_obligation, stored_ack_dominates, topic_fingerprint_for,
+    validate_batch, validate_heads,
 };
 
 #[cfg(feature = "fjall")]
@@ -1522,8 +1523,17 @@ impl Storage for FjallStorage {
         }
         Ok(out)
     }
-    fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()> {
-        self.transaction(|tx| Self::tx_put_obligation(tx, &self.records, &obligation))
+    fn put_sync_obligation(
+        &self,
+        obligation: SyncObligation,
+        expected_genesis: Option<OpId>,
+    ) -> Result<()> {
+        self.transaction(|tx| {
+            let state: Option<TopicState> =
+                Self::tx_get(tx, &self.records, Self::key_id(b"ts", &obligation.topic_id))?;
+            branch_matches(state.as_ref(), expected_genesis)?;
+            Self::tx_put_obligation(tx, &self.records, &obligation)
+        })
     }
 
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>> {
@@ -1635,8 +1645,18 @@ impl Storage for FjallStorage {
         Ok(counts)
     }
 
-    fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize> {
+    fn clear_peer_sync_state(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+        expected_genesis: Option<OpId>,
+    ) -> Result<usize> {
         self.transaction(|tx| {
+            let state: Option<TopicState> =
+                Self::tx_get(tx, &self.records, Self::key_id(b"ts", topic_id))?;
+            if !peer_departed(state.as_ref(), peer_id, expected_genesis) {
+                return Ok(0);
+            }
             let cleared = Self::tx_remove_prefix(
                 tx,
                 &self.records,
@@ -1718,7 +1738,9 @@ mod tests {
             TopicId::hash(b"collision-topic"),
             [OpId::hash(b"collision-op")].into(),
         );
-        storage.put_sync_obligation(obligation.clone()).unwrap();
+        storage
+            .put_sync_obligation(obligation.clone(), None)
+            .unwrap();
 
         assert_eq!(
             storage.all_sync_obligations().unwrap(),

@@ -389,8 +389,12 @@ impl Storage for StaleReadStorage {
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<crate::storage::PeerAck>, Error> {
         self.inner.peer_acks(topic_id)
     }
-    fn put_sync_obligation(&self, obligation: crate::storage::SyncObligation) -> Result<(), Error> {
-        self.inner.put_sync_obligation(obligation)
+    fn put_sync_obligation(
+        &self,
+        obligation: crate::storage::SyncObligation,
+        expected_genesis: Option<OpId>,
+    ) -> Result<(), Error> {
+        self.inner.put_sync_obligation(obligation, expected_genesis)
     }
     fn all_sync_obligations(&self) -> Result<Vec<crate::storage::SyncObligation>, Error> {
         self.inner.all_sync_obligations()
@@ -435,8 +439,14 @@ impl Storage for StaleReadStorage {
     ) -> Result<Vec<crate::storage::SyncPeerStatus>, Error> {
         self.inner.sync_statuses(topic_id)
     }
-    fn clear_peer_sync_state(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize, Error> {
-        self.inner.clear_peer_sync_state(peer_id, topic_id)
+    fn clear_peer_sync_state(
+        &self,
+        peer_id: &PeerId,
+        topic_id: &TopicId,
+        expected_genesis: Option<OpId>,
+    ) -> Result<usize, Error> {
+        self.inner
+            .clear_peer_sync_state(peer_id, topic_id, expected_genesis)
     }
     fn reset_topic(&self, topic_id: &TopicId) -> Result<usize, Error> {
         self.inner.reset_topic(topic_id)
