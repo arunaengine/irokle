@@ -1270,7 +1270,7 @@ impl<S: Storage> IrohNet<S> {
         // I/O error merely because another page is needed.
         let mut result = Ok(());
         for _ in 0..MAX_SYNC_NOW_PAGES {
-            let mut outcomes = self.run_topic_batch(peer.clone(), &[topic_id]).await;
+            let mut outcomes = self.run_topic_batch(peer.clone(), &[topic_id], None).await;
             result = outcomes.results.remove(&topic_id).unwrap_or(Ok(()));
             if result.is_err() || !outcomes.advanced.contains(&topic_id) {
                 break;
@@ -1400,33 +1400,28 @@ impl<S: Storage> IrohNet<S> {
     ) {
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
         let endpoint_id = peer.id;
-        let outcomes = self.run_topic_batch(peer, topic_ids).await;
-        let advanced = outcomes.advanced;
+        let outcomes = self
+            .run_topic_batch(peer, topic_ids, Some((lease, runtime)))
+            .await;
         let mut failures = 0_usize;
         let mut first_error = None;
-        for (topic_id, outcome) in outcomes.results {
-            let record_result = match &outcome {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    failures += 1;
-                    if first_error.is_none() {
-                        first_error = Some(clone_error(error));
-                    }
-                    Err(error)
+        for (topic_id, outcome) in &outcomes.results {
+            if let Err(error) = outcome {
+                failures += 1;
+                if first_error.is_none() {
+                    first_error = Some(clone_error(error));
                 }
-            };
-            let _ = self
-                .node
-                .record_sync_result(remote_peer_id, topic_id, record_result);
-            if let Some(claim) = lease.take_claim(&ResyncTargetKey {
-                peer_id: remote_peer_id,
-                topic_id,
-            }) {
-                self.finish_resync_attempt(
-                    claim,
-                    record_result,
+            }
+            // Outcomes decided before any exchange ran, such as a planning
+            // failure, are the only ones left to publish here.
+            if !outcomes.settled.contains(topic_id) {
+                self.publish_topic_result(
+                    remote_peer_id,
+                    *topic_id,
+                    outcome,
+                    outcomes.advanced.contains(topic_id),
+                    lease,
                     runtime,
-                    advanced.contains(&topic_id),
                 );
             }
         }
@@ -1450,10 +1445,12 @@ impl<S: Storage> IrohNet<S> {
         &self,
         peer: iroh::EndpointAddr,
         topic_ids: &[crate::TopicId],
+        mut settle: Option<(&mut ResyncLease, IrohRuntimeConfig)>,
     ) -> BatchOutcomes {
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
         let mut outcomes = BTreeMap::new();
         let mut advanced = BTreeSet::new();
+        let mut settled = BTreeSet::new();
 
         let mut fingerprints = BTreeMap::new();
         let mut request = Vec::with_capacity(topic_ids.len() * 2);
@@ -1470,7 +1467,7 @@ impl<S: Storage> IrohNet<S> {
             }
         }
         if fingerprints.is_empty() {
-            return BatchOutcomes::new(outcomes, advanced);
+            return BatchOutcomes::new(outcomes, advanced, settled);
         }
         let responses = match self.sync_with(peer.clone(), &request).await {
             Ok(responses) => responses,
@@ -1478,7 +1475,7 @@ impl<S: Storage> IrohNet<S> {
                 for topic_id in fingerprints.keys() {
                     outcomes.insert(*topic_id, Err(clone_error(&error)));
                 }
-                return BatchOutcomes::new(outcomes, advanced);
+                return BatchOutcomes::new(outcomes, advanced, settled);
             }
         };
 
@@ -1516,7 +1513,7 @@ impl<S: Storage> IrohNet<S> {
                             .entry(*topic_id)
                             .or_insert_with(|| Err(clone_error(&error)));
                     }
-                    return BatchOutcomes::new(outcomes, advanced);
+                    return BatchOutcomes::new(outcomes, advanced, settled);
                 }
             }
         }
@@ -1602,6 +1599,19 @@ impl<S: Storage> IrohNet<S> {
                     &mut advanced,
                 )
                 .await;
+                // Each topic's durable outcome is published before the next
+                // exchange awaits, so a later failure or the batch deadline
+                // cannot re-run work this batch already finished.
+                if let Some((lease, runtime)) = settle.as_mut() {
+                    self.settle_known_results(
+                        remote_peer_id,
+                        &outcomes,
+                        &advanced,
+                        &mut settled,
+                        lease,
+                        *runtime,
+                    );
+                }
                 group_messages = 0;
                 group_responses = 0;
                 group_bytes = 0;
@@ -1621,7 +1631,17 @@ impl<S: Storage> IrohNet<S> {
             )
             .await;
         }
-        BatchOutcomes::new(outcomes, advanced)
+        if let Some((lease, runtime)) = settle.as_mut() {
+            self.settle_known_results(
+                remote_peer_id,
+                &outcomes,
+                &advanced,
+                &mut settled,
+                lease,
+                *runtime,
+            );
+        }
+        BatchOutcomes::new(outcomes, advanced, settled)
     }
 
     fn plan_topic_messages(
@@ -1998,6 +2018,56 @@ impl<S: Storage> IrohNet<S> {
         }
     }
 
+    /// Publishes every decided outcome this batch has not published yet:
+    /// records it and releases the claim the batch owns for it. Called between
+    /// exchanges, so ownership of finished work is handed back immediately.
+    fn settle_known_results(
+        &self,
+        remote_peer_id: PeerId,
+        outcomes: &BTreeMap<crate::TopicId, io::Result<()>>,
+        advanced: &BTreeSet<crate::TopicId>,
+        settled: &mut BTreeSet<crate::TopicId>,
+        lease: &mut ResyncLease,
+        runtime: IrohRuntimeConfig,
+    ) {
+        for (topic_id, outcome) in outcomes {
+            if !settled.insert(*topic_id) {
+                continue;
+            }
+            self.publish_topic_result(
+                remote_peer_id,
+                *topic_id,
+                outcome,
+                advanced.contains(topic_id),
+                lease,
+                runtime,
+            );
+        }
+    }
+
+    /// Records one topic's attempt and completes the claim this batch holds for
+    /// it, if any.
+    fn publish_topic_result(
+        &self,
+        remote_peer_id: PeerId,
+        topic_id: crate::TopicId,
+        outcome: &io::Result<()>,
+        advanced: bool,
+        lease: &mut ResyncLease,
+        runtime: IrohRuntimeConfig,
+    ) {
+        let record_result = outcome.as_ref().copied();
+        let _ = self
+            .node
+            .record_sync_result(remote_peer_id, topic_id, record_result);
+        if let Some(claim) = lease.take_claim(&ResyncTargetKey {
+            peer_id: remote_peer_id,
+            topic_id,
+        }) {
+            self.finish_resync_attempt(claim, record_result, runtime, advanced);
+        }
+    }
+
     /// Durable state a topic exchange can be judged against: the local clock,
     /// whether the topic is whole, and whether work is still owed to this peer.
     /// A change in any of these is real progress; an unchanged mark is not.
@@ -2292,14 +2362,22 @@ fn per_topic_failure_scope(message: &SyncMessage) -> Option<crate::sync::SyncFai
 struct BatchOutcomes {
     results: BTreeMap<crate::TopicId, io::Result<()>>,
     advanced: BTreeSet<crate::TopicId>,
+    /// Topics already recorded and released during the batch, so the caller
+    /// does not publish them a second time.
+    settled: BTreeSet<crate::TopicId>,
 }
 
 impl BatchOutcomes {
     fn new(
         results: BTreeMap<crate::TopicId, io::Result<()>>,
         advanced: BTreeSet<crate::TopicId>,
+        settled: BTreeSet<crate::TopicId>,
     ) -> Self {
-        Self { results, advanced }
+        Self {
+            results,
+            advanced,
+            settled,
+        }
     }
 }
 
@@ -2903,6 +2981,51 @@ mod tests {
         let targets = due.remove(0).1;
         assert_eq!(targets.len(), 1);
         targets[0]
+    }
+
+    /// A topic settled during a batch leaves the lease, so the batch deadline
+    /// recovers only the claims still unfinished. A completed topic keeps its
+    /// one terminal result instead of being reinserted as a forced retry.
+    #[test]
+    fn timeout_spares_settled() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(31), topic(32), false);
+        scheduler.schedule_now(peer(31), topic(33), false);
+        let mut due = scheduler.due_targets_by_peer(8, 8);
+        assert_eq!(due.len(), 1);
+        let claims = due.remove(0).1;
+        assert_eq!(claims.len(), 2);
+        let mut lease = scheduler.lease(claims, BACKOFF);
+
+        // The first topic finishes cleanly inside the batch.
+        let done = lease
+            .take_claim(&ResyncTargetKey {
+                peer_id: peer(31),
+                topic_id: topic(32),
+            })
+            .expect("first claim");
+        scheduler.complete_clean(done);
+        assert!(
+            scheduler.target_state(peer(31), topic(32)).is_none(),
+            "a clean completion removes the target"
+        );
+
+        // The deadline then expires while the second topic is still in flight.
+        let timed_out_claims = lease.drain_claims();
+        assert_eq!(
+            timed_out_claims.len(),
+            1,
+            "only unfinished work is recovered"
+        );
+        assert_eq!(timed_out_claims[0].key.topic_id, topic(33));
+        scheduler.complete_failed(timed_out_claims[0], BACKOFF, Duration::from_secs(600));
+        assert!(
+            scheduler.target_state(peer(31), topic(32)).is_none(),
+            "the settled topic must not be reinserted by the timeout"
+        );
+        let (_, failures, force) = scheduler.target_state(peer(31), topic(33)).unwrap();
+        assert_eq!(failures, 1);
+        assert!(force.is_some(), "the unfinished topic retries");
     }
 
     /// A bounded page that really advanced is served again after a short turn.
