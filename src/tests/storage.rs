@@ -1416,6 +1416,53 @@ fn fjall_status_counters() {
     assert_status_counters(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
+/// A commit that keeps losing is retried by admission alone, so local and
+/// received writes stop after one budget of attempts, not one per layer.
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_conflict_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    let topic_id = TopicId::hash(b"conflict-budget-topic");
+    let (log, signer, _, _) = forked_side(storage.clone(), topic_id, 91, [], "one");
+    let actor = actor_id_for(topic_id, signer.peer_id());
+    let remote = oplog::Oplog::new();
+    remote
+        .receive_ops(oplog::topological(&storage, &topic_id).unwrap())
+        .unwrap();
+    let received = remote
+        .create_event_op(
+            topic_id,
+            actor,
+            EventEnvelope::encode_event(&Note { text: "two".into() }).unwrap(),
+            &signer,
+        )
+        .unwrap();
+
+    storage.race_heads(&topic_id);
+    let budget = oplog::MAX_ADMISSION_RETRIES as u64;
+    let before = storage.counters().transaction_attempts;
+    let local = log.create_event_op(
+        topic_id,
+        actor,
+        EventEnvelope::encode_event(&Note {
+            text: "local".into(),
+        })
+        .unwrap(),
+        &signer,
+    );
+    assert!(matches!(local, Err(Error::AdmissionConflict)), "{local:?}");
+    assert_eq!(storage.counters().transaction_attempts - before, budget);
+
+    let before = storage.counters().transaction_attempts;
+    let remote = log.receive_ops(vec![received]);
+    assert!(
+        matches!(remote, Err(Error::AdmissionConflict)),
+        "{remote:?}"
+    );
+    assert_eq!(storage.counters().transaction_attempts - before, budget);
+}
+
 fn clock_at(actor: ActorId, seq: u64) -> ActorClock {
     let mut clock = ActorClock::new();
     clock.observe(actor, seq);

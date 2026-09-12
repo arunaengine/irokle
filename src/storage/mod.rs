@@ -86,13 +86,15 @@ pub struct PeerAck {
 }
 
 /// Diagnostic counts of work a backend performed: op records and metadata
-/// read through [`Storage`], and buffered payloads decoded.
+/// read through [`Storage`], buffered payloads decoded and write transactions
+/// attempted.
 #[derive(Debug, Default)]
 pub struct StorageCounters {
     op_reads: std::sync::atomic::AtomicU64,
     meta_reads: std::sync::atomic::AtomicU64,
     index_reads: std::sync::atomic::AtomicU64,
     pending_payload_reads: std::sync::atomic::AtomicU64,
+    transaction_attempts: std::sync::atomic::AtomicU64,
 }
 
 /// A copy of [`StorageCounters`] at one moment.
@@ -102,6 +104,7 @@ pub struct CounterSnapshot {
     pub meta_reads: u64,
     pub index_reads: u64,
     pub pending_payload_reads: u64,
+    pub transaction_attempts: u64,
 }
 
 impl StorageCounters {
@@ -120,6 +123,12 @@ impl StorageCounters {
             .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
+    #[cfg(feature = "fjall")]
+    pub(crate) fn count_attempt(&self) {
+        self.transaction_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn count_payloads(&self, count: usize) {
         self.pending_payload_reads
             .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
@@ -134,6 +143,7 @@ impl StorageCounters {
             meta_reads: read(&self.meta_reads),
             index_reads: read(&self.index_reads),
             pending_payload_reads: read(&self.pending_payload_reads),
+            transaction_attempts: read(&self.transaction_attempts),
         }
     }
 }
@@ -278,6 +288,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// a dependency the DAG cannot resolve.
     /// The same transaction must clear sync state for members present in the
     /// expected topic state but absent from the committed topic state.
+    /// A lost optimistic commit returns [`crate::Error::AdmissionConflict`]
+    /// without retrying: the caller owns the retry budget.
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()>;
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;

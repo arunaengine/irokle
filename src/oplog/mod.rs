@@ -28,7 +28,8 @@ use topology::topological_ops;
 pub(crate) use topology::topological_subset_entries;
 pub use topology::{topological, topological_subset};
 
-const MAX_ADMISSION_RETRIES: usize = 64;
+/// Attempts one admission job makes; storage writes on this path try once each.
+pub(crate) const MAX_ADMISSION_RETRIES: usize = 64;
 /// Buffered ops one admission call attempts, and how many it reads at once.
 const MAX_DRAIN_OPS: usize = 4096;
 const READY_SLICE: usize = 256;

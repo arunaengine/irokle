@@ -26,6 +26,9 @@ pub struct FjallStorage {
     pub(super) records: fjall::OptimisticTxKeyspace,
     persist_mode: fjall::PersistMode,
     pub(super) counters: std::sync::Arc<StorageCounters>,
+    /// Key a test rewrites before every single-attempt commit, forcing a conflict.
+    #[cfg(test)]
+    conflict_key: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
 }
 
 #[cfg(feature = "fjall")]
@@ -119,6 +122,8 @@ impl FjallStorage {
             db,
             persist_mode,
             counters: Default::default(),
+            #[cfg(test)]
+            conflict_key: Default::default(),
         };
         storage.ensure_schema_version()?;
         Ok(storage)
@@ -375,6 +380,7 @@ impl FjallStorage {
         mut f: impl FnMut(&mut fjall::OptimisticWriteTx) -> Result<R>,
     ) -> Result<R> {
         for _ in 0..64 {
+            self.counters.count_attempt();
             let mut tx = self.db.write_tx()?.durability(Some(self.persist_mode));
             let result = f(&mut tx)?;
             match tx.commit()? {
@@ -383,6 +389,43 @@ impl FjallStorage {
             }
         }
         Err(Error::AdmissionConflict)
+    }
+
+    /// One attempt that reports a commit conflict as `AdmissionConflict`, for
+    /// admission writes whose caller owns the whole retry budget.
+    fn transaction_once<R>(
+        &self,
+        f: impl FnOnce(&mut fjall::OptimisticWriteTx) -> Result<R>,
+    ) -> Result<R> {
+        self.counters.count_attempt();
+        let mut tx = self.db.write_tx()?.durability(Some(self.persist_mode));
+        let result = f(&mut tx)?;
+        #[cfg(test)]
+        self.race_commit()?;
+        match tx.commit()? {
+            Ok(()) => Ok(result),
+            Err(_) => Err(Error::AdmissionConflict),
+        }
+    }
+
+    /// Make every later single-attempt transaction that reads `topic_id`'s
+    /// heads lose its commit to a concurrent rewrite of them.
+    #[cfg(test)]
+    pub(crate) fn race_heads(&self, topic_id: &TopicId) {
+        *self.conflict_key.lock().unwrap() = Some(Self::key_id(b"h", topic_id));
+    }
+
+    #[cfg(test)]
+    fn race_commit(&self) -> Result<()> {
+        let Some(key) = self.conflict_key.lock().unwrap().clone() else {
+            return Ok(());
+        };
+        let mut tx = self.db.write_tx()?;
+        if let Some(value) = fjall::Readable::get(&tx, &self.records, key.as_slice())? {
+            tx.insert(&self.records, key, value);
+        }
+        tx.commit()?
+            .map_err(|_| Error::Storage("racing commit conflicted".into()))
     }
 
     pub(super) fn key_id(prefix: &[u8], id: &impl AsRef<[u8]>) -> Vec<u8> {
@@ -1029,7 +1072,7 @@ impl FjallStorage {
 #[cfg(feature = "fjall")]
 impl Storage for FjallStorage {
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
-        self.transaction(|tx| self.tx_admit_batch(tx, &batch))
+        self.transaction_once(|tx| self.tx_admit_batch(tx, &batch))
     }
 
     fn reset_topic_and_admit(
@@ -1039,7 +1082,7 @@ impl Storage for FjallStorage {
         batch: AdmittedBatch,
         eviction: Option<&TopicEviction>,
     ) -> Result<usize> {
-        self.transaction(|tx| {
+        self.transaction_once(|tx| {
             if Self::tx_get::<bool>(
                 tx,
                 &self.records,
