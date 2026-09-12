@@ -543,6 +543,23 @@ pub(crate) fn genesis_of<S: Storage>(storage: &S, topic_id: &TopicId) -> Option<
         .map(|state| state.genesis)
 }
 
+/// Whether `obligations` still require `op_id`, by repair id or clock position.
+pub(crate) fn obligation_covers<S: Storage>(
+    storage: &S,
+    obligations: &[crate::storage::SyncObligation],
+    op_id: &OpId,
+) -> bool {
+    let meta = storage.get_meta(op_id).unwrap();
+    obligations
+        .iter()
+        .any(|obligation| match &obligation.target {
+            crate::storage::ObligationTarget::Repair(ids) => ids.contains(op_id),
+            crate::storage::ObligationTarget::Clock(clock) => meta.as_ref().is_some_and(|meta| {
+                meta.topic_id == obligation.topic_id && clock.get(&meta.actor_id) >= meta.actor_seq
+            }),
+        })
+}
+
 pub(crate) fn node(seed: u8) -> Irokle {
     Irokle::new(NodeConfig {
         signer: Ed25519Signer::from_bytes(&[seed; 32]),

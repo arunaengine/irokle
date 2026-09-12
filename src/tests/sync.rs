@@ -557,7 +557,11 @@ fn receive_forwarding_obligates_other_selected_peers() {
         .into_iter()
         .filter(|obligation| {
             obligation.topic_id == topic.id()
-                && obligation.target_clock.get(&record.meta.actor_id) >= record.meta.actor_seq
+                && obligation_covers(
+                    alice.storage(),
+                    std::slice::from_ref(obligation),
+                    &record.meta.op_id,
+                )
         })
         .map(|obligation| obligation.peer_id)
         .collect::<BTreeSet<_>>();
@@ -682,7 +686,12 @@ fn scopes_accepted_ops() {
             .all_sync_obligations()
             .unwrap()
             .iter()
-            .all(|obligation| !obligation.op_ids.contains(&buffered.meta.op_id))
+            .all(|obligation| obligation.topic_id != first.id()
+                || !obligation_covers(
+                    bob.storage(),
+                    std::slice::from_ref(obligation),
+                    &buffered.meta.op_id
+                ))
     );
 }
 
@@ -726,7 +735,10 @@ fn report_filters_obligations() {
     assert_eq!(report.obligations.len(), 1);
     assert_eq!(report.obligations[0].peer_id, peer_a);
     assert_eq!(report.obligations[0].topic_id, topic_a);
-    assert!(report.obligations[0].op_ids.contains(&op_a));
+    assert_eq!(
+        report.obligations[0].target,
+        crate_storage::ObligationTarget::Repair([op_a].into())
+    );
 }
 
 #[test]
@@ -876,9 +888,11 @@ fn receive_schedules_forwarding_only_for_missing_selected_peers() {
         .unwrap();
     // Forwarded work coalesces into one clock target covering every accepted op.
     assert_eq!(dana_obligations.len(), 1);
-    assert!(dana_obligations[0].op_ids.is_empty());
     assert!(ack.accepted.contains(&record.meta.op_id));
-    assert!(dana_obligations[0].target_clock.dominates(&clock));
+    assert!(matches!(
+        &dana_obligations[0].target,
+        crate_storage::ObligationTarget::Clock(target) if target.dominates(&clock)
+    ));
 }
 
 #[test]
@@ -918,14 +932,14 @@ fn failed_sync_result_keeps_obligation_pending_for_retry() {
             .unwrap()
             .contains("dial timed out")
     );
-    assert_eq!(
-        alice
+    assert!(obligation_covers(
+        alice.storage(),
+        &alice
             .storage()
             .sync_obligations(&bob.peer_id(), &topic.id())
-            .unwrap()[0]
-            .op_ids,
-        [record.meta.op_id].into()
-    );
+            .unwrap(),
+        &record.meta.op_id
+    ));
 
     alice
         .record_sync_result(bob.peer_id(), topic.id(), Ok(()))
@@ -1610,19 +1624,17 @@ fn assert_resolved_targets<S: Storage>(storage: S) {
         .unwrap();
 
     let obligations = storage.sync_obligations(&peer, &topic.id()).unwrap();
-    let clocked = obligations
-        .iter()
-        .find(|obligation| !obligation.target_clock.is_empty())
-        .expect("the resolved id keeps its actor position");
+    // The resolved id becomes a clock target at its actor position, and the
+    // unknown id an explicit repair want of its own.
+    let mut position = ActorClock::new();
+    position.observe(record.meta.actor_id, record.meta.actor_seq);
     assert_eq!(
-        clocked.target_clock.get(&record.meta.actor_id),
-        record.meta.actor_seq
+        obligations,
+        vec![
+            crate_storage::SyncObligation::clock(peer, topic.id(), position),
+            crate_storage::SyncObligation::repair(peer, topic.id(), [unknown].into()),
+        ]
     );
-    assert!(clocked.op_ids.contains(&record.meta.op_id));
-    assert!(!clocked.op_ids.contains(&unknown));
-    assert!(obligations.iter().any(
-        |obligation| obligation.op_ids.contains(&unknown) && obligation.target_clock.is_empty()
-    ));
 }
 
 #[test]

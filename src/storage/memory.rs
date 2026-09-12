@@ -11,11 +11,11 @@ use crate::{
 use super::{
     AckCommit, AdmittedBatch, MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL,
     MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
-    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
-    SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers,
-    ack_reached_op, apply_status_update, ensure_deps_resolvable, journalled_eviction,
-    merged_peer_ack, new_peer_status, pending_op_bytes, stored_ack_dominates,
-    sync_obligation_satisfied, topic_fingerprint_for, validate_batch, validate_heads,
+    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, ObligationTarget, OpMeta, PeerAck, Storage,
+    SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit,
+    ack_covers, ack_reached_op, apply_status_update, ensure_deps_resolvable, journalled_eviction,
+    merged_obligation, merged_peer_ack, new_peer_status, pending_op_bytes, settled_obligation,
+    stored_ack_dominates, topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[derive(Clone, Default)]
@@ -40,7 +40,7 @@ struct MemoryInner {
     pending_by_source: BTreeMap<PeerId, BTreeSet<OpId>>,
     pending_waiters: BTreeMap<OpId, BTreeSet<OpId>>,
     peer_acks: HashMap<(PeerId, TopicId), PeerAck>,
-    obligations: BTreeMap<(PeerId, TopicId), BTreeMap<BTreeSet<OpId>, SyncObligation>>,
+    obligations: BTreeMap<(PeerId, TopicId), BTreeMap<ObligationKind, SyncObligation>>,
     sync_statuses: BTreeMap<(TopicId, PeerId), SyncPeerStatus>,
     evictions: BTreeMap<EvictionKey, TopicEviction>,
     sealed_topics: BTreeSet<TopicId>,
@@ -469,7 +469,8 @@ impl Storage for MemoryStorage {
     }
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()> {
         let mut inner = self.lock()?;
-        put_obligation_locked(&mut inner, obligation);
+        let merged = merged_obligation_locked(&inner, &obligation)?;
+        put_obligation_locked(&mut inner, merged);
         Ok(())
     }
 
@@ -656,6 +657,28 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
                 == Some(&meta.id)
             || inner.children.contains_key(&meta.id))
     })?;
+    // Merged before any write, so a refused effect leaves the store untouched.
+    let genesis = batch
+        .topic_state
+        .as_ref()
+        .or(batch.expected_topic_state.as_ref())
+        .map(|state| state.genesis);
+    let mut effects = BTreeMap::new();
+    for obligation in &batch.effects.sync_obligations {
+        let ack = inner.peer_acks.get(&(obligation.peer_id, batch.topic_id));
+        if obligation.topic_id != batch.topic_id {
+            return Err(Error::TopicMismatch);
+        }
+        if obligation.is_empty() || ack_covers(ack, genesis, obligation) {
+            continue;
+        }
+        let key = (obligation.peer_id, ObligationKind::of(obligation));
+        let merged = match effects.remove(&key) {
+            Some(pending) => merged_obligation(Some(pending), obligation)?,
+            None => merged_obligation_locked(inner, obligation)?,
+        };
+        effects.insert(key, merged);
+    }
     let removed_peers = batch
         .expected_topic_state
         .as_ref()
@@ -673,7 +696,6 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
         entries,
         heads,
         topic_state,
-        effects,
         ..
     } = batch;
     let mut actor_tips = BTreeMap::new();
@@ -799,12 +821,8 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
     if let Some(state) = topic_state {
         inner.topics.insert(state.topic_id, state);
     }
-    let genesis = inner.topics.get(&topic_id).map(|state| state.genesis);
-    for obligation in effects.sync_obligations {
-        let ack = inner.peer_acks.get(&(obligation.peer_id, topic_id));
-        if !ack_covers(ack, genesis, &obligation) {
-            put_obligation_locked(inner, obligation);
-        }
+    for obligation in effects.into_values() {
+        put_obligation_locked(inner, obligation);
     }
     for peer_id in removed_peers {
         inner.obligations.remove(&(peer_id, topic_id));
@@ -878,39 +896,77 @@ fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> Result<usize>
     if commit == AckCommit::Retain {
         return Ok(0);
     }
-    Ok(clear_satisfied_locked(inner, &effective_ack))
+    clear_satisfied_locked(inner, &effective_ack)
 }
 
-/// One record per id set, so an ordinary target coalesces into the empty-id
-/// slot while an explicit repair want keeps a slot of its own. A repeat raises
-/// the stored watermark instead of adding a record.
-fn put_obligation_locked(inner: &mut MemoryInner, obligation: SyncObligation) {
-    let records = inner
-        .obligations
-        .entry((obligation.peer_id, obligation.topic_id))
-        .or_default();
-    match records.entry(obligation.op_ids.clone()) {
-        std::collections::btree_map::Entry::Occupied(mut entry) => {
-            entry.get_mut().target_clock.merge(&obligation.target_clock);
-        }
-        std::collections::btree_map::Entry::Vacant(entry) => {
-            entry.insert(obligation);
+/// Which of a peer's two records per topic an obligation belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ObligationKind {
+    Clock,
+    Repair,
+}
+
+impl ObligationKind {
+    fn of(obligation: &SyncObligation) -> Self {
+        match obligation.target {
+            ObligationTarget::Clock(_) => Self::Clock,
+            ObligationTarget::Repair(_) => Self::Repair,
         }
     }
 }
 
-fn clear_satisfied_locked(inner: &mut MemoryInner, ack: &PeerAck) -> usize {
+/// `obligation` merged into the record of its kind the store already holds.
+fn merged_obligation_locked(
+    inner: &MemoryInner,
+    obligation: &SyncObligation,
+) -> Result<SyncObligation> {
+    let existing = inner
+        .obligations
+        .get(&(obligation.peer_id, obligation.topic_id))
+        .and_then(|records| records.get(&ObligationKind::of(obligation)))
+        .cloned();
+    merged_obligation(existing, obligation)
+}
+
+/// Store an already merged record, replacing the one of its kind.
+fn put_obligation_locked(inner: &mut MemoryInner, obligation: SyncObligation) {
+    if obligation.is_empty() {
+        return;
+    }
+    inner
+        .obligations
+        .entry((obligation.peer_id, obligation.topic_id))
+        .or_default()
+        .insert(ObligationKind::of(&obligation), obligation);
+}
+
+fn clear_satisfied_locked(inner: &mut MemoryInner, ack: &PeerAck) -> Result<usize> {
     let key = (ack.peer_id, ack.topic_id);
-    let Some(records) = inner.obligations.get_mut(&key) else {
-        return 0;
+    let Some(records) = inner.obligations.get(&key) else {
+        return Ok(0);
     };
-    let before = records.len();
-    records.retain(|_, obligation| !sync_obligation_satisfied(obligation, ack));
-    let cleared = before - records.len();
+    let mut settled = BTreeMap::new();
+    for (kind, obligation) in records {
+        let rest = settled_obligation(obligation, ack, |id| Ok(inner.meta.get(id).cloned()))?;
+        settled.insert(*kind, rest);
+    }
+    let records = inner.obligations.entry(key).or_default();
+    let mut cleared = 0;
+    for (kind, rest) in settled {
+        match rest {
+            Some(rest) => {
+                records.insert(kind, rest);
+            }
+            None => {
+                records.remove(&kind);
+                cleared += 1;
+            }
+        }
+    }
     if records.is_empty() {
         inner.obligations.remove(&key);
     }
-    cleared
+    Ok(cleared)
 }
 
 /// Metadata of a stored op and the genesis of the topic branch holding it.

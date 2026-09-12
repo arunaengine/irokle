@@ -1017,7 +1017,11 @@ fn rejects_stale_incarnation() {
         obligations
             .iter()
             .any(|obligation| obligation.peer_id == winner_peer
-                && obligation.op_ids.contains(&newest)),
+                && obligation_covers(
+                    loser_oplog.storage(),
+                    std::slice::from_ref(obligation),
+                    &newest
+                )),
         "replayed old-branch ack cleared work owed on the replacement branch"
     );
 }

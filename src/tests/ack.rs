@@ -58,19 +58,23 @@ fn assert_clears_satisfied<S: Storage>(storage: S) {
     ack.sign(&ack_signer).unwrap();
     irokle.apply_sync_ack(&ack).unwrap();
 
+    // Both ops coalesce into one clock target; the proof of the earlier one
+    // leaves only the later position outstanding.
     let report = irokle.sync_report(peer, topic.id()).unwrap();
     assert_eq!(report.obligations.len(), 1);
-    assert_eq!(
-        report.obligations[0].op_ids,
-        [unsatisfied.meta.op_id].into()
-    );
+    assert!(obligation_covers(
+        irokle.storage(),
+        &report.obligations,
+        &unsatisfied.meta.op_id
+    ));
 
     let other_report = irokle.sync_report(peer, other_topic.id()).unwrap();
     assert_eq!(other_report.obligations.len(), 1);
-    assert_eq!(
-        other_report.obligations[0].op_ids,
-        [other.meta.op_id].into()
-    );
+    assert!(obligation_covers(
+        irokle.storage(),
+        &other_report.obligations,
+        &other.meta.op_id
+    ));
 }
 
 #[test]
@@ -668,7 +672,7 @@ fn fjall_clear_persists() {
     let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
     let obligations = storage.sync_obligations(&peer, &topic_id).unwrap();
     assert_eq!(obligations.len(), 1);
-    assert_eq!(obligations[0].op_ids, [unsatisfied_id].into());
+    assert!(obligation_covers(&storage, &obligations, &unsatisfied_id));
 }
 
 #[test]
@@ -693,12 +697,11 @@ fn ack_needs_closure() {
     .unwrap();
     source
         .storage()
-        .put_sync_obligation(crate::storage::SyncObligation {
-            peer_id: holder.peer_id(),
+        .put_sync_obligation(crate::storage::SyncObligation::clock(
+            holder.peer_id(),
             topic_id,
-            op_ids: [ops[2].id].into(),
-            target_clock: source.storage().actor_clock(&topic_id).unwrap(),
-        })
+            source.storage().actor_clock(&topic_id).unwrap(),
+        ))
         .unwrap();
 
     let (damaged_ack, _) = holder
@@ -908,17 +911,10 @@ fn accepts_older_evidence() {
         .sync_obligations(&peer, &topic.id())
         .unwrap();
     assert!(
-        remaining
-            .iter()
-            .any(|obligation| obligation.op_ids.contains(&late.meta.op_id)),
+        obligation_covers(alice.storage(), &remaining, &late.meta.op_id),
         "later work must stay outstanding"
     );
-    assert!(
-        !remaining
-            .iter()
-            .any(|obligation| obligation.op_ids.contains(&early.meta.op_id)),
-        "the proven earlier frontier must be cleared"
-    );
+    assert_eq!(remaining.len(), 1, "both targets share one record");
 }
 
 /// Removing the peer between validation and the write must make the validated
@@ -1057,12 +1053,11 @@ fn fjall_migrates_legacy() {
 
     // Work owed to that peer stays outstanding until it acknowledges again.
     storage
-        .put_sync_obligation(crate_storage::SyncObligation {
-            peer_id: peer,
+        .put_sync_obligation(crate_storage::SyncObligation::repair(
+            peer,
             topic_id,
-            op_ids: [op_id].into(),
-            target_clock: ActorClock::new(),
-        })
+            [op_id].into(),
+        ))
         .unwrap();
     assert_eq!(storage.sync_obligations(&peer, &topic_id).unwrap().len(), 1);
 

@@ -115,13 +115,51 @@ pub struct AdmittedBatch {
     pub effects: AdmissionEffects,
 }
 
+/// Explicit repair ids one peer may owe for one topic.
+pub const MAX_REPAIR_IDS: usize = 4096;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncObligation {
     pub peer_id: PeerId,
     pub topic_id: TopicId,
-    pub op_ids: BTreeSet<OpId>,
-    #[serde(default)]
-    pub target_clock: ActorClock,
+    pub target: ObligationTarget,
+}
+
+/// What a peer must prove before an obligation clears.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObligationTarget {
+    /// A certified clock must reach this clock. One coalesced record per peer
+    /// and topic.
+    Clock(ActorClock),
+    /// Ids without a local actor position. An ack settles an id it names as a
+    /// head, or covers by clock once the id's metadata is known.
+    Repair(BTreeSet<OpId>),
+}
+
+impl SyncObligation {
+    pub fn clock(peer_id: PeerId, topic_id: TopicId, clock: ActorClock) -> Self {
+        Self {
+            peer_id,
+            topic_id,
+            target: ObligationTarget::Clock(clock),
+        }
+    }
+
+    pub fn repair(peer_id: PeerId, topic_id: TopicId, ids: BTreeSet<OpId>) -> Self {
+        Self {
+            peer_id,
+            topic_id,
+            target: ObligationTarget::Repair(ids),
+        }
+    }
+
+    /// Whether the record requires nothing; such a record is never stored.
+    pub fn is_empty(&self) -> bool {
+        match &self.target {
+            ObligationTarget::Clock(clock) => clock.is_empty(),
+            ObligationTarget::Repair(ids) => ids.is_empty(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -446,21 +484,79 @@ pub(super) fn ack_covers(
     genesis: Option<OpId>,
     obligation: &SyncObligation,
 ) -> bool {
-    obligation.op_ids.is_empty()
-        && !obligation.target_clock.is_empty()
-        && genesis.is_some()
-        && ack.is_some_and(|ack| {
-            ack.genesis == genesis && ack.clock.dominates(&obligation.target_clock)
-        })
+    let ObligationTarget::Clock(target) = &obligation.target else {
+        return false;
+    };
+    genesis.is_some()
+        && ack.is_some_and(|ack| ack.genesis == genesis && ack.clock.dominates(target))
 }
 
-pub(super) fn sync_obligation_satisfied(obligation: &SyncObligation, ack: &PeerAck) -> bool {
-    // An empty id set proves nothing: without this guard it is a subset of
-    // every frontier, so any ack would clear a target clock it never reached.
-    if !obligation.op_ids.is_empty() && obligation.op_ids.is_subset(&ack.heads) {
-        return true;
+/// Merge `incoming` into the stored record of the same kind. A repair record
+/// past [`MAX_REPAIR_IDS`] is refused rather than growing without bound.
+pub(super) fn merged_obligation(
+    existing: Option<SyncObligation>,
+    incoming: &SyncObligation,
+) -> Result<SyncObligation> {
+    let Some(mut merged) = existing else {
+        return Ok(incoming.clone());
+    };
+    match (&mut merged.target, &incoming.target) {
+        (ObligationTarget::Clock(stored), ObligationTarget::Clock(clock)) => stored.merge(clock),
+        (ObligationTarget::Repair(stored), ObligationTarget::Repair(ids)) => {
+            stored.extend(ids.iter().copied());
+            if stored.len() > MAX_REPAIR_IDS {
+                return Err(crate::Error::Storage(
+                    "repair obligation exceeds its id limit".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(crate::Error::Storage(
+                "obligation kinds differ under one key".into(),
+            ));
+        }
     }
-    !obligation.target_clock.is_empty() && ack.clock.dominates(&obligation.target_clock)
+    Ok(merged)
+}
+
+/// What remains of `obligation` after certified `ack`, or `None` when nothing
+/// does. Each covered clock entry or id is dropped even while the rest stays
+/// outstanding; `meta` resolves a repair id's actor position.
+pub(super) fn settled_obligation(
+    obligation: &SyncObligation,
+    ack: &PeerAck,
+    mut meta: impl FnMut(&OpId) -> Result<Option<OpMeta>>,
+) -> Result<Option<SyncObligation>> {
+    let target = match &obligation.target {
+        ObligationTarget::Clock(target) => {
+            let mut rest = ActorClock::new();
+            for (actor_id, seq) in target.iter() {
+                if ack.clock.get(actor_id) < *seq {
+                    rest.observe(*actor_id, *seq);
+                }
+            }
+            ObligationTarget::Clock(rest)
+        }
+        ObligationTarget::Repair(ids) => {
+            let mut rest = BTreeSet::new();
+            for id in ids {
+                let covered = ack.heads.contains(id)
+                    || meta(id)?.is_some_and(|meta| {
+                        meta.topic_id == obligation.topic_id
+                            && ack.clock.get(&meta.actor_id) >= meta.actor_seq
+                    });
+                if !covered {
+                    rest.insert(*id);
+                }
+            }
+            ObligationTarget::Repair(rest)
+        }
+    };
+    let rest = SyncObligation {
+        target,
+        ..obligation.clone()
+    };
+    Ok((!rest.is_empty()).then_some(rest))
 }
 
 /// Fold one status update into `status`, reporting whether the record changed

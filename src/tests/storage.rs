@@ -258,12 +258,11 @@ fn assert_reset_topic_clears_everything<S: Storage>(storage: S) {
         })
         .unwrap();
     storage
-        .put_sync_obligation(crate_storage::SyncObligation {
-            peer_id: other_peer,
+        .put_sync_obligation(crate_storage::SyncObligation::repair(
+            other_peer,
             topic_id,
-            op_ids: [OpId::hash(b"reset-obligation-op")].into(),
-            target_clock: ActorClock::new(),
-        })
+            [OpId::hash(b"reset-obligation-op")].into(),
+        ))
         .unwrap();
     storage
         .put_sync_status(crate_storage::SyncPeerStatus {
@@ -1174,12 +1173,11 @@ fn assert_vacuous_obligation<S: Storage>(storage: S) {
     let mut target_clock = ActorClock::new();
     target_clock.observe(actor, 4);
     storage
-        .put_sync_obligation(crate_storage::SyncObligation {
-            peer_id: peer,
+        .put_sync_obligation(crate_storage::SyncObligation::clock(
+            peer,
             topic_id,
-            op_ids: BTreeSet::new(),
             target_clock,
-        })
+        ))
         .unwrap();
 
     // An ack that proves nothing must not stand in for the clock target.
@@ -1238,12 +1236,11 @@ fn assert_merged_acks<S: Storage>(storage: S) {
     target_clock.observe(first_actor, 5);
     target_clock.observe(second_actor, 3);
     storage
-        .put_sync_obligation(crate_storage::SyncObligation {
-            peer_id: peer,
+        .put_sync_obligation(crate_storage::SyncObligation::clock(
+            peer,
             topic_id,
-            op_ids: [OpId::hash(b"merge-want")].into(),
             target_clock,
-        })
+        ))
         .unwrap();
 
     let mut first_clock = ActorClock::new();
@@ -1418,14 +1415,17 @@ fn fjall_status_counters() {
     assert_status_counters(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
+fn clock_at(actor: ActorId, seq: u64) -> ActorClock {
+    let mut clock = ActorClock::new();
+    clock.observe(actor, seq);
+    clock
+}
+
 fn put_target<S: Storage>(storage: &S, peer_id: PeerId, topic_id: TopicId, clock: ActorClock) {
     storage
-        .put_sync_obligation(crate_storage::SyncObligation {
-            peer_id,
-            topic_id,
-            op_ids: BTreeSet::new(),
-            target_clock: clock,
-        })
+        .put_sync_obligation(crate_storage::SyncObligation::clock(
+            peer_id, topic_id, clock,
+        ))
         .unwrap();
 }
 
@@ -1446,7 +1446,10 @@ fn assert_coalesced_targets<S: Storage>(storage: S) {
         // One target record per peer and topic, whatever the backlog length.
         let obligations = storage.sync_obligations(&peer, &topic_id).unwrap();
         assert_eq!(obligations.len(), 1);
-        assert_eq!(obligations[0].target_clock.get(&actor), rounds);
+        assert_eq!(
+            obligations[0].target,
+            crate_storage::ObligationTarget::Clock(clock_at(actor, rounds))
+        );
     }
     assert_eq!(
         storage
@@ -1456,26 +1459,24 @@ fn assert_coalesced_targets<S: Storage>(storage: S) {
         Some(&1)
     );
 
-    // Explicit repair wants stay distinct and bounded by their own ids.
+    // Explicit repair wants coalesce into one record of their own.
     for _ in 0..3 {
         storage
-            .put_sync_obligation(crate_storage::SyncObligation {
-                peer_id: peer,
+            .put_sync_obligation(crate_storage::SyncObligation::repair(
+                peer,
                 topic_id,
-                op_ids: [OpId::hash(b"coalesce-want-one")].into(),
-                target_clock: ActorClock::new(),
-            })
+                [OpId::hash(b"coalesce-want-one")].into(),
+            ))
             .unwrap();
     }
     storage
-        .put_sync_obligation(crate_storage::SyncObligation {
-            peer_id: peer,
+        .put_sync_obligation(crate_storage::SyncObligation::repair(
+            peer,
             topic_id,
-            op_ids: [OpId::hash(b"coalesce-want-two")].into(),
-            target_clock: ActorClock::new(),
-        })
+            [OpId::hash(b"coalesce-want-two")].into(),
+        ))
         .unwrap();
-    assert_eq!(storage.sync_obligations(&peer, &topic_id).unwrap().len(), 3);
+    assert_eq!(storage.sync_obligations(&peer, &topic_id).unwrap().len(), 2);
 
     let mut lagging = ActorClock::new();
     lagging.observe(actor, 4);
@@ -1495,7 +1496,18 @@ fn assert_coalesced_targets<S: Storage>(storage: S) {
     // Clearing one peer's reached target leaves the explicit wants and every
     // other peer's backlog in place.
     assert_eq!(cleared, 1);
-    assert_eq!(storage.sync_obligations(&peer, &topic_id).unwrap().len(), 2);
+    assert_eq!(
+        storage.sync_obligations(&peer, &topic_id).unwrap(),
+        vec![crate_storage::SyncObligation::repair(
+            peer,
+            topic_id,
+            [
+                OpId::hash(b"coalesce-want-one"),
+                OpId::hash(b"coalesce-want-two")
+            ]
+            .into(),
+        )]
+    );
     assert_eq!(
         storage.sync_obligations(&other, &topic_id).unwrap().len(),
         1

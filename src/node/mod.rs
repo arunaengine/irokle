@@ -813,12 +813,7 @@ impl<S: Storage> Irokle<S> {
                 .sync_peers(state.topic_id, state)
                 .into_iter()
                 .filter(|peer_id| Some(*peer_id) != source && *peer_id != self.peer_id())
-                .map(|peer_id| SyncObligation {
-                    peer_id,
-                    topic_id: state.topic_id,
-                    op_ids: BTreeSet::new(),
-                    target_clock: target_clock.clone(),
-                })
+                .map(|peer_id| SyncObligation::clock(peer_id, state.topic_id, target_clock.clone()))
                 .collect(),
         })
     }
@@ -873,12 +868,7 @@ impl<S: Storage> Irokle<S> {
             sync_obligations: self
                 .sync_peers(topic_id, state)
                 .into_iter()
-                .map(|peer_id| SyncObligation {
-                    peer_id,
-                    topic_id,
-                    op_ids: BTreeSet::new(),
-                    target_clock: target_clock.clone(),
-                })
+                .map(|peer_id| SyncObligation::clock(peer_id, topic_id, target_clock.clone()))
                 .collect(),
         })
     }
