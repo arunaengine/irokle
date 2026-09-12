@@ -319,3 +319,183 @@ fn fjall_revoked_invitation() {
     let dir = tempfile::tempdir().unwrap();
     revoked_invitation(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
+
+/// Two staged genesis candidates: the first proven one becomes active and the
+/// other branch never merges into it.
+fn competing_genesis<S: Storage>(storage: S) {
+    let topic_id = TopicId::hash(b"bootstrap-competing-genesis");
+    let side = |seed: u8| {
+        let peer = Ed25519Signer::from_bytes(&[seed; 32]).peer_id();
+        let (log, signer, genesis, event) =
+            forked_side(MemoryStorage::new(), topic_id, seed, [peer], "side");
+        let control = TopicControl::AddPeer { peer: bob_peer() };
+        let actor = actor_id_for(topic_id, peer);
+        let invite = log
+            .create_control_op(topic_id, actor, control, &signer)
+            .unwrap();
+        (peer, vec![genesis, event], invite)
+    };
+    let (first, first_history, first_invite) = side(189);
+    let (second, second_history, second_invite) = side(190);
+    let bob = bob_node(storage);
+
+    staged(receive(&bob, first, topic_id, &first_history));
+    staged(receive(&bob, second, topic_id, &second_history));
+    let candidates = [first_history.clone(), second_history.clone()].concat();
+    assert_invisible(&bob, first, topic_id, &candidates);
+
+    acked(receive(
+        &bob,
+        first,
+        topic_id,
+        std::slice::from_ref(&first_invite),
+    ));
+    let winner = [first_history, vec![first_invite]].concat();
+    let winner_ids = winner.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+    assert!(
+        bob.storage()
+            .staged_bootstrap_ops(&second, &topic_id)
+            .unwrap()
+            .is_empty()
+    );
+    let other = [second_history, vec![second_invite]].concat();
+    acked(receive(&bob, second, topic_id, &other));
+    assert_eq!(bob.storage().list_op_ids(&topic_id).unwrap(), winner_ids);
+    assert_eq!(genesis_of(bob.storage(), &topic_id), Some(winner[0].id));
+}
+
+#[test]
+fn memory_competing_genesis() {
+    competing_genesis(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_competing_genesis() {
+    let dir = tempfile::tempdir().unwrap();
+    competing_genesis(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// An op of `topic_id` at `seq` carrying a note of `size` bytes.
+fn stub_op(topic_id: TopicId, seq: u64, size: usize) -> Op {
+    let signer = Ed25519Signer::from_bytes(&[191; 32]);
+    let note = Note {
+        text: "x".repeat(size),
+    };
+    let body = OpBody {
+        topic_id,
+        author: signer.peer_id(),
+        actor_id: actor_id_for(topic_id, signer.peer_id()),
+        actor_seq: seq,
+        actor_prev: None,
+        deps: BTreeSet::new(),
+        generation: 0,
+        payload: TopicPayload::Event(EventEnvelope::encode_event(&note).unwrap()),
+    };
+    Op::sign(body, &signer).unwrap()
+}
+
+fn staging_quota<S: Storage>(storage: S) {
+    use crate::storage::{MAX_STAGED_SESSIONS, MAX_STAGED_SESSIONS_PER_SOURCE};
+    let topic = |index: usize| TopicId::hash(format!("quota-topic-{index}").as_bytes());
+    let source = |index: usize| PeerId::hash(format!("quota-source-{index}").as_bytes());
+    let stage = |owner: PeerId, topic_id: TopicId, ops: Vec<Op>, now_ms: u64| {
+        storage.stage_bootstrap_ops(owner, topic_id, ops, now_ms)
+    };
+
+    let mismatch = stage(source(0), topic(0), vec![stub_op(topic(1), 1, 1)], 10);
+    assert!(matches!(mismatch, Err(Error::TopicMismatch)));
+    for index in 0..MAX_STAGED_SESSIONS_PER_SOURCE {
+        stage(
+            source(0),
+            topic(index),
+            vec![stub_op(topic(index), 1, 1)],
+            10,
+        )
+        .unwrap();
+    }
+    let crowded = topic(MAX_STAGED_SESSIONS);
+    let per_source = stage(source(0), crowded, vec![stub_op(crowded, 1, 1)], 10);
+    assert!(matches!(per_source, Err(Error::Storage(_))));
+    for index in MAX_STAGED_SESSIONS_PER_SOURCE..MAX_STAGED_SESSIONS {
+        let owner = source(index / MAX_STAGED_SESSIONS_PER_SOURCE);
+        stage(owner, topic(index), vec![stub_op(topic(index), 1, 1)], 10).unwrap();
+    }
+    let total = stage(source(99), crowded, vec![stub_op(crowded, 1, 1)], 10);
+    assert!(matches!(total, Err(Error::Storage(_))));
+    assert!(
+        storage
+            .staged_bootstrap_ops(&source(99), &crowded)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(storage.expire_bootstrap(10).unwrap(), 0);
+    assert_eq!(storage.expire_bootstrap(11).unwrap(), MAX_STAGED_SESSIONS);
+    stage(source(99), crowded, vec![stub_op(crowded, 1, 1)], 20).unwrap();
+    assert_eq!(storage.discard_bootstrap(&source(99), &crowded).unwrap(), 1);
+
+    // Bytes per session: four 7 MiB ops fit, a fifth is refused with its call.
+    let large = (1..=5)
+        .map(|seq| stub_op(crowded, seq, 7 * 1024 * 1024))
+        .collect::<Vec<_>>();
+    for op in &large[..4] {
+        stage(source(1), crowded, vec![op.clone()], 30).unwrap();
+    }
+    let small = stub_op(crowded, 6, 1);
+    let over = stage(source(1), crowded, vec![small, large[4].clone()], 30);
+    assert!(matches!(over, Err(Error::Storage(_))));
+    let full = stage(source(1), crowded, vec![large[0].clone()], 30).unwrap();
+    let actor = actor_id_for(crowded, Ed25519Signer::from_bytes(&[191; 32]).peer_id());
+    assert_eq!((full.ops, full.clock.get(&actor)), (4, 4));
+    assert_eq!(
+        storage.staged_bootstrap_ops(&source(1), &crowded).unwrap(),
+        large[..4].to_vec()
+    );
+}
+
+#[test]
+fn memory_staging_quota() {
+    staging_quota(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_staging_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    staging_quota(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// Staging survives a reopen, and a reopen after promotion shows the whole
+/// history.
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reopen_promotion() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || crate::storage::FjallStorage::open(dir.path()).unwrap();
+    let (alice, topic_id, ops) = invited_history(192, 30, 1);
+    let (invite, history) = ops.split_last().unwrap();
+    {
+        let bob = bob_node(open());
+        staged(receive(&bob, alice.peer_id(), topic_id, &history[..16]));
+        staged(receive(&bob, alice.peer_id(), topic_id, &history[16..]));
+    }
+
+    let bob = bob_node(open());
+    assert_eq!(
+        bob.storage()
+            .staged_bootstrap_ops(&alice.peer_id(), &topic_id)
+            .unwrap(),
+        history.to_vec()
+    );
+    assert_invisible(&bob, alice.peer_id(), topic_id, &ops);
+    let ack = acked(receive(
+        &bob,
+        alice.peer_id(),
+        topic_id,
+        std::slice::from_ref(invite),
+    ));
+    drop(bob);
+
+    let bob = bob_node(open());
+    assert_promoted(&bob, &alice, topic_id, &ack);
+}
