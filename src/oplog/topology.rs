@@ -19,13 +19,31 @@ pub fn topological<S: Storage>(storage: &S, topic_id: &TopicId) -> Result<Vec<Op
 /// discarded - a deferred op stays admitted and reappears here once its
 /// dependency is refetched. Only a cycle among fully present ops is an error.
 pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) -> Result<Vec<Op>> {
+    topological_ids(storage, ids)?
+        .into_iter()
+        .map(|id| {
+            storage
+                .get_op(&id)?
+                .ok_or_else(|| Error::Storage(format!("missing op {id}")))
+        })
+        .collect()
+}
+
+pub(crate) fn topological_ids<S: Storage>(
+    storage: &S,
+    ids: &BTreeSet<crate::OpId>,
+) -> Result<Vec<crate::OpId>> {
     let mut present = BTreeMap::new();
     let mut blocked = BTreeSet::new();
     for id in ids {
-        let (Some(meta), Some(op)) = (storage.get_meta(id)?, storage.get_op(id)?) else {
+        let Some(meta) = storage.get_meta(id)? else {
             blocked.insert(*id);
             continue;
         };
+        if !storage.dep_resolvable(id)? {
+            blocked.insert(*id);
+            continue;
+        }
         let mut deps_in_set = 0_usize;
         let mut dangling = false;
         for dep in &meta.deps {
@@ -38,7 +56,7 @@ pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) 
         if dangling {
             blocked.insert(*id);
         } else {
-            present.insert(*id, (op, deps_in_set));
+            present.insert(*id, deps_in_set);
         }
     }
 
@@ -60,16 +78,16 @@ pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) 
 
     let mut ready = present
         .iter()
-        .filter_map(|(id, (_, count))| (*count == 0).then_some(*id))
+        .filter_map(|(id, count)| (*count == 0).then_some(*id))
         .collect::<VecDeque<_>>();
     let mut out = Vec::with_capacity(present.len());
     while let Some(id) = ready.pop_front() {
-        let Some((op, _)) = present.get(&id) else {
+        if !present.contains_key(&id) {
             continue;
-        };
-        out.push(op.clone());
+        }
+        out.push(id);
         for child in storage.children(&id)? {
-            if let Some((_, count)) = present.get_mut(&child) {
+            if let Some(count) = present.get_mut(&child) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     ready.push_back(child);

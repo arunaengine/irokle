@@ -23,14 +23,23 @@ use helpers::{
     is_semantic_rejection, materialize_topic_state, merge_states, next_actor_position,
     pending_meta_for,
 };
+pub(crate) use topology::topological_ids;
 use topology::topological_ops;
 pub use topology::{topological, topological_subset};
 
 const MAX_ADMISSION_RETRIES: usize = 64;
+const MAX_CACHED_PROJECTIONS: usize = 4096;
 // Genesis collisions are rare. Serialize their resolution across all Oplog
 // facades in this process; storage reset preconditions still provide the
 // authoritative stale-write guard.
 static GENESIS_RESOLUTION_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Default)]
+struct MembershipCache {
+    epoch: Arc<()>,
+    states: BTreeMap<OpId, Arc<TopicState>>,
+    order: VecDeque<OpId>,
+}
 
 enum OpAdmission {
     Admit,
@@ -143,6 +152,7 @@ pub struct Oplog<S = MemoryStorage> {
     // that invariant, so only damage from outside irokle can reintroduce a
     // hole; scanning once per topic keeps the sync fast path off a full scan.
     whole_topics: Arc<Mutex<BTreeSet<TopicId>>>,
+    membership_cache: Arc<Mutex<MembershipCache>>,
 }
 
 impl Default for Oplog<MemoryStorage> {
@@ -162,6 +172,7 @@ impl<S: Storage> Oplog<S> {
         Self {
             storage,
             whole_topics: Arc::new(Mutex::new(BTreeSet::new())),
+            membership_cache: Arc::new(Mutex::new(MembershipCache::default())),
         }
     }
     pub fn storage(&self) -> &S {
@@ -210,6 +221,7 @@ impl<S: Storage> Oplog<S> {
     /// ask a second time.
     pub fn recheck_topics(&self) -> Result<()> {
         self.whole_topics()?.clear();
+        *self.membership_cache()? = MembershipCache::default();
         Ok(())
     }
 
@@ -317,6 +329,10 @@ impl<S: Storage> Oplog<S> {
                 tracing::warn!(%topic_id, %id, "deferred quarantine: repair the frontier first");
                 return Ok(None);
             };
+            if self.storage.get_meta(&id)?.is_none() {
+                tracing::warn!(%topic_id, %id, "deferred quarantine: repair the frontier first");
+                return Ok(None);
+            }
             survivors.push(op);
         }
         if !survivors.iter().any(|op| op.id == state.genesis) {
@@ -338,6 +354,12 @@ impl<S: Storage> Oplog<S> {
         self.whole_topics
             .lock()
             .map_err(|_| Error::Storage("topic integrity cache lock poisoned".into()))
+    }
+
+    fn membership_cache(&self) -> Result<std::sync::MutexGuard<'_, MembershipCache>> {
+        self.membership_cache
+            .lock()
+            .map_err(|_| Error::Storage("membership cache lock poisoned".into()))
     }
 
     pub fn create_topic_genesis(
@@ -599,7 +621,6 @@ impl<S: Storage> Oplog<S> {
                     self.storage.pending_waiters(op_id)?,
                 );
             }
-            self.enqueue_ready_pending_ops(&mut queue, &mut queued_pending)?;
             accepted.extend(batch_accepted);
         }
 
@@ -851,7 +872,25 @@ impl<S: Storage> Oplog<S> {
         let mut overlay_index = BTreeMap::new();
         let mut entries = Vec::new();
         let mut pending = Vec::new();
-        let mut projections = BTreeMap::new();
+        // Reuse immutable causal states only within the current genesis.
+        let (projection_epoch, mut projections) = {
+            let mut cache = self.membership_cache()?;
+            if reset {
+                *cache = MembershipCache::default();
+            }
+            let projections = cache
+                .states
+                .iter()
+                .filter(|(_, state)| {
+                    expected_state.as_ref().is_some_and(|expected| {
+                        state.topic_id == topic_id && state.genesis == expected.genesis
+                    })
+                })
+                .map(|(id, state)| (*id, Arc::clone(state)))
+                .collect();
+            (Arc::clone(&cache.epoch), projections)
+        };
+        let mut projection_tips = BTreeSet::new();
 
         for op in ops {
             if !verified.contains(&op.id) {
@@ -916,6 +955,7 @@ impl<S: Storage> Oplog<S> {
             )? {
                 continue;
             }
+            projection_tips = op.signed.body.deps.clone();
             let meta = self.meta_for_projected(&op, &overlay_meta)?;
             heads = heads_after(&heads, &op);
             match &op.signed.body.payload {
@@ -971,6 +1011,7 @@ impl<S: Storage> Oplog<S> {
                 },
                 Some(&plan.eviction),
             )?;
+            *self.membership_cache()? = MembershipCache::default();
         } else if !entries.is_empty() {
             self.storage.put_admitted_batch(AdmittedBatch {
                 topic_id,
@@ -996,6 +1037,23 @@ impl<S: Storage> Oplog<S> {
             )?;
         }
 
+        // A reset or integrity recheck must also invalidate in-flight cache writes.
+        let mut cache = self.membership_cache()?;
+        if Arc::ptr_eq(&projection_epoch, &cache.epoch) {
+            for id in projection_tips {
+                if let Some(state) = projections.get(&id)
+                    && !cache.states.contains_key(&id)
+                {
+                    if cache.states.len() == MAX_CACHED_PROJECTIONS
+                        && let Some(oldest) = cache.order.pop_front()
+                    {
+                        cache.states.remove(&oldest);
+                    }
+                    cache.states.insert(id, Arc::clone(state));
+                    cache.order.push_back(id);
+                }
+            }
+        }
         Ok(accepted)
     }
 
@@ -1190,6 +1248,11 @@ impl<S: Storage> Oplog<S> {
         let body = &op.signed.body;
         if body.actor_id != actor_id_for(body.topic_id, body.author) {
             return Err(Error::ActorAuthorMismatch);
+        }
+        if let Some(prev) = body.actor_prev
+            && !body.deps.contains(&prev)
+        {
+            return Err(Error::ActorPrevMismatch);
         }
         for dep in &body.deps {
             if self.storage.get_op(dep)?.is_none() {
@@ -1509,6 +1572,11 @@ impl<S: Storage> Oplog<S> {
         let body = &op.signed.body;
         if body.actor_id != actor_id_for(body.topic_id, body.author) {
             return Err(Error::ActorAuthorMismatch);
+        }
+        if let Some(prev) = body.actor_prev
+            && !body.deps.contains(&prev)
+        {
+            return Err(Error::ActorPrevMismatch);
         }
         if let Some(existing) = self.stored_actor_index(body, overlay.reset)?.or_else(|| {
             overlay

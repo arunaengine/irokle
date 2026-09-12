@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! User-facing history and DAG traversal helpers.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::hash::Hash;
 
 /// Ordering used when traversing linearized history.
@@ -81,26 +81,34 @@ where
     I: Clone + Eq + Hash,
     F: FnMut(&I) -> Vec<I>,
 {
+    if query.limit == Some(0) {
+        return Vec::new();
+    }
+    let heads: HashSet<_> = query.heads.iter().cloned().collect();
     let mut seen = HashSet::new();
-    let mut queue: VecDeque<(I, bool)> = query.heads.into_iter().map(|head| (head, true)).collect();
+    let mut stack: Vec<_> = query
+        .heads
+        .into_iter()
+        .rev()
+        .map(|head| (head, false))
+        .collect();
     let mut out = Vec::new();
 
-    while let Some((id, is_head)) = queue.pop_front() {
+    while let Some((id, expanded)) = stack.pop() {
+        if expanded {
+            if query.include_heads || !heads.contains(&id) {
+                out.push(id);
+            }
+            continue;
+        }
         if !seen.insert(id.clone()) {
             continue;
         }
 
-        if query.include_heads || !is_head {
-            out.push(id.clone());
-            if query.limit.is_some_and(|limit| out.len() >= limit) {
-                break;
-            }
-        }
-
-        for parent in parents(&id) {
-            queue.push_back((parent, false));
-        }
+        let predecessors = parents(&id);
+        stack.push((id, true));
+        stack.extend(predecessors.into_iter().rev().map(|parent| (parent, false)));
     }
 
-    ordered(out, query.order)
+    limited(ordered(out, query.order), query.limit)
 }

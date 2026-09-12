@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::marker::PhantomData;
 
-use crate::history::{DagQuery, HistoryOrder, limited};
-use crate::oplog::{Oplog, topological, topological_subset};
+use crate::history::{DagQuery, HistoryOrder, limited, ordered};
+use crate::oplog::{Oplog, topological, topological_ids};
 use crate::reducer::EventRecord;
 use crate::storage::{MemoryStorage, Storage};
 use crate::{ActorClock, ActorId, Error, Event, Op, OpId, PeerId, Result, TopicControl, TopicId};
@@ -152,7 +152,10 @@ pub(super) fn dag_ops<S: Storage>(
     topic_id: TopicId,
     query: DagQuery<OpId>,
 ) -> Result<Vec<Op>> {
-    if query.order == HistoryOrder::NewestFirst || !query.heads.is_empty() {
+    let ids = if query.order == HistoryOrder::NewestFirst
+        || !query.heads.is_empty()
+        || !query.include_heads
+    {
         let starts = if query.heads.is_empty() {
             storage.heads(&topic_id)?.into_iter().collect::<Vec<_>>()
         } else {
@@ -186,25 +189,19 @@ pub(super) fn dag_ops<S: Storage>(
         // The walk runs unbounded: `query.limit` counts usable results, so
         // applying it here would let blocked ids spend the caller's budget and
         // return a short page over history that is still reachable.
-        let subset = ids.iter().copied().collect::<BTreeSet<_>>();
-        let usable = topological_subset(storage, &subset)?;
-        if query.order == HistoryOrder::OldestFirst {
-            return Ok(limited(usable, query.limit));
-        }
-        // Both orders must agree on membership: an op whose dependencies cannot
-        // be resolved is withheld here exactly as the oldest-first walk withholds
-        // it, so a caller never receives an op whose parents it cannot fetch.
-        let mut usable = usable
-            .into_iter()
-            .map(|op| (op.id, op))
-            .collect::<BTreeMap<_, _>>();
-        Ok(limited(
-            ids.into_iter()
-                .filter_map(|id| usable.remove(&id))
-                .collect(),
-            query.limit,
-        ))
+        ids.into_iter().collect::<BTreeSet<_>>()
     } else {
-        Ok(limited(topological(storage, &topic_id)?, query.limit))
-    }
+        storage.list_op_ids(&topic_id)?
+    };
+    let ids = limited(
+        ordered(topological_ids(storage, &ids)?, query.order),
+        query.limit,
+    );
+    ids.into_iter()
+        .map(|id| {
+            storage
+                .get_op(&id)?
+                .ok_or_else(|| Error::Storage(format!("missing op {id}")))
+        })
+        .collect()
 }
