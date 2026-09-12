@@ -739,6 +739,17 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
     quarantine_started: AtomicBool,
     outbound_streams: AtomicU64,
     shared: Arc<SharedNet<S>>,
+    #[cfg(test)]
+    accept_hooks: AcceptHooks,
+}
+
+/// Test-only accept loop knobs: a lower connection cap, and a semaphore every
+/// handshake waits on before it runs, so tests can hold handshakes pending.
+#[cfg(test)]
+#[derive(Default)]
+struct AcceptHooks {
+    connections: Option<usize>,
+    handshakes: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// The part of a net that storage jobs use off the async executor.
@@ -836,6 +847,8 @@ impl<S: Storage> IrohNet<S> {
             resync_started: AtomicBool::new(false),
             quarantine_started: AtomicBool::new(false),
             outbound_streams: AtomicU64::new(0),
+            #[cfg(test)]
+            accept_hooks: AcceptHooks::default(),
             shared: Arc::new(SharedNet {
                 node,
                 runtime,
@@ -1043,6 +1056,15 @@ impl<S: Storage> IrohNet<S> {
             latch: |net| &net.accept_started,
         };
         let tracker = Arc::clone(&self.tasks);
+        #[cfg(not(test))]
+        let max_connections = MAX_ACCEPT_CONNECTIONS;
+        #[cfg(test)]
+        let max_connections = self
+            .accept_hooks
+            .connections
+            .unwrap_or(MAX_ACCEPT_CONNECTIONS);
+        #[cfg(test)]
+        let hold = self.accept_hooks.handshakes.clone();
         let task = tracker.track();
         let endpoint = self.endpoint().clone();
         let mut shutdown = self.shutdown.subscribe();
@@ -1054,8 +1076,8 @@ impl<S: Storage> IrohNet<S> {
                 tokio::task::JoinSet::<io::Result<iroh::endpoint::Connection>>::new();
             let mut peer_connections = HashMap::<iroh::EndpointId, usize>::new();
             let mut connection_tasks = HashMap::<tokio::task::Id, iroh::EndpointId>::new();
-            loop {
-                while connections.len() >= MAX_ACCEPT_CONNECTIONS {
+            'accept: loop {
+                while connections.len() >= max_connections {
                     tokio::select! {
                         Some(result) = connections.join_next_with_id() => {
                             let task_id = match &result {
@@ -1075,10 +1097,9 @@ impl<S: Storage> IrohNet<S> {
                             }
                         }
                         changed = shutdown.changed() => {
+                            // Pending handshakes are reaped with the connections below.
                             if changed.is_err() || *shutdown.borrow() {
-                                connections.abort_all();
-                                while connections.join_next().await.is_some() {}
-                                return;
+                                break 'accept;
                             }
                         }
                     }
@@ -1175,8 +1196,14 @@ impl<S: Storage> IrohNet<S> {
                     continue;
                 }
                 let task = tracker.track();
+                #[cfg(test)]
+                let hold = hold.clone();
                 handshakes.spawn(async move {
                     let _task = task;
+                    #[cfg(test)]
+                    if let Some(hold) = hold {
+                        let _ = hold.acquire_owned().await.map(|permit| permit.forget());
+                    }
                     tokio::time::timeout(connect_timeout, incoming)
                         .await
                         .map_err(|_| timed_out("iroh accept timed out"))
@@ -4923,5 +4950,109 @@ mod tests {
             .expect("a schedule after an empty scan must leave a wake permit");
 
         assert_eq!(scheduler.due_targets_by_peer(8, 8).len(), 1);
+    }
+
+    /// Shutdown while the accept loop sits at its connection cap also ends
+    /// the handshakes still pending: no owned task is left and the latch clears.
+    #[tokio::test]
+    async fn capacity_shutdown_reaps() {
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let node = Irokle::builder()
+            .with_iroh_secret_key(endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        let runtime = IrohRuntimeConfig {
+            connect_timeout: Duration::from_secs(600),
+            sync_io_timeout: Duration::from_secs(600),
+            ..IrohRuntimeConfig::default()
+        };
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut net = IrohNet::new_with_config(endpoint, node, runtime).unwrap();
+        net.accept_hooks = AcceptHooks {
+            connections: Some(1),
+            handshakes: Some(Arc::clone(&hold)),
+        };
+        let net = Arc::new(net);
+        let accept = net
+            .spawn_accept_loop()
+            .unwrap()
+            .expect("accept loop starts");
+        let addr = {
+            use futures::StreamExt;
+            use iroh::Watcher;
+            let mut addr = net.endpoint().addr();
+            let mut addrs = net.endpoint().watch_addr().stream();
+            while addr.addrs.is_empty() {
+                addr = tokio::time::timeout(Duration::from_secs(60), addrs.next())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            addr
+        };
+        let held_by_net = Arc::strong_count(&hold);
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let client = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                .bind()
+                .await
+                .unwrap();
+            let addr = addr.clone();
+            clients.push(tokio::spawn(async move {
+                let connection = client.connect(addr, IROKLE_SYNC_ALPN).await;
+                (client, connection)
+            }));
+        }
+        /// Waits for observable progress, with a generous lost-progress cap.
+        async fn settle(condition: impl Fn() -> bool) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while !condition() {
+                assert!(tokio::time::Instant::now() < deadline, "lost progress");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        // Both handshakes wait on the hold, owned by the net.
+        settle(|| Arc::strong_count(&hold) == held_by_net + 2 && net.tasks.running() == 3).await;
+
+        // One handshake finishes into the only connection slot; the other stays
+        // pending while the loop waits at capacity.
+        hold.add_permits(1);
+        settle(|| {
+            Arc::strong_count(&hold) == held_by_net + 1
+                && net.tasks.running() == 3
+                && clients.iter().any(|client| client.is_finished())
+        })
+        .await;
+
+        // The loop must have ended its handshakes by the time it reports done,
+        // not leave them to be cancelled after it.
+        let stopping = {
+            let net = Arc::clone(&net);
+            tokio::spawn(async move { net.shutdown_with_timeout(Duration::from_secs(60)).await })
+        };
+        accept.await.unwrap();
+        let alive_at_exit = Arc::strong_count(&hold);
+        assert_eq!(stopping.await.unwrap(), ShutdownOutcome::Complete);
+        assert_eq!(
+            alive_at_exit,
+            held_by_net - 1,
+            "a handshake outlived the loop"
+        );
+        assert_eq!(net.tasks.running(), 0);
+        // The loop's own copy of the hold is gone too.
+        assert_eq!(
+            Arc::strong_count(&hold),
+            held_by_net - 1,
+            "a handshake outlived the loop"
+        );
+        assert!(!net.accept_started.load(Ordering::SeqCst));
+        for client in clients {
+            client.abort();
+            let _ = client.await;
+        }
     }
 }
