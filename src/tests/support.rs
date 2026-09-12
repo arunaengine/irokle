@@ -289,7 +289,7 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
         if self.failed_writes.lock().unwrap().contains(&batch.topic_id) {
             return Err(Error::Storage("injected admission write failure".into()));
         }
-        let lost = self.conflicts.fetch_update(
+        let lost = self.conflicts.try_update(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
             |left| left.checked_sub(1),
