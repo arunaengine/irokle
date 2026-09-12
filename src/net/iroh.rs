@@ -1990,11 +1990,10 @@ impl SyncSession {
                     false
                 }
             };
+            // Deny silently, like the non-member path in handle_message, rather
+            // than replying with a failure code.
             if !allowed {
-                return Ok(vec![SyncMessage::Failure(crate::sync::SyncFailure {
-                    topic_id: open.topic_id,
-                    code: crate::sync::SyncFailureCode::Open,
-                })]);
+                return Ok(Vec::new());
             }
             self.open_allowed = true;
         } else {
