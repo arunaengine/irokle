@@ -86,6 +86,14 @@ fn runtime() -> net::IrohRuntimeConfig {
     }
 }
 
+/// A QUIC transport with 16 KiB stream and 64 KiB connection windows.
+fn small_windows() -> iroh::endpoint::QuicTransportConfig {
+    iroh::endpoint::QuicTransportConfig::builder()
+        .stream_receive_window(iroh::endpoint::VarInt::from_u32(16 * 1024))
+        .receive_window(iroh::endpoint::VarInt::from_u32(64 * 1024))
+        .build()
+}
+
 async fn bind(
     lookup: &MemoryLookup,
     key: Option<iroh::SecretKey>,
@@ -368,4 +376,180 @@ async fn large_payload_pull() {
         let params = format!("backend={name} ops=64 op_bytes=1048576");
         report("large_payload", &params, runs);
     }
+}
+
+/// The only selected replica is unreachable (`held`: bound but never accepts;
+/// otherwise no address at all). Measures how long a member invited after
+/// 256 notes takes to hold the writer's frontier.
+async fn peer_fallback(held: bool) -> Run {
+    let lookup = MemoryLookup::new();
+    let alice = Irokle::builder()
+        .with_iroh_runtime_config(runtime())
+        .with_net(bind(&lookup, None, None).await)
+        .build()
+        .unwrap();
+    let held_endpoint = bind(&lookup, None, None).await;
+    let down = if held {
+        lookup.add_endpoint_info(ready_addr(&held_endpoint).await);
+        Ed25519Signer::from_iroh_secret_key(held_endpoint.secret_key()).peer_id()
+    } else {
+        Ed25519Signer::generate().peer_id()
+    };
+    let carol_key = iroh::SecretKey::generate();
+    let carol_peer = Ed25519Signer::from_iroh_secret_key(&carol_key).peer_id();
+    let carol = Irokle::builder()
+        .with_peer_whitelist([alice.peer_id()])
+        .with_iroh_runtime_config(runtime())
+        .with_net(bind(&lookup, Some(carol_key), None).await)
+        .build()
+        .unwrap();
+    lookup.add_endpoint_info(ready_addr(carol.endpoint().unwrap()).await);
+    lookup.add_endpoint_info(ready_addr(alice.endpoint().unwrap()).await);
+
+    let mut chosen = None;
+    for _ in 0..64 {
+        let config = TopicConfig {
+            initial_peers: [down].into(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(1),
+        };
+        let topic = alice.create_topic::<Note>(config).unwrap();
+        let mut state = alice.storage().topic_state(&topic.id()).unwrap().unwrap();
+        state.members.insert(carol_peer);
+        if node::select_sync_peers(topic.id(), alice.peer_id(), &state) == vec![down] {
+            chosen = Some(topic);
+            break;
+        }
+    }
+    let topic = chosen.expect("a topic preferring the unreachable replica");
+    for index in 0..256 {
+        let text = format!("note {index}");
+        topic.publish(Note { text }).unwrap();
+    }
+    let started = Instant::now();
+    topic.add_peer(carol_peer).unwrap();
+    let goal = alice.storage().actor_clock(&topic.id()).unwrap();
+    let done = wait_until(Duration::from_secs(60), || {
+        carol
+            .storage()
+            .actor_clock(&topic.id())
+            .unwrap()
+            .dominates(&goal)
+    })
+    .await;
+    let ms = millis(started);
+    alice.shutdown_iroh().await;
+    carol.shutdown_iroh().await;
+    held_endpoint.close().await;
+    Run {
+        ms,
+        done,
+        values: Vec::new(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement, run explicitly"]
+async fn unavailable_peer_fallback() {
+    for held in [false, true] {
+        let mut runs = Vec::new();
+        for _ in 0..REPS {
+            runs.push(peer_fallback(held).await);
+        }
+        let down = if held { "held" } else { "unknown" };
+        let params = format!("backend=memory preferred={down} notes=256 cap_ms=60000");
+        report("fallback", &params, runs);
+    }
+}
+
+/// Small QUIC windows on both sides: a pull of 600 KiB notes, then 200 more
+/// pulled after the member restarts its endpoint.
+async fn window_reconnect() -> (Run, Run) {
+    let lookup = MemoryLookup::new();
+    let alice_endpoint = bind(&lookup, None, Some(small_windows())).await;
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .with_write_concern(WriteConcern::Local)
+        .build()
+        .unwrap();
+    let alice_net =
+        Arc::new(net::IrohNet::new_with_config(alice_endpoint, alice.clone(), runtime()).unwrap());
+    alice_net.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice_net.endpoint()).await;
+    let bob_key = iroh::SecretKey::generate();
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(&bob_key)
+        .with_peer_whitelist([alice.peer_id()])
+        .build()
+        .unwrap();
+    let config = TopicConfig {
+        initial_peers: [bob.peer_id()].into(),
+        ..TopicConfig::default()
+    };
+    let topic = alice.create_topic::<Note>(config).unwrap();
+    let topic_id = topic.id();
+    let genesis = alice.storage().list_ops(&topic_id).unwrap();
+    bob.receive_sync_data_from(
+        alice.peer_id(),
+        SyncData {
+            topic_id,
+            ops: genesis,
+        },
+    )
+    .unwrap();
+    let publish = |from: usize, to: usize| {
+        for index in from..to {
+            topic
+                .publish(Note {
+                    text: format!("{index:0>1024}"),
+                })
+                .unwrap();
+        }
+        alice.storage().actor_clock(&topic_id).unwrap()
+    };
+
+    let mut phases = Vec::new();
+    for (from, to) in [(0, 600), (600, 800)] {
+        let goal = publish(from, to);
+        let endpoint = bind(&lookup, Some(bob_key.clone()), Some(small_windows())).await;
+        let net = net::IrohNet::new_with_config(endpoint, bob.clone(), runtime()).unwrap();
+        let sent = (sent_bytes(alice_net.endpoint()), sent_bytes(net.endpoint()));
+        let started = Instant::now();
+        let (done, exchanges) = pull_until(&net, &alice_addr, topic_id, &goal).await;
+        let ms = millis(started);
+        let values = vec![
+            ("exchanges", exchanges),
+            (
+                "alice_sent_bytes",
+                sent_bytes(alice_net.endpoint()) - sent.0,
+            ),
+            ("bob_sent_bytes", sent_bytes(net.endpoint()) - sent.1),
+        ];
+        net.shutdown().await;
+        phases.push(Run { ms, done, values });
+    }
+    alice_net.shutdown().await;
+    let reconnect = phases.pop().unwrap();
+    (phases.pop().unwrap(), reconnect)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement, run explicitly"]
+async fn small_window_reconnect() {
+    let (mut first, mut second) = (Vec::new(), Vec::new());
+    for _ in 0..REPS {
+        let (initial, reconnect) = window_reconnect().await;
+        first.push(initial);
+        second.push(reconnect);
+    }
+    let params = "backend=memory stream_window=16384 conn_window=65536 op_bytes=1024";
+    report(
+        "small_windows",
+        &format!("{params} ops=600 phase=initial"),
+        first,
+    );
+    report(
+        "small_windows",
+        &format!("{params} ops=200 phase=reconnect"),
+        second,
+    );
 }
