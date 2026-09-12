@@ -515,10 +515,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// from one view.
     fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>>;
 
-    /// Keep verified `ops` for a topic this store does not hold, apart from
-    /// every active query, in the session of `source` and `topic_id`.
-    /// Duplicates are free; a call past a staging limit stores nothing. A
-    /// topic that exists is refused with [`crate::Error::AdmissionConflict`].
+    /// Keep verified `ops` of a topic this store does not hold in the session of
+    /// `source`, invisible to topic queries. Duplicates are free, a call past a
+    /// limit stores nothing, an existing topic is an admission conflict.
     fn stage_bootstrap_ops(
         &self,
         source: PeerId,

@@ -1412,10 +1412,9 @@ impl<S: Storage> Oplog<S> {
         Ok(accepted)
     }
 
-    /// The batch that promotes a staged bootstrap history, validated like any
-    /// admission against a fresh topic. `None` until the causally complete part
-    /// of `staged` makes both `local` and `source` members. The caller must
-    /// have verified the signatures of `staged`.
+    /// The batch promoting verified `staged` ops, validated like any admission
+    /// against a fresh topic. `None` until their causally complete part makes
+    /// both `local` and `source` members.
     pub(crate) fn bootstrap_batch(
         &self,
         local: PeerId,

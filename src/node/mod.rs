@@ -586,8 +586,9 @@ impl<S: Storage> Irokle<S> {
         self.sync.plan_response_data(peer_id, request)
     }
 
-    /// Admit sync data from `source_peer_id` and return the signed ack payload
-    /// plus any topic evictions produced by genesis tie-break resolution.
+    /// Admit sync data from `source_peer_id` and return the signed ack plus any
+    /// genesis tie-break evictions. Data for a topic this node does not hold
+    /// fails with [`Error::BootstrapPending`] while it stays staged.
     pub fn receive_sync_data_from(
         &self,
         source_peer_id: PeerId,
@@ -600,8 +601,6 @@ impl<S: Storage> Irokle<S> {
     /// callers handling genesis tie-break evictions. The embedder consumes
     /// evictions to re-emit discarded payloads under the winning genesis;
     /// re-emission itself is out of scope for irokle.
-    /// Data for a topic this node does not hold fails with
-    /// [`Error::BootstrapPending`] while it stays staged.
     pub fn receive_sync_data_from_evicting(
         &self,
         source_peer_id: PeerId,
