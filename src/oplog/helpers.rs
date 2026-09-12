@@ -11,14 +11,25 @@ pub(super) fn materialize_topic_state(
     heads: BTreeSet<crate::OpId>,
 ) -> Result<TopicState> {
     let mut genesis = None;
+    let mut topic_id = None;
     let mut member_controls = BTreeMap::new();
     let mut replication_policy_control = None;
 
     for op in ops {
         let body = &op.signed.body;
+        if topic_id.is_some_and(|topic_id| topic_id != body.topic_id) {
+            return Err(Error::TopicMismatch);
+        }
+        topic_id.get_or_insert(body.topic_id);
         match &body.payload {
             TopicPayload::Genesis(topic_genesis) => {
-                genesis = Some((op.id, body.topic_id, topic_genesis.clone()));
+                if genesis
+                    .as_ref()
+                    .is_some_and(|(genesis_id, _, _)| *genesis_id != op.id)
+                {
+                    return Err(Error::InvalidGenesis);
+                }
+                genesis.get_or_insert((op.id, body.topic_id, topic_genesis.clone()));
             }
             TopicPayload::Control(TopicControl::AddPeer { peer }) => {
                 set_membership_control(&mut member_controls, *peer, control_key(&op), true);
@@ -91,6 +102,10 @@ pub(super) fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
 }
 
 pub(super) fn is_semantic_rejection(err: &Error) -> bool {
+    #[cfg(feature = "iroh")]
+    if matches!(err, Error::OpTooLarge) {
+        return true;
+    }
     matches!(
         err,
         Error::InvalidSignature

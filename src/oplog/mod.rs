@@ -24,6 +24,7 @@ use helpers::{
     pending_meta_for,
 };
 use topology::topological_ops;
+pub(crate) use topology::topological_subset_entries;
 pub use topology::{topological, topological_subset};
 
 const MAX_ADMISSION_RETRIES: usize = 64;
@@ -134,6 +135,49 @@ fn is_structural_genesis(op: &Op) -> bool {
         && body.actor_seq == 1
         && body.actor_prev.is_none()
         && body.deps.is_empty()
+}
+
+fn without_descendants(ops: Vec<Op>, rejected: OpId) -> Vec<Op> {
+    let mut children = BTreeMap::<OpId, Vec<OpId>>::new();
+    for op in &ops {
+        for dep in &op.signed.body.deps {
+            children.entry(*dep).or_default().push(op.id);
+        }
+    }
+    let mut rejected_ids = BTreeSet::from([rejected]);
+    let mut pending = VecDeque::from([rejected]);
+    while let Some(id) = pending.pop_front() {
+        for child in children.remove(&id).unwrap_or_default() {
+            if rejected_ids.insert(child) {
+                pending.push_back(child);
+            }
+        }
+    }
+    ops.into_iter()
+        .filter(|op| !rejected_ids.contains(&op.id))
+        .collect()
+}
+
+fn admission_failure(mut admitted: Admitted, error: Error) -> Error {
+    let source = match error {
+        Error::AdmissionCommitted {
+            admitted: partial,
+            source,
+        } => {
+            admitted.accepted.extend(partial.accepted);
+            admitted.evictions.extend(partial.evictions);
+            source
+        }
+        error => Box::new(error),
+    };
+    if admitted.accepted.is_empty() && admitted.evictions.is_empty() {
+        *source
+    } else {
+        Error::AdmissionCommitted {
+            admitted: Box::new(admitted),
+            source,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -347,12 +391,12 @@ impl<S: Storage> Oplog<S> {
         genesis: TopicGenesis,
         signer: &impl Signer,
     ) -> Result<Op> {
-        self.create_topic_genesis_with_effects(topic_id, actor_id, genesis, signer, |_, _, _| {
+        self.create_topic_effects(topic_id, actor_id, genesis, signer, |_, _, _| {
             Ok(AdmissionEffects::default())
         })
     }
 
-    pub(crate) fn create_topic_genesis_with_effects<F>(
+    pub(crate) fn create_topic_effects<F>(
         &self,
         topic_id: TopicId,
         actor_id: ActorId,
@@ -369,13 +413,14 @@ impl<S: Storage> Oplog<S> {
             initial_peers: peers,
             ..genesis
         };
-        self.create_and_admit_local_op_with_effects(
+        self.create_local_effects(
             topic_id,
             actor_id,
             TopicPayload::Genesis(genesis),
             signer,
             effects,
         )
+        .map(|(op, _)| op)
     }
 
     /// Create a topic genesis op plus its first event op and admit both in a
@@ -391,17 +436,13 @@ impl<S: Storage> Oplog<S> {
         event: EventEnvelope,
         signer: &impl Signer,
     ) -> Result<(Op, Op)> {
-        self.create_topic_genesis_with_event_with_effects(
-            topic_id,
-            actor_id,
-            genesis,
-            event,
-            signer,
-            |_, _, _| Ok(AdmissionEffects::default()),
-        )
+        self.create_genesis_effects(topic_id, actor_id, genesis, event, signer, |_, _, _| {
+            Ok(AdmissionEffects::default())
+        })
+        .map(|((genesis, _), (event, _))| (genesis, event))
     }
 
-    pub(crate) fn create_topic_genesis_with_event_with_effects<F>(
+    pub(crate) fn create_genesis_effects<F>(
         &self,
         topic_id: TopicId,
         actor_id: ActorId,
@@ -409,7 +450,7 @@ impl<S: Storage> Oplog<S> {
         event: EventEnvelope,
         signer: &impl Signer,
         effects: F,
-    ) -> Result<(Op, Op)>
+    ) -> Result<((Op, OpMeta), (Op, OpMeta))>
     where
         F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
     {
@@ -420,7 +461,7 @@ impl<S: Storage> Oplog<S> {
             ..genesis
         };
         for _ in 0..MAX_ADMISSION_RETRIES {
-            match self.try_create_and_admit_genesis_with_event(
+            match self.try_genesis_effects(
                 topic_id,
                 actor_id,
                 genesis.clone(),
@@ -442,23 +483,24 @@ impl<S: Storage> Oplog<S> {
         event: EventEnvelope,
         signer: &impl Signer,
     ) -> Result<Op> {
-        self.create_event_op_with_effects(topic_id, actor_id, event, signer, |_, _, _| {
+        self.create_event_effects(topic_id, actor_id, event, signer, |_, _, _| {
             Ok(AdmissionEffects::default())
         })
+        .map(|(op, _)| op)
     }
 
-    pub(crate) fn create_event_op_with_effects<F>(
+    pub(crate) fn create_event_effects<F>(
         &self,
         topic_id: TopicId,
         actor_id: ActorId,
         event: EventEnvelope,
         signer: &impl Signer,
         effects: F,
-    ) -> Result<Op>
+    ) -> Result<(Op, OpMeta)>
     where
         F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
     {
-        self.create_and_admit_local_op_with_effects(
+        self.create_local_effects(
             topic_id,
             actor_id,
             TopicPayload::Event(event),
@@ -474,12 +516,12 @@ impl<S: Storage> Oplog<S> {
         control: TopicControl,
         signer: &impl Signer,
     ) -> Result<Op> {
-        self.create_control_op_with_effects(topic_id, actor_id, control, signer, |_, _, _| {
+        self.create_control_effects(topic_id, actor_id, control, signer, |_, _, _| {
             Ok(AdmissionEffects::default())
         })
     }
 
-    pub(crate) fn create_control_op_with_effects<F>(
+    pub(crate) fn create_control_effects<F>(
         &self,
         topic_id: TopicId,
         actor_id: ActorId,
@@ -490,13 +532,14 @@ impl<S: Storage> Oplog<S> {
     where
         F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
     {
-        self.create_and_admit_local_op_with_effects(
+        self.create_local_effects(
             topic_id,
             actor_id,
             TopicPayload::Control(control),
             signer,
             effects,
         )
+        .map(|(op, _)| op)
     }
 
     pub fn receive_op(&self, op: Op) -> Result<()> {
@@ -558,55 +601,57 @@ impl<S: Storage> Oplog<S> {
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
     ) -> Result<Admitted> {
-        let mut accepted = BTreeSet::new();
-        let mut evictions = Vec::new();
-        let mut queue = VecDeque::new();
-        let mut queued_pending = BTreeSet::new();
-        if !ops.is_empty() {
-            queue.push_back((source_peer, ops, false));
-        }
-        self.enqueue_ready_pending_ops(&mut queue, &mut queued_pending)?;
-
-        while let Some((batch_source_peer, ops, from_pending)) = queue.pop_front() {
-            let pending_op_ids = if from_pending {
-                ops.iter().map(|op| op.id).collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            for op_id in &pending_op_ids {
-                queued_pending.remove(op_id);
-            }
-            // Pending ops re-queued from storage are not in `verified`; they
-            // get re-verified during admission like before.
-            let (batch_accepted, batch_eviction) =
-                match self.admit_ops_batch_retry(batch_source_peer, ops, verified) {
-                    Ok(outcome) => outcome,
-                    Err(err) if from_pending && is_semantic_rejection(&err) => {
-                        for op_id in pending_op_ids {
-                            self.storage.remove_pending_op(&op_id)?;
-                        }
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                };
-            if let Some(eviction) = batch_eviction {
-                evictions.push(eviction);
-            }
-            for op_id in &batch_accepted {
-                self.enqueue_pending_ops(
-                    &mut queue,
-                    &mut queued_pending,
-                    self.storage.pending_waiters(op_id)?,
-                );
+        let mut admitted = Admitted::default();
+        let result = (|| -> Result<()> {
+            let mut queue = VecDeque::new();
+            let mut queued_pending = BTreeSet::new();
+            if !ops.is_empty() {
+                queue.push_back((source_peer, ops, false));
             }
             self.enqueue_ready_pending_ops(&mut queue, &mut queued_pending)?;
-            accepted.extend(batch_accepted);
-        }
 
-        Ok(Admitted {
-            accepted,
-            evictions,
-        })
+            while let Some((batch_source_peer, ops, from_pending)) = queue.pop_front() {
+                let pending_op_ids = if from_pending {
+                    ops.iter().map(|op| op.id).collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                for op_id in &pending_op_ids {
+                    queued_pending.remove(op_id);
+                }
+                // Pending ops re-queued from storage are not in `verified`; they
+                // get re-verified during admission like before.
+                let (batch_accepted, batch_eviction) =
+                    match self.admit_ops_batch_retry(batch_source_peer, ops, verified) {
+                        Ok(outcome) => outcome,
+                        Err(err) if from_pending && is_semantic_rejection(&err) => {
+                            for op_id in pending_op_ids {
+                                self.storage.remove_pending_op(&op_id)?;
+                            }
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
+                if let Some(eviction) = batch_eviction {
+                    admitted.evictions.push(eviction);
+                }
+                admitted.accepted.extend(batch_accepted.iter().copied());
+                for op_id in &batch_accepted {
+                    self.enqueue_pending_ops(
+                        &mut queue,
+                        &mut queued_pending,
+                        self.storage.pending_waiters(op_id)?,
+                    );
+                }
+                self.enqueue_ready_pending_ops(&mut queue, &mut queued_pending)?;
+            }
+
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(admitted),
+            Err(error) => Err(admission_failure(admitted, error)),
+        }
     }
 
     fn enqueue_ready_pending_ops(
@@ -655,17 +700,15 @@ impl<S: Storage> Oplog<S> {
                 (ops.clone(), None, None)
             };
             let eviction = reset.as_ref().map(|plan| plan.eviction.clone());
+            if let Some(losing) = rejected_genesis {
+                self.purge_losing_pending(losing)?;
+            }
             // A won foreign genesis discards the local chain: admit the winner
             // batch against a fresh topic and fold the reset into the same
             // storage transaction as its admission (`reset_topic_and_admit`).
             match self.admit_ops_batch(source_peer, ops_to_admit, verified, reset) {
                 Err(Error::AdmissionConflict) => continue,
-                Ok(accepted) => {
-                    if let Some(losing) = rejected_genesis {
-                        self.purge_losing_pending(losing)?;
-                    }
-                    return Ok((accepted, eviction));
-                }
+                Ok(accepted) => return Ok((accepted, eviction)),
                 Err(err) => return Err(err),
             }
         }
@@ -730,7 +773,7 @@ impl<S: Storage> Oplog<S> {
                     author = %genesis.signed.body.author,
                     "rejected non-member genesis collision"
                 );
-                let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
+                let filtered = without_descendants(ops, genesis.id);
                 return Ok((filtered, None, Some(genesis.id)));
             }
             let eviction = self.extract_eviction(topic_id, &state, genesis.id)?;
@@ -757,7 +800,7 @@ impl<S: Storage> Oplog<S> {
                 evicted = 0,
                 "genesis collision resolved: kept local genesis, rejected larger foreign genesis"
             );
-            let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
+            let filtered = without_descendants(ops, genesis.id);
             Ok((filtered, None, Some(genesis.id)))
         }
     }
@@ -854,6 +897,8 @@ impl<S: Storage> Oplog<S> {
         let mut projections = BTreeMap::new();
 
         for op in ops {
+            #[cfg(feature = "iroh")]
+            op.validate_frame()?;
             if !verified.contains(&op.id) {
                 op.validate()?;
             }
@@ -872,7 +917,91 @@ impl<S: Storage> Oplog<S> {
             // dependencies can be resolved again.
             if matches!(stored, StoredOp::Repair) {
                 if missing_deps.is_empty() {
+                    let body = &op.signed.body;
+                    if body.actor_id != actor_id_for(body.topic_id, body.author) {
+                        return Err(Error::ActorAuthorMismatch);
+                    }
+                    if self
+                        .storage
+                        .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+                        .is_some_and(|id| id != op.id)
+                    {
+                        return Err(Error::ActorFork);
+                    }
+                    match &body.payload {
+                        TopicPayload::Genesis(_) => {
+                            if !is_structural_genesis(&op)
+                                || state.as_ref().is_some_and(|state| state.genesis != op.id)
+                            {
+                                return Err(Error::InvalidGenesis);
+                            }
+                        }
+                        TopicPayload::Event(envelope) => {
+                            let state = state.as_ref().ok_or(Error::TopicNotFound)?;
+                            ensure_event_type(&state.event_type_id, &envelope.type_id)?;
+                            if !self
+                                .project_membership(
+                                    &body.topic_id,
+                                    &body.deps,
+                                    &overlay_ops,
+                                    &overlay_meta,
+                                    &mut projections,
+                                )?
+                                .members
+                                .contains(&body.author)
+                            {
+                                return Err(Error::NotTopicMember);
+                            }
+                        }
+                        TopicPayload::Control(_) => {
+                            state.as_ref().ok_or(Error::TopicNotFound)?;
+                            if !self
+                                .project_membership(
+                                    &body.topic_id,
+                                    &body.deps,
+                                    &overlay_ops,
+                                    &overlay_meta,
+                                    &mut projections,
+                                )?
+                                .members
+                                .contains(&body.author)
+                            {
+                                return Err(Error::NotTopicMember);
+                            }
+                        }
+                    }
+                    match (body.actor_seq, body.actor_prev) {
+                        (1, None) => {}
+                        (2.., Some(prev)) if body.deps.contains(&prev) => {
+                            let prev_meta = self.meta_projected(&prev, &overlay_meta)?;
+                            if prev_meta.topic_id != body.topic_id
+                                || prev_meta.actor_id != body.actor_id
+                                || checked_next(prev_meta.actor_seq)? != body.actor_seq
+                            {
+                                return Err(Error::ActorPrevMismatch);
+                            }
+                        }
+                        _ => return Err(Error::ActorPrevMismatch),
+                    }
+                    let mut generation = 0;
+                    for id in &body.deps {
+                        let dep_meta = self.meta_projected(id, &overlay_meta)?;
+                        if dep_meta.topic_id != body.topic_id {
+                            return Err(Error::TopicMismatch);
+                        }
+                        generation = generation.max(checked_next(dep_meta.generation)?);
+                    }
+                    if body.generation != generation {
+                        return Err(Error::InvalidOpId);
+                    }
                     let meta = self.meta_for_projected(&op, &overlay_meta)?;
+                    if self
+                        .storage
+                        .get_meta(&op.id)?
+                        .is_some_and(|stored| stored != meta)
+                    {
+                        return Err(Error::InvalidOpId);
+                    }
                     overlay_meta.insert(op.id, meta.clone());
                     overlay_ops.insert(op.id, op.clone());
                     accepted.insert(op.id);
@@ -883,7 +1012,7 @@ impl<S: Storage> Oplog<S> {
                 continue;
             }
             if !missing_deps.is_empty() {
-                match self.validate_pending_op_projected(
+                match self.validate_pending_op(
                     &op,
                     &missing_deps,
                     &BatchOverlay {
@@ -989,11 +1118,21 @@ impl<S: Storage> Oplog<S> {
         // `entries`, so ordering after admission cannot spuriously reject it.
         for (op, missing_deps) in pending {
             let source_peer = source_peer.unwrap_or(op.signed.body.author);
-            self.storage.put_pending_op(
-                source_peer,
-                op.clone(),
-                pending_meta_for(&op, missing_deps),
-            )?;
+            self.storage
+                .put_pending_op(source_peer, op.clone(), pending_meta_for(&op, missing_deps))
+                .map_err(|error| {
+                    admission_failure(
+                        Admitted {
+                            accepted: accepted.clone(),
+                            evictions: reset_plan
+                                .as_ref()
+                                .map(|plan| plan.eviction.clone())
+                                .into_iter()
+                                .collect(),
+                        },
+                        error,
+                    )
+                })?;
         }
 
         Ok(accepted)
@@ -1003,25 +1142,19 @@ impl<S: Storage> Oplog<S> {
         self.storage.actor_clock(topic_id)
     }
 
-    fn create_and_admit_local_op_with_effects<F>(
+    fn create_local_effects<F>(
         &self,
         topic_id: TopicId,
         actor_id: ActorId,
         payload: TopicPayload,
         signer: &impl Signer,
         effects: F,
-    ) -> Result<Op>
+    ) -> Result<(Op, OpMeta)>
     where
         F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
     {
         for _ in 0..MAX_ADMISSION_RETRIES {
-            match self.try_create_and_admit_local_op(
-                topic_id,
-                actor_id,
-                payload.clone(),
-                signer,
-                &effects,
-            ) {
+            match self.try_local_effects(topic_id, actor_id, payload.clone(), signer, &effects) {
                 Err(err) if is_local_admission_race(&err) => continue,
                 result => return result,
             }
@@ -1029,14 +1162,14 @@ impl<S: Storage> Oplog<S> {
         Err(Error::AdmissionConflict)
     }
 
-    fn try_create_and_admit_local_op<F>(
+    fn try_local_effects<F>(
         &self,
         topic_id: TopicId,
         actor_id: ActorId,
         payload: TopicPayload,
         signer: &impl Signer,
         effects: &F,
-    ) -> Result<Op>
+    ) -> Result<(Op, OpMeta)>
     where
         F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
     {
@@ -1046,14 +1179,22 @@ impl<S: Storage> Oplog<S> {
         let expected_heads = self.storage.heads(&topic_id)?;
         let expected_state = self.storage.topic_state(&topic_id)?;
         let op = self.next_local_op(topic_id, actor_id, expected_heads.clone(), payload, signer)?;
+        #[cfg(feature = "iroh")]
+        op.validate_frame()?;
         op.validate()?;
         self.validate_op(&op)?;
         let meta = self.meta_for(&op)?;
-        self.commit_admission(op.clone(), meta, expected_heads, expected_state, effects)?;
-        Ok(op)
+        self.commit_admission(
+            op.clone(),
+            meta.clone(),
+            expected_heads,
+            expected_state,
+            effects,
+        )?;
+        Ok((op, meta))
     }
 
-    fn try_create_and_admit_genesis_with_event<F>(
+    fn try_genesis_effects<F>(
         &self,
         topic_id: TopicId,
         actor_id: ActorId,
@@ -1061,7 +1202,7 @@ impl<S: Storage> Oplog<S> {
         event: EventEnvelope,
         signer: &impl Signer,
         effects: &F,
-    ) -> Result<(Op, Op)>
+    ) -> Result<((Op, OpMeta), (Op, OpMeta))>
     where
         F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
     {
@@ -1074,6 +1215,8 @@ impl<S: Storage> Oplog<S> {
             TopicPayload::Genesis(genesis),
             signer,
         )?;
+        #[cfg(feature = "iroh")]
+        genesis_op.validate_frame()?;
         genesis_op.validate()?;
         self.validate_op(&genesis_op)?;
         let genesis_meta = self.meta_for(&genesis_op)?;
@@ -1091,6 +1234,8 @@ impl<S: Storage> Oplog<S> {
             },
             signer,
         )?;
+        #[cfg(feature = "iroh")]
+        event_op.validate_frame()?;
         event_op.validate()?;
 
         let genesis_heads = heads_after(&expected_heads, &genesis_op);
@@ -1133,14 +1278,14 @@ impl<S: Storage> Oplog<S> {
             expected_heads,
             expected_topic_state: expected_state,
             entries: vec![
-                (genesis_op.clone(), genesis_meta),
-                (event_op.clone(), event_meta),
+                (genesis_op.clone(), genesis_meta.clone()),
+                (event_op.clone(), event_meta.clone()),
             ],
             heads,
             topic_state: Some(state),
             effects: admission_effects,
         })?;
-        Ok((genesis_op, event_op))
+        Ok(((genesis_op, genesis_meta), (event_op, event_meta)))
     }
 
     fn next_local_op(
@@ -1191,6 +1336,29 @@ impl<S: Storage> Oplog<S> {
         if body.actor_id != actor_id_for(body.topic_id, body.author) {
             return Err(Error::ActorAuthorMismatch);
         }
+        if matches!(body.payload, TopicPayload::Genesis(_))
+            && self.storage.topic_state(&body.topic_id)?.is_some()
+        {
+            return Err(Error::InvalidGenesis);
+        }
+        if let Some(existing) =
+            self.storage
+                .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+            && existing != op.id
+        {
+            return Err(Error::ActorFork);
+        }
+        let expected = self.storage.actor_tip(&body.topic_id, &body.actor_id)?;
+        let (expected_seq, expected_prev) = next_actor_position(expected)?;
+        if body.actor_seq != expected_seq {
+            return Err(Error::ActorSeqGap {
+                expected: expected_seq,
+                actual: body.actor_seq,
+            });
+        }
+        if body.actor_prev != expected_prev {
+            return Err(Error::ActorPrevMismatch);
+        }
         for dep in &body.deps {
             if self.storage.get_op(dep)?.is_none() {
                 return Err(Error::MissingDependency(*dep));
@@ -1239,24 +1407,6 @@ impl<S: Storage> Oplog<S> {
                     return Err(Error::NotTopicMember);
                 }
             }
-        }
-        if let Some(existing) =
-            self.storage
-                .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            && existing != op.id
-        {
-            return Err(Error::ActorFork);
-        }
-        let expected = self.storage.actor_tip(&body.topic_id, &body.actor_id)?;
-        let (expected_seq, expected_prev) = next_actor_position(expected)?;
-        if body.actor_seq != expected_seq {
-            return Err(Error::ActorSeqGap {
-                expected: expected_seq,
-                actual: body.actor_seq,
-            });
-        }
-        if body.actor_prev != expected_prev {
-            return Err(Error::ActorPrevMismatch);
         }
         let mut generation = 0;
         for id in &body.deps {
@@ -1368,7 +1518,7 @@ impl<S: Storage> Oplog<S> {
         Ok(missing)
     }
 
-    fn validate_pending_op_projected(
+    fn validate_pending_op(
         &self,
         op: &Op,
         missing_deps: &BTreeSet<crate::OpId>,
@@ -1417,25 +1567,13 @@ impl<S: Storage> Oplog<S> {
                 if body.deps.is_empty() || body.generation == 0 {
                     return Err(Error::InvalidOpId);
                 }
-                // When we already know the topic, only buffer pending ops from
-                // known members. This stops non-members from consuming
-                // per-source pending quota by submitting structurally-valid
-                // ops that would be rejected at admission time anyway.
                 if let Some(state) = state {
                     ensure_event_type(&state.event_type_id, &envelope.type_id)?;
-                    if !state.members.contains(&body.author) {
-                        return Err(Error::NotTopicMember);
-                    }
                 }
             }
             TopicPayload::Control(_) => {
                 if body.deps.is_empty() || body.generation == 0 {
                     return Err(Error::InvalidOpId);
-                }
-                if let Some(state) = state
-                    && !state.members.contains(&body.author)
-                {
-                    return Err(Error::NotTopicMember);
                 }
             }
         }
