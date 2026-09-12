@@ -10,6 +10,8 @@ mod combined;
 mod core;
 #[cfg(feature = "iroh")]
 mod exchange;
+#[cfg(feature = "iroh")]
+mod fallback;
 mod holes;
 #[cfg(feature = "iroh")]
 mod iroh;
