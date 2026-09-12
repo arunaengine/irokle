@@ -19,7 +19,9 @@ use crate::ActorClock;
 use crate::history::{DagQuery, HistoryOrder, ordered};
 use crate::oplog::{Oplog, topological_subset_entries};
 use crate::reducer::EventRecord;
-use crate::storage::{AdmissionEffects, OpMeta, SyncObligation, TopicState};
+use crate::storage::{
+    AdmissionEffects, MAX_STAGED_IDLE_MS, OpMeta, StagedTopic, SyncObligation, TopicState,
+};
 use crate::storage::{
     MemoryStorage, Storage, SyncPeerState, SyncPeerStatus, SyncStateUpdate, SyncStatusUpdate,
 };
@@ -47,6 +49,26 @@ fn is_unreachable(error: &std::io::Error) -> bool {
 const SYNC_PEER_SHARED_OVERLAP: usize = 2;
 #[cfg(feature = "iroh")]
 const SYNC_TOPIC_CONCURRENCY: usize = 8;
+
+/// What receiving sync data did.
+#[derive(Clone, Debug)]
+pub enum ReceiveOutcome {
+    /// The data reached the active topic; the signed ack speaks for it.
+    Acked {
+        ack: Box<SyncAck>,
+        evictions: Vec<TopicEviction>,
+    },
+    /// The topic is not held here and its staged history does not prove
+    /// membership yet. This is no ack and certifies nothing.
+    Staged(StagedTopic),
+}
+
+/// Where data for a possibly unknown topic stands.
+enum Bootstrap {
+    /// The topic is active, with the ids a promotion just admitted.
+    Active(BTreeSet<OpId>),
+    Staged(StagedTopic),
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum WriteConcern {
@@ -578,14 +600,31 @@ impl<S: Storage> Irokle<S> {
     /// callers handling genesis tie-break evictions. The embedder consumes
     /// evictions to re-emit discarded payloads under the winning genesis;
     /// re-emission itself is out of scope for irokle.
+    /// Data for a topic this node does not hold fails with
+    /// [`Error::BootstrapPending`] while it stays staged.
     pub fn receive_sync_data_from_evicting(
         &self,
         source_peer_id: PeerId,
         data: SyncData,
     ) -> Result<(SyncAck, Vec<TopicEviction>)> {
-        // Verify each op once up front; both the unknown-topic dry run and
-        // the real admission below reuse the result instead of re-running
-        // the ed25519 verification per pass.
+        match self.receive_sync_outcome(source_peer_id, data)? {
+            ReceiveOutcome::Acked { ack, evictions } => Ok((*ack, evictions)),
+            ReceiveOutcome::Staged(staged) => Err(Error::BootstrapPending {
+                staged: staged.clock,
+            }),
+        }
+    }
+
+    /// Receive sync data. Data for a topic this node does not hold is staged
+    /// per source until the staged history makes this node and the source
+    /// members; then the whole history is admitted atomically and acked.
+    pub fn receive_sync_outcome(
+        &self,
+        source_peer_id: PeerId,
+        data: SyncData,
+    ) -> Result<ReceiveOutcome> {
+        // Verify each op once up front; staging and the real admission below
+        // reuse the result instead of re-running the ed25519 verification.
         for op in &data.ops {
             if op.signed.body.topic_id != data.topic_id {
                 return Err(Error::TopicMismatch);
@@ -596,11 +635,14 @@ impl<S: Storage> Irokle<S> {
             op.validate()?;
             verified.insert(op.id);
         }
-        self.check_unknown_topic(source_peer_id, &data, &verified)?;
         let forwarded = std::cell::RefCell::new(BTreeSet::new());
         let forward = |source: Option<PeerId>, entries: &[(Op, OpMeta)], state: &TopicState| {
             forwarded.borrow_mut().insert(state.topic_id);
             self.forward_effects(source, entries, state)
+        };
+        let promoted = match self.bootstrap_unknown(source_peer_id, &data, &forward)? {
+            Bootstrap::Active(promoted) => promoted,
+            Bootstrap::Staged(staged) => return Ok(ReceiveOutcome::Staged(staged)),
         };
         let received = self.sync.receive_data_preverified(
             source_peer_id,
@@ -635,6 +677,8 @@ impl<S: Storage> Irokle<S> {
                 return Err(error);
             }
         };
+        ack.accepted
+            .extend(promoted.intersection(&verified).copied());
         if let Err(source) = ack.sign(&self.config.signer) {
             #[cfg(feature = "iroh")]
             if let Some(net) = &self.net {
@@ -649,7 +693,10 @@ impl<S: Storage> Irokle<S> {
                 source: Box::new(source),
             });
         }
-        Ok((ack, evictions))
+        Ok(ReceiveOutcome::Acked {
+            ack: Box::new(ack),
+            evictions,
+        })
     }
 
     pub fn receive_sync_data_as_local(
@@ -757,30 +804,58 @@ impl<S: Storage> Irokle<S> {
         Ok(())
     }
 
-    fn check_unknown_topic(
+    /// Stage data for a topic this node does not hold, and promote the staged
+    /// history of the source once it makes this node and the source members.
+    fn bootstrap_unknown(
         &self,
         source_peer_id: PeerId,
         data: &SyncData,
-        verified: &BTreeSet<crate::OpId>,
-    ) -> Result<()> {
-        if self.storage().topic_state(&data.topic_id)?.is_some() {
-            return Ok(());
+        forward: crate::oplog::ReceiveEffects<'_>,
+    ) -> Result<Bootstrap> {
+        let storage = self.storage();
+        let topic_id = data.topic_id;
+        if storage.topic_state(&topic_id)?.is_some() {
+            return Ok(Bootstrap::Active(BTreeSet::new()));
         }
-        let dry_storage = MemoryStorage::new();
-        let dry_oplog = Oplog::with_storage(dry_storage.clone());
-        dry_oplog.receive_ops_from_peer_preverified(
-            Some(source_peer_id),
-            data.ops.clone(),
-            verified,
-            None,
-        )?;
-        let Some(state) = dry_storage.topic_state(&data.topic_id)? else {
-            return Err(Error::InvalidGenesis);
-        };
-        if !state.members.contains(&self.peer_id()) || !state.members.contains(&source_peer_id) {
-            return Err(Error::NotTopicMember);
+        let now_ms = now_millis()?;
+        storage.expire_bootstrap(now_ms.saturating_sub(MAX_STAGED_IDLE_MS))?;
+        let staged =
+            match storage.stage_bootstrap_ops(source_peer_id, topic_id, data.ops.clone(), now_ms) {
+                Err(Error::AdmissionConflict) => return self.bootstrap_raced(topic_id),
+                staged => staged?,
+            };
+        let history = storage.staged_bootstrap_ops(&source_peer_id, &topic_id)?;
+        let batch =
+            match self
+                .oplog
+                .bootstrap_batch(self.peer_id(), source_peer_id, history, Some(forward))
+            {
+                Ok(Some(batch)) => batch,
+                Ok(None) => return Ok(Bootstrap::Staged(staged)),
+                Err(error) => {
+                    // Invalid signed history never becomes valid; drop the session.
+                    if !is_backend_failure(&error) {
+                        storage.discard_bootstrap(&source_peer_id, &topic_id)?;
+                    }
+                    return Err(error);
+                }
+            };
+        let promoted = batch.entries.iter().map(|(op, _)| op.id).collect();
+        match storage.promote_bootstrap(batch) {
+            Ok(()) => Ok(Bootstrap::Active(promoted)),
+            Err(Error::AdmissionConflict) => self.bootstrap_raced(topic_id),
+            Err(error) => Err(error),
         }
-        Ok(())
+    }
+
+    /// A staging write refused because the topic became active meanwhile. The
+    /// normal receive then decides between branches; it must never admit an
+    /// unknown topic without staging, so a conflict on a missing topic fails.
+    fn bootstrap_raced(&self, topic_id: TopicId) -> Result<Bootstrap> {
+        if self.storage().topic_state(&topic_id)?.is_none() {
+            return Err(Error::AdmissionConflict);
+        }
+        Ok(Bootstrap::Active(BTreeSet::new()))
     }
 
     pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {
@@ -1217,7 +1292,18 @@ impl Irokle<crate::FjallStorage> {
     }
 }
 
-#[cfg(any(feature = "iroh", test))]
+/// Whether `error` is a failure of the store rather than of the data.
+fn is_backend_failure(error: &Error) -> bool {
+    #[cfg(feature = "fjall")]
+    if matches!(error, Error::Fjall(_)) {
+        return true;
+    }
+    matches!(
+        error,
+        Error::Storage(_) | Error::AdmissionConflict | Error::Encode(_) | Error::Decode(_)
+    )
+}
+
 fn now_millis() -> Result<u64> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -108,6 +108,11 @@ pub enum Error {
     #[error("op {0} was rejected on this branch")]
     RejectedOp(crate::ids::OpId),
 
+    /// Data for a topic this node does not hold was staged: its history does
+    /// not yet make this node and the source members. Nothing was acknowledged.
+    #[error("bootstrap data staged until its history proves membership")]
+    BootstrapPending { staged: crate::ActorClock },
+
     #[error("eviction journal is full")]
     EvictionJournalFull,
 

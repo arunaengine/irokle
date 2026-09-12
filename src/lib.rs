@@ -26,7 +26,10 @@ pub use error::{Error, Result};
 pub use event::{Event, EventEnvelope};
 pub use ids::{ActorId, EvictionKey, IdParseError, OpId, PeerId, TopicId, actor_id_for};
 pub use irokle_derive::Event;
-pub use node::{Irokle, IrokleBuilder, NodeConfig, PublishOptions, RawTopic, Topic, WriteConcern};
+pub use node::{
+    Irokle, IrokleBuilder, NodeConfig, PublishOptions, RawTopic, ReceiveOutcome, Topic,
+    WriteConcern,
+};
 pub use op::{Op, OpBody, SignedOp};
 pub use oplog::{Admitted, EvictedOp, TopicEviction};
 #[doc(hidden)]

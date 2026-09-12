@@ -40,6 +40,8 @@ pub const MAX_STAGED_BYTES_PER_SESSION: u64 = 32 * 1024 * 1024;
 pub const MAX_STAGED_OPS_PER_SESSION: u64 = 65536;
 pub const MAX_STAGED_SESSIONS: usize = 64;
 pub const MAX_STAGED_SESSIONS_PER_SOURCE: usize = 8;
+/// A session with no write for this long may be expired.
+pub const MAX_STAGED_IDLE_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpMeta {

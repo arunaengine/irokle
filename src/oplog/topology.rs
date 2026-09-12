@@ -133,6 +133,42 @@ fn topological_meta<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) -> Res
     Ok(out)
 }
 
+/// The ops of `ops` whose dependencies all lie, transitively, inside `ops`.
+pub(crate) fn complete_ops(ops: Vec<Op>) -> Vec<Op> {
+    let mut by_id = ops
+        .into_iter()
+        .map(|op| (op.id, op))
+        .collect::<BTreeMap<_, _>>();
+    let mut waiting = BTreeMap::new();
+    let mut children: BTreeMap<crate::OpId, Vec<crate::OpId>> = BTreeMap::new();
+    let mut ready = VecDeque::new();
+    for (id, op) in &by_id {
+        let deps = &op.signed.body.deps;
+        if deps.is_empty() {
+            ready.push_back(*id);
+        } else {
+            waiting.insert(*id, deps.len());
+        }
+        for dep in deps {
+            children.entry(*dep).or_default().push(*id);
+        }
+    }
+    let mut complete = BTreeSet::new();
+    while let Some(id) = ready.pop_front() {
+        complete.insert(id);
+        for child in children.remove(&id).unwrap_or_default() {
+            if let Some(count) = waiting.get_mut(&child) {
+                *count -= 1;
+                if *count == 0 {
+                    ready.push_back(child);
+                }
+            }
+        }
+    }
+    by_id.retain(|id, _| complete.contains(id));
+    by_id.into_values().collect()
+}
+
 pub(crate) fn topological_ops(ops: Vec<Op>) -> Result<Vec<Op>> {
     let by_id = ops
         .into_iter()

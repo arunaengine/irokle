@@ -183,7 +183,7 @@ fn rejects_unknown_nonmember() {
     let err = outsider
         .receive_sync_data_from(a.peer_id(), raw_data)
         .unwrap_err();
-    assert!(matches!(err, Error::NotTopicMember));
+    assert!(matches!(err, Error::BootstrapPending { .. }));
     assert!(
         outsider
             .storage()

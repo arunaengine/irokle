@@ -24,8 +24,8 @@ use helpers::{
     pending_meta_for,
 };
 pub(crate) use topology::topological_ids;
-use topology::topological_ops;
 pub(crate) use topology::topological_subset_entries;
+use topology::{complete_ops, topological_ops};
 pub use topology::{topological, topological_subset};
 
 /// Attempts one admission job makes; storage writes on this path try once each.
@@ -1410,6 +1410,37 @@ impl<S: Storage> Oplog<S> {
             }
         }
         Ok(accepted)
+    }
+
+    /// The batch that promotes a staged bootstrap history, validated like any
+    /// admission against a fresh topic. `None` until the causally complete part
+    /// of `staged` makes both `local` and `source` members. The caller must
+    /// have verified the signatures of `staged`.
+    pub(crate) fn bootstrap_batch(
+        &self,
+        local: PeerId,
+        source: PeerId,
+        staged: Vec<Op>,
+        effects: Option<ReceiveEffects<'_>>,
+    ) -> Result<Option<AdmittedBatch>> {
+        let complete = complete_ops(staged);
+        let invited = complete.iter().any(|op| match &op.signed.body.payload {
+            TopicPayload::Genesis(genesis) => genesis.initial_peers.contains(&local),
+            TopicPayload::Control(TopicControl::AddPeer { peer }) => *peer == local,
+            _ => false,
+        });
+        if !invited {
+            return Ok(None);
+        }
+        let verified = complete.iter().map(|op| op.id).collect();
+        let Some(built) = self.build_batch(Some(source), complete, &verified, true, effects)?
+        else {
+            return Ok(None);
+        };
+        let members = built.batch.topic_state.as_ref().map(|state| &state.members);
+        Ok(members
+            .is_some_and(|members| members.contains(&local) && members.contains(&source))
+            .then_some(built.batch))
     }
 
     pub fn observed_clock(&self, topic_id: &TopicId) -> Result<crate::ActorClock> {
