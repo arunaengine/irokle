@@ -67,3 +67,7 @@ required-features = ["iroh"]
 [[example]]
 name = "iroh_fjall_recovery"
 required-features = ["iroh", "fjall"]
+
+[[example]]
+name = "iroh_runtime_config"
+required-features = ["iroh"]

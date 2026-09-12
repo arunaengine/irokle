@@ -142,6 +142,7 @@ let runtime = IrohRuntimeConfig {
     connect_timeout: Duration::from_secs(10),
     sync_io_timeout: Duration::from_secs(10),
     resync_interval: Duration::from_secs(15),
+    ..IrohRuntimeConfig::default()
 };
 
 let node = irokle::Irokle::builder()
@@ -178,6 +179,7 @@ See `examples/iroh_fjall_recovery.rs` for a complete example that creates a topi
 - `examples/iroh_chat.rs`: NodeId-only Iroh chat sync using discovery.
 - `examples/iroh_topic_intro.rs`: introduces a peer to a topic, opens it on the receiver, then rejects membership.
 - `examples/iroh_fjall_recovery.rs`: reopens an Iroh/Fjall node from disk with the same Iroh secret key.
+- `examples/iroh_runtime_config.rs`: builds an Iroh node with custom runtime timeouts and resync interval.
 
 Run examples with features as needed:
 
