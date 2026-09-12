@@ -279,6 +279,65 @@ mod fjall;
 #[cfg(feature = "fjall")]
 pub use fjall::FjallStorage;
 
+pub(super) fn validate_batch(batch: &AdmittedBatch) -> Result<()> {
+    for state in [&batch.expected_topic_state, &batch.topic_state]
+        .into_iter()
+        .flatten()
+    {
+        if state.topic_id != batch.topic_id {
+            return Err(crate::Error::TopicMismatch);
+        }
+    }
+    if batch
+        .topic_state
+        .as_ref()
+        .is_some_and(|state| state.heads != batch.heads)
+    {
+        return Err(crate::Error::Storage(
+            "topic state frontier mismatch".into(),
+        ));
+    }
+    for (op, meta) in &batch.entries {
+        let body = &op.signed.body;
+        if body.topic_id != batch.topic_id || meta.topic_id != batch.topic_id {
+            return Err(crate::Error::TopicMismatch);
+        }
+        if meta.id != op.id
+            || meta.author != body.author
+            || meta.actor_id != body.actor_id
+            || meta.actor_seq != body.actor_seq
+            || meta.actor_prev != body.actor_prev
+            || meta.deps != body.deps
+            || meta.generation != body.generation
+            || !meta.ready
+            || !meta.missing_deps.is_empty()
+        {
+            return Err(crate::Error::Storage("operation metadata mismatch".into()));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_heads(
+    batch: &AdmittedBatch,
+    mut accounted: impl FnMut(&OpMeta) -> Result<bool>,
+) -> Result<()> {
+    let mut heads = batch.expected_heads.clone();
+    let mut consumed = BTreeSet::new();
+    for (op, meta) in &batch.entries {
+        // Repairs and duplicates retain their existing position in the frontier.
+        if !accounted(meta)? {
+            heads.insert(op.id);
+            consumed.extend(op.signed.body.deps.iter().copied());
+        }
+    }
+    heads.retain(|id| !consumed.contains(id));
+    if heads != batch.heads {
+        return Err(crate::Error::Storage("admitted frontier mismatch".into()));
+    }
+    Ok(())
+}
+
 pub(crate) fn topic_fingerprint_for(
     heads: &BTreeSet<OpId>,
     clock: &ActorClock,

@@ -14,7 +14,7 @@ use super::{
     AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
     MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
     SyncPeerStatus, TopicState, ensure_deps_resolvable, journalled_eviction, stored_ack_dominates,
-    sync_obligation_satisfied, topic_fingerprint_for,
+    sync_obligation_satisfied, topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[cfg(feature = "fjall")]
@@ -72,6 +72,12 @@ impl FjallStorage {
         };
         storage.ensure_schema_version()?;
         Ok(storage)
+    }
+
+    /// Flush buffered transactions with the requested durability.
+    pub fn persist(&self, persist_mode: fjall::PersistMode) -> Result<()> {
+        self.db.persist(persist_mode)?;
+        Ok(())
     }
 
     fn ensure_schema_version(&self) -> Result<()> {
@@ -194,16 +200,41 @@ impl FjallStorage {
         Ok(())
     }
 
-    fn sync_obligation_key(obligation: &SyncObligation) -> Vec<u8> {
-        let digest =
-            blake3::hash(&postcard::to_allocvec(&obligation.op_ids).expect("op ids serialize"));
-        [
+    fn sync_obligation_key(obligation: &SyncObligation) -> Result<Vec<u8>> {
+        let digest = blake3::hash(&postcard::to_allocvec(&(
+            &obligation.op_ids,
+            &obligation.target_clock,
+        ))?);
+        Ok([
             b"ob".as_slice(),
             obligation.peer_id.as_ref(),
             obligation.topic_id.as_ref(),
             digest.as_bytes(),
         ]
-        .concat()
+        .concat())
+    }
+
+    fn tx_put_obligation(
+        tx: &mut fjall::OptimisticWriteTx,
+        records: &fjall::OptimisticTxKeyspace,
+        obligation: &SyncObligation,
+    ) -> Result<()> {
+        let legacy_digest = blake3::hash(&postcard::to_allocvec(&obligation.op_ids)?);
+        let legacy_key = [
+            b"ob".as_slice(),
+            obligation.peer_id.as_ref(),
+            obligation.topic_id.as_ref(),
+            legacy_digest.as_bytes(),
+        ]
+        .concat();
+        let key = Self::sync_obligation_key(obligation)?;
+        for candidate in [&legacy_key, &key] {
+            if Self::tx_get::<SyncObligation>(tx, records, candidate)?.as_ref() == Some(obligation)
+            {
+                return Ok(());
+            }
+        }
+        Self::tx_put(tx, records, key, obligation)
     }
     fn get<T: for<'de> Deserialize<'de>>(&self, key: impl AsRef<[u8]>) -> Result<Option<T>> {
         Ok(self
@@ -243,11 +274,12 @@ impl FjallStorage {
         Ok(OpId::from_bytes(out))
     }
 
-    fn tx_put_admitted_batch(
+    fn tx_admit_batch(
         &self,
         tx: &mut fjall::OptimisticWriteTx,
         batch: &AdmittedBatch,
     ) -> Result<()> {
+        validate_batch(batch)?;
         let AdmittedBatch {
             topic_id,
             expected_heads,
@@ -277,6 +309,7 @@ impl FjallStorage {
 
             let mut actor_tips = BTreeMap::new();
             let mut new_entries = Vec::new();
+            let mut accounted_entries = BTreeSet::new();
             for (op, meta) in entries {
                 if meta.topic_id != topic_id {
                     return Err(Error::TopicMismatch);
@@ -293,6 +326,7 @@ impl FjallStorage {
                     Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", &op.id))?
                         .is_some();
                 if has_op && has_meta {
+                    accounted_entries.insert(op.id);
                     continue;
                 }
                 let indexed = Self::tx_get::<OpId>(
@@ -322,6 +356,7 @@ impl FjallStorage {
                 // append: its actor position is already recorded, so the checks
                 // below cannot apply.
                 if has_op || has_meta || indexed == Some(op.id) || has_children {
+                    accounted_entries.insert(op.id);
                     new_entries.push((op.clone(), meta.clone()));
                     continue;
                 }
@@ -368,6 +403,7 @@ impl FjallStorage {
                 new_entries.push((op.clone(), meta.clone()));
             }
 
+            validate_heads(batch, |meta| Ok(accounted_entries.contains(&meta.id)))?;
             ensure_deps_resolvable(&new_entries, |dep| {
                 Ok(
                     Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", dep))?.is_some()
@@ -493,12 +529,7 @@ impl FjallStorage {
                 )?;
             }
             for obligation in &effects.sync_obligations {
-                Self::tx_put(
-                    tx,
-                    &self.records,
-                    Self::sync_obligation_key(obligation),
-                    obligation,
-                )?;
+                Self::tx_put_obligation(tx, &self.records, obligation)?;
             }
             Ok(())
         }
@@ -685,7 +716,7 @@ impl FjallStorage {
 #[cfg(feature = "fjall")]
 impl Storage for FjallStorage {
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
-        self.transaction(|tx| self.tx_put_admitted_batch(tx, &batch))
+        self.transaction(|tx| self.tx_admit_batch(tx, &batch))
     }
 
     fn reset_topic_and_admit(
@@ -718,7 +749,7 @@ impl Storage for FjallStorage {
                 return Err(Error::AdmissionConflict);
             }
             let removed = self.tx_reset_topic(tx, topic_id)?;
-            self.tx_put_admitted_batch(tx, &batch)?;
+            self.tx_admit_batch(tx, &batch)?;
             // The journal entry commits with the reset that made it the only
             // copy, so no crash point can leave the payloads unrecorded.
             if let Some((key, eviction)) = journalled_eviction(eviction) {
@@ -848,12 +879,18 @@ impl Storage for FjallStorage {
         Ok(self.get(Self::key_id(b"mg", topic_id))?.unwrap_or_default())
     }
     fn topic_state(&self, topic_id: &TopicId) -> Result<Option<TopicState>> {
-        self.get::<TopicState>(Self::key_id(b"ts", topic_id))?
-            .map(|mut state| {
-                state.heads = self.heads(topic_id)?;
-                Ok(state)
-            })
-            .transpose()
+        let read_tx = self.db.read_tx();
+        let Some(value) =
+            fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"ts", topic_id))?
+        else {
+            return Ok(None);
+        };
+        let mut state: TopicState = postcard::from_bytes(value.as_ref())?;
+        state.heads = fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"h", topic_id))?
+            .map(|value| postcard::from_bytes(value.as_ref()))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Some(state))
     }
     fn list_topics(&self) -> Result<Vec<TopicInfo>> {
         // v0 keeps this simple: scan durable topic records instead of maintaining a second index.
@@ -1051,7 +1088,7 @@ impl Storage for FjallStorage {
         Ok(out)
     }
     fn put_sync_obligation(&self, obligation: SyncObligation) -> Result<()> {
-        self.put(Self::sync_obligation_key(&obligation), &obligation)
+        self.transaction(|tx| Self::tx_put_obligation(tx, &self.records, &obligation))
     }
 
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>> {

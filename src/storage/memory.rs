@@ -12,7 +12,7 @@ use super::{
     AdmittedBatch, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
     MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
     SyncPeerStatus, TopicState, ensure_deps_resolvable, journalled_eviction, stored_ack_dominates,
-    sync_obligation_satisfied, topic_fingerprint_for,
+    sync_obligation_satisfied, topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[derive(Clone, Default)]
@@ -92,7 +92,7 @@ impl MemoryStorage {
 impl Storage for MemoryStorage {
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
         let mut inner = self.lock()?;
-        put_admitted_batch_locked(&mut inner, batch)
+        admit_batch_locked(&mut inner, batch)
     }
 
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
@@ -222,15 +222,16 @@ impl Storage for MemoryStorage {
         if dep_resolvable_locked(&inner, &op.id) {
             return Ok(());
         }
-        let replace_pending = if let Some((_, existing, _)) = inner.pending_ops.get(&op.id) {
+        let replaced = if let Some((source, existing, pending_meta)) = inner.pending_ops.get(&op.id)
+        {
             if existing != &op {
                 return Err(Error::Storage(
                     "pending op id collision with different op".into(),
                 ));
             }
-            true
+            Some((*source, pending_meta.missing_deps.clone()))
         } else {
-            false
+            None
         };
         if meta
             .missing_deps
@@ -244,25 +245,32 @@ impl Storage for MemoryStorage {
                 "pending op has too many missing deps".into(),
             ));
         }
-        if replace_pending {
-            remove_pending_locked(&mut inner, &op.id);
-        }
-        if inner.pending_ops.len() >= MAX_PENDING_OPS_TOTAL {
+        if replaced.is_none() && inner.pending_ops.len() >= MAX_PENDING_OPS_TOTAL {
             return Err(Error::Storage("pending op buffer is full".into()));
         }
         let source_pending = inner
             .pending_by_source
             .get(&source_peer)
             .map_or(0, BTreeSet::len);
-        if source_pending >= MAX_PENDING_OPS_PER_SOURCE {
+        let replaces_source = replaced
+            .as_ref()
+            .is_some_and(|(source, _)| *source == source_peer);
+        if !replaces_source && source_pending >= MAX_PENDING_OPS_PER_SOURCE {
             return Err(Error::Storage("pending op source quota exceeded".into()));
         }
         for dep in &meta.missing_deps {
-            if inner.pending_waiters.get(dep).map_or(0, BTreeSet::len)
-                >= MAX_PENDING_WAITERS_PER_DEP
+            let replaces_waiter = replaced
+                .as_ref()
+                .is_some_and(|(_, missing)| missing.contains(dep));
+            if !replaces_waiter
+                && inner.pending_waiters.get(dep).map_or(0, BTreeSet::len)
+                    >= MAX_PENDING_WAITERS_PER_DEP
             {
                 return Err(Error::Storage("pending waiter quota exceeded".into()));
             }
+        }
+        if replaced.is_some() {
+            remove_pending_locked(&mut inner, &op.id);
         }
         for dep in &meta.missing_deps {
             inner.pending_waiters.entry(*dep).or_default().insert(op.id);
@@ -435,7 +443,7 @@ impl Storage for MemoryStorage {
         // an empty topic with nothing installed in its place.
         let mut staged = inner.clone();
         let removed = reset_topic_locked(&mut staged, topic_id);
-        put_admitted_batch_locked(&mut staged, batch)?;
+        admit_batch_locked(&mut staged, batch)?;
         // The journal entry is part of the same swap: after it the discarded
         // payloads exist nowhere else, so no ordering here can lose them.
         if let Some((key, eviction)) = journalled_eviction(eviction) {
@@ -468,22 +476,37 @@ impl Storage for MemoryStorage {
     }
 }
 
-fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<()> {
+fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<()> {
+    validate_batch(&batch)?;
+    if inner
+        .heads
+        .get(&batch.topic_id)
+        .cloned()
+        .unwrap_or_default()
+        != batch.expected_heads
+    {
+        return Err(Error::AdmissionConflict);
+    }
+    if memory_topic_state_locked(inner, &batch.topic_id) != batch.expected_topic_state {
+        return Err(Error::AdmissionConflict);
+    }
+    validate_heads(&batch, |meta| {
+        Ok(inner.ops.contains_key(&meta.id)
+            || inner.meta.contains_key(&meta.id)
+            || inner
+                .actor_by_seq
+                .get(&(meta.topic_id, meta.actor_id, meta.actor_seq))
+                == Some(&meta.id)
+            || inner.children.contains_key(&meta.id))
+    })?;
     let AdmittedBatch {
         topic_id,
-        expected_heads,
-        expected_topic_state,
         entries,
         heads,
         topic_state,
         effects,
+        ..
     } = batch;
-    if inner.heads.get(&topic_id).cloned().unwrap_or_default() != expected_heads {
-        return Err(Error::AdmissionConflict);
-    }
-    if memory_topic_state_locked(inner, &topic_id) != expected_topic_state {
-        return Err(Error::AdmissionConflict);
-    }
     let mut actor_tips = BTreeMap::new();
     let mut new_entries = Vec::new();
     for (op, meta) in entries {
@@ -708,7 +731,7 @@ fn purge_waiters_locked(inner: &mut MemoryInner, dep_id: &OpId) -> usize {
 }
 
 fn remove_pending_locked(inner: &mut MemoryInner, op_id: &OpId) {
-    let Some((_, _, meta)) = inner.pending_ops.remove(op_id) else {
+    let Some((source, _, meta)) = inner.pending_ops.remove(op_id) else {
         return;
     };
     for dep in meta.missing_deps {
@@ -719,10 +742,14 @@ fn remove_pending_locked(inner: &mut MemoryInner, op_id: &OpId) {
             }
         }
     }
-    inner.pending_by_source.retain(|_, op_ids| {
-        op_ids.remove(op_id);
-        !op_ids.is_empty()
-    });
+    if let std::collections::btree_map::Entry::Occupied(mut entry) =
+        inner.pending_by_source.entry(source)
+    {
+        entry.get_mut().remove(op_id);
+        if entry.get().is_empty() {
+            entry.remove();
+        }
+    }
 }
 
 fn memory_topic_state_locked(inner: &MemoryInner, topic_id: &TopicId) -> Option<TopicState> {
