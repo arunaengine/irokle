@@ -26,6 +26,7 @@ const DEFAULT_FULL_SWEEP_TIME_OF_DAY: Duration = Duration::from_secs(3 * 60 * 60
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const EMPTY_RESYNC_SLEEP: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 const MAX_ACCEPT_CONNECTIONS: usize = 128;
+const MAX_ACCEPT_CONNECTIONS_PER_PEER: usize = 4;
 const MAX_RESYNC_PEER_CONCURRENCY: usize = 8;
 const MAX_RESYNC_TARGETS_PER_PEER_PASS: usize = 16 * 1024;
 const MAX_TOPICS_PER_RESYNC_BATCH: usize = 1024;
@@ -107,7 +108,10 @@ impl ResyncScheduler {
         let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
         match targets.get_mut(&key) {
             Some(target) => {
-                if !target.in_flight && next_due < target.next_due {
+                if !target.in_flight
+                    && (target.failures == 0 || force)
+                    && next_due < target.next_due
+                {
                     target.next_due = next_due;
                 }
                 target.force |= force;
@@ -125,7 +129,7 @@ impl ResyncScheduler {
             }
         }
         drop(targets);
-        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     fn due_targets_by_peer(
@@ -136,19 +140,22 @@ impl ResyncScheduler {
         let now = tokio::time::Instant::now();
         let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
         let mut due: BTreeMap<PeerId, Vec<ResyncTargetKey>> = BTreeMap::new();
-        for (key, target) in targets.iter() {
-            if target.in_flight || target.next_due > now {
-                continue;
-            }
+        let mut ready: Vec<_> = targets
+            .iter()
+            .filter(|(_, target)| !target.in_flight && target.next_due <= now)
+            .map(|(key, target)| (target.next_due, *key))
+            .collect();
+        ready.sort_unstable();
+        for (_, key) in ready {
             match due.get_mut(&key.peer_id) {
                 Some(keys) => {
                     if keys.len() < max_targets_per_peer {
-                        keys.push(*key);
+                        keys.push(key);
                     }
                 }
                 None => {
                     if due.len() < max_peers {
-                        due.insert(key.peer_id, vec![*key]);
+                        due.insert(key.peer_id, vec![key]);
                     }
                 }
             }
@@ -161,7 +168,7 @@ impl ResyncScheduler {
                     target.in_flight = true;
                     batch.push(ResyncTarget {
                         key,
-                        force: std::mem::take(&mut target.force),
+                        force: target.force,
                     });
                 }
             }
@@ -187,6 +194,14 @@ impl ResyncScheduler {
             .remove(&ResyncTargetKey { peer_id, topic_id });
     }
 
+    fn is_forced(&self, peer_id: PeerId, topic_id: crate::TopicId) -> bool {
+        self.inner
+            .lock()
+            .expect("resync scheduler lock poisoned")
+            .get(&ResyncTargetKey { peer_id, topic_id })
+            .is_some_and(|target| target.force)
+    }
+
     fn complete_dirty(&self, peer_id: PeerId, topic_id: crate::TopicId, after: Duration) {
         let key = ResyncTargetKey { peer_id, topic_id };
         let next_due = tokio::time::Instant::now() + after;
@@ -200,8 +215,9 @@ impl ResyncScheduler {
         target.next_due = next_due;
         target.failures = 0;
         target.in_flight = false;
+        target.force = false;
         drop(targets);
-        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     fn peer_reachable(&self, peer_id: PeerId) {
@@ -219,7 +235,7 @@ impl ResyncScheduler {
         }
         drop(targets);
         if changed {
-            self.notify.notify_waiters();
+            self.notify.notify_one();
         }
     }
 
@@ -244,9 +260,8 @@ impl ResyncScheduler {
         let backoff = initial_backoff.saturating_mul(multiplier).min(max_backoff);
         target.next_due = tokio::time::Instant::now() + backoff;
         target.in_flight = false;
-        target.force = false;
         drop(targets);
-        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 }
 
@@ -528,10 +543,24 @@ impl<S: Storage> IrohNet<S> {
         let mut shutdown = self.shutdown.subscribe();
         Ok(Some(handle.spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
+            let mut peer_connections = HashMap::<iroh::EndpointId, usize>::new();
+            let mut connection_tasks = HashMap::<tokio::task::Id, iroh::EndpointId>::new();
             loop {
                 while connections.len() >= MAX_ACCEPT_CONNECTIONS {
                     tokio::select! {
-                        Some(result) = connections.join_next() => {
+                        Some(result) = connections.join_next_with_id() => {
+                            let task_id = match &result {
+                                Ok((task_id, ())) => *task_id,
+                                Err(error) => error.id(),
+                            };
+                            if let Some(peer) = connection_tasks.remove(&task_id)
+                                && let Some(count) = peer_connections.get_mut(&peer)
+                            {
+                                *count = count.saturating_sub(1);
+                                if *count == 0 {
+                                    peer_connections.remove(&peer);
+                                }
+                            }
                             if let Err(error) = result {
                                 tracing::warn!(%error, "iroh connection task failed");
                             }
@@ -554,7 +583,19 @@ impl<S: Storage> IrohNet<S> {
                 drop(current);
 
                 let incoming = tokio::select! {
-                    Some(result) = connections.join_next(), if !connections.is_empty() => {
+                    Some(result) = connections.join_next_with_id(), if !connections.is_empty() => {
+                        let task_id = match &result {
+                            Ok((task_id, ())) => *task_id,
+                            Err(error) => error.id(),
+                        };
+                        if let Some(peer) = connection_tasks.remove(&task_id)
+                            && let Some(count) = peer_connections.get_mut(&peer)
+                        {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                peer_connections.remove(&peer);
+                            }
+                        }
                         if let Err(error) = result {
                             tracing::warn!(%error, "iroh connection task failed");
                         }
@@ -577,6 +618,7 @@ impl<S: Storage> IrohNet<S> {
                 if current.is_shutdown() {
                     break;
                 }
+                let idle_timeout = current.runtime.sync_io_timeout;
                 drop(current);
                 let accepted = tokio::select! {
                     changed = shutdown.changed() => {
@@ -590,17 +632,25 @@ impl<S: Storage> IrohNet<S> {
                 match accepted {
                     Ok(connection) => {
                         let peer = connection.remote_id();
+                        let peer_count = peer_connections.entry(peer).or_default();
+                        if *peer_count >= MAX_ACCEPT_CONNECTIONS_PER_PEER {
+                            tracing::warn!(%peer, "rejecting excess inbound iroh connection");
+                            continue;
+                        }
+                        *peer_count += 1;
                         let connection_net = Weak::clone(&net);
                         let connection_shutdown = shutdown.clone();
-                        connections.spawn(async move {
+                        let task = connections.spawn(async move {
                             handle_connection(
                                 connection_net,
                                 connection_shutdown,
                                 peer,
                                 connection,
+                                idle_timeout,
                             )
-                            .await;
+                            .await
                         });
+                        connection_tasks.insert(task.id(), peer);
                     }
                     Err(error) => {
                         tracing::warn!(%error, "failed to accept iroh connection");
@@ -658,14 +708,13 @@ impl<S: Storage> IrohNet<S> {
                 let due_sleep = tokio::time::sleep_until(next_due);
                 tokio::pin!(due_sleep);
                 tokio::select! {
+                    biased;
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
                             break;
                         }
                         continue;
                     }
-                    _ = notify.notified() => {}
-                    _ = &mut due_sleep => {}
                     _ = &mut full_sweep, if !runtime.full_sweep_interval.is_zero() => {
                         if let Some(current) = net.upgrade()
                             && let Err(error) = current.schedule_full_sweep_resync() {
@@ -673,6 +722,8 @@ impl<S: Storage> IrohNet<S> {
                             }
                         full_sweep.as_mut().reset(tokio::time::Instant::now() + runtime.full_sweep_interval);
                     }
+                    _ = notify.notified() => {}
+                    _ = &mut due_sleep => {}
                 }
             }
         })))
@@ -693,7 +744,7 @@ impl<S: Storage> IrohNet<S> {
             }
         };
 
-        if !needs_sync {
+        if !needs_sync && (result.is_ok() || !self.resync_scheduler.is_forced(peer_id, topic_id)) {
             self.resync_scheduler.complete_clean(peer_id, topic_id);
             return;
         }
@@ -728,10 +779,30 @@ impl<S: Storage> IrohNet<S> {
         else {
             return Ok(false);
         };
-        if !state.members.contains(&self.node.peer_id()) || !state.members.contains(&peer_id) {
+        if !state.members.contains(&peer_id)
+            || (!state.members.contains(&self.node.peer_id())
+                && self.local_leave_op(&state)?.is_none())
+        {
             return Ok(false);
         }
         Ok(select_sync_peers(topic_id, self.node.peer_id(), &state).contains(&peer_id))
+    }
+
+    fn local_leave_op(
+        &self,
+        state: &crate::storage::TopicState,
+    ) -> io::Result<Option<crate::OpId>> {
+        let Some((key, false)) = state.membership_controls.get(&self.node.peer_id()) else {
+            return Ok(None);
+        };
+        let meta = self
+            .node
+            .storage()
+            .get_meta(&key.op_id)
+            .map_err(invalid_data)?;
+        Ok(meta
+            .filter(|meta| meta.ready && meta.author == self.node.peer_id())
+            .map(|_| key.op_id))
     }
 
     /// Whether the local topic may be certified as synchronized. A topic
@@ -756,8 +827,20 @@ impl<S: Storage> IrohNet<S> {
         else {
             return Ok(false);
         };
-        if !state.members.contains(&self.node.peer_id()) || !state.members.contains(&peer_id) {
+        if !state.members.contains(&peer_id) {
             return Ok(false);
+        }
+        if !state.members.contains(&self.node.peer_id()) {
+            let Some(op_id) = self.local_leave_op(&state)? else {
+                return Ok(false);
+            };
+            return Ok(
+                select_sync_peers(topic_id, self.node.peer_id(), &state).contains(&peer_id)
+                    && !self
+                        .node
+                        .peer_reached_op(peer_id, op_id)
+                        .map_err(invalid_data)?,
+            );
         }
         if self
             .node
@@ -800,7 +883,7 @@ impl<S: Storage> IrohNet<S> {
         else {
             return Ok(Vec::new());
         };
-        if !state.members.contains(&self.node.peer_id()) {
+        if !state.members.contains(&self.node.peer_id()) && self.local_leave_op(&state)?.is_none() {
             return Ok(Vec::new());
         }
         let mut targets = Vec::new();
@@ -985,7 +1068,9 @@ impl<S: Storage> IrohNet<S> {
             .map_err(invalid_data)?
         {
             Some(state) => {
-                !state.members.contains(&peer_id) || !state.members.contains(&self.node.peer_id())
+                !state.members.contains(&peer_id)
+                    || (!state.members.contains(&self.node.peer_id())
+                        && self.local_leave_op(&state)?.is_none())
             }
             None => true,
         };
@@ -1118,8 +1203,15 @@ impl<S: Storage> IrohNet<S> {
             summaries.remove(topic_id);
             let outcome = self
                 .node
-                .record_peer_synced(remote_peer_id, *topic_id)
-                .map_err(invalid_data);
+                .record_fingerprint(remote_peer_id, *topic_id, fingerprints[topic_id])
+                .map_err(invalid_data)
+                .and_then(|matched| {
+                    if matched {
+                        Ok(())
+                    } else {
+                        Err(invalid_data("topic changed during fingerprint exchange"))
+                    }
+                });
             outcomes.insert(*topic_id, outcome);
         }
         for topic_id in &incomplete {
@@ -1190,10 +1282,40 @@ impl<S: Storage> IrohNet<S> {
         topic_id: crate::TopicId,
         summary: &SyncSummary,
     ) -> io::Result<Option<PlannedTopicSync>> {
-        let plan = self
+        let mut plan = self
             .node
             .negotiate_sync(remote_peer_id, summary)
             .map_err(invalid_data)?;
+        if let Some(state) = self
+            .node
+            .storage()
+            .topic_state(&topic_id)
+            .map_err(invalid_data)?
+            && !state.members.contains(&self.node.peer_id())
+            && let Some(op_id) = self.local_leave_op(&state)?
+        {
+            let mut closure = BTreeSet::new();
+            let mut pending = vec![op_id];
+            while let Some(id) = pending.pop() {
+                if !closure.insert(id) {
+                    continue;
+                }
+                let op = self
+                    .node
+                    .storage()
+                    .get_op(&id)
+                    .map_err(invalid_data)?
+                    .ok_or_else(|| invalid_data("missing leave dependency"))?;
+                if op.signed.body.topic_id != topic_id {
+                    return Err(invalid_data("leave dependency belongs to another topic"));
+                }
+                pending.extend(op.signed.body.deps);
+                pending.extend(op.signed.body.actor_prev);
+            }
+            plan.send.retain(|op| closure.contains(&op.id));
+            plan.need.clear();
+            plan.actor_range_hints.clear();
+        }
         let request = crate::sync::SyncRequest {
             topic_id: plan.topic_id,
             known: plan.common,
@@ -1201,7 +1323,7 @@ impl<S: Storage> IrohNet<S> {
             actor_range_hints: plan.actor_range_hints,
         };
         let mut messages = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
-        messages.extend(sync_data_messages(plan.topic_id, plan.send));
+        messages.extend(sync_data_messages(plan.topic_id, plan.send)?);
         let data_count = messages.len() - 1;
         let wants = !request.wants.is_empty() || !request.actor_range_hints.is_empty();
         let requested_ops = request.wants.len() as u64
@@ -1442,6 +1564,11 @@ impl<S: Storage> IrohNet<S> {
                 continue;
             };
             if !state.members.contains(&self.node.peer_id()) {
+                targets.extend(
+                    self.dirty_selected_targets(topic.topic_id)?
+                        .into_iter()
+                        .map(|peer_id| (peer_id, topic.topic_id)),
+                );
                 continue;
             }
             targets.extend(
@@ -1502,11 +1629,17 @@ impl<S: Storage> IrohNet<S> {
                 // the requester can serve what this side cannot resolve.
                 if local.fingerprint == fingerprint.fingerprint
                     && self.topic_is_whole(fingerprint.topic_id)
+                    && (!state.members.contains(&peer_id)
+                        || self
+                            .node
+                            .record_fingerprint(
+                                peer_id,
+                                fingerprint.topic_id,
+                                fingerprint.fingerprint,
+                            )
+                            .map_err(invalid_data)?)
                 {
                     if state.members.contains(&peer_id) {
-                        self.node
-                            .record_peer_synced(peer_id, fingerprint.topic_id)
-                            .map_err(invalid_data)?;
                         self.finish_resync_attempt(
                             peer_id,
                             fingerprint.topic_id,
@@ -1533,7 +1666,7 @@ impl<S: Storage> IrohNet<S> {
                     .map_err(invalid_data)?;
                 let mut responses = Vec::new();
                 if !plan.send.is_empty() {
-                    responses.extend(sync_data_messages(plan.topic_id, plan.send));
+                    responses.extend(sync_data_messages(plan.topic_id, plan.send)?);
                 }
                 if !plan.need.is_empty() || !plan.actor_range_hints.is_empty() {
                     responses.push(SyncMessage::Request(crate::sync::SyncRequest {
@@ -1553,7 +1686,7 @@ impl<S: Storage> IrohNet<S> {
                     .node
                     .plan_sync_response_data(peer_id, &request)
                     .map_err(invalid_data)?;
-                Ok(sync_data_messages(data.topic_id, data.ops))
+                sync_data_messages(data.topic_id, data.ops)
             }
             SyncMessage::Data(data) => {
                 let data_topic_id = data.topic_id;
@@ -1760,54 +1893,53 @@ async fn run_due_resyncs<S: Storage>(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     runtime: IrohRuntimeConfig,
 ) -> bool {
-    loop {
+    let Some(current) = net.upgrade() else {
+        return false;
+    };
+    if current.is_shutdown() || current.endpoint().is_closed() {
+        return false;
+    }
+    let due = current.resync_scheduler.due_targets_by_peer(
+        MAX_RESYNC_PEER_CONCURRENCY,
+        MAX_RESYNC_TARGETS_PER_PEER_PASS,
+    );
+    drop(current);
+    if due.is_empty() {
+        return true;
+    }
+
+    let mut syncs = tokio::task::JoinSet::new();
+    for (peer_id, targets) in due {
         let Some(current) = net.upgrade() else {
             return false;
         };
-        if current.is_shutdown() || current.endpoint().is_closed() {
+        if current.is_shutdown() {
             return false;
         }
-        let due = current.resync_scheduler.due_targets_by_peer(
-            MAX_RESYNC_PEER_CONCURRENCY,
-            MAX_RESYNC_TARGETS_PER_PEER_PASS,
-        );
-        drop(current);
-        if due.is_empty() {
-            return true;
-        }
+        syncs.spawn(async move {
+            current
+                .sync_peer_batch_with_runtime(peer_id, targets, runtime)
+                .await;
+        });
+    }
 
-        let mut syncs = tokio::task::JoinSet::new();
-        for (peer_id, targets) in due {
-            let Some(current) = net.upgrade() else {
-                return false;
-            };
-            if current.is_shutdown() {
-                return false;
-            }
-            syncs.spawn(async move {
-                current
-                    .sync_peer_batch_with_runtime(peer_id, targets, runtime)
-                    .await;
-            });
-        }
-
-        while !syncs.is_empty() {
-            tokio::select! {
-                Some(result) = syncs.join_next() => {
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "resync batch task failed");
-                    }
+    while !syncs.is_empty() {
+        tokio::select! {
+            Some(result) = syncs.join_next() => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "resync batch task failed");
                 }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        syncs.abort_all();
-                        while syncs.join_next().await.is_some() {}
-                        return false;
-                    }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    syncs.abort_all();
+                    while syncs.join_next().await.is_some() {}
+                    return false;
                 }
             }
         }
     }
+    true
 }
 
 fn next_full_sweep_deadline(interval: Duration, time_of_day: Duration) -> tokio::time::Instant {
@@ -1848,6 +1980,7 @@ async fn handle_connection<S: Storage>(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     peer: iroh::EndpointId,
     connection: iroh::endpoint::Connection,
+    idle_timeout: Duration,
 ) {
     if let Some(current) = net.upgrade() {
         current
@@ -1862,7 +1995,15 @@ async fn handle_connection<S: Storage>(
                 }
                 continue;
             }
-            streams = connection.accept_bi() => streams,
+            streams = tokio::time::timeout(idle_timeout, connection.accept_bi()) => {
+                match streams {
+                    Ok(streams) => streams,
+                    Err(_) => {
+                        tracing::debug!(%peer, "closing idle inbound iroh connection");
+                        break;
+                    }
+                }
+            },
         };
         let (send, recv) = match streams {
             Ok(streams) => streams,

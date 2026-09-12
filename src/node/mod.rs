@@ -256,7 +256,7 @@ impl<S: Storage> Irokle<S> {
             |op, meta, state| {
                 self.replication_admission_effects(
                     topic_id,
-                    op.id,
+                    op,
                     meta,
                     state,
                     &self.config.default_write_concern,
@@ -301,7 +301,7 @@ impl<S: Storage> Irokle<S> {
             |op, meta, state| {
                 self.replication_admission_effects(
                     topic_id,
-                    op.id,
+                    op,
                     meta,
                     state,
                     &self.config.default_write_concern,
@@ -732,11 +732,15 @@ impl<S: Storage> Irokle<S> {
     fn replication_admission_effects(
         &self,
         topic_id: TopicId,
-        op_id: OpId,
+        op: &Op,
         meta: &OpMeta,
         state: &TopicState,
         write_concern: &WriteConcern,
     ) -> Result<AdmissionEffects> {
+        if self.net.is_some() {
+            crate::net::sync_data_messages(topic_id, vec![op.clone()])
+                .map_err(|error| Error::Storage(error.to_string()))?;
+        }
         if !matches!(write_concern, WriteConcern::AsyncReplication) || self.net.is_none() {
             return Ok(AdmissionEffects::default());
         }
@@ -749,7 +753,7 @@ impl<S: Storage> Irokle<S> {
                 .map(|peer_id| SyncObligation {
                     peer_id,
                     topic_id,
-                    op_ids: [op_id].into(),
+                    op_ids: [op.id].into(),
                     target_clock: target_clock.clone(),
                 })
                 .collect(),
@@ -916,7 +920,7 @@ impl<S: Storage> Irokle<S> {
             |op, meta, state| {
                 self.replication_admission_effects(
                     topic_id,
-                    op.id,
+                    op,
                     meta,
                     state,
                     &options.write_concern,
@@ -966,7 +970,7 @@ impl<S: Storage> Irokle<S> {
             |op, meta, state| {
                 self.replication_admission_effects(
                     topic_id,
-                    op.id,
+                    op,
                     meta,
                     state,
                     &self.config.default_write_concern,

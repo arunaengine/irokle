@@ -23,15 +23,41 @@ pub use frame::{
 pub use iroh::{IrohNet, IrohRuntimeConfig};
 
 #[cfg(any(feature = "iroh", test))]
-pub(crate) fn sync_data_messages(topic_id: TopicId, ops: Vec<Op>) -> Vec<SyncMessage> {
-    ops.chunks(MAX_SYNC_DATA_OPS_PER_MESSAGE)
-        .map(|ops| {
-            SyncMessage::Data(SyncData {
+pub(crate) fn sync_data_messages(topic_id: TopicId, ops: Vec<Op>) -> io::Result<Vec<SyncMessage>> {
+    use postcard::experimental::serialized_size;
+
+    let mut data = SyncData {
+        topic_id,
+        ops: Vec::new(),
+    };
+    let header_size = serialized_size(&SyncMessage::Data(data.clone())).map_err(invalid_data)?
+        - serialized_size(&0_usize).map_err(invalid_data)?;
+    let mut batch_size = header_size;
+    let mut messages = Vec::new();
+    for op in ops {
+        let op_size = serialized_size(&op).map_err(invalid_data)?;
+        let count_size = serialized_size(&(data.ops.len() + 1)).map_err(invalid_data)?;
+        if !data.ops.is_empty()
+            && (data.ops.len() == MAX_SYNC_DATA_OPS_PER_MESSAGE
+                || batch_size + op_size + count_size > frame::MAX_FRAME_LEN)
+        {
+            messages.push(SyncMessage::Data(SyncData {
                 topic_id,
-                ops: ops.to_vec(),
-            })
-        })
-        .collect()
+                ops: std::mem::take(&mut data.ops),
+            }));
+            batch_size = header_size;
+        }
+        let count_size = serialized_size(&(data.ops.len() + 1)).map_err(invalid_data)?;
+        if batch_size + op_size + count_size > frame::MAX_FRAME_LEN {
+            return Err(invalid_data("sync operation exceeds maximum frame length"));
+        }
+        batch_size += op_size;
+        data.ops.push(op);
+    }
+    if !data.ops.is_empty() {
+        messages.push(SyncMessage::Data(data));
+    }
+    Ok(messages)
 }
 
 pub fn _message_type_name(message: &SyncMessage) -> &'static str {
