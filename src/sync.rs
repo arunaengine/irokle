@@ -1191,9 +1191,15 @@ impl<S: Storage> SyncEngine<S> {
     ) -> Result<(Vec<Op>, bool)> {
         let storage = self.oplog.storage();
         let mut closure = BTreeSet::new();
+        let mut covered = BTreeSet::new();
         let mut stack = wants.iter().copied().collect::<Vec<_>>();
+        let mut more = false;
         while let Some(id) = stack.pop() {
-            if closure.len() >= MAX_PAGE_OPS || closure.contains(&id) {
+            if closure.contains(&id) || covered.contains(&id) {
+                continue;
+            }
+            if closure.len() >= MAX_PAGE_OPS {
+                more = true;
                 continue;
             }
             let Some(meta) = storage.get_meta(&id)? else {
@@ -1204,21 +1210,32 @@ impl<S: Storage> SyncEngine<S> {
             }
             // An explicit want overrides what the clock implies; ancestry does not.
             if !wants.contains(&id) && peer.get(&meta.actor_id) >= meta.actor_seq {
+                covered.insert(id);
                 continue;
             }
             closure.insert(id);
             stack.extend(meta.deps.iter().copied());
         }
-        let mut more = closure.len() >= MAX_PAGE_OPS;
         let mut ops = Vec::new();
+        let mut sent = BTreeSet::new();
         let mut bytes = 0;
         for op in topological_subset(storage, &closure)? {
+            // A walk cut short leaves ancestors unsent; an op above them waits.
+            let deps = &op.signed.body.deps;
+            if !deps
+                .iter()
+                .all(|dep| sent.contains(dep) || covered.contains(dep))
+            {
+                more = true;
+                continue;
+            }
             let size = postcard::experimental::serialized_size(&op)?;
             if ops.len() >= budget.ops || bytes + size > budget.bytes {
                 more = true;
                 break;
             }
             bytes += size;
+            sent.insert(op.id);
             ops.push(op);
         }
         Ok((ops, more))

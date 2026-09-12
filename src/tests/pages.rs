@@ -326,3 +326,35 @@ fn one_op_cheap() {
         + (after.op_reads - before.op_reads);
     assert!(reads <= 12, "one new op cost {reads} reads");
 }
+
+/// A want for a head far beyond the reader's clock cannot be served by one
+/// repair walk; what is sent must still be admissible, never a tail whose
+/// ancestors were cut off.
+#[test]
+fn repair_walk_causal() {
+    let source = many_actors(1, 6000, 0);
+    let reader = Oplog::new();
+    reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+    let mut request = request_for(&source, &reader, SyncCredit::default());
+    request
+        .wants
+        .extend(source.log.storage().heads(&source.topic_id).unwrap());
+    let page = source
+        .engine
+        .response_page(
+            source.reader,
+            &request,
+            PageBudget::from_credit(request.credit),
+        )
+        .unwrap();
+    assert!(page.more);
+    let ids = page.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+    assert_eq!(reader.receive_ops(page.ops).unwrap(), ids);
+    assert!(
+        reader
+            .storage()
+            .pending_missing_deps(&source.topic_id)
+            .unwrap()
+            .is_empty()
+    );
+}
