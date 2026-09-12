@@ -343,3 +343,234 @@ async fn duplicates_served_once() {
     alice.net.shutdown().await;
     bob.net.shutdown().await;
 }
+
+/// A hot topic served first cannot take the share of the quiet topics after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hot_topic_shares() {
+    let limits = StreamLimits {
+        bytes: 256 * 1024,
+        messages: 16,
+        batch_messages: 8,
+    };
+    let (alice, bob) = stream_pair(limits).await;
+    // Requests are served in topic id order, so the hot topic goes first.
+    let hot = topic(1);
+    let quiet = (2..5).map(topic).collect::<Vec<_>>();
+    seed_topic(&alice.node, &bob.node, hot, 2000, 64);
+    let mut messages = vec![
+        open(&bob.node, hot),
+        SyncMessage::Request(events_request(&alice.node, hot, SyncCredit::default())),
+    ];
+    for topic_id in &quiet {
+        seed_topic(&alice.node, &bob.node, *topic_id, 5, 64);
+        messages.push(open(&bob.node, *topic_id));
+        messages.push(SyncMessage::Request(events_request(
+            &alice.node,
+            *topic_id,
+            SyncCredit::default(),
+        )));
+    }
+
+    let replies = serve_stream(&alice, &bob, messages);
+    assert_eq!(page_more(&replies, hot), Some(true));
+    assert!(!data_ids(&replies, hot).is_empty());
+    for topic_id in &quiet {
+        assert_eq!(data_ids(&replies, *topic_id).len(), 5);
+        assert_eq!(page_more(&replies, *topic_id), Some(false));
+    }
+    alice.net.shutdown().await;
+    bob.net.shutdown().await;
+}
+
+/// A continuation planned against another branch fails its topic and serves
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrong_branch_fails() {
+    let (alice, bob) = stream_pair(StreamLimits::default()).await;
+    let topic_id = topic(51);
+    seed_topic(&alice.node, &bob.node, topic_id, 10, 8);
+    let mut request = events_request(&alice.node, topic_id, SyncCredit::default());
+    request.genesis = Some(OpId::hash(b"another branch"));
+
+    let replies = serve_stream(
+        &alice,
+        &bob,
+        vec![open(&bob.node, topic_id), SyncMessage::Request(request)],
+    );
+    assert!(data_ids(&replies, topic_id).is_empty());
+    assert_eq!(page_more(&replies, topic_id), None);
+    assert!(replies.iter().any(|reply| matches!(
+        reply,
+        SyncMessage::Failure(failure)
+            if failure.topic_id == topic_id
+                && failure.code == crate::sync::SyncFailureCode::Request
+    )));
+    alice.net.shutdown().await;
+    bob.net.shutdown().await;
+}
+
+/// A credit far above the page limits is served within them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forged_credit_bounded() {
+    let (alice, bob) = stream_pair(StreamLimits::default()).await;
+    let topic_id = topic(61);
+    let limit = SyncCredit::default();
+    seed_topic(
+        &alice.node,
+        &bob.node,
+        topic_id,
+        limit.ops as usize + 100,
+        8,
+    );
+    let forged = SyncCredit {
+        ops: u32::MAX,
+        bytes: u64::MAX,
+    };
+
+    let replies = serve_stream(
+        &alice,
+        &bob,
+        vec![
+            open(&bob.node, topic_id),
+            SyncMessage::Request(events_request(&alice.node, topic_id, forged)),
+        ],
+    );
+    let served = data_ids(&replies, topic_id).len();
+    assert!(served > 0 && served <= limit.ops as usize, "{served}");
+    let bytes = replies
+        .iter()
+        .filter(|reply| matches!(reply, SyncMessage::Data(_)))
+        .map(|reply| crate::net::framed_message_len(reply).unwrap())
+        .sum::<usize>();
+    assert!(bytes as u64 <= limit.bytes);
+    assert_eq!(page_more(&replies, topic_id), Some(true));
+    alice.net.shutdown().await;
+    bob.net.shutdown().await;
+}
+
+/// A reply lost with its connection certifies nothing: the obligation stays
+/// until an exchange with the restarted peer really succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_reply_retransmits() {
+    let runtime = net::IrohRuntimeConfig {
+        connect_timeout: Duration::from_secs(2),
+        sync_io_timeout: Duration::from_secs(10),
+        ..net::IrohRuntimeConfig::default()
+    };
+    let alice = peer(bind(None).await, runtime, StreamLimits::default());
+    let bob_endpoint = bind(None).await;
+    let bob_key = bob_endpoint.secret_key().clone();
+    let bob_peer = PeerId::from_bytes(*bob_endpoint.id().as_bytes());
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(&bob_key)
+        .with_peer_whitelist([alice.node.peer_id()])
+        .build()
+        .unwrap();
+    let topic = alice
+        .node
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob_peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let record = topic
+        .publish(Note {
+            text: "owed".into(),
+        })
+        .unwrap();
+    alice
+        .node
+        .put_sync_obligation(bob_peer, topic.id(), [record.meta.op_id].into())
+        .unwrap();
+    let owed = || {
+        alice
+            .node
+            .storage()
+            .has_sync_obligations(&bob_peer, &topic.id())
+            .unwrap()
+    };
+
+    // Bob answers the fingerprint stream, reads the data stream to its end and
+    // then drops the connection and the endpoint without replying.
+    let bob_net =
+        Arc::new(net::IrohNet::new_with_config(bob_endpoint, bob.clone(), runtime).unwrap());
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    let lossy = Arc::clone(&bob_net);
+    let responder = tokio::spawn(async move {
+        let incoming = lossy.endpoint().accept().await.unwrap();
+        let connection = incoming.await.unwrap();
+        let (send, recv) = connection.accept_bi().await.unwrap();
+        lossy
+            .handle_stream(connection.remote_id(), recv, send)
+            .await
+            .unwrap();
+        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+        recv.read_to_end(64 * 1024 * 1024).await.unwrap();
+        connection.close(0u32.into(), b"reply lost");
+        lossy.shutdown().await;
+    });
+    assert!(alice.net.sync_now(bob_addr, topic.id()).await.is_err());
+    responder.await.unwrap();
+    assert!(owed());
+    assert!(
+        alice
+            .node
+            .storage()
+            .peer_ack(&bob_peer, &topic.id())
+            .unwrap()
+            .is_none()
+    );
+
+    let restarted = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+        .secret_key(bob_key)
+        .bind()
+        .await
+        .unwrap();
+    let bob_net = Arc::new(net::IrohNet::new_with_config(restarted, bob.clone(), runtime).unwrap());
+    bob_net.start_accept_loop().unwrap();
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    alice.net.sync_now(bob_addr, topic.id()).await.unwrap();
+    assert!(!owed());
+    let ack = alice
+        .node
+        .storage()
+        .peer_ack(&bob_peer, &topic.id())
+        .unwrap()
+        .expect("certified ack after the successful exchange");
+    assert_eq!(ack.genesis, genesis_of(alice.node.storage(), &topic.id()));
+    assert_eq!(
+        bob.storage().list_op_ids(&topic.id()).unwrap(),
+        alice.node.storage().list_op_ids(&topic.id()).unwrap()
+    );
+    alice.net.shutdown().await;
+    bob_net.shutdown().await;
+}
+
+/// A peer offering only the previous protocol cannot open a sync connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_protocol_refused() {
+    assert_eq!(crate::sync::SYNC_PROTOCOL, "irokle/sync/3");
+    assert_eq!(crate::net::IROKLE_SYNC_ALPN, b"irokle/sync/3");
+    let alice = peer(
+        bind(None).await,
+        net::IrohRuntimeConfig::default(),
+        StreamLimits::default(),
+    );
+    let alice_addr = serve(&alice).await;
+    let old = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .alpns(vec![b"irokle/sync/2".to_vec()])
+        .bind()
+        .await
+        .unwrap();
+
+    let connected = tokio::time::timeout(
+        Duration::from_secs(30),
+        old.connect(alice_addr, b"irokle/sync/2"),
+    )
+    .await
+    .expect("the handshake ends instead of hanging");
+    assert!(connected.is_err());
+    old.close().await;
+    alice.net.shutdown().await;
+}
