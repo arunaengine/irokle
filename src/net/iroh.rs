@@ -26,6 +26,11 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const EMPTY_RESYNC_SLEEP: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 const MAX_ACCEPT_CONNECTIONS: usize = 128;
 const MAX_ACCEPT_CONNECTIONS_PER_PEER: usize = 4;
+/// Handshakes the accept loop carries at once, before any identity is known.
+/// Completing them one at a time let a single slow peer hold off every other
+/// inbound connection for a whole connect timeout. A per-peer limit cannot
+/// apply yet, so this global bound is what keeps pre-authentication work finite.
+const MAX_PENDING_HANDSHAKES: usize = 32;
 const MAX_RESYNC_PEER_CONCURRENCY: usize = 8;
 const MAX_TOPICS_PER_RESYNC_BATCH: usize = 1024;
 const MAX_SYNC_MESSAGES_PER_STREAM: usize = 4096;
@@ -768,6 +773,8 @@ impl<S: Storage> IrohNet<S> {
         let mut shutdown = self.shutdown.subscribe();
         Ok(Some(handle.spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
+            let mut handshakes =
+                tokio::task::JoinSet::<io::Result<iroh::endpoint::Connection>>::new();
             let mut peer_connections = HashMap::<iroh::EndpointId, usize>::new();
             let mut connection_tasks = HashMap::<tokio::task::Id, iroh::EndpointId>::new();
             loop {
@@ -808,6 +815,45 @@ impl<S: Storage> IrohNet<S> {
                 drop(current);
 
                 let incoming = tokio::select! {
+                    Some(result) = handshakes.join_next(), if !handshakes.is_empty() => {
+                        match result {
+                            Ok(Ok(connection)) => {
+                                if connection.alpn() != IROKLE_SYNC_ALPN {
+                                    connection.close(0u32.into(), b"unsupported protocol");
+                                    continue;
+                                }
+                                // Identity is known only now, so the per-peer
+                                // limit is applied here rather than on accept.
+                                let peer = connection.remote_id();
+                                let peer_count = peer_connections.entry(peer).or_default();
+                                if *peer_count >= MAX_ACCEPT_CONNECTIONS_PER_PEER {
+                                    tracing::warn!(
+                                        %peer,
+                                        "rejecting excess inbound iroh connection"
+                                    );
+                                    continue;
+                                }
+                                *peer_count += 1;
+                                let connection_net = Weak::clone(&net);
+                                let connection_shutdown = shutdown.clone();
+                                let task = connections.spawn(async move {
+                                    handle_connection(
+                                        connection_net,
+                                        connection_shutdown,
+                                        peer,
+                                        connection,
+                                    )
+                                    .await
+                                });
+                                connection_tasks.insert(task.id(), peer);
+                            }
+                            Ok(Err(error)) => {
+                                tracing::warn!(%error, "failed to accept iroh connection");
+                            }
+                            Err(error) => tracing::warn!(%error, "iroh handshake task failed"),
+                        }
+                        continue;
+                    }
                     Some(result) = connections.join_next_with_id(), if !connections.is_empty() => {
                         let task_id = match &result {
                             Ok((task_id, ())) => *task_id,
@@ -845,47 +891,21 @@ impl<S: Storage> IrohNet<S> {
                 }
                 let connect_timeout = current.runtime.connect_timeout;
                 drop(current);
-                let accepted = tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
-                        }
-                        continue;
-                    }
-                    accepted = tokio::time::timeout(connect_timeout, incoming) => {
-                        accepted.map_err(|_| timed_out("iroh accept timed out"))
-                            .and_then(|accepted| accepted.map_err(other))
-                    },
-                };
-                match accepted {
-                    Ok(connection) => {
-                        if connection.alpn() != IROKLE_SYNC_ALPN {
-                            connection.close(0u32.into(), b"unsupported protocol");
-                            continue;
-                        }
-                        let peer = connection.remote_id();
-                        let peer_count = peer_connections.entry(peer).or_default();
-                        if *peer_count >= MAX_ACCEPT_CONNECTIONS_PER_PEER {
-                            tracing::warn!(%peer, "rejecting excess inbound iroh connection");
-                            continue;
-                        }
-                        *peer_count += 1;
-                        let connection_net = Weak::clone(&net);
-                        let connection_shutdown = shutdown.clone();
-                        let task = connections.spawn(async move {
-                            handle_connection(connection_net, connection_shutdown, peer, connection)
-                                .await
-                        });
-                        connection_tasks.insert(task.id(), peer);
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to accept iroh connection");
-                        continue;
-                    }
+                if handshakes.len() >= MAX_PENDING_HANDSHAKES {
+                    tracing::warn!("refusing inbound iroh connection: handshakes are saturated");
+                    continue;
                 }
+                handshakes.spawn(async move {
+                    tokio::time::timeout(connect_timeout, incoming)
+                        .await
+                        .map_err(|_| timed_out("iroh accept timed out"))
+                        .and_then(|accepted| accepted.map_err(other))
+                });
             }
             connections.abort_all();
+            handshakes.abort_all();
             while connections.join_next().await.is_some() {}
+            while handshakes.join_next().await.is_some() {}
         })))
     }
 
