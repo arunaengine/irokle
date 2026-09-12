@@ -1065,3 +1065,68 @@ fn rejects_stale_incarnation() {
         "replayed old-branch ack cleared work owed on the replacement branch"
     );
 }
+
+/// A topic holding one op no head reaches, the shape quarantine removes.
+fn orphaned_topic<S: Corrupt>(storage: &S, seed: u8) -> TopicId {
+    let topic_id = TopicId::hash([b"orphaned-topic".as_slice(), &[seed]].concat());
+    let (source, _, genesis, event) = forked_side(MemoryStorage::new(), topic_id, seed, [], "lost");
+    Oplog::with_storage(storage.clone())
+        .receive_ops(vec![genesis])
+        .unwrap();
+    let meta = source.storage().get_meta(&event.id).unwrap().unwrap();
+    storage.orphan_op(&event, &meta);
+    topic_id
+}
+
+/// A maintenance pass returns the evictions of the topics before a failing
+/// one, and their journal records survive a restart: a later pass neither
+/// drops nor repeats them, and only `clear_eviction` releases one.
+fn assert_eviction_recovers<S: Corrupt>(storage: S, reopen: impl FnOnce(S) -> S) {
+    let config = NodeConfig {
+        signer: Ed25519Signer::from_bytes(&[211; 32]),
+        default_write_concern: WriteConcern::Local,
+        ..NodeConfig::default()
+    };
+    let mut topics = [orphaned_topic(&storage, 212), orphaned_topic(&storage, 213)];
+    topics.sort();
+    let [first, failing] = topics;
+    assert!(storage.seal_topic(&failing).unwrap());
+
+    let holder = Irokle::with_storage(storage.clone(), config.clone()).unwrap();
+    let evictions = holder.quarantine_topics().unwrap();
+    assert_eq!(evictions.len(), 1);
+    assert_eq!(evictions[0].topic_id, first);
+    let eviction = evictions[0].clone();
+    assert_eq!(storage.pending_evictions().unwrap(), vec![eviction.clone()]);
+    drop(holder);
+
+    let storage = reopen(storage);
+    let holder = Irokle::with_storage(storage.clone(), config).unwrap();
+    assert_eq!(holder.pending_evictions().unwrap(), vec![eviction.clone()]);
+    assert!(holder.quarantine_topics().unwrap().is_empty());
+    assert_eq!(holder.pending_evictions().unwrap(), vec![eviction.clone()]);
+
+    assert!(holder.unseal_topic(failing).unwrap());
+    let later = holder.quarantine_topics().unwrap();
+    assert_eq!(later.len(), 1);
+    assert_eq!(later[0].topic_id, failing);
+    assert_eq!(holder.pending_evictions().unwrap().len(), 2);
+    holder.clear_eviction(&eviction.key()).unwrap();
+    assert_eq!(holder.pending_evictions().unwrap(), later);
+}
+
+#[test]
+fn memory_eviction_recovers() {
+    assert_eviction_recovers(MemoryStorage::new(), |storage| storage);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_eviction_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+    assert_eviction_recovers(storage, |storage| {
+        drop(storage);
+        crate::storage::FjallStorage::open(dir.path()).unwrap()
+    });
+}
