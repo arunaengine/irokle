@@ -312,13 +312,9 @@ pub enum SyncStateUpdate {
     BehindUnlessFailed,
 }
 
-/// One atomic change to a peer's sync status. `successful_attempts` and
-/// `failed_attempts` are deltas added to the stored counters; the rest are
-/// gauges that leave the stored value alone when unset. Timestamps only move
-/// forward and `expected_attempts` drops the whole update unless the stored
-/// attempt total still matches, so a late outcome cannot overwrite a newer one.
-/// An update with an `attempt` identity is ordered by that identity instead of
-/// by its timestamps.
+/// One atomic change to a peer's sync status: attempt counts are deltas, the rest
+/// are gauges left alone when unset. Updates are ordered by `attempt` when set, else
+/// by timestamps, and `expected_attempts` drops a late update whose total changed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncStatusUpdate {
     pub successful_attempts: u64,
@@ -337,14 +333,9 @@ pub struct SyncStatusUpdate {
 }
 
 pub trait Storage: Clone + Send + Sync + 'static {
-    /// Durably admit `batch`. Backends must write each entry's op record and
-    /// its [`OpMeta`] in one atomic unit and must reject a batch whose entry
-    /// depends on an op with no metadata, so a committed op can never reference
-    /// a dependency the DAG cannot resolve.
-    /// The same transaction must clear sync state for members present in the
-    /// expected topic state but absent from the committed topic state.
-    /// A lost optimistic commit returns [`crate::Error::AdmissionConflict`]
-    /// without retrying: the caller owns the retry budget.
+    /// Durably admit `batch`: each op and its [`OpMeta`] atomically, refusing deps without
+    /// metadata, and clearing sync state of members the batch removes. A lost optimistic
+    /// commit returns [`crate::Error::AdmissionConflict`]; the caller owns the retry budget.
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()>;
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
@@ -376,11 +367,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn max_generation(&self, topic_id: &TopicId) -> Result<u64>;
     fn topic_state(&self, topic_id: &TopicId) -> Result<Option<TopicState>>;
     fn list_topics(&self) -> Result<Vec<TopicInfo>>;
-    /// Read the topic's state, heads, clock, tips, fingerprint, data epoch
-    /// and pending holes as one view, plus `peer_id`'s stored ack and whether
-    /// it is owed work. The epoch grows with every destructive change of the
-    /// topic (reset, reset-and-admit) and never with an append, so anything
-    /// keyed by genesis and epoch cannot outlive the data it describes.
+    /// Read state, heads, clock, tips, fingerprint, data epoch, pending holes, `peer_id`'s
+    /// ack and owed flag as one view. The epoch grows with every reset, never with an append.
     /// Required rather than defaulted: separate reads can mix two commits.
     fn topic_view(&self, topic_id: &TopicId, peer_id: Option<&PeerId>)
     -> Result<Option<TopicView>>;
@@ -437,13 +425,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// [`crate::Error::StaleIncarnation`]; a removed peer's with
     /// [`crate::Error::NotTopicMember`].
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize>;
-    /// Apply many peer acks in order, equivalent to calling
-    /// [`Storage::apply_peer_ack`] per ack. Backends may batch all writes into
-    /// one durable operation. Returns one result per input ack, in order, so a
-    /// single uncertifiable record neither commits nor discards the rest. A
-    /// reported failure must never leave that ack's writes committed: a backend
-    /// that batches returns a backend failure as the outer error and commits
-    /// nothing of the batch.
+    /// Apply acks in order as [`Storage::apply_peer_ack`] would, one result per ack, so one
+    /// uncertifiable ack neither commits nor discards the rest. A batching backend returns a
+    /// backend failure as the outer error and commits nothing.
     fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<Vec<Result<usize>>> {
         Ok(acks
             .into_iter()
@@ -549,10 +533,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// an error: acknowledgement is idempotent.
     fn clear_eviction(&self, key: &EvictionKey) -> Result<()>;
 
-    /// Whether `peer_id` holds `op_id` on the branch that currently stores it.
-    /// Required rather than defaulted: the op's metadata, the topic genesis
-    /// and the ack must come from one view, or evidence installed by a reset
-    /// in between proves an op of the discarded branch.
+    /// Whether `peer_id` holds `op_id` on the branch that currently stores it. Required:
+    /// the op's metadata, the genesis and the ack must come from one view, or a reset in
+    /// between lets evidence prove an op of the discarded branch.
     fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool>;
 
     /// Every peer [`Storage::peer_reached_op`] would confirm, sorted, read
@@ -892,21 +875,9 @@ pub(super) fn settled_obligation(
     Ok((!rest.is_empty()).then_some(rest))
 }
 
-/// Fold one status update into `status`, reporting whether the record changed
-/// and must be persisted. Counters accumulate and timestamps only advance, so
-/// two concurrent outcomes keep both increments and a late one cannot rewind
-/// the record.
-///
-/// A stale update still counts its attempt: the attempt did happen, and losing
-/// the increment would undercount work. Only the state, error and pending gauge
-/// it would install are dropped, because those describe a moment that has since
-/// passed. A failure no newer than the stored success is stale in that sense; on
-/// an equal timestamp the success is kept, since `Failed` is the stronger claim
-/// and a genuinely failing peer is marked again by its next attempt.
-///
-/// With an attempt identity, order is the identity alone: an identity already
-/// counted changes nothing, and only an identity newer than the recorded one
-/// installs its gauges, whatever the timestamps say.
+/// Fold one update into `status`; returns whether it changed. Counts always accumulate;
+/// gauges install only from a newer update: by `attempt` identity when set, else by
+/// timestamp, where a stored success wins a tie with a failure.
 pub(super) fn apply_status_update(status: &mut SyncPeerStatus, update: &SyncStatusUpdate) -> bool {
     let attempts = status
         .successful_attempts

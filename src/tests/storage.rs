@@ -2234,10 +2234,8 @@ fn fjall_pending_byte_budget() {
     assert_pending_byte_budget(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
-/// Rewrite a current database into the schema 2 layout written between the
-/// ack identity change and the pending byte counters: acks and obligations
-/// keyed peer first, legacy obligation shapes, whole pending records with
-/// count counters, and no byte counters.
+/// Rewrite a current database into the schema 2 layout that predates byte counters:
+/// peer-first acks and obligations, legacy obligation shapes and whole pending records.
 #[cfg(feature = "fjall")]
 fn downgrade_to_schema_two(
     db: &fjall::OptimisticTxDatabase,

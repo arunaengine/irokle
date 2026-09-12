@@ -145,10 +145,9 @@ fn rejects_impossible_seq() {
     );
 }
 
-/// Latest membership never rejects a buffered op: the author may be invited
-/// by a control this node has not seen. The op is admitted once its causal
-/// frontier proves membership, in either arrival order, and rejected once the
-/// frontier is known and proves the opposite.
+/// A buffered op is never rejected by latest membership, since its author may be invited
+/// by an unseen control: it is admitted once its frontier proves membership, in either
+/// arrival order, and rejected once the frontier proves the opposite.
 #[test]
 fn causal_membership_orders() {
     for invite_first in [false, true] {

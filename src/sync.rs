@@ -816,11 +816,9 @@ impl<S: Storage> SyncEngine<S> {
         }
     }
 
-    /// Heads and clock an acknowledgement may certify, all read from one view
-    /// together with the genesis they are signed for. A topic holding an id it
-    /// cannot resolve is unable to replay the history those values name, so it
-    /// certifies nothing until repair completes: the source keeps its retry
-    /// obligation and this node stays visibly behind instead of going quiet.
+    /// Heads and clock an ack may certify, read from one view with their genesis. A topic
+    /// holding an unresolvable id certifies nothing until repair completes, so the source
+    /// keeps its obligation and this node stays visibly behind.
     fn ack_frontier(&self, topic_id: &TopicId) -> Result<(TopicState, BTreeSet<OpId>, ActorClock)> {
         let (view, whole) = self
             .oplog
@@ -1072,12 +1070,9 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     #[cfg(feature = "iroh")]
-    /// The next causal page of `topic_id` for a peer holding `peer`, from
-    /// forward actor ranges merged by generation. An op's generation is one
-    /// past its highest dependency, so the merge emits dependencies first, and
-    /// a dependency is satisfied once the peer's clock or this page covers it.
-    /// Work is proportional to the page and the number of actors behind, never
-    /// to the history the peer already holds.
+    /// The next causal page for a peer at `peer`, merging forward actor ranges by generation
+    /// (one past the highest dependency), so dependencies come first. Work grows with the
+    /// page and the number of actors behind, never with history the peer holds.
     pub(crate) fn plan_page(
         &self,
         topic_id: &TopicId,

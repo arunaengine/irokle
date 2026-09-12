@@ -299,10 +299,9 @@ impl<S: Storage> Oplog<S> {
         Ok((unresolved, true))
     }
 
-    /// A view of the topic and whether that view is whole. A view is whole
-    /// only when the recorded verdict for its own branch and epoch says so
-    /// without a scan in between, so a reset during a scan cannot lend the
-    /// verdict to the frontier being certified.
+    /// A view of the topic and whether it is whole: only a verdict recorded for
+    /// this branch and epoch with no scan in between counts, so a reset during
+    /// a scan cannot lend the verdict to the frontier being certified.
     pub(crate) fn whole_view(&self, topic_id: &TopicId) -> Result<Option<(TopicView, bool)>> {
         let mut last = None;
         for _ in 0..MAX_VIEW_ATTEMPTS {
@@ -672,11 +671,9 @@ impl<S: Storage> Oplog<S> {
         self.receive_ops_admission(source_peer, ops, &BTreeSet::new(), None)
     }
 
-    /// Like [`Self::receive_ops_from_peer_evicting`], but skips signature
-    /// verification for ops whose id is in `verified`. The caller must have run
-    /// [`Op::validate`] on those exact ops; op ids are content-addressed over
-    /// the signed envelope, so a verified id proves the signature. `effects`
-    /// computes what each admitted batch commits alongside its ops.
+    /// Like [`Self::receive_ops_from_peer_evicting`], but skips signature checks
+    /// for ids in `verified`, which the caller validated (ids are content-addressed).
+    /// `effects` computes what each admitted batch commits alongside its ops.
     pub(crate) fn receive_ops_from_peer_preverified(
         &self,
         source_peer: Option<crate::PeerId>,
@@ -1072,9 +1069,7 @@ impl<S: Storage> Oplog<S> {
             return Err(Error::TopicMismatch);
         }
 
-        // On the reset path the local topic is wiped and the winner batch is
-        // self-contained, so validate and admit it against a fresh topic; the
-        // reset is applied atomically with these writes.
+        // On reset the wiped topic admits the self-contained winner batch atomically.
         // Heads and state come from one read: a membership verdict taken from a
         // state newer than the heads would reject an authorized op for good.
         let (expected_heads, expected_state) = if reset {

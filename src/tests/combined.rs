@@ -25,11 +25,9 @@ async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
     .expect("dialable address")
 }
 
-/// A member is invited after more than one page of history while a writer
-/// keeps publishing, the preferred replica never answers, and a manual sync
-/// toward the new member is cancelled mid-flight. Without a sweep or a manual
-/// retry, the resync loop still bootstraps the new member through the
-/// alternate path and brings it up to the writer's final frontier.
+/// A member invited after a page of history, with a writer publishing, the preferred
+/// replica down and a cancelled manual sync, is still brought to the writer's final
+/// frontier by the resync loop through the alternate path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn late_invite_faults() {
     let lookup = iroh::address_lookup::memory::MemoryLookup::new();

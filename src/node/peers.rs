@@ -61,9 +61,8 @@ impl PeerHealthStore {
         failures > 0
     }
 
-    /// Clears a peer's failure record once an attempt reaches it again. With no
-    /// peer failing there is nothing left to route around, so the rotation
-    /// epoch resets and selection returns to the policy's preferred order.
+    /// Clears a peer's failure record once an attempt reaches it again; with no
+    /// peer failing the rotation epoch resets to the policy's preferred order.
     /// Returns whether the peer had failures, so selection may move back to it.
     #[cfg(any(feature = "iroh", test))]
     pub(crate) fn record_success(&self, peer: &PeerId) -> bool {

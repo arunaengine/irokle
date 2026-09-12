@@ -120,10 +120,8 @@ impl Rendezvous {
     }
 }
 
-/// One-shot pause a test arms at a storage read. The reader reports its
-/// arrival and waits for release; every wait is capped, and the guard returned
-/// by [`Gate::releaser`] releases on drop, so a failed assertion cannot leave a
-/// reader parked.
+/// One-shot pause armed at a storage read. The reader reports arrival and waits for
+/// release; waits are capped and the [`Gate::releaser`] guard releases on drop.
 #[derive(Default)]
 pub(crate) struct Gate {
     state: std::sync::Mutex<(bool, bool)>,
