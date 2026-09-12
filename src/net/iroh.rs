@@ -463,13 +463,64 @@ impl ResyncLease {
     }
 
     /// Takes a claim out of the lease so its own result is recorded once.
-    fn take_claim(&mut self, key: &ResyncTargetKey) -> Option<ResyncTarget> {
-        self.claims.remove(key)
+    /// Ownership moves into a guard, so losing the guard hands the claim back
+    /// instead of leaving the target owned by nobody.
+    fn take_claim(&mut self, key: &ResyncTargetKey) -> Option<ClaimGuard> {
+        self.claims.remove(key).map(|claim| self.guard(claim))
     }
 
     /// The claims whose result was never recorded, for a timeout to consume.
-    fn drain_claims(&mut self) -> Vec<ResyncTarget> {
-        std::mem::take(&mut self.claims).into_values().collect()
+    fn drain_claims(&mut self) -> Vec<ClaimGuard> {
+        std::mem::take(&mut self.claims)
+            .into_values()
+            .map(|claim| ClaimGuard {
+                scheduler: self.scheduler.clone(),
+                claim: Some(claim),
+                retry_after: self.retry_after,
+            })
+            .collect()
+    }
+
+    fn guard(&self, claim: ResyncTarget) -> ClaimGuard {
+        ClaimGuard {
+            scheduler: self.scheduler.clone(),
+            claim: Some(claim),
+            retry_after: self.retry_after,
+        }
+    }
+}
+
+/// One claim taken out of a lease, owned until a terminal transition consumes
+/// it. Dropping it first hands the claim back, so a panic or early return
+/// between taking a claim and recording its result cannot strand the target in
+/// flight forever.
+struct ClaimGuard {
+    scheduler: ResyncScheduler,
+    claim: Option<ResyncTarget>,
+    retry_after: Duration,
+}
+
+impl ClaimGuard {
+    fn key(&self) -> ResyncTargetKey {
+        self.expect_claim().key
+    }
+
+    /// Consumes the guard for a terminal transition. Call it immediately before
+    /// the scheduler transition so nothing can fail in between.
+    fn settle(mut self) -> ResyncTarget {
+        self.claim.take().expect("claim guard settled twice")
+    }
+
+    fn expect_claim(&self) -> &ResyncTarget {
+        self.claim.as_ref().expect("claim guard already settled")
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            self.scheduler.release_claim(claim, self.retry_after);
+        }
     }
 }
 
@@ -1011,13 +1062,13 @@ impl<S: Storage> IrohNet<S> {
     /// Completes one owned attempt. Only the holder of the claim may call this.
     fn finish_resync_attempt(
         &self,
-        claim: ResyncTarget,
+        claim: ClaimGuard,
         result: std::result::Result<(), &io::Error>,
         runtime: IrohRuntimeConfig,
         advanced: bool,
     ) {
-        let peer_id = claim.key.peer_id;
-        let topic_id = claim.key.topic_id;
+        let peer_id = claim.key().peer_id;
+        let topic_id = claim.key().topic_id;
         let needs_sync = match self.target_needs_sync(peer_id, topic_id) {
             Ok(needs_sync) => needs_sync,
             Err(error) => {
@@ -1027,19 +1078,19 @@ impl<S: Storage> IrohNet<S> {
         };
 
         if !needs_sync && result.is_ok() {
-            self.resync_scheduler.complete_clean(claim);
+            self.resync_scheduler.complete_clean(claim.settle());
             return;
         }
 
         match result {
             Ok(()) if advanced => self
                 .resync_scheduler
-                .complete_dirty(claim, RESYNC_PROGRESS_TURN),
+                .complete_dirty(claim.settle(), RESYNC_PROGRESS_TURN),
             Ok(()) => self
                 .resync_scheduler
-                .complete_dirty(claim, runtime.resync_interval),
+                .complete_dirty(claim.settle(), runtime.resync_interval),
             Err(_) => self.resync_scheduler.complete_failed(
-                claim,
+                claim.settle(),
                 runtime.resync_initial_backoff,
                 runtime.resync_max_backoff,
             ),
@@ -1350,7 +1401,7 @@ impl<S: Storage> IrohNet<S> {
                         tracing::warn!(%peer_id, %topic_id, %error, "failed to gc stale sync obligations");
                     }
                     if let Some(claim) = lease.take_claim(&target.key) {
-                        self.resync_scheduler.complete_clean(claim);
+                        self.resync_scheduler.complete_clean(claim.settle());
                     }
                 }
                 Err(error) => {
@@ -1372,9 +1423,9 @@ impl<S: Storage> IrohNet<S> {
                 // timeout; a released chunk keeps its recorded result.
                 let error = timed_out("peer sync batch timed out");
                 for claim in lease.drain_claims() {
-                    let _ = self
-                        .node
-                        .record_sync_result(peer_id, claim.key.topic_id, Err(&error));
+                    let _ =
+                        self.node
+                            .record_sync_result(peer_id, claim.key().topic_id, Err(&error));
                     self.finish_resync_attempt(claim, Err(&error), runtime, false);
                 }
                 return;
@@ -3041,6 +3092,65 @@ mod tests {
         targets[0]
     }
 
+    /// A panic between taking a claim and recording its result must not leave
+    /// the target owned by nobody: the guard hands the claim back on unwind, so
+    /// the target becomes dispatchable again.
+    #[test]
+    fn panic_returns_claim() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(71), topic(72), false);
+        let claim = one_claim(&scheduler);
+        let mut lease = scheduler.lease(vec![claim], BACKOFF);
+        let key = ResyncTargetKey {
+            peer_id: peer(71),
+            topic_id: topic(72),
+        };
+
+        let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = lease.take_claim(&key).expect("claim");
+            assert_eq!(guard.key(), key);
+            panic!("result recording failed");
+        }));
+        assert!(taken.is_err(), "the work between take and settle panicked");
+
+        let (active, _, _) = scheduler
+            .target_state(peer(71), topic(72))
+            .expect("the target must survive");
+        assert!(
+            active.is_none(),
+            "an orphan claim would leave the target owned forever"
+        );
+        // It is dispatchable again rather than stuck in flight.
+        assert!(scheduler.next_due().is_some());
+    }
+
+    /// A drained collection releases every claim it still holds when the task
+    /// finishing them unwinds part way through.
+    #[test]
+    fn panic_returns_drained() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(73), topic(74), false);
+        scheduler.schedule_now(peer(73), topic(75), false);
+        let mut due = scheduler.due_targets_by_peer(8, 8);
+        let claims = due.remove(0).1;
+        assert_eq!(claims.len(), 2);
+        let mut lease = scheduler.lease(claims, BACKOFF);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let drained = lease.drain_claims();
+            assert_eq!(drained.len(), 2);
+            panic!("failed part way through the drained claims");
+        }));
+        assert!(result.is_err());
+
+        for topic_id in [topic(74), topic(75)] {
+            let (active, _, _) = scheduler
+                .target_state(peer(73), topic_id)
+                .expect("target survives");
+            assert!(active.is_none(), "every drained claim is handed back");
+        }
+    }
+
     /// A peer waiting behind a full set of slots is served as soon as one
     /// frees, and peers still taking a turn are never claimed twice.
     #[test]
@@ -3170,7 +3280,7 @@ mod tests {
                 topic_id: topic(32),
             })
             .expect("first claim");
-        scheduler.complete_clean(done);
+        scheduler.complete_clean(done.settle());
         assert!(
             scheduler.target_state(peer(31), topic(32)).is_none(),
             "a clean completion removes the target"
@@ -3183,8 +3293,13 @@ mod tests {
             1,
             "only unfinished work is recovered"
         );
-        assert_eq!(timed_out_claims[0].key.topic_id, topic(33));
-        scheduler.complete_failed(timed_out_claims[0], BACKOFF, Duration::from_secs(600));
+        assert_eq!(timed_out_claims[0].key().topic_id, topic(33));
+        let mut recovered = timed_out_claims;
+        scheduler.complete_failed(
+            recovered.remove(0).settle(),
+            BACKOFF,
+            Duration::from_secs(600),
+        );
         assert!(
             scheduler.target_state(peer(31), topic(32)).is_none(),
             "the settled topic must not be reinserted by the timeout"
@@ -3314,14 +3429,18 @@ mod tests {
                 topic_id: topic(1),
             })
             .unwrap();
-        scheduler.complete_clean(done);
+        scheduler.complete_clean(done.settle());
 
         let unfinished = lease.drain_claims();
 
         assert_eq!(unfinished.len(), 1);
-        assert_eq!(unfinished[0].key.topic_id, topic(2));
+        assert_eq!(unfinished[0].key().topic_id, topic(2));
         for claim in unfinished {
-            scheduler.complete_failed(claim, Duration::from_secs(1), Duration::from_secs(600));
+            scheduler.complete_failed(
+                claim.settle(),
+                Duration::from_secs(1),
+                Duration::from_secs(600),
+            );
         }
         assert_eq!(scheduler.target_state(peer(15), topic(1)), None);
         let (active, failures, _) = scheduler.target_state(peer(15), topic(2)).unwrap();
