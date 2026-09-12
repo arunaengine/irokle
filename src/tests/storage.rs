@@ -1163,3 +1163,321 @@ fn fjall_reset_rollback() {
     let dir = tempfile::tempdir().unwrap();
     assert_reset_rollback(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
+
+fn assert_vacuous_obligation<S: Storage>(storage: S) {
+    let peer = PeerId::hash(b"vacuous-peer");
+    let topic_id = TopicId::hash(b"vacuous-topic");
+    let actor = actor_id_for(topic_id, peer);
+    let mut target_clock = ActorClock::new();
+    target_clock.observe(actor, 4);
+    storage
+        .put_sync_obligation(crate_storage::SyncObligation {
+            peer_id: peer,
+            topic_id,
+            op_ids: BTreeSet::new(),
+            target_clock,
+        })
+        .unwrap();
+
+    // An ack that proves nothing must not stand in for the clock target.
+    let cleared = storage
+        .apply_peer_ack(crate_storage::PeerAck {
+            peer_id: peer,
+            topic_id,
+            heads: BTreeSet::new(),
+            clock: ActorClock::new(),
+        })
+        .unwrap();
+    assert_eq!(cleared, 0);
+    assert_eq!(storage.sync_obligations(&peer, &topic_id).unwrap().len(), 1);
+
+    let mut proof = ActorClock::new();
+    proof.observe(actor, 4);
+    let cleared = storage
+        .apply_peer_ack(crate_storage::PeerAck {
+            peer_id: peer,
+            topic_id,
+            heads: BTreeSet::new(),
+            clock: proof,
+        })
+        .unwrap();
+    assert_eq!(cleared, 1);
+    assert!(
+        storage
+            .sync_obligations(&peer, &topic_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn memory_vacuous_obligation() {
+    assert_vacuous_obligation(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_vacuous_obligation() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_vacuous_obligation(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+fn assert_merged_acks<S: Storage>(storage: S) {
+    let peer = PeerId::hash(b"merge-peer");
+    let topic_id = TopicId::hash(b"merge-topic");
+    let first_actor = actor_id_for(topic_id, PeerId::hash(b"merge-actor-one"));
+    let second_actor = actor_id_for(topic_id, PeerId::hash(b"merge-actor-two"));
+    let mut target_clock = ActorClock::new();
+    target_clock.observe(first_actor, 5);
+    target_clock.observe(second_actor, 3);
+    storage
+        .put_sync_obligation(crate_storage::SyncObligation {
+            peer_id: peer,
+            topic_id,
+            op_ids: [OpId::hash(b"merge-want")].into(),
+            target_clock,
+        })
+        .unwrap();
+
+    let mut first_clock = ActorClock::new();
+    first_clock.observe(first_actor, 5);
+    let first_ack = crate_storage::PeerAck {
+        peer_id: peer,
+        topic_id,
+        heads: BTreeSet::new(),
+        clock: first_clock,
+    };
+    assert_eq!(storage.apply_peer_ack(first_ack).unwrap(), 0);
+
+    let mut second_clock = ActorClock::new();
+    second_clock.observe(second_actor, 3);
+    let second_ack = crate_storage::PeerAck {
+        peer_id: peer,
+        topic_id,
+        heads: BTreeSet::new(),
+        clock: second_clock,
+    };
+    assert_eq!(storage.apply_peer_ack(second_ack.clone()).unwrap(), 1);
+
+    // Incomparable evidence adds a component instead of replacing the proven one.
+    let stored = storage.peer_ack(&peer, &topic_id).unwrap().unwrap();
+    assert_eq!(stored.clock.get(&first_actor), 5);
+    assert_eq!(stored.clock.get(&second_actor), 3);
+
+    assert_eq!(storage.apply_peer_ack(second_ack).unwrap(), 0);
+    let replayed = storage.peer_ack(&peer, &topic_id).unwrap().unwrap();
+    assert_eq!(replayed.clock, stored.clock);
+}
+
+#[test]
+fn memory_merged_acks() {
+    assert_merged_acks(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_merged_acks() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_merged_acks(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+fn assert_status_counters<S: Storage>(storage: S) {
+    let peer = PeerId::hash(b"counter-peer");
+    let topic_id = TopicId::hash(b"counter-topic");
+    let success = crate_storage::SyncStatusUpdate {
+        successful_attempts: 1,
+        last_attempt_ms: Some(20),
+        last_success_ms: Some(20),
+        last_error: Some(None),
+        state: crate_storage::SyncStateUpdate::Set(crate_storage::SyncPeerState::Healthy),
+        ..crate_storage::SyncStatusUpdate::default()
+    };
+    let failure = crate_storage::SyncStatusUpdate {
+        failed_attempts: 1,
+        last_attempt_ms: Some(10),
+        last_error: Some(Some("dial failed".into())),
+        state: crate_storage::SyncStateUpdate::Set(crate_storage::SyncPeerState::Failed),
+        ..crate_storage::SyncStatusUpdate::default()
+    };
+
+    let first = storage
+        .update_sync_status(&peer, &topic_id, &success)
+        .unwrap();
+    assert_eq!(first.peer_id, peer);
+    assert_eq!(first.successful_attempts, 1);
+    let second = storage
+        .update_sync_status(&peer, &topic_id, &failure)
+        .unwrap();
+    assert_eq!(second.successful_attempts, 1);
+    assert_eq!(second.failed_attempts, 1);
+    assert_eq!(second.state, crate_storage::SyncPeerState::Failed);
+    // A late attempt timestamp cannot rewind the record.
+    assert_eq!(second.last_attempt_ms, Some(20));
+    assert_eq!(second.last_success_ms, Some(20));
+
+    // The guard drops an update whose attempt context is already superseded.
+    let stale = crate_storage::SyncStatusUpdate {
+        expected_attempts: Some(0),
+        state: crate_storage::SyncStateUpdate::Set(crate_storage::SyncPeerState::Idle),
+        ..crate_storage::SyncStatusUpdate::default()
+    };
+    let guarded = storage
+        .update_sync_status(&peer, &topic_id, &stale)
+        .unwrap();
+    assert_eq!(guarded.state, crate_storage::SyncPeerState::Failed);
+    assert_eq!(
+        storage.sync_statuses(&topic_id).unwrap()[0].state,
+        crate_storage::SyncPeerState::Failed
+    );
+
+    // A guarded update on an unknown peer records nothing.
+    let other = PeerId::hash(b"counter-peer-other");
+    let unmatched = crate_storage::SyncStatusUpdate {
+        expected_attempts: Some(1),
+        ..stale.clone()
+    };
+    storage
+        .update_sync_status(&other, &topic_id, &unmatched)
+        .unwrap();
+    assert_eq!(storage.sync_statuses(&topic_id).unwrap().len(), 1);
+
+    let rounds = 16_u64;
+    let threads = 2;
+    let barrier = Arc::new(Barrier::new(threads));
+    let handles = (0..threads)
+        .map(|index| {
+            let storage = storage.clone();
+            let barrier = Arc::clone(&barrier);
+            let update = if index == 0 {
+                success.clone()
+            } else {
+                failure.clone()
+            };
+            thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..rounds {
+                    storage
+                        .update_sync_status(&peer, &topic_id, &update)
+                        .unwrap();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let status = storage
+        .sync_statuses(&topic_id)
+        .unwrap()
+        .into_iter()
+        .find(|status| status.peer_id == peer)
+        .unwrap();
+    assert_eq!(status.successful_attempts, rounds + 1);
+    assert_eq!(status.failed_attempts, rounds + 1);
+}
+
+#[test]
+fn memory_status_counters() {
+    assert_status_counters(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_status_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_status_counters(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+fn put_target<S: Storage>(storage: &S, peer_id: PeerId, topic_id: TopicId, clock: ActorClock) {
+    storage
+        .put_sync_obligation(crate_storage::SyncObligation {
+            peer_id,
+            topic_id,
+            op_ids: BTreeSet::new(),
+            target_clock: clock,
+        })
+        .unwrap();
+}
+
+fn assert_coalesced_targets<S: Storage>(storage: S) {
+    let peer = PeerId::hash(b"coalesce-peer");
+    let other = PeerId::hash(b"coalesce-other");
+    let topic_id = TopicId::hash(b"coalesce-topic");
+    let actor = actor_id_for(topic_id, peer);
+
+    for rounds in [8_u64, 16] {
+        for seq in 1..=rounds {
+            let mut clock = ActorClock::new();
+            clock.observe(actor, seq);
+            put_target(&storage, peer, topic_id, clock);
+        }
+        // One target record per peer and topic, whatever the backlog length.
+        let obligations = storage.sync_obligations(&peer, &topic_id).unwrap();
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(obligations[0].target_clock.get(&actor), rounds);
+    }
+    assert_eq!(
+        storage
+            .topic_obligation_counts(&topic_id)
+            .unwrap()
+            .get(&peer),
+        Some(&1)
+    );
+
+    // Explicit repair wants stay distinct and bounded by their own ids.
+    for _ in 0..3 {
+        storage
+            .put_sync_obligation(crate_storage::SyncObligation {
+                peer_id: peer,
+                topic_id,
+                op_ids: [OpId::hash(b"coalesce-want-one")].into(),
+                target_clock: ActorClock::new(),
+            })
+            .unwrap();
+    }
+    storage
+        .put_sync_obligation(crate_storage::SyncObligation {
+            peer_id: peer,
+            topic_id,
+            op_ids: [OpId::hash(b"coalesce-want-two")].into(),
+            target_clock: ActorClock::new(),
+        })
+        .unwrap();
+    assert_eq!(storage.sync_obligations(&peer, &topic_id).unwrap().len(), 3);
+
+    let mut lagging = ActorClock::new();
+    lagging.observe(actor, 4);
+    put_target(&storage, other, topic_id, lagging);
+    let mut proof = ActorClock::new();
+    proof.observe(actor, 16);
+    let cleared = storage
+        .apply_peer_ack(crate_storage::PeerAck {
+            peer_id: peer,
+            topic_id,
+            heads: BTreeSet::new(),
+            clock: proof,
+        })
+        .unwrap();
+
+    // Clearing one peer's reached target leaves the explicit wants and every
+    // other peer's backlog in place.
+    assert_eq!(cleared, 1);
+    assert_eq!(storage.sync_obligations(&peer, &topic_id).unwrap().len(), 2);
+    assert_eq!(
+        storage.sync_obligations(&other, &topic_id).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn memory_coalesced_targets() {
+    assert_coalesced_targets(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_coalesced_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_coalesced_targets(crate_storage::FjallStorage::open(dir.path()).unwrap());
+}
