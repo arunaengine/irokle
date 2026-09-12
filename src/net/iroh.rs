@@ -38,10 +38,10 @@ const MAX_SYNC_MESSAGES_PER_STREAM: usize = 4096;
 // reply (which can echo up to two messages per topic) stays under its own cap.
 const MAX_BATCH_STREAM_MESSAGES: usize = MAX_SYNC_MESSAGES_PER_STREAM / 2;
 const MAX_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
-/// Delay before a topic that advanced but still owes work is served again.
-/// Short enough to keep catching up, long enough to let other peers take a
-/// turn on the shared slots.
-const RESYNC_PROGRESS_TURN: Duration = Duration::from_millis(50);
+/// Delay before a topic that advanced but still owes work is served again. It
+/// is due at once but behind every target that became due earlier, so other
+/// work takes its turn first and an idle queue continues immediately.
+const RESYNC_PROGRESS_TURN: Duration = Duration::ZERO;
 /// Pages one `sync_now` call will fetch while each is really advancing, before
 /// it reports what it reached. Bounds the caller's wait instead of paging on
 /// until the peer stops publishing.
@@ -1136,15 +1136,19 @@ impl<S: Storage> IrohNet<S> {
             }
         };
 
+        // An advancing page continues even when outbound evidence reads clean:
+        // the peer may still hold more of the inbound goal.
+        if advanced && result.is_ok() {
+            self.resync_scheduler
+                .complete_dirty(claim.settle(), RESYNC_PROGRESS_TURN);
+            return;
+        }
         if !needs_sync && result.is_ok() {
             self.resync_scheduler.complete_clean(claim.settle());
             return;
         }
 
         match result {
-            Ok(()) if advanced => self
-                .resync_scheduler
-                .complete_dirty(claim.settle(), RESYNC_PROGRESS_TURN),
             Ok(()) => self
                 .resync_scheduler
                 .complete_dirty(claim.settle(), runtime.resync_interval),
@@ -1396,27 +1400,41 @@ impl<S: Storage> IrohNet<S> {
         // advances, up to a caller budget, so catching up is not reported as an
         // I/O error merely because another page is needed.
         let mut result = Ok(());
+        let mut advancing = false;
         for _ in 0..MAX_SYNC_NOW_PAGES {
             let mut outcomes = self.run_topic_batch(peer.clone(), &[topic_id], None).await;
             result = outcomes.results.remove(&topic_id).unwrap_or(Ok(()));
-            if result.is_err() || !outcomes.advanced.contains(&topic_id) {
+            advancing = outcomes.advanced.contains(&topic_id);
+            if result.is_err() || !advancing {
                 break;
             }
+        }
+        // Work still outstanding after the page budget is not a completed sync.
+        if result.is_ok() && advancing {
+            result = Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "sync page budget exhausted; the rest is scheduled",
+            ));
         }
         if result.is_err() {
             // Drops the pooled connection only when it is already closed.
             let _ = self.pool.get(&endpoint_id);
         }
+        // An exhausted budget is progress, not an unreachable peer.
         let record_result = match &result {
-            Ok(()) => Ok(()),
-            Err(error) => Err(error),
+            Err(error) if !advancing => Err(error),
+            _ => Ok(()),
         };
         let _ = self
             .node
             .record_sync_result(remote_peer_id, topic_id, record_result);
         // A manual sync holds no claim, so it reports evidence instead of
         // completing an attempt the resync loop may own.
-        self.reconsider_target(remote_peer_id, topic_id);
+        if advancing {
+            self.resync_scheduler.reconsider(remote_peer_id, topic_id);
+        } else {
+            self.reconsider_target(remote_peer_id, topic_id);
+        }
         result
     }
 
