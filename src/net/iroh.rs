@@ -48,6 +48,10 @@ const RESYNC_PROGRESS_TURN: Duration = Duration::ZERO;
 const MAX_SYNC_NOW_PAGES: usize = 64;
 /// Staging receipts remembered per peer and topic, oldest dropped first.
 const MAX_BOOTSTRAP_RECEIPTS: usize = 1024;
+/// Storage jobs running at once for acks, fingerprints, summaries and status.
+const CONTROL_JOBS: usize = 4;
+/// Storage jobs running at once for admission and page planning.
+const BULK_JOBS: usize = 2;
 
 /// Bounds of one sync stream. Tests scale them down; everything else uses the
 /// defaults.
@@ -729,22 +733,45 @@ impl ReceiptLog {
 
 pub struct IrohNet<S: Storage = MemoryStorage> {
     pool: ConnectionPool,
-    node: Irokle<S>,
-    runtime: IrohRuntimeConfig,
-    resync_scheduler: ResyncScheduler,
     accept_started: AtomicBool,
     resync_started: AtomicBool,
     quarantine_started: AtomicBool,
     outbound_streams: AtomicU64,
+    shared: Arc<SharedNet<S>>,
+}
+
+/// The part of a net that storage jobs use off the async executor.
+pub struct SharedNet<S: Storage> {
+    node: Irokle<S>,
+    runtime: IrohRuntimeConfig,
+    resync_scheduler: ResyncScheduler,
     limits: StreamLimits,
     receipts: Mutex<ReceiptLog>,
     shutdown: tokio::sync::watch::Sender<bool>,
     tasks: Arc<TaskTracker>,
+    control_lane: Arc<tokio::sync::Semaphore>,
+    bulk_lane: Arc<tokio::sync::Semaphore>,
     // Optional sink for genesis tie-break evictions produced while admitting
     // remote sync data. The embedder consumes these to re-emit the discarded
     // payloads under the winning genesis; when unset they are recovered from
     // the eviction journal instead.
     eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
+}
+
+impl<S: Storage> std::ops::Deref for IrohNet<S> {
+    type Target = SharedNet<S>;
+
+    fn deref(&self) -> &SharedNet<S> {
+        &self.shared
+    }
+}
+
+/// Which bounded worker lane a storage job runs in. Control work has its own
+/// permits, so acks and status never wait behind admission or page planning.
+#[derive(Clone, Copy, Debug)]
+enum Lane {
+    Control,
+    Bulk,
 }
 
 impl<S: Storage> IrohNet<S> {
@@ -801,27 +828,62 @@ impl<S: Storage> IrohNet<S> {
         let (shutdown, _) = tokio::sync::watch::channel(false);
         Ok(Self {
             pool: ConnectionPool::new(endpoint),
-            node,
-            runtime,
-            resync_scheduler: ResyncScheduler::default(),
             accept_started: AtomicBool::new(false),
             resync_started: AtomicBool::new(false),
             quarantine_started: AtomicBool::new(false),
             outbound_streams: AtomicU64::new(0),
-            limits: StreamLimits::default(),
-            receipts: Mutex::default(),
-            shutdown,
-            tasks: Arc::default(),
-            eviction_sink,
+            shared: Arc::new(SharedNet {
+                node,
+                runtime,
+                resync_scheduler: ResyncScheduler::default(),
+                limits: StreamLimits::default(),
+                receipts: Mutex::default(),
+                shutdown,
+                tasks: Arc::default(),
+                control_lane: Arc::new(tokio::sync::Semaphore::new(CONTROL_JOBS)),
+                bulk_lane: Arc::new(tokio::sync::Semaphore::new(BULK_JOBS)),
+                eviction_sink,
+            }),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn with_stream_limits(mut self, limits: StreamLimits) -> Self {
-        self.limits = limits;
+        Arc::get_mut(&mut self.shared)
+            .expect("limits are set before the net is shared")
+            .limits = limits;
         self
     }
 
+    /// Run storage work on a blocking thread in `lane`. The permit and the
+    /// task guard move into the job, so both are held until the job really
+    /// ends, even when the awaiting caller is cancelled first.
+    async fn run_job<T, F>(&self, lane: Lane, job: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&SharedNet<S>) -> T + Send + 'static,
+    {
+        let permits = match lane {
+            Lane::Control => &self.control_lane,
+            Lane::Bulk => &self.bulk_lane,
+        };
+        let permit = Arc::clone(permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("storage job lane closed"))?;
+        let task = self.tasks.track();
+        let shared = Arc::clone(&self.shared);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _task = task;
+            job(&shared)
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("storage job failed: {error}")))
+    }
+}
+
+impl<S: Storage> SharedNet<S> {
     /// Forwards evictions to the configured sink as the fast path. The sink is
     /// an optimization, not the handoff: every payload is already journalled by
     /// the transaction that discarded it, so an undelivered eviction stays
@@ -845,7 +907,9 @@ impl<S: Storage> IrohNet<S> {
             }
         }
     }
+}
 
+impl<S: Storage> IrohNet<S> {
     pub fn node(&self) -> &Irokle<S> {
         &self.node
     }
@@ -895,7 +959,9 @@ impl<S: Storage> IrohNet<S> {
         self.sync_now(peer_id_to_endpoint_addr(peer_id)?, topic_id)
             .await
     }
+}
 
+impl<S: Storage> SharedNet<S> {
     pub fn schedule_resync(&self, peer_id: PeerId, topic_id: crate::TopicId) {
         self.resync_scheduler.schedule_now(peer_id, topic_id, false);
     }
@@ -941,7 +1007,9 @@ impl<S: Storage> IrohNet<S> {
         }
         Ok(scheduled)
     }
+}
 
+impl<S: Storage> IrohNet<S> {
     pub async fn sync_endpoint_now(
         &self,
         endpoint_id: iroh::EndpointId,
@@ -1213,7 +1281,9 @@ impl<S: Storage> IrohNet<S> {
             while syncs.join_next().await.is_some() {}
         })))
     }
+}
 
+impl<S: Storage> SharedNet<S> {
     /// Completes one owned attempt. Only the holder of the claim may call this.
     fn finish_resync_attempt(
         &self,
@@ -1400,7 +1470,9 @@ impl<S: Storage> IrohNet<S> {
         }
         Ok(targets)
     }
+}
 
+impl<S: Storage> IrohNet<S> {
     fn schedule_startup_resync(self: &Arc<Self>) -> io::Result<usize> {
         self.schedule_full_sweep_resync()
     }
@@ -1507,6 +1579,7 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         messages: &[SyncMessage],
     ) -> io::Result<Vec<SyncMessage>> {
+        let _task = self.tasks.track();
         let mut last_error = None;
         for _ in 0..2 {
             let connection = match self
@@ -1558,6 +1631,7 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         topic_id: crate::TopicId,
     ) -> io::Result<()> {
+        let _task = self.tasks.track();
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
         let endpoint_id = peer.id;
         // A bounded page is not the goal: keep paging while the exchange really
@@ -1668,7 +1742,9 @@ impl<S: Storage> IrohNet<S> {
             }
         }
     }
+}
 
+impl<S: Storage> SharedNet<S> {
     /// Drops persisted obligations toward a peer that is no longer a topic
     /// member (or whose topic state is gone) so sweeps stop rescheduling them.
     fn gc_stale_obligations(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<()> {
@@ -1693,7 +1769,9 @@ impl<S: Storage> IrohNet<S> {
             .map_err(invalid_data)?;
         Ok(())
     }
+}
 
+impl<S: Storage> IrohNet<S> {
     async fn sync_topic_chunk(
         &self,
         peer: iroh::EndpointAddr,
@@ -1953,7 +2031,9 @@ impl<S: Storage> IrohNet<S> {
         }
         BatchOutcomes::new(outcomes, advanced, settled)
     }
+}
 
+impl<S: Storage> SharedNet<S> {
     fn plan_topic_messages(
         &self,
         remote_peer_id: PeerId,
@@ -2086,7 +2166,9 @@ impl<S: Storage> IrohNet<S> {
             credit,
         })
     }
+}
 
+impl<S: Storage> IrohNet<S> {
     async fn run_topic_batch_exchange(
         &self,
         peer: iroh::EndpointAddr,
@@ -2369,7 +2451,9 @@ impl<S: Storage> IrohNet<S> {
             }
         }
     }
+}
 
+impl<S: Storage> SharedNet<S> {
     /// Publishes every decided outcome this batch has not published yet:
     /// records it and releases the claim the batch owns for it. Called between
     /// exchanges, so ownership of finished work is handed back immediately.
@@ -2473,8 +2557,11 @@ impl<S: Storage> IrohNet<S> {
     ) -> Option<crate::ActorClock> {
         self.receipt_log().clocks.get(&(peer_id, topic_id)).cloned()
     }
+}
 
+impl<S: Storage> IrohNet<S> {
     pub async fn accept_one(&self) -> io::Result<Option<iroh::EndpointId>> {
+        let _task = self.tasks.track();
         let Some(incoming) = self.endpoint().accept().await else {
             return Ok(None);
         };
@@ -2505,6 +2592,7 @@ impl<S: Storage> IrohNet<S> {
         mut recv: iroh::endpoint::RecvStream,
         mut send: iroh::endpoint::SendStream,
     ) -> io::Result<()> {
+        let _task = self.tasks.track();
         tokio::time::timeout(self.runtime.sync_io_timeout, async {
             let mut session = SyncSession::new(peer);
             let mut limits = SyncReadLimits::new(self.limits);
@@ -2517,9 +2605,28 @@ impl<S: Storage> IrohNet<S> {
                         frame.len()
                     ))
                 })?;
-                session.handle(self, message)?;
+                // Messages are handled one job at a time, in stream order.
+                let lane = match message {
+                    SyncMessage::Data(_) | SyncMessage::Summary(_) => Lane::Bulk,
+                    _ => Lane::Control,
+                };
+                let handled;
+                (session, handled) = self
+                    .run_job(lane, move |shared| {
+                        let handled = session.handle(shared, message);
+                        (session, handled)
+                    })
+                    .await?;
+                handled?;
             }
-            let responses = session.finish(self)?;
+            let lane = if session.requests.is_empty() {
+                Lane::Control
+            } else {
+                Lane::Bulk
+            };
+            let responses = self
+                .run_job(lane, move |shared| session.finish(shared))
+                .await??;
             let timeout = self.runtime.sync_io_timeout;
             write_sync_messages(&mut send, &responses, timeout, self.limits).await?;
             Ok(())
@@ -2527,7 +2634,9 @@ impl<S: Storage> IrohNet<S> {
         .await
         .map_err(|_| timed_out("sync stream timed out"))?
     }
+}
 
+impl<S: Storage> SharedNet<S> {
     pub fn handle_messages(
         &self,
         peer: iroh::EndpointId,
@@ -2847,7 +2956,7 @@ impl SyncSession {
         }
     }
 
-    fn handle<S: Storage>(&mut self, net: &IrohNet<S>, message: SyncMessage) -> io::Result<()> {
+    fn handle<S: Storage>(&mut self, net: &SharedNet<S>, message: SyncMessage) -> io::Result<()> {
         if let SyncMessage::Open(open) = &message {
             if open.protocol.as_bytes() != IROKLE_SYNC_ALPN {
                 return Err(invalid_data("unsupported sync protocol"));
@@ -2938,7 +3047,7 @@ impl SyncSession {
     }
 
     /// Queue one reply, folding acks and receipts of a topic into the newest.
-    fn keep_reply<S: Storage>(&mut self, net: &IrohNet<S>, reply: SyncMessage) -> io::Result<()> {
+    fn keep_reply<S: Storage>(&mut self, net: &SharedNet<S>, reply: SyncMessage) -> io::Result<()> {
         let mut ack = match reply {
             SyncMessage::Ack(ack) => ack,
             SyncMessage::Receipt(receipt) => {
@@ -2963,7 +3072,7 @@ impl SyncSession {
     /// Apply the stream's acks independently, then reply: every control first,
     /// then one bounded page per request, sharing what is left of the stream
     /// budget among the requests still to serve.
-    fn finish<S: Storage>(&mut self, net: &IrohNet<S>) -> io::Result<Vec<SyncMessage>> {
+    fn finish<S: Storage>(&mut self, net: &SharedNet<S>) -> io::Result<Vec<SyncMessage>> {
         let mut responses = std::mem::take(&mut self.controls);
         responses.extend(self.apply_acks(net)?);
         responses.extend(
@@ -3026,7 +3135,7 @@ impl SyncSession {
 
     /// One rejected ack, a stale clock after a reset or one bound to another
     /// peer, must not discard the others. Each rejection names its own topic.
-    fn apply_acks<S: Storage>(&mut self, net: &IrohNet<S>) -> io::Result<Vec<SyncMessage>> {
+    fn apply_acks<S: Storage>(&mut self, net: &SharedNet<S>) -> io::Result<Vec<SyncMessage>> {
         let acks = std::mem::take(&mut self.acks);
         if acks.is_empty() {
             return Ok(Vec::new());
@@ -3887,6 +3996,162 @@ mod tests {
             .build()
             .unwrap();
         Arc::new(IrohNet::new(endpoint, node).unwrap())
+    }
+
+    /// A net over gated storage, with no loops running.
+    async fn stale_net() -> (
+        Arc<IrohNet<crate::tests::support::StaleReadStorage>>,
+        crate::tests::support::StaleReadStorage,
+    ) {
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let storage = crate::tests::support::StaleReadStorage::new(MemoryStorage::new());
+        let node = Irokle::builder()
+            .with_storage(storage.clone())
+            .with_iroh_secret_key(endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        (Arc::new(IrohNet::new(endpoint, node).unwrap()), storage)
+    }
+
+    /// On a one-worker runtime, a control job completes while every bulk permit
+    /// is taken, one of them by a job held inside a storage read.
+    #[tokio::test]
+    async fn control_passes_bulk() {
+        use crate::tests::support::{Gate, GatePoint, Note, node};
+
+        let (net, storage) = stale_net().await;
+        let remote = node(61);
+        let topic_id = net
+            .node
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [remote.peer_id()].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Heads(topic_id), Arc::clone(&gate));
+        let held = {
+            let net = Arc::clone(&net);
+            tokio::spawn(async move {
+                net.run_job(Lane::Bulk, move |shared| {
+                    shared.node.storage().heads(&topic_id).map(drop)
+                })
+                .await
+            })
+        };
+        let (waiting, parked) = std::sync::mpsc::channel::<()>();
+        let filler = {
+            let net = Arc::clone(&net);
+            tokio::spawn(async move {
+                net.run_job(Lane::Bulk, move |_| {
+                    let _ = parked.recv_timeout(Duration::from_secs(60));
+                })
+                .await
+            })
+        };
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while net.bulk_lane.available_permits() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bulk lane never filled");
+
+        let open = vec![SyncMessage::Open(remote.sync_open(topic_id))];
+        let endpoint = peer_id_to_endpoint_addr(remote.peer_id()).unwrap().id;
+        let replies = tokio::time::timeout(
+            Duration::from_secs(60),
+            net.run_job(Lane::Control, move |shared| {
+                shared.handle_messages(endpoint, open)
+            }),
+        )
+        .await
+        .expect("control work waited behind bulk work")
+        .unwrap()
+        .unwrap();
+        assert!(matches!(&replies[..], [SyncMessage::Summary(_)]));
+        assert!(
+            !gate.has_left(),
+            "control work finished only after bulk work"
+        );
+
+        drop(release);
+        drop(waiting);
+        held.await.unwrap().unwrap().unwrap();
+        filler.await.unwrap().unwrap();
+        net.shutdown().await;
+    }
+
+    /// A requester that goes away does not stop a started bulk job: it still
+    /// commits, keeps its permit until it ends, and shutdown waits for it. A
+    /// requester dropped before its first poll starts nothing.
+    #[tokio::test]
+    async fn cancelled_job_commits() {
+        use crate::tests::support::{Gate, GatePoint, chain_source};
+
+        let (net, storage) = stale_net().await;
+        let (source, topic_id, ops) = chain_source(62, net.node.peer_id());
+        let admit = |net: &Arc<IrohNet<crate::tests::support::StaleReadStorage>>| {
+            let net = Arc::clone(net);
+            let source_peer = source.peer_id();
+            let data = crate::sync::SyncData {
+                topic_id,
+                ops: ops.clone(),
+            };
+            tokio::spawn(async move {
+                net.run_job(Lane::Bulk, move |shared| {
+                    shared.node.storage().heads(&topic_id)?;
+                    shared.node.receive_sync_data_from(source_peer, data)
+                })
+                .await
+            })
+        };
+
+        let unpolled = admit(&net);
+        unpolled.abort();
+        assert!(unpolled.await.unwrap_err().is_cancelled());
+        assert_eq!(net.bulk_lane.available_permits(), BULK_JOBS);
+        assert_eq!(net.tasks.running(), 0);
+        assert!(storage.topic_state(&topic_id).unwrap().is_none());
+
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Heads(topic_id), Arc::clone(&gate));
+        let requester = admit(&net);
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+        requester.abort();
+        assert!(requester.await.unwrap_err().is_cancelled());
+        assert_eq!(net.bulk_lane.available_permits(), BULK_JOBS - 1);
+
+        let outcome = net.shutdown_with_timeout(Duration::from_millis(200)).await;
+        assert!(
+            matches!(outcome, ShutdownOutcome::Incomplete { running } if running >= 1),
+            "{outcome:?}"
+        );
+        drop(release);
+        assert_eq!(
+            net.shutdown_with_timeout(Duration::from_secs(60)).await,
+            ShutdownOutcome::Complete
+        );
+        assert_eq!(net.bulk_lane.available_permits(), BULK_JOBS);
+        assert_eq!(
+            storage.list_op_ids(&topic_id).unwrap().len(),
+            ops.len(),
+            "the job committed after its requester left"
+        );
     }
 
     /// Shutdown before any loop subscribes must still be recorded. The watch
