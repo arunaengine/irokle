@@ -1509,20 +1509,30 @@ impl<S: Storage> Oplog<S> {
             expected_heads.clone(),
             payload,
             signer,
-            signed,
+            signed.take(),
         )?;
-        #[cfg(feature = "iroh")]
-        op.validate_frame()?;
-        self.validate_op(&op)?;
-        let meta = self.meta_for(&op)?;
-        self.commit_admission(
-            op.clone(),
-            meta.clone(),
-            expected_heads,
-            expected_state,
-            effects,
-        )?;
-        Ok((op, meta))
+        let committed = (|| {
+            #[cfg(feature = "iroh")]
+            op.validate_frame()?;
+            self.validate_op(&op)?;
+            let meta = self.meta_for(&op)?;
+            self.commit_admission(
+                op.clone(),
+                meta.clone(),
+                expected_heads,
+                expected_state,
+                effects,
+            )?;
+            Ok(meta)
+        })();
+        match committed {
+            Ok(meta) => Ok((op, meta)),
+            // A failed attempt keeps the signed op for the retry to reuse.
+            Err(error) => {
+                *signed = Some(op);
+                Err(error)
+            }
+        }
     }
 
     fn try_genesis_effects<F>(
@@ -1545,7 +1555,7 @@ impl<S: Storage> Oplog<S> {
             expected_heads.clone(),
             TopicPayload::Genesis(genesis),
             signer,
-            &mut None,
+            None,
         )?;
         #[cfg(feature = "iroh")]
         genesis_op.validate_frame()?;
@@ -1626,7 +1636,7 @@ impl<S: Storage> Oplog<S> {
         mut deps: BTreeSet<crate::OpId>,
         payload: TopicPayload,
         signer: &impl Signer,
-        previous: &mut Option<Op>,
+        previous: Option<Op>,
     ) -> Result<Op> {
         let tip = self.storage.actor_tip(&topic_id, &actor_id)?;
         let (actor_seq, actor_prev) = match tip {
@@ -1659,12 +1669,11 @@ impl<S: Storage> Oplog<S> {
             payload,
         };
         // A retry whose body did not change reuses the op signed before.
-        if let Some(op) = previous.as_ref().filter(|op| op.signed.body == body) {
-            return Ok(op.clone());
+        if let Some(op) = previous.filter(|op| op.signed.body == body) {
+            return Ok(op);
         }
         let op = Op::sign(body, signer)?;
         op.validate()?;
-        *previous = Some(op.clone());
         Ok(op)
     }
 
