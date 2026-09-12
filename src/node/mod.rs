@@ -272,7 +272,7 @@ impl<S: Storage> Irokle<S> {
             op.id,
             &self.config.default_write_concern,
             "topic genesis replication wake failed",
-        )?;
+        );
         Ok(Topic::new(self.clone(), topic_id, actor_id))
     }
 
@@ -334,7 +334,7 @@ impl<S: Storage> Irokle<S> {
             event_op.id,
             &self.config.default_write_concern,
             "topic genesis replication wake failed",
-        )?;
+        );
         Ok((Topic::new(self.clone(), topic_id, actor_id), record))
     }
 
@@ -538,24 +538,9 @@ impl<S: Storage> Irokle<S> {
             verified.insert(op.id);
         }
         self.check_unknown_topic(source_peer_id, &data, &verified)?;
-        let removals = data
-            .ops
-            .iter()
-            .filter_map(|op| match &op.signed.body.payload {
-                crate::TopicPayload::Control(TopicControl::RemovePeer { peer }) => {
-                    Some((op.id, *peer))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         let (mut ack, evictions) =
             self.sync
                 .receive_data_preverified(source_peer_id, self.peer_id(), data, &verified)?;
-        for (op_id, peer) in removals {
-            if peer != self.peer_id() && ack.accepted.contains(&op_id) {
-                self.storage().clear_peer_sync_state(&peer, &ack.topic_id)?;
-            }
-        }
         self.put_receive_forward_obligations(source_peer_id, ack.topic_id, &ack.accepted)?;
         ack.sign(&self.config.signer)?;
         Ok((ack, evictions))
@@ -628,6 +613,16 @@ impl<S: Storage> Irokle<S> {
     #[cfg(feature = "iroh")]
     pub(crate) fn record_peer_synced(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
         self.sync.record_peer_synced(peer_id, topic_id)
+    }
+
+    #[cfg(feature = "iroh")]
+    pub(crate) fn record_fingerprint(
+        &self,
+        peer_id: PeerId,
+        topic_id: TopicId,
+        fingerprint: [u8; 32],
+    ) -> Result<bool> {
+        self.sync.record_fingerprint(peer_id, topic_id, fingerprint)
     }
 
     #[cfg(feature = "iroh")]
@@ -765,10 +760,17 @@ impl<S: Storage> Irokle<S> {
     fn wake_async_replication(
         &self,
         topic_id: TopicId,
-        _op_id: OpId,
+        op_id: OpId,
         write_concern: &WriteConcern,
         wake_failed_message: &'static str,
-    ) -> Result<()> {
+    ) {
+        if let Err(error) = self.try_wake_replication(topic_id, write_concern) {
+            tracing::warn!(%topic_id, %op_id, %error, "{}", wake_failed_message);
+        }
+    }
+
+    #[cfg(feature = "iroh")]
+    fn try_wake_replication(&self, topic_id: TopicId, write_concern: &WriteConcern) -> Result<()> {
         let Some(net) = &self.net else {
             return Ok(());
         };
@@ -785,10 +787,8 @@ impl<S: Storage> Irokle<S> {
             }
         }
 
-        net.schedule_topic_recheck(topic_id).map_err(|error| {
-            tracing::warn!(%topic_id, %error, "{}", wake_failed_message);
-            Error::Storage(format!("failed to schedule iroh resync: {error}"))
-        })?;
+        net.schedule_topic_recheck(topic_id)
+            .map_err(|error| Error::Storage(format!("failed to schedule iroh resync: {error}")))?;
 
         Ok(())
     }
@@ -947,7 +947,7 @@ impl<S: Storage> Irokle<S> {
             op.id,
             &options.write_concern,
             "async replication wake failed",
-        )?;
+        );
         Ok(record)
     }
 
@@ -957,10 +957,6 @@ impl<S: Storage> Irokle<S> {
         actor_id: ActorId,
         control: TopicControl,
     ) -> Result<()> {
-        let removed_peer = match &control {
-            TopicControl::RemovePeer { peer } => Some(*peer),
-            _ => None,
-        };
         #[cfg(feature = "iroh")]
         let op = self.oplog.create_control_op_with_effects(
             topic_id,
@@ -986,12 +982,7 @@ impl<S: Storage> Irokle<S> {
             op.id,
             &self.config.default_write_concern,
             "topic control replication wake failed",
-        )?;
-        if let Some(peer) = removed_peer
-            && peer != self.peer_id()
-        {
-            self.storage().clear_peer_sync_state(&peer, &topic_id)?;
-        }
+        );
         Ok(())
     }
 

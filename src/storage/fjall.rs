@@ -500,6 +500,27 @@ impl FjallStorage {
                     obligation,
                 )?;
             }
+            if let (Some(previous), Some(state)) = (expected_topic_state, topic_state) {
+                for peer in previous.members.difference(&state.members) {
+                    let prefix = [b"ob".as_slice(), peer.as_ref(), topic_id.as_ref()].concat();
+                    let mut keys = Vec::new();
+                    for item in fjall::Readable::prefix(tx, &self.records, prefix) {
+                        let (key, _) = item.into_inner()?;
+                        keys.push(key.to_vec());
+                    }
+                    for key in keys {
+                        tx.remove(&self.records, key);
+                    }
+                    tx.remove(
+                        &self.records,
+                        [b"ss".as_slice(), topic_id.as_ref(), peer.as_ref()].concat(),
+                    );
+                    tx.remove(
+                        &self.records,
+                        [b"ak".as_slice(), peer.as_ref(), topic_id.as_ref()].concat(),
+                    );
+                }
+            }
             Ok(())
         }
     }
@@ -785,13 +806,17 @@ impl Storage for FjallStorage {
         )
     }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>> {
-        self.list_op_ids(topic_id)?
-            .iter()
-            .map(|id| {
-                self.get_op(id)?
-                    .ok_or_else(|| Error::Storage(format!("missing op indexed for topic: {id}")))
-            })
-            .collect()
+        let read_tx = self.db.read_tx();
+        let prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
+        let mut out = Vec::new();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
+            let (key, _) = item.into_inner()?;
+            let id = Self::op_id_from_key(key.as_ref(), 2 + TopicId::LEN)?;
+            let value = fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", &id))?
+                .ok_or_else(|| Error::Storage(format!("missing op indexed for topic: {id}")))?;
+            out.push(postcard::from_bytes(value.as_ref())?);
+        }
+        Ok(out)
     }
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         let prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
@@ -837,23 +862,27 @@ impl Storage for FjallStorage {
         Ok(self.get(Self::key_id(b"ac", topic_id))?.unwrap_or_default())
     }
     fn topic_fingerprint(&self, topic_id: &TopicId) -> Result<[u8; 32]> {
-        Ok(self
-            .get(Self::key_id(b"fp", topic_id))?
-            .unwrap_or(topic_fingerprint_for(
-                &self.heads(topic_id)?,
-                &self.actor_clock(topic_id)?,
-            )?))
+        match self.get(Self::key_id(b"fp", topic_id))? {
+            Some(fingerprint) => Ok(fingerprint),
+            None => topic_fingerprint_for(&self.heads(topic_id)?, &self.actor_clock(topic_id)?),
+        }
     }
     fn max_generation(&self, topic_id: &TopicId) -> Result<u64> {
         Ok(self.get(Self::key_id(b"mg", topic_id))?.unwrap_or_default())
     }
     fn topic_state(&self, topic_id: &TopicId) -> Result<Option<TopicState>> {
-        self.get::<TopicState>(Self::key_id(b"ts", topic_id))?
-            .map(|mut state| {
-                state.heads = self.heads(topic_id)?;
-                Ok(state)
-            })
-            .transpose()
+        let read_tx = self.db.read_tx();
+        let Some(value) =
+            fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"ts", topic_id))?
+        else {
+            return Ok(None);
+        };
+        let mut state: TopicState = postcard::from_bytes(value.as_ref())?;
+        state.heads = fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"h", topic_id))?
+            .map(|value| postcard::from_bytes(value.as_ref()))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Some(state))
     }
     fn list_topics(&self) -> Result<Vec<TopicInfo>> {
         // v0 keeps this simple: scan durable topic records instead of maintaining a second index.

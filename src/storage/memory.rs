@@ -222,15 +222,17 @@ impl Storage for MemoryStorage {
         if dep_resolvable_locked(&inner, &op.id) {
             return Ok(());
         }
-        let replace_pending = if let Some((_, existing, _)) = inner.pending_ops.get(&op.id) {
+        let replaced = if let Some((existing_source, existing, existing_meta)) =
+            inner.pending_ops.get(&op.id)
+        {
             if existing != &op {
                 return Err(Error::Storage(
                     "pending op id collision with different op".into(),
                 ));
             }
-            true
+            Some((*existing_source, existing_meta.missing_deps.clone()))
         } else {
-            false
+            None
         };
         if meta
             .missing_deps
@@ -244,25 +246,36 @@ impl Storage for MemoryStorage {
                 "pending op has too many missing deps".into(),
             ));
         }
-        if replace_pending {
-            remove_pending_locked(&mut inner, &op.id);
-        }
-        if inner.pending_ops.len() >= MAX_PENDING_OPS_TOTAL {
+        if replaced.is_none() && inner.pending_ops.len() >= MAX_PENDING_OPS_TOTAL {
             return Err(Error::Storage("pending op buffer is full".into()));
         }
-        let source_pending = inner
+        let mut source_pending = inner
             .pending_by_source
             .get(&source_peer)
             .map_or(0, BTreeSet::len);
+        if replaced
+            .as_ref()
+            .is_some_and(|(existing_source, _)| *existing_source == source_peer)
+        {
+            source_pending = source_pending.saturating_sub(1);
+        }
         if source_pending >= MAX_PENDING_OPS_PER_SOURCE {
             return Err(Error::Storage("pending op source quota exceeded".into()));
         }
         for dep in &meta.missing_deps {
-            if inner.pending_waiters.get(dep).map_or(0, BTreeSet::len)
-                >= MAX_PENDING_WAITERS_PER_DEP
+            let mut waiters = inner.pending_waiters.get(dep).map_or(0, BTreeSet::len);
+            if replaced
+                .as_ref()
+                .is_some_and(|(_, missing_deps)| missing_deps.contains(dep))
             {
+                waiters = waiters.saturating_sub(1);
+            }
+            if waiters >= MAX_PENDING_WAITERS_PER_DEP {
                 return Err(Error::Storage("pending waiter quota exceeded".into()));
             }
+        }
+        if replaced.is_some() {
+            remove_pending_locked(&mut inner, &op.id);
         }
         for dep in &meta.missing_deps {
             inner.pending_waiters.entry(*dep).or_default().insert(op.id);
@@ -484,6 +497,17 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
     if memory_topic_state_locked(inner, &topic_id) != expected_topic_state {
         return Err(Error::AdmissionConflict);
     }
+    let removed_peers = expected_topic_state
+        .as_ref()
+        .zip(topic_state.as_ref())
+        .map(|(expected, state)| {
+            expected
+                .members
+                .difference(&state.members)
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut actor_tips = BTreeMap::new();
     let mut new_entries = Vec::new();
     for (op, meta) in entries {
@@ -611,6 +635,13 @@ fn put_admitted_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> R
         if !inner.obligations.contains(&obligation) {
             inner.obligations.push(obligation);
         }
+    }
+    for peer_id in removed_peers {
+        inner
+            .obligations
+            .retain(|o| o.peer_id != peer_id || o.topic_id != topic_id);
+        inner.sync_statuses.remove(&(topic_id, peer_id));
+        inner.peer_acks.remove(&(peer_id, topic_id));
     }
     Ok(())
 }

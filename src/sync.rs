@@ -412,13 +412,29 @@ impl<S: Storage> SyncEngine<S> {
 
         let mut wanted = request.wants.clone();
         let local_clock = self.oplog.storage().actor_clock(&request.topic_id)?;
-        for hint in &request.actor_range_hints {
+        let mut remaining = MAX_ACTOR_RANGE_HINT_SPAN;
+        let mut visited = BTreeSet::new();
+        for hint in request
+            .actor_range_hints
+            .iter()
+            .take(MAX_ACTOR_RANGE_HINT_SPAN as usize)
+        {
+            if remaining == 0 {
+                break;
+            }
             let Some((from_exclusive, to_inclusive)) =
                 clamp_actor_range_hint(hint, local_clock.get(&hint.actor_id))
             else {
                 continue;
             };
             for seq in (from_exclusive + 1)..=to_inclusive {
+                if remaining == 0 {
+                    break;
+                }
+                remaining -= 1;
+                if !visited.insert((hint.actor_id, seq)) {
+                    continue;
+                }
                 if let Some(op_id) =
                     self.oplog
                         .storage()
@@ -574,6 +590,34 @@ impl<S: Storage> SyncEngine<S> {
         Ok(())
     }
 
+    #[cfg(feature = "iroh")]
+    pub(crate) fn record_fingerprint(
+        &self,
+        peer_id: PeerId,
+        topic_id: TopicId,
+        fingerprint: [u8; 32],
+    ) -> Result<bool> {
+        let state = self
+            .oplog
+            .storage()
+            .topic_state(&topic_id)?
+            .ok_or(Error::TopicNotFound)?;
+        if !state.members.contains(&peer_id) {
+            return Err(Error::NotTopicMember);
+        }
+        let (heads, clock) = self.ack_frontier(&topic_id)?;
+        if crate::storage::topic_fingerprint_for(&heads, &clock)? != fingerprint {
+            return Ok(false);
+        }
+        self.oplog.storage().apply_peer_ack(PeerAck {
+            peer_id,
+            topic_id,
+            heads,
+            clock,
+        })?;
+        Ok(true)
+    }
+
     fn validate_ack(&self, ack: &SyncAck) -> Result<()> {
         let state = self
             .oplog
@@ -629,6 +673,9 @@ impl<S: Storage> SyncEngine<S> {
                 && meta.topic_id == topic_id
             {
                 target_clock.observe(meta.actor_id, meta.actor_seq);
+            } else {
+                target_clock = ActorClock::new();
+                break;
             }
         }
         self.oplog.storage().put_sync_obligation(SyncObligation {
