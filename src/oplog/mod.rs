@@ -641,28 +641,51 @@ impl<S: Storage> Oplog<S> {
                 for op_id in &pending_op_ids {
                     queued_pending.remove(op_id);
                 }
+                // A permanent rejection names the batch, not the op inside it,
+                // so the retained copy lets one invalid record be isolated
+                // without discarding the valid ops queued beside it.
+                let retained = if from_pending && ops.len() > 1 {
+                    ops.clone()
+                } else {
+                    Vec::new()
+                };
                 // Pending ops re-queued from storage are not in `verified`; they
                 // get re-verified during admission like before.
-                let (batch_accepted, batch_eviction) =
-                    match self.admit_ops_batch_retry(batch_source_peer, ops, verified) {
-                        Ok(outcome) => outcome,
-                        Err(err) if from_pending && is_permanent_rejection(&err) => {
+                let (batch_accepted, batch_eviction) = match self.admit_ops_batch_retry(
+                    batch_source_peer,
+                    ops,
+                    verified,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(err) if from_pending && is_permanent_rejection(&err) => {
+                        if retained.is_empty() {
                             for op_id in pending_op_ids {
                                 tracing::debug!(%op_id, error = %err, "rejecting pending subtree");
                                 self.storage.reject_pending_subtree(&op_id)?;
                             }
-                            continue;
-                        }
-                        // A repairable failure keeps the buffered record and
-                        // must not fail the ops the caller actually sent.
-                        Err(err) if from_pending && is_pending_retry(&err) => {
-                            for op_id in pending_op_ids {
-                                tracing::debug!(%op_id, error = %err, "retaining pending op");
+                        } else {
+                            // Re-admit one at a time so only the offending
+                            // subtree is rejected. Dependency order is
+                            // preserved, so a dependent still follows its
+                            // dependency.
+                            for op in retained {
+                                let op_id = op.id;
+                                queued_pending.insert(op_id);
+                                queue.push_back((batch_source_peer, vec![op], true));
                             }
-                            continue;
                         }
-                        Err(err) => return Err(err),
-                    };
+                        continue;
+                    }
+                    // A repairable failure keeps the buffered record and
+                    // must not fail the ops the caller actually sent.
+                    Err(err) if from_pending && is_pending_retry(&err) => {
+                        for op_id in pending_op_ids {
+                            tracing::debug!(%op_id, error = %err, "retaining pending op");
+                        }
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
                 if let Some(eviction) = batch_eviction {
                     admitted.evictions.push(eviction);
                 }
@@ -1040,7 +1063,10 @@ impl<S: Storage> Oplog<S> {
                         generation = generation.max(checked_next(dep_meta.generation)?);
                     }
                     if body.generation != generation {
-                        return Err(Error::InvalidOpId);
+                        return Err(Error::GenerationMismatch {
+                            expected: generation,
+                            actual: body.generation,
+                        });
                     }
                     let meta = self.meta_for_projected(&op, &overlay_meta)?;
                     if self
@@ -1492,7 +1518,10 @@ impl<S: Storage> Oplog<S> {
             generation = generation.max(checked_next(meta.generation)?);
         }
         if body.generation != generation {
-            return Err(Error::InvalidOpId);
+            return Err(Error::GenerationMismatch {
+                expected: generation,
+                actual: body.generation,
+            });
         }
         Ok(())
     }
@@ -1716,7 +1745,10 @@ impl<S: Storage> Oplog<S> {
                 return Err(Error::TopicMismatch);
             }
             if meta.generation >= body.generation {
-                return Err(Error::InvalidOpId);
+                return Err(Error::GenerationMismatch {
+                    expected: checked_next(meta.generation)?,
+                    actual: body.generation,
+                });
             }
         }
         Ok(OpAdmission::Admit)
@@ -1825,7 +1857,10 @@ impl<S: Storage> Oplog<S> {
             generation = generation.max(checked_next(meta.generation)?);
         }
         if body.generation != generation {
-            return Err(Error::InvalidOpId);
+            return Err(Error::GenerationMismatch {
+                expected: generation,
+                actual: body.generation,
+            });
         }
         Ok(OpAdmission::Admit)
     }

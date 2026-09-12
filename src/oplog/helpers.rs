@@ -116,6 +116,7 @@ pub(super) fn is_permanent_rejection(err: &Error) -> bool {
             | Error::WrongSigner
             | Error::ActorAuthorMismatch
             | Error::TopicMismatch
+            | Error::GenerationMismatch { .. }
     )
 }
 
@@ -139,8 +140,9 @@ pub(super) fn is_pending_retry(err: &Error) -> bool {
 }
 
 pub(super) fn is_local_admission_race(err: &Error) -> bool {
-    // InvalidOpId covers a concurrent admission advancing max_generation
-    // between the heads read and op validation; a retry re-reads fresh state.
+    // A generation mismatch here is a concurrent admission advancing
+    // max_generation between the heads read and op validation, not immutable
+    // invalidity: the retry recomputes the generation from fresh state.
     matches!(
         err,
         Error::AdmissionConflict
@@ -148,6 +150,7 @@ pub(super) fn is_local_admission_race(err: &Error) -> bool {
             | Error::ActorPrevMismatch
             | Error::ActorFork
             | Error::InvalidOpId
+            | Error::GenerationMismatch { .. }
     )
 }
 

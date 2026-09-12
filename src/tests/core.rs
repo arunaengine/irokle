@@ -272,3 +272,210 @@ fn event_rejects_type_mismatch() {
         Err(Error::EventTypeMismatch { .. })
     ));
 }
+
+/// A buffered op whose signed generation cannot match its dependency is invalid
+/// for good once that dependency arrives: the generation is signed and the
+/// dependency's is fixed. It must be rejected with its descendants rather than
+/// staying eligible for revalidation on every later receipt, and an independent
+/// waiter on the same dependency must survive.
+fn assert_rejects_impossible<S: Storage>(storage: S) {
+    let alice = Irokle::with_storage(
+        storage,
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[140; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let bob = Ed25519Signer::from_bytes(&[141; 32]);
+    let carol = Ed25519Signer::from_bytes(&[142; 32]);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id(), carol.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let topic_id = topic.id();
+    let genesis = oplog::topological(alice.storage(), &topic_id).unwrap()[0].clone();
+    let base = genesis.signed.body.generation;
+    let bob_actor = actor_id_for(topic_id, bob.peer_id());
+    let carol_actor = actor_id_for(topic_id, carol.peer_id());
+    let note = |text: &str| {
+        TopicPayload::Event(
+            EventEnvelope::encode_event(&Note {
+                text: text.to_owned(),
+            })
+            .unwrap(),
+        )
+    };
+
+    // Withheld dependency; everything below waits on it.
+    let d = Op::sign(
+        OpBody {
+            topic_id,
+            author: bob.peer_id(),
+            actor_id: bob_actor,
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [genesis.id].into(),
+            generation: base + 1,
+            payload: note("d"),
+        },
+        &bob,
+    )
+    .unwrap();
+    // P claims a generation its only dependency can never justify.
+    let p = Op::sign(
+        OpBody {
+            topic_id,
+            author: bob.peer_id(),
+            actor_id: bob_actor,
+            actor_seq: 2,
+            actor_prev: Some(d.id),
+            deps: [d.id].into(),
+            generation: base + 10,
+            payload: note("p"),
+        },
+        &bob,
+    )
+    .unwrap();
+    let c = Op::sign(
+        OpBody {
+            topic_id,
+            author: bob.peer_id(),
+            actor_id: bob_actor,
+            actor_seq: 3,
+            actor_prev: Some(p.id),
+            deps: [p.id].into(),
+            generation: base + 11,
+            payload: note("c"),
+        },
+        &bob,
+    )
+    .unwrap();
+    let gc = Op::sign(
+        OpBody {
+            topic_id,
+            author: bob.peer_id(),
+            actor_id: bob_actor,
+            actor_seq: 4,
+            actor_prev: Some(c.id),
+            deps: [c.id].into(),
+            generation: base + 12,
+            payload: note("gc"),
+        },
+        &bob,
+    )
+    .unwrap();
+    // Independent sibling waiting on the same dependency.
+    let s = Op::sign(
+        OpBody {
+            topic_id,
+            author: carol.peer_id(),
+            actor_id: carol_actor,
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [d.id].into(),
+            generation: base + 2,
+            payload: note("s"),
+        },
+        &carol,
+    )
+    .unwrap();
+
+    let log = oplog::Oplog::with_storage(alice.storage().clone());
+    log.receive_ops_from_peer(Some(bob.peer_id()), vec![p.clone(), c.clone(), gc.clone()])
+        .unwrap();
+    log.receive_ops_from_peer(Some(carol.peer_id()), vec![s.clone()])
+        .unwrap();
+    assert!(
+        alice
+            .storage()
+            .pending_missing_deps(&topic_id)
+            .unwrap()
+            .contains(&d.id),
+        "all four must be buffered behind the withheld dependency"
+    );
+
+    log.receive_ops_from_peer(Some(bob.peer_id()), vec![d.clone()])
+        .unwrap();
+
+    assert!(
+        alice.storage().ready_pending_ops().unwrap().is_empty(),
+        "an impossible root must not stay eligible for revalidation"
+    );
+    assert!(alice.storage().pending_waiters(&p.id).unwrap().is_empty());
+    assert!(alice.storage().pending_waiters(&c.id).unwrap().is_empty());
+    assert!(
+        alice
+            .storage()
+            .pending_missing_deps(&topic_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    let admitted = alice.storage().list_op_ids(&topic_id).unwrap();
+    assert!(admitted.contains(&d.id), "the dependency admits");
+    assert!(admitted.contains(&s.id), "the independent sibling admits");
+    for rejected in [&p, &c, &gc] {
+        assert!(
+            !admitted.contains(&rejected.id),
+            "an impossible generation must not be admitted"
+        );
+    }
+
+    // Resending the rejected root reports the permanent failure instead of
+    // buffering it again, so it cannot return through the pending pool.
+    assert!(matches!(
+        log.receive_ops_from_peer(Some(bob.peer_id()), vec![p.clone()]),
+        Err(Error::GenerationMismatch { .. })
+    ));
+    assert!(alice.storage().ready_pending_ops().unwrap().is_empty());
+    assert!(
+        !alice
+            .storage()
+            .list_op_ids(&topic_id)
+            .unwrap()
+            .contains(&p.id)
+    );
+
+    // A genuinely repairable record keeps its buffered copy: its dependency is
+    // simply not here yet, which a later arrival can still resolve.
+    let repairable = Op::sign(
+        OpBody {
+            topic_id,
+            author: carol.peer_id(),
+            actor_id: carol_actor,
+            actor_seq: 2,
+            actor_prev: Some(s.id),
+            deps: [s.id, OpId::hash(b"not-yet-here")].into(),
+            generation: base + 3,
+            payload: note("repairable"),
+        },
+        &carol,
+    )
+    .unwrap();
+    log.receive_ops_from_peer(Some(carol.peer_id()), vec![repairable.clone()])
+        .unwrap();
+    assert!(
+        alice
+            .storage()
+            .pending_missing_deps(&topic_id)
+            .unwrap()
+            .contains(&OpId::hash(b"not-yet-here")),
+        "a missing dependency must keep the buffered op"
+    );
+}
+
+#[test]
+fn memory_rejects_impossible() {
+    assert_rejects_impossible(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_rejects_impossible() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_rejects_impossible(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}

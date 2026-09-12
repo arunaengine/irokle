@@ -25,6 +25,12 @@ pub enum Error {
     #[error("op id does not match signed op")]
     InvalidOpId,
 
+    /// The signed generation does not equal one past the highest dependency.
+    /// Both sides are fixed once every dependency is stored, so within one
+    /// incarnation no later arrival can make such an op admissible.
+    #[error("op generation {actual} does not match dependencies, expected {expected}")]
+    GenerationMismatch { expected: u64, actual: u64 },
+
     #[error("signer does not match op author")]
     WrongSigner,
 
