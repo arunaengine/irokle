@@ -11,7 +11,7 @@ use crate::storage::{
     AdmissionEffects, AdmittedBatch, FjallStorage, OpMeta, PeerAck, SyncObligation,
     SyncStatusUpdate, TopicState, TopicView,
 };
-use crate::sync::{SyncData, SyncEngine};
+use crate::sync::{ActorRangeHint, SyncData, SyncEngine, SyncRequest};
 use crate::{EvictionKey, SyncPeerStatus, TopicEviction, TopicInfo};
 
 const REPS: usize = 3;
@@ -287,6 +287,13 @@ fn signed_chain(
     ops
 }
 
+fn load<S: Storage>(storage: &S, ops: &[Op]) {
+    let log = Oplog::with_storage(storage.clone());
+    for batch in ops.chunks(1024) {
+        log.receive_ops(batch.to_vec()).unwrap();
+    }
+}
+
 /// Local publishing with one replication target per peer per publish, as the
 /// facade's `AsyncReplication` admission effects write them.
 fn publish<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
@@ -414,4 +421,180 @@ fn pending_pool<S: Storage + PayloadReads>(storage: Counting<S>) -> Sample {
 fn unrelated_pool() {
     let params = "pending=2000 admissions=100";
     each_backend("pending_pool", params, pending_pool, pending_pool);
+}
+
+fn range_hints(local: &ActorClock, clock: &ActorClock) -> Vec<ActorRangeHint> {
+    local
+        .iter()
+        .filter(|(actor, seq)| clock.get(actor) < **seq)
+        .map(|(actor, seq)| ActorRangeHint {
+            actor_id: *actor,
+            from_exclusive: clock.get(actor),
+            to_inclusive: *seq,
+        })
+        .collect()
+}
+
+/// A requester holding only the genesis catches up page by page.
+fn catch_up<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
+    let (author, reader) = (signer(7), signer(8).peer_id());
+    let ops = signed_chain(&author, &format!("bench-chain-{len}"), &[reader], len, note);
+    let topic_id = ops[0].signed.body.topic_id;
+    load(&storage, &ops);
+    let responder = SyncEngine::new(Oplog::with_storage(storage.clone()), author.peer_id());
+    let requester = Oplog::new();
+    requester.receive_ops(vec![ops[0].clone()]).unwrap();
+    let local = storage.actor_clock(&topic_id).unwrap();
+
+    let before = storage.snapshot();
+    let (mut ms, mut pages) = (0.0, 0);
+    loop {
+        let clock = requester.storage().actor_clock(&topic_id).unwrap();
+        if clock.dominates(&local) {
+            break;
+        }
+        let request = SyncRequest {
+            topic_id,
+            known: BTreeSet::new(),
+            wants: BTreeSet::new(),
+            actor_range_hints: range_hints(&local, &clock),
+        };
+        let served = Instant::now();
+        let page = responder.response_page(reader, &request).unwrap();
+        ms += millis(served);
+        assert!(!page.ops.is_empty(), "a page behind the goal must advance");
+        requester.receive_ops(page.ops).unwrap();
+        pages += 1;
+    }
+    let mut counters = vec![("pages", pages)];
+    counters.extend(read_delta(before, storage.snapshot()));
+    Sample { ms, counters }
+}
+
+#[test]
+#[ignore = "measurement, run explicitly"]
+fn chain_catch_up() {
+    for len in [8192, 16384] {
+        let params = format!("ops={len} page_ops=4096 timed=response_page");
+        each_backend(
+            "catch_up",
+            &params,
+            |s| catch_up(s, len),
+            |s| catch_up(s, len),
+        );
+    }
+}
+
+/// Serving one new op to a peer that holds the whole earlier history.
+fn steady_page<S: Storage>(storage: Counting<S>) -> Vec<Sample> {
+    let (author, reader) = (signer(9), signer(10).peer_id());
+    let mut ops = signed_chain(&author, "bench-steady", &[reader], 16384, note);
+    let topic_id = ops[0].signed.body.topic_id;
+    load(&storage, &ops);
+    let log = Oplog::with_storage(storage.clone());
+    let responder = SyncEngine::new(log.clone(), author.peer_id());
+    (0..REPS)
+        .map(|index| {
+            let op = next_op(&author, ops.last().unwrap(), note(16384 + index));
+            log.receive_ops(vec![op.clone()]).unwrap();
+            let request = SyncRequest {
+                topic_id,
+                known: BTreeSet::new(),
+                wants: BTreeSet::new(),
+                actor_range_hints: vec![ActorRangeHint {
+                    actor_id: op.signed.body.actor_id,
+                    from_exclusive: op.signed.body.actor_seq - 1,
+                    to_inclusive: op.signed.body.actor_seq,
+                }],
+            };
+            let before = storage.snapshot();
+            let started = Instant::now();
+            let page = responder.response_page(reader, &request).unwrap();
+            let ms = millis(started);
+            assert_eq!(page.ops, vec![op.clone()]);
+            ops.push(op);
+            Sample {
+                ms,
+                counters: read_delta(before, storage.snapshot()),
+            }
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "measurement, run explicitly"]
+fn steady_catch_up() {
+    let params = "history=16384 new_ops=1";
+    let samples = steady_page(Counting::new(MemoryStorage::new()));
+    report("steady_page", &format!("backend=memory {params}"), samples);
+    let dir = tempfile::tempdir().unwrap();
+    let samples = steady_page(Counting::new(FjallStorage::open(dir.path()).unwrap()));
+    report("steady_page", &format!("backend=fjall {params}"), samples);
+}
+
+/// A joining writer's event on an old op, admitted through a fresh facade
+/// (cold) and then a second writer's event on the same op (warm).
+fn projection<S: Storage>(storage: Counting<S>) -> (Vec<Sample>, Vec<Sample>) {
+    let owner = signer(41);
+    let writers = (0..2 * REPS as u8)
+        .map(|i| signer(42 + i))
+        .collect::<Vec<_>>();
+    let peers = writers.iter().map(Signer::peer_id).collect::<Vec<_>>();
+    let payload = |index: usize| match index % 65 {
+        64 => TopicPayload::Control(TopicControl::AddPeer {
+            peer: PeerId::hash(index.to_le_bytes()),
+        }),
+        _ => note(index),
+    };
+    let ops = signed_chain(&owner, "bench-members", &peers, 4096 + 64, payload);
+    load(&storage, &ops);
+    let joined = |writer: &Ed25519Signer, dep: &Op| {
+        let body = &dep.signed.body;
+        let op = Op::sign(
+            OpBody {
+                topic_id: body.topic_id,
+                author: writer.peer_id(),
+                actor_id: actor_id_for(body.topic_id, writer.peer_id()),
+                actor_seq: 1,
+                actor_prev: None,
+                deps: [dep.id].into(),
+                generation: body.generation + 1,
+                payload: note(0),
+            },
+            writer,
+        )
+        .unwrap();
+        let log = Oplog::with_storage(storage.clone());
+        (log, op)
+    };
+    let mut cold = Vec::new();
+    let mut warm = Vec::new();
+    for rep in 0..REPS {
+        let dep = &ops[100];
+        let (log, first) = joined(&writers[2 * rep], dep);
+        let (_, second) = joined(&writers[2 * rep + 1], dep);
+        for (samples, op) in [(&mut cold, first), (&mut warm, second)] {
+            let before = storage.snapshot();
+            let started = Instant::now();
+            let accepted = log.receive_ops(vec![op.clone()]).unwrap();
+            let ms = millis(started);
+            assert!(accepted.contains(&op.id));
+            let counters = read_delta(before, storage.snapshot());
+            samples.push(Sample { ms, counters });
+        }
+    }
+    (cold, warm)
+}
+
+#[test]
+#[ignore = "measurement, run explicitly"]
+fn membership_projection() {
+    let params = "events=4096 controls=64";
+    let (cold, warm) = projection(Counting::new(MemoryStorage::new()));
+    report("projection_cold", &format!("backend=memory {params}"), cold);
+    report("projection_warm", &format!("backend=memory {params}"), warm);
+    let dir = tempfile::tempdir().unwrap();
+    let (cold, warm) = projection(Counting::new(FjallStorage::open(dir.path()).unwrap()));
+    report("projection_cold", &format!("backend=fjall {params}"), cold);
+    report("projection_warm", &format!("backend=fjall {params}"), warm);
 }
