@@ -3,6 +3,8 @@ mod bootstrap;
 mod branch;
 mod core;
 #[cfg(feature = "iroh")]
+mod exchange;
+#[cfg(feature = "iroh")]
 mod iroh;
 mod membership;
 #[cfg(feature = "iroh")]
