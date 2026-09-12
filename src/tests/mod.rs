@@ -9,7 +9,7 @@ mod pending;
 #[cfg(feature = "iroh")]
 mod planning;
 mod storage;
-mod support;
+pub(crate) mod support;
 mod sync;
 mod tiebreak;
 #[cfg(feature = "fjall")]

@@ -685,6 +685,7 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
     resync_scheduler: ResyncScheduler,
     accept_started: AtomicBool,
     resync_started: AtomicBool,
+    quarantine_started: AtomicBool,
     outbound_streams: AtomicU64,
     shutdown: tokio::sync::watch::Sender<bool>,
     tasks: Arc<TaskTracker>,
@@ -754,6 +755,7 @@ impl<S: Storage> IrohNet<S> {
             resync_scheduler: ResyncScheduler::default(),
             accept_started: AtomicBool::new(false),
             resync_started: AtomicBool::new(false),
+            quarantine_started: AtomicBool::new(false),
             outbound_streams: AtomicU64::new(0),
             shutdown,
             tasks: Arc::default(),
@@ -1340,7 +1342,7 @@ impl<S: Storage> IrohNet<S> {
         Ok(targets)
     }
 
-    fn schedule_startup_resync(&self) -> io::Result<usize> {
+    fn schedule_startup_resync(self: &Arc<Self>) -> io::Result<usize> {
         self.schedule_full_sweep_resync()
     }
 
@@ -1360,25 +1362,85 @@ impl<S: Storage> IrohNet<S> {
         Ok(targets.len())
     }
 
-    fn schedule_full_sweep_resync(&self) -> io::Result<usize> {
+    fn schedule_full_sweep_resync(self: &Arc<Self>) -> io::Result<usize> {
         // The sweep is the one pass that revisits every topic, so let it audit
-        // stored records again rather than reuse an earlier whole verdict, and
-        // clear damage no peer can repair before planning the resyncs.
-        // Maintenance is separate from scheduling: durable work owed for
-        // healthy topics must be scheduled even when maintenance cannot run.
+        // stored records again rather than reuse an earlier whole verdict.
         if let Err(error) = self.node.recheck_topics() {
             tracing::warn!(%error, "sweep could not refresh topic caches");
         }
-        match self.node.quarantine_topics() {
-            Ok(evictions) => self.forward_evictions(evictions),
-            Err(error) => tracing::warn!(%error, "sweep could not quarantine topics"),
+        // Durable work is scheduled before maintenance starts, and maintenance
+        // runs as its own job, so no topic it visits can delay that work.
+        let scheduled = self
+            .schedule_persisted_obligations()
+            .and_then(|mut scheduled| {
+                for (peer_id, topic_id) in self.full_sweep_resync_targets()? {
+                    self.resync_scheduler.schedule_now(peer_id, topic_id, true);
+                    scheduled += 1;
+                }
+                Ok(scheduled)
+            });
+        self.spawn_quarantine();
+        scheduled
+    }
+
+    /// Quarantine every topic in one owned background job, one topic per
+    /// blocking step, forwarding each eviction as soon as its topic commits.
+    /// A failed topic is left for the next sweep; one job runs at a time.
+    fn spawn_quarantine(self: &Arc<Self>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.quarantine_started.swap(true, Ordering::SeqCst) {
+            return;
         }
-        let mut scheduled = self.schedule_persisted_obligations()?;
-        for (peer_id, topic_id) in self.full_sweep_resync_targets()? {
-            self.resync_scheduler.schedule_now(peer_id, topic_id, true);
-            scheduled += 1;
-        }
-        Ok(scheduled)
+        let net = Arc::downgrade(self);
+        let running = LoopGuard {
+            net: Weak::clone(&net),
+            latch: |net| &net.quarantine_started,
+        };
+        let task = self.tasks.track();
+        handle.spawn(async move {
+            let _task = task;
+            let _running = running;
+            let topics = match net.upgrade().map(|current| current.node.list_topics()) {
+                Some(Ok(topics)) => topics,
+                Some(Err(error)) => {
+                    tracing::warn!(%error, "sweep could not list topics to quarantine");
+                    return;
+                }
+                None => return,
+            };
+            for (index, topic) in topics.into_iter().enumerate() {
+                let Some(current) = net.upgrade() else {
+                    return;
+                };
+                if current.is_shutdown() {
+                    return;
+                }
+                let node = current.node.clone();
+                drop(current);
+                let topic_id = topic.topic_id;
+                let result =
+                    tokio::task::spawn_blocking(move || node.quarantine_orphans(topic_id)).await;
+                match result {
+                    Ok(Ok(Some(eviction))) => {
+                        if let Some(current) = net.upgrade() {
+                            current.forward_evictions(vec![eviction]);
+                        }
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        %topic_id,
+                        index,
+                        %error,
+                        "leaving topic quarantine for a later sweep"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(%topic_id, index, %error, "topic quarantine job failed")
+                    }
+                }
+            }
+        });
     }
 
     pub async fn sync_with(
@@ -3737,6 +3799,89 @@ mod tests {
         );
         resync.abort();
         let _ = resync.await;
+        net.shutdown().await;
+    }
+
+    /// A slow maintenance topic must not hold the resync loop: durable work for
+    /// a healthy topic is scheduled and dispatched while quarantine of the
+    /// first topic is held inside a storage read.
+    #[tokio::test]
+    async fn sweep_isolates_quarantine() {
+        use crate::tests::support::{Gate, GatePoint, Note, StaleReadStorage};
+
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let storage = StaleReadStorage::new(MemoryStorage::new());
+        let node = Irokle::with_storage(
+            storage.clone(),
+            crate::NodeConfig {
+                signer: crate::Ed25519Signer::from_iroh_secret_key(endpoint.secret_key()),
+                default_write_concern: crate::WriteConcern::Local,
+                ..crate::NodeConfig::default()
+            },
+        )
+        .unwrap();
+        let remote = crate::Signer::peer_id(&crate::Ed25519Signer::from_bytes(&[41; 32]));
+        let healthy = node
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [remote].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+        // Topics are visited in id order, so the held topic must sort first.
+        let slow = (0..256)
+            .map(|_| {
+                node.create_topic::<Note>(crate::TopicConfig::default())
+                    .unwrap()
+                    .id()
+            })
+            .find(|topic_id| *topic_id < healthy)
+            .expect("a topic sorting before the healthy one");
+        let genesis = storage
+            .topic_state(&healthy)
+            .unwrap()
+            .map(|state| state.genesis);
+        let mut clock = crate::ActorClock::new();
+        clock.observe(crate::actor_id_for(healthy, node.peer_id()), 1);
+        storage
+            .put_sync_obligation(
+                crate::storage::SyncObligation::clock(remote, healthy, clock),
+                genesis,
+            )
+            .unwrap();
+
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Heads(slow), Arc::clone(&gate));
+        let net = Arc::new(IrohNet::new(endpoint, node).unwrap());
+        net.spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("loop starts");
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !net
+                .resync_scheduler
+                .target_state(remote, healthy)
+                .is_some_and(|(active, failures, _)| active.is_some() || failures > 0)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the healthy target was not dispatched while maintenance was held");
+        assert!(
+            !gate.has_left(),
+            "the target was dispatched only after maintenance"
+        );
+
+        drop(release);
         net.shutdown().await;
     }
 

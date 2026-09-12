@@ -128,6 +128,7 @@ impl Rendezvous {
 pub(crate) struct Gate {
     state: std::sync::Mutex<(bool, bool)>,
     signal: std::sync::Condvar,
+    left: std::sync::atomic::AtomicBool,
 }
 
 /// A gate and the read it waits at.
@@ -137,6 +138,7 @@ pub(crate) type ArmedGate = (GatePoint, Arc<Gate>);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GatePoint {
     View(TopicId),
+    Heads(TopicId),
     Meta(OpId),
     PeerAck(PeerId),
 }
@@ -150,6 +152,13 @@ impl Gate {
         let _ =
             self.signal
                 .wait_timeout_while(state, std::time::Duration::from_secs(60), |state| !state.1);
+        self.left.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a reader went on past the gate, released or timed out.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn has_left(&self) -> bool {
+        self.left.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Called by a party that finished without reaching the gate, so a waiter
@@ -318,7 +327,9 @@ impl Storage for StaleReadStorage {
         if self.failed_heads.lock().unwrap().contains(topic_id) {
             return Err(Error::Storage("injected head read failure".into()));
         }
-        self.inner.heads(topic_id)
+        let heads = self.inner.heads(topic_id);
+        self.gate_read(GatePoint::Heads(*topic_id));
+        heads
     }
     fn children(&self, op_id: &OpId) -> Result<BTreeSet<OpId>, Error> {
         self.inner.children(op_id)
