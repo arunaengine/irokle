@@ -342,6 +342,8 @@ fn response_includes_closure() {
                     from_exclusive: 1,
                     to_inclusive: 3,
                 }],
+                genesis: None,
+                credit: Default::default(),
             },
         )
         .unwrap();
@@ -982,6 +984,8 @@ fn clamps_oversized_hint() {
                     from_exclusive: 0,
                     to_inclusive: u64::MAX,
                 }],
+                genesis: None,
+                credit: Default::default(),
             },
         )
         .unwrap();
@@ -1017,6 +1021,8 @@ fn ignores_reversed_hint() {
                     from_exclusive: u64::MAX,
                     to_inclusive: u64::MAX,
                 }],
+                genesis: None,
+                credit: Default::default(),
             },
         )
         .unwrap();
@@ -1034,6 +1040,7 @@ fn unknown_topic_empty_plan() {
     let summary = crate_sync::SyncSummary {
         topic_id: unknown_topic,
         event_type_id: None,
+        genesis: None,
         fingerprint: [0; 32],
         heads: [OpId::hash(b"forged-head-1"), OpId::hash(b"forged-head-2")].into(),
         actor_clock: ActorClock::new(),
@@ -1205,6 +1212,8 @@ fn unknown_want_serves_the_rest() {
         known: BTreeSet::new(),
         wants: [ops[0].id, OpId::hash(b"never-seen")].into(),
         actor_range_hints: Vec::new(),
+        genesis: None,
+        credit: Default::default(),
     };
 
     let data = engine
@@ -1394,6 +1403,8 @@ fn assert_repairs_hole<S: Corrupt>(storage: S, seed: u8, damage: Damage) {
                 known: plan.common,
                 wants: plan.need,
                 actor_range_hints: plan.actor_range_hints,
+                genesis: None,
+                credit: Default::default(),
             },
         )
         .unwrap();
@@ -1489,6 +1500,8 @@ fn repair_refetches_dangling_dep() {
                 known: plan.common,
                 wants: plan.need,
                 actor_range_hints: plan.actor_range_hints,
+                genesis: None,
+                credit: Default::default(),
             },
         )
         .unwrap();
@@ -1701,6 +1714,7 @@ fn request_skips_bodies() {
     let remote = crate_sync::SyncSummary {
         topic_id,
         event_type_id: None,
+        genesis: None,
         fingerprint: [0; 32],
         heads: BTreeSet::new(),
         actor_clock: ActorClock::new(),
@@ -1751,6 +1765,8 @@ fn request_matches_negotiation() {
             known: plan.common,
             wants: plan.need,
             actor_range_hints: plan.actor_range_hints,
+            genesis: genesis_of(alice.storage(), &plan.topic_id),
+            credit: Default::default(),
         };
         assert_eq!(request, expected);
         assert_eq!(

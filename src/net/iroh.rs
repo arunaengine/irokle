@@ -1769,9 +1769,13 @@ impl<S: Storage> IrohNet<S> {
         topic_id: crate::TopicId,
         summary: &SyncSummary,
     ) -> io::Result<Option<PlannedTopicSync>> {
-        let mut plan = self
+        let (mut plan, _) = self
             .node
-            .negotiate_page(remote_peer_id, summary)
+            .negotiate_page(
+                remote_peer_id,
+                summary,
+                crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default()),
+            )
             .map_err(invalid_data)?;
         let mut terminal = false;
         if let Some(state) = self
@@ -1792,7 +1796,10 @@ impl<S: Storage> IrohNet<S> {
                         known: plan.common.clone(),
                         wants: BTreeSet::from([op_id]),
                         actor_range_hints: Vec::new(),
+                        genesis: None,
+                        credit: crate::sync::SyncCredit::default(),
                     },
+                    crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default()),
                 )
                 .map_err(invalid_data)?
                 .ops;
@@ -1804,6 +1811,8 @@ impl<S: Storage> IrohNet<S> {
             known: plan.common,
             wants: plan.need,
             actor_range_hints: plan.actor_range_hints,
+            genesis: summary.genesis,
+            credit: crate::sync::SyncCredit::default(),
         };
         let mut messages = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
         messages.extend(sync_data_messages(plan.topic_id, plan.send)?);
@@ -1933,9 +1942,9 @@ impl<S: Storage> IrohNet<S> {
                     let topic_id = request.topic_id;
                     match self
                         .node
-                        .response_page(remote_peer_id, &request)
+                                                .response_page(remote_peer_id, &request, crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default()))
                         .map_err(invalid_data)
-                        .and_then(|data| sync_data_messages(data.topic_id, data.ops))
+                        .and_then(|data| sync_data_messages(topic_id, data.ops))
                     {
                         Ok(messages) => followups.entry(topic_id).or_default().extend(messages),
                         Err(error) => {
@@ -2401,9 +2410,13 @@ impl<S: Storage> IrohNet<S> {
                 let peer_id = remote_peer_id.ok_or_else(|| {
                     invalid_data("sync summary requires a preceding SyncOpen with peer_id")
                 })?;
-                let plan = self
+                let (plan, _) = self
                     .node
-                    .negotiate_page(peer_id, &summary)
+                    .negotiate_page(
+                        peer_id,
+                        &summary,
+                        crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default()),
+                    )
                     .map_err(invalid_data)?;
                 let mut responses = Vec::new();
                 if !plan.send.is_empty() {
@@ -2415,6 +2428,8 @@ impl<S: Storage> IrohNet<S> {
                         known: plan.common,
                         wants: plan.need,
                         actor_range_hints: plan.actor_range_hints,
+                        genesis: summary.genesis,
+                        credit: crate::sync::SyncCredit::default(),
                     }));
                 }
                 Ok(responses)
@@ -2425,9 +2440,13 @@ impl<S: Storage> IrohNet<S> {
                 })?;
                 let data = self
                     .node
-                    .response_page(peer_id, &request)
+                    .response_page(
+                        peer_id,
+                        &request,
+                        crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default()),
+                    )
                     .map_err(invalid_data)?;
-                sync_data_messages(data.topic_id, data.ops)
+                sync_data_messages(request.topic_id, data.ops)
             }
             SyncMessage::Data(data) => {
                 let data_topic_id = data.topic_id;
@@ -2459,7 +2478,9 @@ impl<S: Storage> IrohNet<S> {
             // `SyncSession::finish`, so one rejected ack cannot discard the
             // rest; there is deliberately no second path that applies one.
             SyncMessage::Ack(_) => Err(invalid_data("sync ack must be applied by the session")),
-            SyncMessage::Failure(_) => Err(invalid_data("sync failure is a response-only message")),
+            SyncMessage::Failure(_) | SyncMessage::Page(_) => Err(invalid_data(
+                "sync failure and page are response-only messages",
+            )),
         }
     }
 }
@@ -2478,7 +2499,7 @@ fn per_topic_failure_scope(message: &SyncMessage) -> Option<crate::sync::SyncFai
         SyncMessage::Summary(summary) => (summary.topic_id, crate::sync::SyncFailureCode::Summary),
         SyncMessage::Request(request) => (request.topic_id, crate::sync::SyncFailureCode::Request),
         SyncMessage::Data(data) => (data.topic_id, crate::sync::SyncFailureCode::Data),
-        SyncMessage::Ack(_) | SyncMessage::Failure(_) => return None,
+        SyncMessage::Ack(_) | SyncMessage::Failure(_) | SyncMessage::Page(_) => return None,
     };
     Some(crate::sync::SyncFailure { topic_id, code })
 }
@@ -3011,6 +3032,7 @@ fn message_topic_id(message: &SyncMessage) -> Option<crate::TopicId> {
         SyncMessage::Data(data) => Some(data.topic_id),
         SyncMessage::Ack(ack) => Some(ack.topic_id),
         SyncMessage::Failure(failure) => Some(failure.topic_id),
+        SyncMessage::Page(page) => Some(page.topic_id),
     }
 }
 

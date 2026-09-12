@@ -529,13 +529,23 @@ impl<S: Storage> Irokle<S> {
     }
 
     #[cfg(feature = "iroh")]
-    pub(crate) fn negotiate_page(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
-        self.sync.negotiate_page(peer_id, remote)
+    pub(crate) fn negotiate_page(
+        &self,
+        peer_id: PeerId,
+        remote: &SyncSummary,
+        budget: crate::sync::PageBudget,
+    ) -> Result<(SyncPlan, bool)> {
+        self.sync.negotiate_page(peer_id, remote, budget)
     }
 
     #[cfg(feature = "iroh")]
-    pub(crate) fn response_page(&self, peer_id: PeerId, request: &SyncRequest) -> Result<SyncData> {
-        self.sync.response_page(peer_id, request)
+    pub(crate) fn response_page(
+        &self,
+        peer_id: PeerId,
+        request: &SyncRequest,
+        budget: crate::sync::PageBudget,
+    ) -> Result<crate::sync::PlannedPage> {
+        self.sync.response_page(peer_id, request, budget)
     }
 
     pub fn plan_sync_data(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncData> {

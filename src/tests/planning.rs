@@ -90,8 +90,16 @@ fn catch_up_work(len: usize) -> (u64, usize) {
             known: BTreeSet::new(),
             wants: BTreeSet::new(),
             actor_range_hints,
+            genesis: None,
+            credit: Default::default(),
         };
-        let page = responder.response_page(reader, &request).unwrap();
+        let page = responder
+            .response_page(
+                reader,
+                &request,
+                crate::sync::PageBudget::from_credit(Default::default()),
+            )
+            .unwrap();
         assert!(!page.ops.is_empty(), "a page behind the goal must advance");
         requester.receive_ops(page.ops).unwrap();
         pages += 1;

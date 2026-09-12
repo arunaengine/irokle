@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Transport-neutral sync messages, planning, acknowledgements, and reports.
 
+#[cfg(feature = "iroh")]
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+#[cfg(feature = "iroh")]
+use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
@@ -17,10 +20,10 @@ use crate::{
 
 const SYNC_ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/2";
 
-/// Wire contract this build speaks. Version 2 binds every acknowledgement to
-/// the topic incarnation it certifies, so a version 1 peer is refused at the
-/// transport rather than connecting and sending evidence that names no branch.
-pub const SYNC_PROTOCOL: &str = "irokle/sync/2";
+/// Wire contract this build speaks. Version 3 adds receive credits, page results
+/// and branch names to summaries and requests; older peers are refused by the
+/// transport before any message is exchanged.
+pub const SYNC_PROTOCOL: &str = "irokle/sync/3";
 
 /// Maximum number of sequences a single ActorRangeHint may span. Caps both the
 /// hint a peer can construct via `needed_actor_ranges` and the work
@@ -30,12 +33,15 @@ pub const MAX_ACTOR_RANGE_HINT_SPAN: u64 = 65_536;
 const MAX_REQUEST_ITEMS: usize = 65_536;
 const MAX_PAGE_OPS: usize = 4096;
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(feature = "iroh")]
 /// Actors one page plan keeps range heads for; the rest wait for a later page.
 const MAX_PAGE_ACTORS: usize = 4096;
 
+#[cfg(feature = "iroh")]
 /// A queued range position: generation, actor, sequence, id and range limit.
 type RangeHead = (u64, ActorId, u64, OpId, u64);
 
+#[cfg(feature = "iroh")]
 /// One planned page and whether the goal still holds more after it.
 pub(crate) struct PlannedPage {
     pub(crate) ops: Vec<Op>,
@@ -56,6 +62,8 @@ pub struct SyncSummary {
     pub topic_id: TopicId,
     #[serde(default)]
     pub event_type_id: Option<String>,
+    /// Genesis of the branch this summary describes, if the topic is known.
+    pub genesis: Option<OpId>,
     pub fingerprint: [u8; 32],
     pub heads: BTreeSet<OpId>,
     pub actor_clock: ActorClock,
@@ -91,6 +99,54 @@ pub struct SyncRequest {
     pub known: BTreeSet<OpId>,
     pub wants: BTreeSet<OpId>,
     pub actor_range_hints: Vec<ActorRangeHint>,
+    /// Branch the requester plans against; a responder on another branch refuses.
+    pub genesis: Option<OpId>,
+    pub credit: SyncCredit,
+}
+
+/// What a requester is willing to receive for one page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncCredit {
+    pub ops: u32,
+    pub bytes: u64,
+}
+
+impl Default for SyncCredit {
+    fn default() -> Self {
+        Self {
+            ops: MAX_PAGE_OPS as u32,
+            bytes: MAX_PAGE_BYTES as u64,
+        }
+    }
+}
+
+/// Ends the data a responder served for one topic's request. `more` means the
+/// requested goal holds more than this page; the requester asks again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncPage {
+    pub topic_id: TopicId,
+    pub more: bool,
+}
+
+#[cfg(feature = "iroh")]
+/// Bounds of one planned page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PageBudget {
+    pub(crate) ops: usize,
+    pub(crate) bytes: usize,
+}
+
+#[cfg(feature = "iroh")]
+impl PageBudget {
+    /// The budget a credit allows, never above the page limits.
+    pub(crate) fn from_credit(credit: SyncCredit) -> Self {
+        Self {
+            ops: (credit.ops as usize).min(MAX_PAGE_OPS),
+            bytes: usize::try_from(credit.bytes)
+                .unwrap_or(usize::MAX)
+                .min(MAX_PAGE_BYTES),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -192,6 +248,7 @@ pub enum SyncMessage {
     Data(SyncData),
     Ack(SyncAck),
     Failure(SyncFailure),
+    Page(SyncPage),
 }
 
 #[derive(Clone)]
@@ -205,7 +262,7 @@ pub struct SyncEngine<S> {
 enum SendSet {
     Closure,
     #[cfg(feature = "iroh")]
-    Page,
+    Page(PageBudget),
     /// Nothing: the caller only needs the plan's id sets.
     Empty,
 }
@@ -230,6 +287,7 @@ impl<S: Storage> SyncEngine<S> {
             return Ok(SyncSummary {
                 topic_id,
                 event_type_id: None,
+                genesis: None,
                 fingerprint: self.oplog.storage().topic_fingerprint(&topic_id)?,
                 heads: BTreeSet::new(),
                 actor_clock: ActorClock::new(),
@@ -245,6 +303,7 @@ impl<S: Storage> SyncEngine<S> {
             .collect();
         Ok(SyncSummary {
             topic_id,
+            genesis: Some(view.state.genesis),
             event_type_id: Some(view.state.event_type_id),
             fingerprint,
             heads: view.state.heads,
@@ -279,18 +338,25 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     pub fn negotiate(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
-        self.negotiate_inner(peer_id, remote, SendSet::Closure)
+        self.negotiate_inner(peer_id, remote, SendSet::Closure, &mut false)
     }
 
-    /// Plan a causal prefix; repeat negotiation with the receiver's updated summary.
+    /// Plan a causal push page within `budget`, and whether more remains.
     #[cfg(feature = "iroh")]
-    pub(crate) fn negotiate_page(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
-        self.negotiate_inner(peer_id, remote, SendSet::Page)
+    pub(crate) fn negotiate_page(
+        &self,
+        peer_id: PeerId,
+        remote: &SyncSummary,
+        budget: PageBudget,
+    ) -> Result<(SyncPlan, bool)> {
+        let mut more = false;
+        let plan = self.negotiate_inner(peer_id, remote, SendSet::Page(budget), &mut more)?;
+        Ok((plan, more))
     }
 
     /// Negotiate the id sets only. The returned plan's `send` is always empty.
     fn negotiate_request(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
-        self.negotiate_inner(peer_id, remote, SendSet::Empty)
+        self.negotiate_inner(peer_id, remote, SendSet::Empty, &mut false)
     }
 
     fn negotiate_inner(
@@ -298,6 +364,7 @@ impl<S: Storage> SyncEngine<S> {
         peer_id: PeerId,
         remote: &SyncSummary,
         send_set: SendSet,
+        more: &mut bool,
     ) -> Result<SyncPlan> {
         // If we don't know this topic locally, the remote's heads are
         // unauthenticated claims. We must not surface them as `need`
@@ -359,20 +426,26 @@ impl<S: Storage> SyncEngine<S> {
         let (common, dangling) = match send_set {
             SendSet::Closure | SendSet::Empty => self.survey_local(remote)?,
             #[cfg(feature = "iroh")]
-            SendSet::Page => Default::default(),
+            SendSet::Page(_) => Default::default(),
         };
         let send = match send_set {
             SendSet::Closure => self.missing_closure(remote)?,
             #[cfg(feature = "iroh")]
-            SendSet::Page => {
-                let page =
-                    self.plan_page(&remote.topic_id, &view.clock, &remote.actor_clock, None)?;
-                if page.more {
-                    tracing::debug!(topic_id = %remote.topic_id, "planned a partial push page");
-                }
+            SendSet::Page(budget) => {
+                let page = self.plan_page(
+                    &remote.topic_id,
+                    &view.clock,
+                    &remote.actor_clock,
+                    None,
+                    budget,
+                )?;
+                *more = page.more;
                 page.ops
             }
-            SendSet::Empty => Vec::new(),
+            SendSet::Empty => {
+                *more = false;
+                Vec::new()
+            }
         };
         let mut need = BTreeSet::new();
         for id in &remote.heads {
@@ -487,30 +560,89 @@ impl<S: Storage> SyncEngine<S> {
 
     pub fn plan_request(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncRequest> {
         let plan = self.negotiate_request(peer_id, remote)?;
+        let genesis = self
+            .oplog
+            .storage()
+            .topic_state(&plan.topic_id)?
+            .map(|state| state.genesis);
         Ok(SyncRequest {
             topic_id: plan.topic_id,
             known: plan.common,
             wants: plan.need,
             actor_range_hints: plan.actor_range_hints,
+            genesis,
+            credit: SyncCredit::default(),
         })
     }
 
     pub fn plan_response_data(&self, peer_id: PeerId, request: &SyncRequest) -> Result<SyncData> {
-        self.response_inner(peer_id, request, false)
+        self.response_inner(peer_id, request)
     }
 
     /// Return a causal prefix; request the remainder after acknowledging this page.
     #[cfg(feature = "iroh")]
-    pub(crate) fn response_page(&self, peer_id: PeerId, request: &SyncRequest) -> Result<SyncData> {
-        self.response_inner(peer_id, request, true)
-    }
-
-    fn response_inner(
+    pub(crate) fn response_page(
         &self,
         peer_id: PeerId,
         request: &SyncRequest,
-        paged: bool,
-    ) -> Result<SyncData> {
+        budget: PageBudget,
+    ) -> Result<PlannedPage> {
+        let empty = PlannedPage {
+            ops: Vec::new(),
+            more: false,
+        };
+        let Some(view) = self.oplog.storage().topic_view(&request.topic_id, None)? else {
+            return Ok(empty);
+        };
+        if !view.state.members.contains(&peer_id) {
+            return Ok(empty);
+        }
+        if request
+            .genesis
+            .is_some_and(|genesis| genesis != view.state.genesis)
+        {
+            return Err(Error::StaleIncarnation);
+        }
+        if request.actor_range_hints.len() > MAX_REQUEST_ITEMS
+            || request.wants.len() > MAX_REQUEST_ITEMS
+        {
+            return Err(Error::Storage("sync request exceeds work budget".into()));
+        }
+        let local = &view.clock;
+        let mut peer_clock = local.clone();
+        let mut goal = local.clone();
+        for hint in &request.actor_range_hints {
+            if let Some((from, to)) = clamp_actor_range_hint(hint, local.get(&hint.actor_id)) {
+                peer_clock.set(hint.actor_id, from);
+                goal.set(hint.actor_id, to);
+            }
+        }
+        let (mut ops, repair_more) =
+            self.plan_repair(&request.topic_id, &request.wants, &peer_clock, budget)?;
+        let mut used = 0;
+        for op in &ops {
+            used += postcard::experimental::serialized_size(op)?;
+            let body = &op.signed.body;
+            if peer_clock.get(&body.actor_id) + 1 == body.actor_seq {
+                peer_clock.set(body.actor_id, body.actor_seq);
+            }
+        }
+        let rest = PageBudget {
+            ops: budget.ops.saturating_sub(ops.len()),
+            bytes: budget.bytes.saturating_sub(used),
+        };
+        if repair_more || rest.ops == 0 {
+            return Ok(PlannedPage { ops, more: true });
+        }
+        let planned = self.plan_page(&request.topic_id, local, &peer_clock, Some(&goal), rest)?;
+        ops.extend(planned.ops);
+        Ok(PlannedPage {
+            ops,
+            more: planned.more,
+        })
+    }
+
+    fn response_inner(&self, peer_id: PeerId, request: &SyncRequest) -> Result<SyncData> {
         let Some(state) = self.oplog.storage().topic_state(&request.topic_id)? else {
             return Ok(SyncData {
                 topic_id: request.topic_id,
@@ -562,35 +694,7 @@ impl<S: Storage> SyncEngine<S> {
                 }
             }
         }
-        let ops = if paged {
-            let mut peer_clock = local_clock.clone();
-            let mut goal = local_clock.clone();
-            for hint in &request.actor_range_hints {
-                if let Some((from, to)) =
-                    clamp_actor_range_hint(hint, local_clock.get(&hint.actor_id))
-                {
-                    peer_clock.set(hint.actor_id, from);
-                    goal.set(hint.actor_id, to);
-                }
-            }
-            let mut page = self.plan_repair(&request.topic_id, &request.wants, &peer_clock)?;
-            if page.len() < MAX_PAGE_OPS {
-                for op in &page {
-                    let body = &op.signed.body;
-                    if peer_clock.get(&body.actor_id) + 1 == body.actor_seq {
-                        peer_clock.set(body.actor_id, body.actor_seq);
-                    }
-                }
-                let planned =
-                    self.plan_page(&request.topic_id, &local_clock, &peer_clock, Some(&goal))?;
-                if planned.more {
-                    tracing::debug!(topic_id = %request.topic_id, "served a partial page");
-                }
-                page.extend(planned.ops);
-                page.truncate(MAX_PAGE_OPS);
-            }
-            page
-        } else {
+        let ops = {
             let wanted_closure =
                 self.closure_excluding(&request.topic_id, wanted, &request.known)?;
             topological_subset(self.oplog.storage(), &wanted_closure)?
@@ -945,6 +1049,7 @@ impl<S: Storage> SyncEngine<S> {
             .collect())
     }
 
+    #[cfg(feature = "iroh")]
     /// The next causal page of `topic_id` for a peer holding `peer`, from
     /// forward actor ranges merged by generation. An op's generation is one
     /// past its highest dependency, so the merge emits dependencies first, and
@@ -957,6 +1062,7 @@ impl<S: Storage> SyncEngine<S> {
         local: &ActorClock,
         peer: &ActorClock,
         goal: Option<&ActorClock>,
+        budget: PageBudget,
     ) -> Result<PlannedPage> {
         let storage = self.oplog.storage();
         let mut heads = BinaryHeap::new();
@@ -1006,7 +1112,7 @@ impl<S: Storage> SyncEngine<S> {
             if size > MAX_PAGE_BYTES {
                 return Err(Error::Storage("operation exceeds sync page budget".into()));
             }
-            if ops.len() == MAX_PAGE_OPS || bytes + size > MAX_PAGE_BYTES {
+            if ops.len() >= budget.ops || bytes + size > budget.bytes {
                 more = true;
                 break;
             }
@@ -1024,6 +1130,7 @@ impl<S: Storage> SyncEngine<S> {
         })
     }
 
+    #[cfg(feature = "iroh")]
     /// Queue the op after `after` on `actor_id`, up to `limit`. Returns false
     /// when the index skips a position: the actor stops at that hole.
     fn push_range_head(
@@ -1050,6 +1157,7 @@ impl<S: Storage> SyncEngine<S> {
         Ok(true)
     }
 
+    #[cfg(feature = "iroh")]
     /// Requested repair ids and the ancestry the peer's clock does not cover,
     /// oldest first, bounded by the page.
     fn plan_repair(
@@ -1057,7 +1165,8 @@ impl<S: Storage> SyncEngine<S> {
         topic_id: &TopicId,
         wants: &BTreeSet<OpId>,
         peer: &ActorClock,
-    ) -> Result<Vec<Op>> {
+        budget: PageBudget,
+    ) -> Result<(Vec<Op>, bool)> {
         let storage = self.oplog.storage();
         let mut closure = BTreeSet::new();
         let mut stack = wants.iter().copied().collect::<Vec<_>>();
@@ -1078,9 +1187,19 @@ impl<S: Storage> SyncEngine<S> {
             closure.insert(id);
             stack.extend(meta.deps.iter().copied());
         }
-        let mut ops = topological_subset(storage, &closure)?;
-        ops.truncate(MAX_PAGE_OPS);
-        Ok(ops)
+        let mut more = closure.len() >= MAX_PAGE_OPS;
+        let mut ops = Vec::new();
+        let mut bytes = 0;
+        for op in topological_subset(storage, &closure)? {
+            let size = postcard::experimental::serialized_size(&op)?;
+            if ops.len() >= budget.ops || bytes + size > budget.bytes {
+                more = true;
+                break;
+            }
+            bytes += size;
+            ops.push(op);
+        }
+        Ok((ops, more))
     }
 
     fn closure_excluding(

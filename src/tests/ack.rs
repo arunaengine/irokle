@@ -738,6 +738,8 @@ fn ack_needs_closure() {
                 known: plan.common,
                 wants: plan.need,
                 actor_range_hints: plan.actor_range_hints,
+                genesis: None,
+                credit: Default::default(),
             },
         )
         .unwrap();
