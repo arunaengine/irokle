@@ -3017,6 +3017,81 @@ mod tests {
         targets[0]
     }
 
+    /// A peer waiting behind a full set of slots is served as soon as one
+    /// frees, and peers still taking a turn are never claimed twice.
+    #[test]
+    fn free_slot_serves_waiter() {
+        let scheduler = ResyncScheduler::default();
+        let waiting = MAX_RESYNC_PEER_CONCURRENCY + 1;
+        for index in 0..waiting {
+            scheduler.schedule_now(peer(50 + index as u8), topic(60), false);
+        }
+
+        let first =
+            scheduler.due_targets_by_peer(MAX_RESYNC_PEER_CONCURRENCY, MAX_TOPICS_PER_RESYNC_BATCH);
+        assert_eq!(
+            first.len(),
+            MAX_RESYNC_PEER_CONCURRENCY,
+            "every slot is filled"
+        );
+        assert!(
+            scheduler
+                .due_targets_by_peer(0, MAX_TOPICS_PER_RESYNC_BATCH)
+                .is_empty(),
+            "no slot is free, so nothing more is claimed"
+        );
+
+        // The first peer finishes; the waiting peer takes the freed slot.
+        let (done_peer, claims) = first.into_iter().next().expect("one claimed peer");
+        for claim in claims {
+            scheduler.complete_clean(claim);
+        }
+        let next = scheduler.due_targets_by_peer(1, MAX_TOPICS_PER_RESYNC_BATCH);
+        assert_eq!(next.len(), 1, "the freed slot is refilled at once");
+        assert_ne!(
+            next[0].0, done_peer,
+            "the finished peer is not reclaimed for work it completed"
+        );
+        assert_eq!(
+            next[0].0,
+            peer(50 + MAX_RESYNC_PEER_CONCURRENCY as u8),
+            "the peer that was waiting is the one served"
+        );
+    }
+
+    /// Work that arrives while an attempt is in flight must survive that
+    /// attempt's clean completion, and repeated reevaluation must not keep
+    /// inventing work revisions.
+    #[test]
+    fn publish_survives_clean() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(41), topic(42), false);
+        let claim = one_claim(&scheduler);
+
+        // Reevaluating the same evidence adds no work.
+        for _ in 0..8 {
+            scheduler.reconsider(peer(41), topic(42));
+        }
+        // A publish during the attempt does.
+        scheduler.schedule_now(peer(41), topic(42), false);
+        scheduler.complete_clean(claim);
+
+        let (active, failures, _) = scheduler
+            .target_state(peer(41), topic(42))
+            .expect("work from mid-attempt must survive a clean completion");
+        assert!(active.is_none(), "the attempt is finished");
+        assert_eq!(failures, 0, "surviving work is not a failure");
+
+        // The next dispatch serves it, and completing that removes the target.
+        let again = one_claim(&scheduler);
+        assert_eq!(again.key.topic_id, topic(42));
+        scheduler.complete_clean(again);
+        assert!(
+            scheduler.target_state(peer(41), topic(42)).is_none(),
+            "a completion covering the newest request clears the target"
+        );
+    }
+
     /// A reply that reaches the stream budget keeps the legal prefix instead of
     /// failing the whole response. Exercised here through the message cap; the
     /// byte cap takes the same branch, but a fixture at the default 256 MiB
