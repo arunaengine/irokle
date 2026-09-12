@@ -1993,7 +1993,8 @@ fn fjall_pending_byte_budget() {
 
 /// Rewrite a current database into the schema 2 layout written between the
 /// ack identity change and the pending byte counters: acks and obligations
-/// keyed peer first, legacy obligation shapes, and no byte counters.
+/// keyed peer first, legacy obligation shapes, whole pending records with
+/// count counters, and no byte counters.
 #[cfg(feature = "fjall")]
 fn downgrade_to_schema_two(
     db: &fjall::OptimisticTxDatabase,
@@ -2005,6 +2006,55 @@ fn downgrade_to_schema_two(
         .keyspace("records", fjall::KeyspaceCreateOptions::default)
         .unwrap();
     let mut tx = db.write_tx().unwrap();
+    let mut pending = Vec::new();
+    for item in fjall::Readable::prefix(&tx, &records, b"pm") {
+        let (key, value) = item.into_inner().unwrap();
+        let record: (PeerId, TopicId, BTreeSet<OpId>, u64) = postcard::from_bytes(&value).unwrap();
+        let payload = fjall::Readable::get(&tx, &records, [b"pp".as_slice(), &key[2..]].concat())
+            .unwrap()
+            .unwrap();
+        pending.push((record, postcard::from_bytes::<Op>(&payload).unwrap()));
+    }
+    for prefix in [b"pp".as_slice(), b"pm", b"pt", b"pr", b"pu", b"pc", b"ps"] {
+        let keys = fjall::Readable::prefix(&tx, &records, prefix)
+            .map(|item| item.key().unwrap().to_vec())
+            .collect::<Vec<_>>();
+        for key in keys {
+            tx.remove(&records, key);
+        }
+    }
+    let mut source_counts = std::collections::BTreeMap::<PeerId, u64>::new();
+    for ((source, _, missing, _), op) in &pending {
+        let body = &op.signed.body;
+        let meta = crate_storage::OpMeta {
+            id: op.id,
+            topic_id: body.topic_id,
+            author: body.author,
+            actor_id: body.actor_id,
+            actor_seq: body.actor_seq,
+            actor_prev: body.actor_prev,
+            deps: body.deps.clone(),
+            generation: body.generation,
+            observed_clock: ActorClock::new(),
+            ready: false,
+            missing_deps: missing.clone(),
+        };
+        let value = postcard::to_allocvec(&(source, op, meta)).unwrap();
+        tx.insert(&records, [b"po".as_slice(), op.id.as_ref()].concat(), value);
+        *source_counts.entry(*source).or_default() += 1;
+    }
+    tx.insert(
+        &records,
+        b"pn".to_vec(),
+        postcard::to_allocvec(&(pending.len() as u64)).unwrap(),
+    );
+    for (source, count) in source_counts {
+        tx.insert(
+            &records,
+            [b"ps".as_slice(), source.as_ref()].concat(),
+            postcard::to_allocvec(&count).unwrap(),
+        );
+    }
     let mut removed = Vec::new();
     for prefix in [b"ak".as_slice(), b"ob", b"pb", b"pq"] {
         for item in fjall::Readable::prefix(&tx, &records, prefix) {
@@ -2156,8 +2206,8 @@ fn fjall_upgrades_schema_two() {
     let ack = facades[1].peer_ack(&peer, &topic.id()).unwrap().unwrap();
     assert_eq!(ack.genesis, Some(genesis));
     assert_eq!(
-        storage.pending_byte_counters(&source.peer_id()),
-        (charge, charge),
+        storage.pending_usage(&source.peer_id()),
+        (1, charge, 1, charge),
         "missing counters are rebuilt from the buffered records"
     );
     drop(facades);
@@ -2170,8 +2220,8 @@ fn fjall_upgrades_schema_two() {
         2
     );
     assert_eq!(
-        storage.pending_byte_counters(&source.peer_id()),
-        (charge, charge)
+        storage.pending_usage(&source.peer_id()),
+        (1, charge, 1, charge)
     );
 }
 

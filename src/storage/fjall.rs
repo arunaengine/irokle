@@ -11,9 +11,7 @@ use crate::{
 };
 
 use super::{
-    AckCommit, AdmittedBatch, MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL,
-    MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
-    MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, ObligationTarget, OpMeta, PeerAck, Storage,
+    AckCommit, AdmittedBatch, MAX_PENDING_EVICTIONS, ObligationTarget, OpMeta, PeerAck, Storage,
     SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit,
     ack_covers, ack_reached_op, apply_status_update, branch_matches, ensure_deps_resolvable,
     journalled_eviction, merged_obligation, merged_peer_ack, new_peer_status, peer_departed,
@@ -24,13 +22,13 @@ use super::{
 #[cfg(feature = "fjall")]
 #[derive(Clone)]
 pub struct FjallStorage {
-    db: fjall::OptimisticTxDatabase,
-    records: fjall::OptimisticTxKeyspace,
+    pub(super) db: fjall::OptimisticTxDatabase,
+    pub(super) records: fjall::OptimisticTxKeyspace,
     persist_mode: fjall::PersistMode,
 }
 
 #[cfg(feature = "fjall")]
-const FJALL_SCHEMA_VERSION: u32 = 3;
+const FJALL_SCHEMA_VERSION: u32 = 4;
 /// Eviction journal records. No other keyspace begins with `e`, so this is the
 /// whole prefix: unlike `ob`, it cannot be shadowed by a single-letter prefix.
 #[cfg(feature = "fjall")]
@@ -135,9 +133,14 @@ impl FjallStorage {
             Some(FJALL_SCHEMA_VERSION) => Ok(()),
             Some(1) => {
                 self.migrate_to_schema_two()?;
-                self.migrate_to_schema_three()
+                self.migrate_to_schema_three()?;
+                self.migrate_to_schema_four()
             }
-            Some(2) => self.migrate_to_schema_three(),
+            Some(2) => {
+                self.migrate_to_schema_three()?;
+                self.migrate_to_schema_four()
+            }
+            Some(3) => self.migrate_to_schema_four(),
             Some(version) => Err(Error::Storage(format!(
                 "unsupported fjall schema version {version}"
             ))),
@@ -302,6 +305,54 @@ impl FjallStorage {
                 )?;
             }
 
+            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &3_u32)?;
+            Ok(())
+        })
+    }
+
+    /// Upgrade schema 3 in one transaction that rechecks the version: each
+    /// buffered op splits into a small record and its payload, with topic,
+    /// waiter and ready indexes and usage counters rebuilt from the records.
+    fn migrate_to_schema_four(&self) -> Result<()> {
+        self.transaction(|tx| {
+            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(3) {
+                return Ok(());
+            }
+            let mut legacy = Vec::new();
+            for item in fjall::Readable::prefix(tx, &self.records, PENDING_OP_PREFIX) {
+                let (key, value) = item.into_inner()?;
+                if key.len() == PENDING_OP_PREFIX.len() + OpId::LEN {
+                    legacy.push(postcard::from_bytes::<(PeerId, Op, OpMeta)>(
+                        value.as_ref(),
+                    )?);
+                }
+            }
+            for prefix in [
+                PENDING_OP_PREFIX,
+                b"pn",
+                PENDING_BYTES_KEY,
+                PENDING_SOURCE_BYTES_PREFIX,
+                b"ps",
+                b"pw",
+                b"wn",
+            ] {
+                Self::tx_remove_prefix(tx, &self.records, prefix)?;
+            }
+            for (source_peer, op, meta) in legacy {
+                let mut missing = BTreeSet::new();
+                for dep in meta.missing_deps {
+                    if !fjall::Readable::contains_key(tx, &self.records, Self::key_id(b"o", &dep))?
+                        || !fjall::Readable::contains_key(
+                            tx,
+                            &self.records,
+                            Self::key_id(b"m", &dep),
+                        )?
+                    {
+                        missing.insert(dep);
+                    }
+                }
+                Self::tx_import_pending(tx, &self.records, source_peer, &op, missing)?;
+            }
             Self::tx_put(
                 tx,
                 &self.records,
@@ -327,7 +378,7 @@ impl FjallStorage {
         Err(Error::AdmissionConflict)
     }
 
-    fn key_id(prefix: &[u8], id: &impl AsRef<[u8]>) -> Vec<u8> {
+    pub(super) fn key_id(prefix: &[u8], id: &impl AsRef<[u8]>) -> Vec<u8> {
         [prefix, id.as_ref()].concat()
     }
 
@@ -345,7 +396,7 @@ impl FjallStorage {
         })
     }
 
-    fn tx_put<T: Serialize>(
+    pub(super) fn tx_put<T: Serialize>(
         tx: &mut fjall::OptimisticWriteTx,
         records: &fjall::OptimisticTxKeyspace,
         key: impl AsRef<[u8]>,
@@ -359,7 +410,7 @@ impl FjallStorage {
         Ok(())
     }
 
-    fn tx_get<T: for<'de> Deserialize<'de>>(
+    pub(super) fn tx_get<T: for<'de> Deserialize<'de>>(
         tx: &impl fjall::Readable,
         records: &fjall::OptimisticTxKeyspace,
         key: impl AsRef<[u8]>,
@@ -378,103 +429,6 @@ impl FjallStorage {
         fjall::Readable::prefix(tx, records, EVICTION_PREFIX)
             .take(MAX_PENDING_EVICTIONS)
             .count()
-    }
-
-    /// Refunds `bytes` on the total and per-source pending byte counters. Kept
-    /// in the transaction that removes the record, so the counters cannot drift
-    /// from the records they describe.
-    fn tx_release_pending_bytes(
-        tx: &mut fjall::OptimisticWriteTx,
-        records: &fjall::OptimisticTxKeyspace,
-        source_peer: PeerId,
-        bytes: usize,
-    ) -> Result<()> {
-        let total: u64 = Self::tx_get(tx, records, PENDING_BYTES_KEY)?.unwrap_or_default();
-        let next_total = total.saturating_sub(bytes as u64);
-        if next_total == 0 {
-            tx.remove(records, PENDING_BYTES_KEY.to_vec());
-        } else {
-            Self::tx_put(tx, records, PENDING_BYTES_KEY, &next_total)?;
-        }
-        let source_key = [PENDING_SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat();
-        let source: u64 = Self::tx_get(tx, records, source_key.as_slice())?.unwrap_or_default();
-        let next_source = source.saturating_sub(bytes as u64);
-        if next_source == 0 {
-            tx.remove(records, source_key);
-        } else {
-            Self::tx_put(tx, records, source_key.as_slice(), &next_source)?;
-        }
-        Ok(())
-    }
-
-    fn tx_remove_pending_op(
-        tx: &mut fjall::OptimisticWriteTx,
-        records: &fjall::OptimisticTxKeyspace,
-        op_id: &OpId,
-    ) -> Result<()> {
-        let Some((source_peer, op, meta)) =
-            Self::tx_get::<(PeerId, Op, OpMeta)>(tx, records, Self::key_id(b"po", op_id))?
-        else {
-            return Ok(());
-        };
-        tx.remove(records, Self::key_id(b"po", op_id));
-        Self::tx_release_pending_bytes(tx, records, source_peer, pending_op_bytes(&op)?)?;
-        for dep in &meta.missing_deps {
-            let waiter_key = [b"pw".as_slice(), dep.as_ref(), op_id.as_ref()].concat();
-            tx.remove(records, waiter_key);
-            let count_key = [b"wn".as_slice(), dep.as_ref()].concat();
-            let count: u64 = Self::tx_get(tx, records, count_key.as_slice())?.unwrap_or_default();
-            let next = count.saturating_sub(1);
-            if next == 0 {
-                tx.remove(records, count_key);
-            } else {
-                Self::tx_put(tx, records, count_key.as_slice(), &next)?;
-            }
-        }
-        let total: u64 = Self::tx_get(tx, records, b"pn".as_slice())?.unwrap_or_default();
-        let next_total = total.saturating_sub(1);
-        if next_total == 0 {
-            tx.remove(records, b"pn".as_slice());
-        } else {
-            Self::tx_put(tx, records, b"pn".as_slice(), &next_total)?;
-        }
-        let source_key = [b"ps".as_slice(), source_peer.as_ref()].concat();
-        let source_count: u64 =
-            Self::tx_get(tx, records, source_key.as_slice())?.unwrap_or_default();
-        let next_source = source_count.saturating_sub(1);
-        if next_source == 0 {
-            tx.remove(records, source_key);
-        } else {
-            Self::tx_put(tx, records, source_key.as_slice(), &next_source)?;
-        }
-        Ok(())
-    }
-
-    /// Remove the transitive pending waiters of `dep_id`, never `dep_id` itself.
-    /// The visited set bounds the walk over a pending graph that may name the
-    /// same dependency from several waiters.
-    fn tx_purge_waiters(
-        tx: &mut fjall::OptimisticWriteTx,
-        records: &fjall::OptimisticTxKeyspace,
-        dep_id: &OpId,
-    ) -> Result<usize> {
-        let mut frontier = vec![*dep_id];
-        let mut seen = BTreeSet::new();
-        while let Some(dep) = frontier.pop() {
-            let prefix = [b"pw".as_slice(), dep.as_ref()].concat();
-            let mut waiters = Vec::new();
-            for item in fjall::Readable::prefix(tx, records, prefix) {
-                let (key, _) = item.into_inner()?;
-                waiters.push(Self::op_id_from_key(key.as_ref(), 2 + OpId::LEN)?);
-            }
-            for op_id in waiters {
-                if seen.insert(op_id) {
-                    Self::tx_remove_pending_op(tx, records, &op_id)?;
-                    frontier.push(op_id);
-                }
-            }
-        }
-        Ok(seen.len())
     }
 
     fn ack_key(topic_id: &TopicId, peer_id: &PeerId) -> Vec<u8> {
@@ -499,7 +453,7 @@ impl FjallStorage {
     }
 
     /// Delete every key under `prefix` and report how many there were.
-    fn tx_remove_prefix(
+    pub(super) fn tx_remove_prefix(
         tx: &mut fjall::OptimisticWriteTx,
         records: &fjall::OptimisticTxKeyspace,
         prefix: &[u8],
@@ -781,6 +735,7 @@ impl FjallStorage {
                 // every other removal, so the pending counts and byte budgets
                 // are released in exactly one place.
                 Self::tx_remove_pending_op(tx, &self.records, &op.id)?;
+                Self::tx_settle_waiters(tx, &self.records, &op.id)?;
                 clock.observe(meta.actor_id, meta.actor_seq);
                 max_generation = max_generation.max(meta.generation);
             }
@@ -860,16 +815,6 @@ impl FjallStorage {
             Ok(())
         })
         .expect("fjall drop meta record");
-    }
-
-    /// Stored pending byte counters: the total and the one for `source_peer`.
-    #[cfg(test)]
-    pub(crate) fn pending_byte_counters(&self, source_peer: &PeerId) -> (u64, u64) {
-        let source_key = [PENDING_SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat();
-        (
-            self.get(PENDING_BYTES_KEY).unwrap().unwrap_or_default(),
-            self.get(source_key).unwrap().unwrap_or_default(),
-        )
     }
 
     /// Store both records and the topic/child indexes while leaving heads and
@@ -975,29 +920,6 @@ impl FjallStorage {
         }))
     }
 
-    fn read_pending_missing(
-        tx: &impl fjall::Readable,
-        records: &fjall::OptimisticTxKeyspace,
-        topic_id: &TopicId,
-    ) -> Result<BTreeSet<OpId>> {
-        let mut out = BTreeSet::new();
-        for item in fjall::Readable::prefix(tx, records, PENDING_OP_PREFIX) {
-            let value = item.value()?;
-            let (_, _, meta): (PeerId, Op, OpMeta) = postcard::from_bytes(value.as_ref())?;
-            if meta.topic_id != *topic_id {
-                continue;
-            }
-            for dep in &meta.missing_deps {
-                if !fjall::Readable::contains_key(tx, records, Self::key_id(b"o", dep))?
-                    || !fjall::Readable::contains_key(tx, records, Self::key_id(b"m", dep))?
-                {
-                    out.insert(*dep);
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// Metadata of a stored op and the genesis of the branch holding it.
     fn read_op_branch(
         tx: &impl fjall::Readable,
@@ -1092,18 +1014,7 @@ impl FjallStorage {
             &self.records,
             &[OBLIGATION_PREFIX, topic_id.as_ref()].concat(),
         )?;
-        // Pending ops key on op id; the topic lives in the stored meta.
-        let mut pending_ids = Vec::new();
-        for item in fjall::Readable::prefix(tx, &self.records, b"po".as_slice()) {
-            let (key, value) = item.into_inner()?;
-            let (_, _, meta): (PeerId, Op, OpMeta) = postcard::from_bytes(value.as_ref())?;
-            if meta.topic_id == *topic_id {
-                pending_ids.push(Self::op_id_from_key(key.as_ref(), 2)?);
-            }
-        }
-        for op_id in pending_ids {
-            Self::tx_remove_pending_op(tx, &self.records, &op_id)?;
-        }
+        Self::tx_reset_pending(tx, &self.records, topic_id)?;
         Ok(removed)
     }
 }
@@ -1340,157 +1251,16 @@ impl Storage for FjallStorage {
         Ok(peers)
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
+        let charge = Self::pending_charge(&op, &meta)?;
         self.transaction(|tx| {
-            // Only a completely stored op is already admitted; a half stored
-            // one still has to buffer so its repair runs once its deps resolve.
-            if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", &op.id))?.is_some()
-                && Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", &op.id))?.is_some()
-            {
-                return Ok(());
-            }
-            if let Some((_, existing, _)) = Self::tx_get::<(PeerId, Op, OpMeta)>(
-                tx,
-                &self.records,
-                Self::key_id(b"po", &op.id),
-            )? {
-                if existing != op {
-                    return Err(Error::Storage(
-                        "pending op id collision with different op".into(),
-                    ));
-                }
-                Self::tx_remove_pending_op(tx, &self.records, &op.id)?;
-            }
-            for dep in &meta.missing_deps {
-                if Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", dep))?.is_some()
-                    && Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", dep))?.is_some()
-                {
-                    return Err(Error::AdmissionConflict);
-                }
-            }
-            if meta.missing_deps.len() > MAX_PENDING_MISSING_DEPS {
-                return Err(Error::Storage(
-                    "pending op has too many missing deps".into(),
-                ));
-            }
-
-            let total_pending: u64 =
-                Self::tx_get(tx, &self.records, b"pn".as_slice())?.unwrap_or_default();
-            if total_pending as usize >= MAX_PENDING_OPS_TOTAL {
-                return Err(Error::Storage("pending op buffer is full".into()));
-            }
-            // A replaced record has already refunded its charge above, so these
-            // counters describe the space this insertion actually needs.
-            let charge = pending_op_bytes(&op)?;
-            let total_bytes: u64 =
-                Self::tx_get(tx, &self.records, PENDING_BYTES_KEY)?.unwrap_or_default();
-            if total_bytes.saturating_add(charge as u64) > MAX_PENDING_BYTES_TOTAL as u64 {
-                return Err(Error::Storage("pending byte budget is full".into()));
-            }
-            let bytes_key = [PENDING_SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat();
-            let source_bytes: u64 =
-                Self::tx_get(tx, &self.records, bytes_key.as_slice())?.unwrap_or_default();
-            if source_bytes.saturating_add(charge as u64) > MAX_PENDING_BYTES_PER_SOURCE as u64 {
-                return Err(Error::Storage(
-                    "pending byte quota exceeded for source".into(),
-                ));
-            }
-            let source_key = [b"ps".as_slice(), source_peer.as_ref()].concat();
-            let source_pending: u64 =
-                Self::tx_get(tx, &self.records, source_key.as_slice())?.unwrap_or_default();
-            if source_pending as usize >= MAX_PENDING_OPS_PER_SOURCE {
-                return Err(Error::Storage("pending op source quota exceeded".into()));
-            }
-            let mut waiter_keys: Vec<(Vec<u8>, u64)> = Vec::with_capacity(meta.missing_deps.len());
-            for dep in &meta.missing_deps {
-                let key = [b"wn".as_slice(), dep.as_ref()].concat();
-                let count: u64 =
-                    Self::tx_get(tx, &self.records, key.as_slice())?.unwrap_or_default();
-                if count as usize >= MAX_PENDING_WAITERS_PER_DEP {
-                    return Err(Error::Storage("pending waiter quota exceeded".into()));
-                }
-                waiter_keys.push((key, count));
-            }
-
-            Self::tx_put(
-                tx,
-                &self.records,
-                Self::key_id(b"po", &op.id),
-                &(source_peer, op.clone(), meta.clone()),
-            )?;
-            for dep in &meta.missing_deps {
-                Self::tx_put(
-                    tx,
-                    &self.records,
-                    [b"pw".as_slice(), dep.as_ref(), op.id.as_ref()].concat(),
-                    &(),
-                )?;
-            }
-            Self::tx_put(tx, &self.records, b"pn".as_slice(), &(total_pending + 1))?;
-            Self::tx_put(
-                tx,
-                &self.records,
-                PENDING_BYTES_KEY,
-                &(total_bytes + charge as u64),
-            )?;
-            Self::tx_put(
-                tx,
-                &self.records,
-                bytes_key.as_slice(),
-                &(source_bytes + charge as u64),
-            )?;
-            Self::tx_put(
-                tx,
-                &self.records,
-                source_key.as_slice(),
-                &(source_pending + 1),
-            )?;
-            for (key, count) in waiter_keys {
-                Self::tx_put(tx, &self.records, key.as_slice(), &(count + 1))?;
-            }
-            Ok(())
+            Self::tx_put_pending(tx, &self.records, source_peer, &op, &meta, charge)
         })
     }
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>> {
-        let prefix = [b"pw".as_slice(), dep_id.as_ref()].concat();
-        let mut out = Vec::new();
-        let read_tx = self.db.read_tx();
-        for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
-            let (key, _) = item.into_inner()?;
-            let op_id = Self::op_id_from_key(key.as_ref(), 2 + OpId::LEN)?;
-            if let Some((source, op, _)) =
-                fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"po", &op_id))?
-                    .map(|value| postcard::from_bytes::<(PeerId, Op, OpMeta)>(value.as_ref()))
-                    .transpose()?
-            {
-                out.push((source, op));
-            }
-        }
-        Ok(out)
+        self.read_pending_waiters(dep_id)
     }
     fn ready_pending_after(&self, after: Option<&OpId>, limit: usize) -> Result<Vec<(PeerId, Op)>> {
-        let mut out = Vec::new();
-        let read_tx = self.db.read_tx();
-        for item in fjall::Readable::prefix(&read_tx, &self.records, b"po".as_slice()) {
-            if out.len() >= limit {
-                break;
-            }
-            let value = item.value()?;
-            let (source, op, meta): (PeerId, Op, OpMeta) = postcard::from_bytes(value.as_ref())?;
-            let mut ready = true;
-            for dep in &meta.missing_deps {
-                if fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", dep))?.is_none()
-                    || fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"m", dep))?
-                        .is_none()
-                {
-                    ready = false;
-                    break;
-                }
-            }
-            if ready && after.is_none_or(|after| op.id > *after) {
-                out.push((source, op));
-            }
-        }
-        Ok(out)
+        self.read_ready_after(after, limit)
     }
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         Self::read_pending_missing(&self.db.read_tx(), &self.records, topic_id)
@@ -1502,17 +1272,9 @@ impl Storage for FjallStorage {
         self.transaction(|tx| Self::tx_purge_waiters(tx, &self.records, dep_id))
     }
     fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize> {
-        self.transaction(|tx| {
-            // The root and its closure share one transaction, so no reader sees
-            // the root gone while its waiters still hold quota against it.
-            if Self::tx_get::<(PeerId, Op, OpMeta)>(tx, &self.records, Self::key_id(b"po", op_id))?
-                .is_none()
-            {
-                return Ok(0);
-            }
-            Self::tx_remove_pending_op(tx, &self.records, op_id)?;
-            Ok(1 + Self::tx_purge_waiters(tx, &self.records, op_id)?)
-        })
+        // The markers, the root and its closure share one transaction, so no
+        // reader sees the root gone while its waiters still hold quota.
+        self.transaction(|tx| Self::tx_reject_subtree(tx, &self.records, op_id))
     }
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>> {
         self.get(Self::ack_key(topic_id, peer_id))
