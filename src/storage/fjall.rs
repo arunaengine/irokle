@@ -861,6 +861,16 @@ impl FjallStorage {
         .expect("fjall drop meta record");
     }
 
+    /// Stored pending byte counters: the total and the one for `source_peer`.
+    #[cfg(test)]
+    pub(crate) fn pending_byte_counters(&self, source_peer: &PeerId) -> (u64, u64) {
+        let source_key = [PENDING_SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat();
+        (
+            self.get(PENDING_BYTES_KEY).unwrap().unwrap_or_default(),
+            self.get(source_key).unwrap().unwrap_or_default(),
+        )
+    }
+
     /// Store both records and the topic/child indexes while leaving heads and
     /// topic state alone, so the op is admitted yet reachable from no head.
     #[cfg(test)]
