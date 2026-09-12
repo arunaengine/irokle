@@ -20,8 +20,8 @@ mod topology;
 
 use helpers::{
     apply_control_to_state, checked_next, ensure_event_type, heads_after, is_local_admission_race,
-    is_pending_retry, is_permanent_rejection, materialize_topic_state, merge_states,
-    next_actor_position, pending_meta_for,
+    is_permanent_rejection, materialize_topic_state, merge_states, next_actor_position,
+    pending_meta_for,
 };
 pub(crate) use topology::topological_ids;
 use topology::topological_ops;
@@ -48,6 +48,14 @@ struct MembershipCache {
 enum OpAdmission {
     Admit,
     Duplicate,
+}
+
+/// What happens to a buffered op whose admission failed.
+enum PendingVerdict {
+    /// The failure is a property of immutable records: drop the op's subtree.
+    Reject,
+    /// A later arrival can still resolve it: keep the record.
+    Retain,
 }
 
 /// How much of an op the local store already holds. `Repair` is an id the local
@@ -694,7 +702,7 @@ impl<S: Storage> Oplog<S> {
                 // A permanent rejection names the batch, not the op inside it,
                 // so the retained copy lets one invalid record be isolated
                 // without discarding the valid ops queued beside it.
-                let retained = if from_pending && ops.len() > 1 {
+                let retained = if from_pending {
                     ops.clone()
                 } else {
                     Vec::new()
@@ -708,30 +716,27 @@ impl<S: Storage> Oplog<S> {
                     effects,
                 ) {
                     Ok(outcome) => outcome,
-                    Err(err) if from_pending && is_permanent_rejection(&err) => {
-                        if retained.is_empty() {
-                            for op_id in pending_op_ids {
-                                tracing::debug!(%op_id, error = %err, "rejecting pending subtree");
-                                self.storage.reject_pending_subtree(&op_id)?;
+                    Err(err) if from_pending && retained.len() == 1 => {
+                        let op = &retained[0];
+                        match self.pending_verdict(op, &err)? {
+                            PendingVerdict::Reject => {
+                                tracing::debug!(op_id = %op.id, error = %err, "rejecting pending subtree");
+                                self.storage.reject_pending_subtree(&op.id)?;
                             }
-                        } else {
-                            // Re-admit one at a time so only the offending
-                            // subtree is rejected. Dependency order is
-                            // preserved, so a dependent still follows its
-                            // dependency.
-                            for op in retained {
-                                let op_id = op.id;
-                                queued_pending.insert(op_id);
-                                queue.push_back((batch_source_peer, vec![op], true));
+                            // A repairable failure keeps the buffered record and
+                            // must not fail the ops the caller actually sent.
+                            PendingVerdict::Retain => {
+                                tracing::debug!(op_id = %op.id, error = %err, "retaining pending op");
                             }
                         }
                         continue;
                     }
-                    // A repairable failure keeps the buffered record and
-                    // must not fail the ops the caller actually sent.
-                    Err(err) if from_pending && is_pending_retry(&err) => {
-                        for op_id in pending_op_ids {
-                            tracing::debug!(%op_id, error = %err, "retaining pending op");
+                    // Several buffered ops failed together: judge each alone, in
+                    // dependency order, so only the offending subtree goes.
+                    Err(_) if from_pending => {
+                        for op in retained {
+                            queued_pending.insert(op.id);
+                            queue.push_back((batch_source_peer, vec![op], true));
                         }
                         continue;
                     }
@@ -756,6 +761,65 @@ impl<S: Storage> Oplog<S> {
             Ok(()) => Ok(admitted),
             Err(error) => Err(admission_failure(admitted, error)),
         }
+    }
+
+    /// Whether a buffered op that failed admission with `error` can never be
+    /// admitted on this branch. Only immutable facts reject: its own signed
+    /// content and the stored records of its dependencies and actor slots.
+    fn pending_verdict(&self, op: &Op, error: &Error) -> Result<PendingVerdict> {
+        let immutable = match error {
+            error if is_permanent_rejection(error) => true,
+            // Raised only once every dependency is known, so they describe the
+            // op's causal frontier, which no later arrival changes.
+            Error::NotTopicMember
+            | Error::EventTypeMismatch { .. }
+            | Error::InvalidGenesis
+            | Error::InvalidOpId => true,
+            Error::ActorPrevMismatch | Error::ActorSeqGap { .. } => self.position_impossible(op)?,
+            Error::ActorFork => self.slot_taken(op, op.signed.body.actor_seq)?.is_some(),
+            _ => false,
+        };
+        Ok(if immutable {
+            PendingVerdict::Reject
+        } else {
+            PendingVerdict::Retain
+        })
+    }
+
+    /// Whether the op's actor position contradicts stored records: a known
+    /// predecessor of another actor or sequence, or a slot before it that a
+    /// different admitted op already holds.
+    fn position_impossible(&self, op: &Op) -> Result<bool> {
+        let body = &op.signed.body;
+        let Some(prev) = body.actor_prev else {
+            return Ok(body.actor_seq != 1);
+        };
+        if body.actor_seq < 2 || !body.deps.contains(&prev) {
+            return Ok(true);
+        }
+        if let Some(meta) = self.storage.get_meta(&prev)?
+            && self.storage.dep_resolvable(&prev)?
+            && (meta.topic_id != body.topic_id
+                || meta.actor_id != body.actor_id
+                || checked_next(meta.actor_seq)? != body.actor_seq)
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .slot_taken(op, body.actor_seq - 1)?
+            .is_some_and(|holder| holder != prev))
+    }
+
+    /// The admitted op holding `seq` of the op's actor, if it is not the op.
+    fn slot_taken(&self, op: &Op, seq: u64) -> Result<Option<OpId>> {
+        let body = &op.signed.body;
+        let Some(holder) = self
+            .storage
+            .actor_index(&body.topic_id, &body.actor_id, seq)?
+        else {
+            return Ok(None);
+        };
+        Ok((holder != op.id && self.storage.dep_resolvable(&holder)?).then_some(holder))
     }
 
     fn enqueue_ready_pending_ops(
@@ -983,13 +1047,17 @@ impl<S: Storage> Oplog<S> {
         // self-contained, so validate and admit it against a fresh topic; the
         // reset is applied atomically with these writes below.
         let reset = reset_plan.is_some();
+        // Heads and state come from one read: a membership verdict taken from a
+        // state newer than the heads would reject an authorized op for good.
         let (expected_heads, expected_state) = if reset {
             (BTreeSet::new(), None)
         } else {
-            (
-                self.storage.heads(&topic_id)?,
-                self.storage.topic_state(&topic_id)?,
-            )
+            let state = self.storage.topic_state(&topic_id)?;
+            let heads = state
+                .as_ref()
+                .map(|state| state.heads.clone())
+                .unwrap_or_default();
+            (heads, state)
         };
         let mut heads = expected_heads.clone();
         let mut state = expected_state.clone();
@@ -1732,24 +1800,16 @@ impl<S: Storage> Oplog<S> {
                 if body.deps.is_empty() || body.generation == 0 {
                     return Err(Error::InvalidOpId);
                 }
-                // Only buffer pending ops from known members, so non-members
-                // cannot consume per-source pending quota with ops that would
-                // be rejected at admission time anyway.
+                // Latest membership says nothing about the op's causal frontier,
+                // which is unknown while a dependency is missing; the source's
+                // pending quota bounds what an unproven author can buffer.
                 if let Some(state) = state {
                     ensure_event_type(&state.event_type_id, &envelope.type_id)?;
-                    if !state.members.contains(&body.author) {
-                        return Err(Error::NotTopicMember);
-                    }
                 }
             }
             TopicPayload::Control(_) => {
                 if body.deps.is_empty() || body.generation == 0 {
                     return Err(Error::InvalidOpId);
-                }
-                if let Some(state) = state
-                    && !state.members.contains(&body.author)
-                {
-                    return Err(Error::NotTopicMember);
                 }
             }
         }

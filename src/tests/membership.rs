@@ -297,40 +297,6 @@ fn rejects_wrong_actor_id() {
 }
 
 #[test]
-fn rejects_pending_nonmember() {
-    let alice = node(85);
-    let outsider = Ed25519Signer::from_bytes(&[86; 32]);
-    // Alice creates a topic where the outsider is *not* a member.
-    let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
-    // Outsider crafts a structurally-valid signed op whose dep doesn't
-    // exist on Alice. Without the membership check this op would consume
-    // a per-source pending-quota slot until eviction; with the check it
-    // is rejected immediately.
-    let fake_dep = OpId::hash(b"missing-dep");
-    let op = Op::sign(
-        OpBody {
-            topic_id: topic.id(),
-            author: outsider.peer_id(),
-            actor_id: actor_id_for(topic.id(), outsider.peer_id()),
-            actor_seq: 1,
-            actor_prev: None,
-            deps: [fake_dep].into(),
-            generation: 1,
-            payload: TopicPayload::Event(
-                EventEnvelope::encode_event(&Note {
-                    text: "outsider".into(),
-                })
-                .unwrap(),
-            ),
-        },
-        &outsider,
-    )
-    .unwrap();
-    let oplog = oplog::Oplog::with_storage(alice.storage().clone());
-    assert!(matches!(oplog.receive_op(op), Err(Error::NotTopicMember)));
-}
-
-#[test]
 fn catchup_reads_bounded() {
     use std::sync::atomic::Ordering;
 

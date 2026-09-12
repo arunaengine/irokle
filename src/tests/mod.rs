@@ -4,6 +4,7 @@ mod core;
 #[cfg(feature = "iroh")]
 mod iroh;
 mod membership;
+mod pending;
 mod storage;
 mod support;
 mod sync;

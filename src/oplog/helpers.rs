@@ -120,25 +120,6 @@ pub(super) fn is_permanent_rejection(err: &Error) -> bool {
     )
 }
 
-/// Failures a later arrival, membership control or genesis replacement can
-/// still resolve. The buffered record must survive, and one stuck pending op
-/// must not fail the caller's whole receive.
-pub(super) fn is_pending_retry(err: &Error) -> bool {
-    matches!(
-        err,
-        Error::MissingDependency(_)
-            | Error::TopicNotFound
-            | Error::NotTopicMember
-            | Error::EventTypeMismatch { .. }
-            | Error::InvalidGenesis
-            | Error::ActorSeqGap { .. }
-            | Error::ActorPrevMismatch
-            | Error::ActorFork
-            | Error::InvalidOpId
-            | Error::Decode(_)
-    )
-}
-
 pub(super) fn is_local_admission_race(err: &Error) -> bool {
     // A generation mismatch here is a concurrent admission advancing
     // max_generation between the heads read and op validation, not immutable
