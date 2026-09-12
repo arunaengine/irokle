@@ -1887,7 +1887,7 @@ impl<S: Storage> IrohNet<S> {
             for message in &planned.messages {
                 match message {
                     SyncMessage::Data(_) => {
-                        *expected_acks.entry(planned.topic_id).or_default() += 1
+                        expected_acks.insert(planned.topic_id, 1);
                     }
                     SyncMessage::Request(_) => {
                         expected_data.insert(planned.topic_id);
@@ -1938,6 +1938,7 @@ impl<S: Storage> IrohNet<S> {
                     outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
                 }
                 SyncMessage::Summary(summary) if group_topics.contains(&summary.topic_id) => {}
+                SyncMessage::Page(page) if group_topics.contains(&page.topic_id) => {}
                 SyncMessage::Request(request) if group_topics.contains(&request.topic_id) => {
                     let topic_id = request.topic_id;
                     match self
@@ -2034,7 +2035,7 @@ impl<S: Storage> IrohNet<S> {
             let mut remaining = BTreeMap::<crate::TopicId, usize>::new();
             for message in &messages {
                 if let SyncMessage::Data(data) = message {
-                    *remaining.entry(data.topic_id).or_default() += 1;
+                    remaining.insert(data.topic_id, 1);
                 }
             }
             match self.sync_with(peer.clone(), &messages).await {
@@ -2236,6 +2237,9 @@ impl<S: Storage> IrohNet<S> {
         Ok(Some(peer))
     }
 
+    /// Serve one inbound stream. The whole request is read before anything is
+    /// written, so neither side waits on the other's unread bytes, and the reply
+    /// carries every control message plus data within the requesters' credits.
     pub async fn handle_stream(
         &self,
         peer: iroh::EndpointId,
@@ -2245,8 +2249,6 @@ impl<S: Storage> IrohNet<S> {
         tokio::time::timeout(self.runtime.sync_io_timeout, async {
             let mut session = SyncSession::new(peer);
             let mut limits = SyncReadLimits::default();
-            let mut responses = Vec::new();
-            let mut response_limits = SyncReadLimits::default();
             while let Some(frame) = read_next_frame(&mut recv, self.runtime.sync_io_timeout).await?
             {
                 let frame_index = limits.observe_frame(frame.len())?;
@@ -2256,19 +2258,9 @@ impl<S: Storage> IrohNet<S> {
                         frame.len()
                     ))
                 })?;
-                if push_responses(
-                    &mut responses,
-                    session.handle(self, message)?,
-                    &mut response_limits,
-                )? {
-                    tracing::debug!(
-                        %peer,
-                        "reply reached the stream budget; sending the legal prefix"
-                    );
-                    break;
-                }
+                session.handle(self, message)?;
             }
-            let _ = push_responses(&mut responses, session.finish(self)?, &mut response_limits)?;
+            let responses = session.finish(self)?;
             write_sync_messages(&mut send, &responses, self.runtime.sync_io_timeout).await?;
             Ok(())
         })
@@ -2282,19 +2274,10 @@ impl<S: Storage> IrohNet<S> {
         messages: Vec<SyncMessage>,
     ) -> io::Result<Vec<SyncMessage>> {
         let mut session = SyncSession::new(peer);
-        let mut responses = Vec::new();
-        let mut response_limits = SyncReadLimits::default();
         for message in messages {
-            if push_responses(
-                &mut responses,
-                session.handle(self, message)?,
-                &mut response_limits,
-            )? {
-                break;
-            }
+            session.handle(self, message)?;
         }
-        let _ = push_responses(&mut responses, session.finish(self)?, &mut response_limits)?;
-        Ok(responses)
+        session.finish(self)
     }
 
     fn full_sweep_resync_targets(&self) -> io::Result<BTreeSet<(PeerId, crate::TopicId)>> {
@@ -2410,43 +2393,27 @@ impl<S: Storage> IrohNet<S> {
                 let peer_id = remote_peer_id.ok_or_else(|| {
                     invalid_data("sync summary requires a preceding SyncOpen with peer_id")
                 })?;
+                // A summary only yields a request: data the peer lacks is served
+                // against its own request, so nothing is sent twice.
+                let no_push = crate::sync::PageBudget { ops: 0, bytes: 0 };
                 let (plan, _) = self
                     .node
-                    .negotiate_page(
-                        peer_id,
-                        &summary,
-                        crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default()),
-                    )
+                    .negotiate_page(peer_id, &summary, no_push)
                     .map_err(invalid_data)?;
-                let mut responses = Vec::new();
-                if !plan.send.is_empty() {
-                    responses.extend(sync_data_messages(plan.topic_id, plan.send)?);
+                if plan.need.is_empty() && plan.actor_range_hints.is_empty() {
+                    return Ok(Vec::new());
                 }
-                if !plan.need.is_empty() || !plan.actor_range_hints.is_empty() {
-                    responses.push(SyncMessage::Request(crate::sync::SyncRequest {
-                        topic_id: plan.topic_id,
-                        known: plan.common,
-                        wants: plan.need,
-                        actor_range_hints: plan.actor_range_hints,
-                        genesis: summary.genesis,
-                        credit: crate::sync::SyncCredit::default(),
-                    }));
-                }
-                Ok(responses)
+                Ok(vec![SyncMessage::Request(crate::sync::SyncRequest {
+                    topic_id: plan.topic_id,
+                    known: plan.common,
+                    wants: plan.need,
+                    actor_range_hints: plan.actor_range_hints,
+                    genesis: summary.genesis,
+                    credit: crate::sync::SyncCredit::default(),
+                })])
             }
-            SyncMessage::Request(request) => {
-                let peer_id = remote_peer_id.ok_or_else(|| {
-                    invalid_data("sync request requires a preceding SyncOpen with peer_id")
-                })?;
-                let data = self
-                    .node
-                    .response_page(
-                        peer_id,
-                        &request,
-                        crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default()),
-                    )
-                    .map_err(invalid_data)?;
-                sync_data_messages(request.topic_id, data.ops)
+            SyncMessage::Request(_) => {
+                Err(invalid_data("sync request must be served by the session"))
             }
             SyncMessage::Data(data) => {
                 let data_topic_id = data.topic_id;
@@ -2542,6 +2509,11 @@ struct SyncSession {
     open_topic_id: Option<crate::TopicId>,
     open_allowed: bool,
     acks: Vec<crate::sync::SyncAck>,
+    controls: Vec<SyncMessage>,
+    /// One ack per topic that received data, covering every message of it.
+    replies: BTreeMap<crate::TopicId, crate::sync::SyncAck>,
+    /// Requests to serve once the whole stream is read, latest per topic.
+    requests: BTreeMap<crate::TopicId, crate::sync::SyncRequest>,
 }
 
 impl SyncSession {
@@ -2552,14 +2524,13 @@ impl SyncSession {
             open_topic_id: None,
             open_allowed: false,
             acks: Vec::new(),
+            controls: Vec::new(),
+            replies: BTreeMap::new(),
+            requests: BTreeMap::new(),
         }
     }
 
-    fn handle<S: Storage>(
-        &mut self,
-        net: &IrohNet<S>,
-        message: SyncMessage,
-    ) -> io::Result<Vec<SyncMessage>> {
+    fn handle<S: Storage>(&mut self, net: &IrohNet<S>, message: SyncMessage) -> io::Result<()> {
         if let SyncMessage::Open(open) = &message {
             if open.protocol.as_bytes() != IROKLE_SYNC_ALPN {
                 return Err(invalid_data("unsupported sync protocol"));
@@ -2582,7 +2553,7 @@ impl SyncSession {
             // Deny silently, like the non-member path in handle_message, rather
             // than replying with a failure code.
             if !allowed {
-                return Ok(Vec::new());
+                return Ok(());
             }
             self.open_allowed = true;
         } else {
@@ -2601,49 +2572,127 @@ impl SyncSession {
         }
 
         if !self.open_allowed {
-            return Ok(vec![SyncMessage::Failure(crate::sync::SyncFailure {
-                topic_id: message_topic_id(&message)
-                    .ok_or_else(|| invalid_data("sync message requires a topic"))?,
-                code: crate::sync::SyncFailureCode::Open,
-            })]);
+            self.controls
+                .push(SyncMessage::Failure(crate::sync::SyncFailure {
+                    topic_id: message_topic_id(&message)
+                        .ok_or_else(|| invalid_data("sync message requires a topic"))?,
+                    code: crate::sync::SyncFailureCode::Open,
+                }));
+            return Ok(());
         }
 
-        if let SyncMessage::Data(data) = &message
-            && data.ops.len() > MAX_SYNC_DATA_OPS_PER_MESSAGE
-        {
-            return Err(invalid_data("sync data has too many operations"));
-        }
-
-        if let SyncMessage::Ack(ack) = message {
-            self.acks.push(ack);
-            return Ok(Vec::new());
-        }
-
-        // A data-plane failure for one topic must not abort the whole stream:
-        // the other topics batched into it would lose their summaries, data and
-        // acks, the caller marks every one of them failed, and the sender
-        // resends the identical ranges forever. It must not read as success
-        // either, so the topic gets an explicit terminal failure. Framing and
-        // authentication failures above stay fatal - those indict the peer.
-        if let Some(failure) = per_topic_failure_scope(&message) {
-            return match net.handle_message(message, self.remote_peer_id) {
-                Ok(responses) => Ok(responses),
-                Err(error) => {
-                    let topic_id = failure.topic_id;
-                    tracing::warn!(%topic_id, %error, "failing one sync topic");
-                    Ok(vec![SyncMessage::Failure(failure)])
+        match message {
+            SyncMessage::Data(data) if data.ops.len() > MAX_SYNC_DATA_OPS_PER_MESSAGE => {
+                Err(invalid_data("sync data has too many operations"))
+            }
+            SyncMessage::Ack(ack) => {
+                self.acks.push(ack);
+                Ok(())
+            }
+            SyncMessage::Request(request) => {
+                self.requests.insert(request.topic_id, request);
+                Ok(())
+            }
+            SyncMessage::Page(_) => Err(invalid_data("sync page is a response-only message")),
+            message => {
+                // A data-plane failure for one topic must not abort the stream:
+                // the other topics batched into it would lose their replies. It
+                // must not read as success either, so the topic gets an explicit
+                // failure. Framing and authentication failures above stay fatal.
+                let failure = per_topic_failure_scope(&message);
+                match net.handle_message(message, self.remote_peer_id) {
+                    Ok(responses) => {
+                        for response in responses {
+                            self.keep_reply(net, response)?;
+                        }
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let failure = failure.ok_or(error)?;
+                        tracing::warn!(topic_id = %failure.topic_id, "failing one sync topic");
+                        self.controls.push(SyncMessage::Failure(failure));
+                        Ok(())
+                    }
                 }
-            };
+            }
         }
-
-        net.handle_message(message, self.remote_peer_id)
     }
 
-    /// Apply the stream's acks independently. One rejected ack - a stale clock
-    /// after a topic reset, or one bound to another peer - must not discard the
-    /// others, or their obligations never clear and the peer resends the same
-    /// ranges forever. Each rejection is reported against its own topic.
+    /// Queue one reply, folding acks of the same topic into the newest one.
+    fn keep_reply<S: Storage>(&mut self, net: &IrohNet<S>, reply: SyncMessage) -> io::Result<()> {
+        let SyncMessage::Ack(mut ack) = reply else {
+            self.controls.push(reply);
+            return Ok(());
+        };
+        if let Some(earlier) = self.replies.remove(&ack.topic_id) {
+            ack.accepted.extend(earlier.accepted);
+            ack.sign(net.node.signer()).map_err(invalid_data)?;
+        }
+        self.replies.insert(ack.topic_id, ack);
+        Ok(())
+    }
+
+    /// Apply the stream's acks independently, then reply: every control first,
+    /// then one bounded page per request, sharing what is left of the stream
+    /// budget among the requests still to serve.
     fn finish<S: Storage>(&mut self, net: &IrohNet<S>) -> io::Result<Vec<SyncMessage>> {
+        let mut responses = std::mem::take(&mut self.controls);
+        responses.extend(self.apply_acks(net)?);
+        responses.extend(
+            std::mem::take(&mut self.replies)
+                .into_values()
+                .map(SyncMessage::Ack),
+        );
+        let requests = std::mem::take(&mut self.requests);
+        let Some(peer_id) = self.remote_peer_id else {
+            return Ok(responses);
+        };
+        let page_len = super::framed_message_len(&SyncMessage::Page(crate::sync::SyncPage {
+            topic_id: crate::TopicId::default(),
+            more: false,
+        }))?;
+        let mut bytes = requests.len() * page_len;
+        for response in &responses {
+            bytes += super::framed_message_len(response)?;
+        }
+        let mut messages = responses.len() + requests.len();
+        if bytes > MAX_SYNC_STREAM_BYTES || messages > MAX_SYNC_MESSAGES_PER_STREAM {
+            return Err(invalid_data("sync reply controls exceed the stream budget"));
+        }
+        let mut left = requests.len();
+        for (topic_id, request) in requests {
+            let share_bytes = (MAX_SYNC_STREAM_BYTES - bytes) / left;
+            let share_messages = (MAX_SYNC_MESSAGES_PER_STREAM - messages) / left;
+            left -= 1;
+            let mut budget = crate::sync::PageBudget::from_credit(request.credit);
+            budget.bytes = budget.bytes.min(share_bytes);
+            budget.ops = budget
+                .ops
+                .min(share_messages * MAX_SYNC_DATA_OPS_PER_MESSAGE);
+            let (data, more) = match net.node.response_page(peer_id, &request, budget) {
+                Ok(page) => fit_page(topic_id, page.ops, page.more, share_messages)?,
+                Err(error) => {
+                    tracing::warn!(%topic_id, %error, "failing one sync request");
+                    responses.push(SyncMessage::Failure(crate::sync::SyncFailure {
+                        topic_id,
+                        code: crate::sync::SyncFailureCode::Request,
+                    }));
+                    continue;
+                }
+            };
+            for message in &data {
+                bytes += super::framed_message_len(message)?;
+            }
+            messages += data.len();
+            responses.extend(data);
+            responses.push(SyncMessage::Page(crate::sync::SyncPage { topic_id, more }));
+        }
+        Ok(responses)
+    }
+
+    /// One rejected ack, a stale clock after a reset or one bound to another
+    /// peer, must not discard the others. Each rejection names its own topic.
+    fn apply_acks<S: Storage>(&mut self, net: &IrohNet<S>) -> io::Result<Vec<SyncMessage>> {
         let acks = std::mem::take(&mut self.acks);
         if acks.is_empty() {
             return Ok(Vec::new());
@@ -2682,6 +2731,24 @@ impl SyncSession {
     }
 }
 
+/// Data messages for a causal page cut to `max_messages`. Cutting the tail
+/// keeps a causal prefix, and whatever is cut is reported as more.
+fn fit_page(
+    topic_id: crate::TopicId,
+    mut ops: Vec<crate::Op>,
+    mut more: bool,
+    max_messages: usize,
+) -> io::Result<(Vec<SyncMessage>, bool)> {
+    loop {
+        let messages = sync_data_messages(topic_id, ops.clone())?;
+        if messages.len() <= max_messages {
+            return Ok((messages, more));
+        }
+        more = true;
+        ops.truncate(ops.len() * max_messages / messages.len());
+    }
+}
+
 #[derive(Default)]
 struct SyncReadLimits {
     messages: usize,
@@ -2689,25 +2756,6 @@ struct SyncReadLimits {
 }
 
 impl SyncReadLimits {
-    /// Whether one more frame of `frame_len` fits in the stream budget. Used
-    /// for outgoing replies, where crossing the cap must stop the reply rather
-    /// than fail it: the prefix already built is legal and useful.
-    fn accept_frame(&mut self, frame_len: usize) -> io::Result<bool> {
-        if self.messages >= MAX_SYNC_MESSAGES_PER_STREAM {
-            return Ok(false);
-        }
-        let total = self
-            .bytes
-            .checked_add(frame_len + 4)
-            .ok_or_else(|| invalid_data("sync stream byte count overflow"))?;
-        if total > MAX_SYNC_STREAM_BYTES {
-            return Ok(false);
-        }
-        self.bytes = total;
-        self.messages += 1;
-        Ok(true)
-    }
-
     fn observe_frame(&mut self, frame_len: usize) -> io::Result<usize> {
         if self.messages >= MAX_SYNC_MESSAGES_PER_STREAM {
             return Err(invalid_data("sync stream has too many messages"));
@@ -2723,25 +2771,6 @@ impl SyncReadLimits {
         self.messages += 1;
         Ok(frame_index)
     }
-}
-
-/// Appends the replies that fit in the stream budget and reports whether any
-/// were left out. A reply that would cross the cap belongs to the next
-/// exchange: failing here would discard a legal prefix the peer can use and
-/// turn a bounded page into a protocol error.
-fn push_responses(
-    out: &mut Vec<SyncMessage>,
-    responses: Vec<SyncMessage>,
-    limits: &mut SyncReadLimits,
-) -> io::Result<bool> {
-    for response in responses {
-        let frame_len = super::framed_message_len(&response)? - 4;
-        if !limits.accept_frame(frame_len)? {
-            return Ok(true);
-        }
-        out.push(response);
-    }
-    Ok(false)
 }
 
 /// Clears a loop's start latch when the loop task actually ends, including on
@@ -3297,37 +3326,34 @@ mod tests {
         );
     }
 
-    /// A reply that reaches the stream budget keeps the legal prefix instead of
-    /// failing the whole response. Exercised here through the message cap; the
-    /// byte cap takes the same branch, but a fixture at the default 256 MiB
-    /// reply limit is not run as a unit test.
+    /// A page cut to the message share keeps a causal prefix and says more
+    /// remains, instead of silently dropping the tail or the page result.
     #[test]
-    fn reply_cap_keeps_prefix() {
-        let mut limits = SyncReadLimits::default();
-        let mut out = Vec::new();
-        let responses = (0..=MAX_SYNC_MESSAGES_PER_STREAM)
-            .map(|index| {
-                SyncMessage::Fingerprint(crate::sync::SyncFingerprint {
-                    topic_id: topic(index as u8),
-                    fingerprint: [0; 32],
-                })
+    fn page_fits_messages() {
+        let node = Irokle::in_memory().unwrap();
+        let topic = node
+            .create_topic::<Ping>(crate::TopicConfig::default())
+            .unwrap();
+        for _ in 0..(3 * MAX_SYNC_DATA_OPS_PER_MESSAGE) {
+            topic.publish(Ping).unwrap();
+        }
+        let ops = crate::oplog::topological(node.storage(), &topic.id()).unwrap();
+        let (whole, more) = fit_page(topic.id(), ops.clone(), false, 8).unwrap();
+        assert!(!more);
+        assert_eq!(whole.len(), 4);
+
+        let (cut, more) = fit_page(topic.id(), ops.clone(), false, 2).unwrap();
+        assert!(more, "a cut page must report the rest");
+        assert!(cut.len() <= 2);
+        let sent = cut
+            .iter()
+            .flat_map(|message| match message {
+                SyncMessage::Data(data) => data.ops.clone(),
+                _ => Vec::new(),
             })
             .collect::<Vec<_>>();
-        let truncated = push_responses(&mut out, responses, &mut limits).unwrap();
-        assert!(truncated, "the reply must report what it left out");
-        assert_eq!(
-            out.len(),
-            MAX_SYNC_MESSAGES_PER_STREAM,
-            "the legal prefix must be kept, not discarded"
-        );
-
-        // A following push adds nothing and still reports truncation.
-        let more = vec![SyncMessage::Fingerprint(crate::sync::SyncFingerprint {
-            topic_id: topic(0),
-            fingerprint: [1; 32],
-        })];
-        assert!(push_responses(&mut out, more, &mut limits).unwrap());
-        assert_eq!(out.len(), MAX_SYNC_MESSAGES_PER_STREAM);
+        assert!(!sent.is_empty());
+        assert_eq!(sent, ops[..sent.len()], "the kept part is a prefix");
     }
 
     /// A topic settled during a batch leaves the lease, so the batch deadline
