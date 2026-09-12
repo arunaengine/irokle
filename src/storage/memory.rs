@@ -12,10 +12,10 @@ use super::{
     AckCommit, AdmittedBatch, MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL,
     MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
     MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
-    SyncPeerStatus, SyncStatusUpdate, TopicState, ack_commit, apply_status_update,
-    ensure_deps_resolvable, journalled_eviction, merged_peer_ack, new_peer_status,
-    pending_op_bytes, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
-    validate_batch, validate_heads,
+    SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_reached_op,
+    apply_status_update, ensure_deps_resolvable, journalled_eviction, merged_peer_ack,
+    new_peer_status, pending_op_bytes, stored_ack_dominates, sync_obligation_satisfied,
+    topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[derive(Clone, Default)]
@@ -44,6 +44,8 @@ struct MemoryInner {
     sync_statuses: BTreeMap<(TopicId, PeerId), SyncPeerStatus>,
     evictions: BTreeMap<EvictionKey, TopicEviction>,
     sealed_topics: BTreeSet<TopicId>,
+    /// Destructive data epochs; a reset keeps and advances them.
+    topic_epochs: BTreeMap<TopicId, u64>,
     pending_bytes: usize,
     pending_source_bytes: BTreeMap<PeerId, usize>,
 }
@@ -220,6 +222,77 @@ impl Storage for MemoryStorage {
             })
             .collect())
     }
+    fn topic_view(
+        &self,
+        topic_id: &TopicId,
+        peer_id: Option<&PeerId>,
+    ) -> Result<Option<TopicView>> {
+        let inner = self.lock()?;
+        let Some(state) = memory_topic_state_locked(&inner, topic_id) else {
+            return Ok(None);
+        };
+        let clock = inner.actor_clock.get(topic_id).cloned().unwrap_or_default();
+        let tips = inner
+            .actor_tip
+            .range(
+                (*topic_id, ActorId::from_bytes([0; 32]))
+                    ..=(*topic_id, ActorId::from_bytes([0xff; 32])),
+            )
+            .map(|((_, actor_id), tip)| (*actor_id, *tip))
+            .collect();
+        let fingerprint = match inner.topic_fingerprint.get(topic_id) {
+            Some(fingerprint) => *fingerprint,
+            None => topic_fingerprint_for(&state.heads, &clock)?,
+        };
+        let (ack, owed) = match peer_id {
+            Some(peer_id) => (
+                inner.peer_acks.get(&(*peer_id, *topic_id)).cloned(),
+                inner
+                    .obligations
+                    .get(&(*peer_id, *topic_id))
+                    .is_some_and(|records| !records.is_empty()),
+            ),
+            None => (None, false),
+        };
+        Ok(Some(TopicView {
+            epoch: inner
+                .topic_epochs
+                .get(topic_id)
+                .copied()
+                .unwrap_or_default(),
+            pending_missing: pending_missing_locked(&inner, topic_id),
+            state,
+            clock,
+            tips,
+            fingerprint,
+            ack,
+            owed,
+        }))
+    }
+    fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
+        let inner = self.lock()?;
+        let Some((meta, genesis)) = stored_op_branch(&inner, op_id) else {
+            return Ok(false);
+        };
+        Ok(inner
+            .peer_acks
+            .get(&(*peer_id, meta.topic_id))
+            .is_some_and(|ack| ack_reached_op(ack, genesis, meta)))
+    }
+    fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>> {
+        let inner = self.lock()?;
+        let Some((meta, genesis)) = stored_op_branch(&inner, op_id) else {
+            return Ok(Vec::new());
+        };
+        let mut peers = inner
+            .peer_acks
+            .values()
+            .filter(|ack| ack.topic_id == meta.topic_id && ack_reached_op(ack, genesis, meta))
+            .map(|ack| ack.peer_id)
+            .collect::<Vec<_>>();
+        peers.sort();
+        Ok(peers)
+    }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         let mut inner = self.lock()?;
         // Only a completely stored op is already admitted; a half stored one
@@ -350,13 +423,7 @@ impl Storage for MemoryStorage {
     }
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         let inner = self.lock()?;
-        Ok(inner
-            .pending_ops
-            .values()
-            .filter(|(_, _, meta)| meta.topic_id == *topic_id)
-            .flat_map(|(_, _, meta)| meta.missing_deps.iter().copied())
-            .filter(|dep| !dep_resolvable_locked(&inner, dep))
-            .collect())
+        Ok(pending_missing_locked(&inner, topic_id))
     }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         let mut inner = self.lock()?;
@@ -733,6 +800,7 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
 }
 
 fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> usize {
+    *inner.topic_epochs.entry(*topic_id).or_default() += 1;
     let op_ids = inner.topic_ops.remove(topic_id).unwrap_or_default();
     let removed = op_ids.len();
     for op_id in &op_ids {
@@ -828,6 +896,23 @@ fn clear_satisfied_locked(inner: &mut MemoryInner, ack: &PeerAck) -> usize {
         inner.obligations.remove(&key);
     }
     cleared
+}
+
+/// Metadata of a stored op and the genesis of the topic branch holding it.
+fn stored_op_branch<'a>(inner: &'a MemoryInner, op_id: &OpId) -> Option<(&'a OpMeta, OpId)> {
+    let meta = inner.meta.get(op_id)?;
+    let genesis = inner.topics.get(&meta.topic_id)?.genesis;
+    Some((meta, genesis))
+}
+
+fn pending_missing_locked(inner: &MemoryInner, topic_id: &TopicId) -> BTreeSet<OpId> {
+    inner
+        .pending_ops
+        .values()
+        .filter(|(_, _, meta)| meta.topic_id == *topic_id)
+        .flat_map(|(_, _, meta)| meta.missing_deps.iter().copied())
+        .filter(|dep| !dep_resolvable_locked(inner, dep))
+        .collect()
 }
 
 /// A dependency is only satisfied once both of its records are stored; either

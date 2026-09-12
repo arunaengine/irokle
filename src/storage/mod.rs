@@ -79,6 +79,26 @@ pub struct PeerAck {
     pub clock: ActorClock,
 }
 
+/// One coherent read of a topic, taken under one lock or read transaction so
+/// every part describes the same commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopicView {
+    /// Topic state carrying the current heads.
+    pub state: TopicState,
+    pub clock: ActorClock,
+    /// Tip of every actor the topic stores.
+    pub tips: BTreeMap<ActorId, (u64, OpId)>,
+    pub fingerprint: [u8; 32],
+    /// Destructive data epoch, see [`Storage::topic_view`].
+    pub epoch: u64,
+    /// Dependencies that buffered ops of this topic still wait for.
+    pub pending_missing: BTreeSet<OpId>,
+    /// Stored ack of the peer the view was read for.
+    pub ack: Option<PeerAck>,
+    /// Whether that peer holds outstanding obligations for this topic.
+    pub owed: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmissionEffects {
     pub sync_obligations: Vec<SyncObligation>,
@@ -184,6 +204,14 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn max_generation(&self, topic_id: &TopicId) -> Result<u64>;
     fn topic_state(&self, topic_id: &TopicId) -> Result<Option<TopicState>>;
     fn list_topics(&self) -> Result<Vec<TopicInfo>>;
+    /// Read the topic's state, heads, clock, tips, fingerprint, data epoch
+    /// and pending holes as one view, plus `peer_id`'s stored ack and whether
+    /// it is owed work. The epoch grows with every destructive change of the
+    /// topic (reset, reset-and-admit) and never with an append, so anything
+    /// keyed by genesis and epoch cannot outlive the data it describes.
+    /// Required rather than defaulted: separate reads can mix two commits.
+    fn topic_view(&self, topic_id: &TopicId, peer_id: Option<&PeerId>)
+    -> Result<Option<TopicView>>;
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()>;
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>>;
     fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>>;
@@ -319,35 +347,15 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// an error: acknowledgement is idempotent.
     fn clear_eviction(&self, key: &EvictionKey) -> Result<()>;
 
-    fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
-        let Some(meta) = self.get_meta(op_id)? else {
-            return Ok(false);
-        };
-        let Some(genesis) = self.topic_state(&meta.topic_id)?.map(|state| state.genesis) else {
-            return Ok(false);
-        };
-        let Some(ack) = self.peer_ack(peer_id, &meta.topic_id)? else {
-            return Ok(false);
-        };
-        Ok(ack_reached_op(&ack, genesis, &meta))
-    }
+    /// Whether `peer_id` holds `op_id` on the branch that currently stores it.
+    /// Required rather than defaulted: the op's metadata, the topic genesis
+    /// and the ack must come from one view, or evidence installed by a reset
+    /// in between proves an op of the discarded branch.
+    fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool>;
 
-    fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>> {
-        let Some(meta) = self.get_meta(op_id)? else {
-            return Ok(Vec::new());
-        };
-        let Some(genesis) = self.topic_state(&meta.topic_id)?.map(|state| state.genesis) else {
-            return Ok(Vec::new());
-        };
-        let mut peers = self
-            .peer_acks(&meta.topic_id)?
-            .into_iter()
-            .filter(|ack| ack_reached_op(ack, genesis, &meta))
-            .map(|ack| ack.peer_id)
-            .collect::<Vec<_>>();
-        peers.sort();
-        Ok(peers)
-    }
+    /// Every peer [`Storage::peer_reached_op`] would confirm, sorted, read
+    /// from one view.
+    fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>>;
 }
 
 mod memory;
@@ -556,7 +564,7 @@ pub(super) fn journalled_eviction(
 /// Whether `ack` proves the peer holds the operation `meta` describes. Only
 /// evidence certified against the topic's current genesis counts: a record from
 /// a replaced branch names the same actor sequences without covering them.
-fn ack_reached_op(ack: &PeerAck, genesis: OpId, meta: &OpMeta) -> bool {
+pub(super) fn ack_reached_op(ack: &PeerAck, genesis: OpId, meta: &OpMeta) -> bool {
     ack.genesis == Some(genesis)
         && (ack.heads.contains(&meta.id) || ack.clock.get(&meta.actor_id) >= meta.actor_seq)
 }

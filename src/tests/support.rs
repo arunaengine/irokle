@@ -250,6 +250,19 @@ impl Storage for StaleReadStorage {
     fn list_topics(&self) -> Result<Vec<crate::TopicInfo>, Error> {
         self.inner.list_topics()
     }
+    fn topic_view(
+        &self,
+        topic_id: &TopicId,
+        peer_id: Option<&PeerId>,
+    ) -> Result<Option<crate::storage::TopicView>, Error> {
+        self.inner.topic_view(topic_id, peer_id)
+    }
+    fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool, Error> {
+        self.inner.peer_reached_op(peer_id, op_id)
+    }
+    fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>, Error> {
+        self.inner.peers_reached_op(op_id)
+    }
     fn put_pending_op(
         &self,
         source_peer: PeerId,

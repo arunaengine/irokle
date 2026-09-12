@@ -14,10 +14,10 @@ use super::{
     AckCommit, AdmittedBatch, MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL,
     MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS, MAX_PENDING_OPS_PER_SOURCE,
     MAX_PENDING_OPS_TOTAL, MAX_PENDING_WAITERS_PER_DEP, OpMeta, PeerAck, Storage, SyncObligation,
-    SyncPeerStatus, SyncStatusUpdate, TopicState, ack_commit, apply_status_update,
-    ensure_deps_resolvable, journalled_eviction, merged_peer_ack, new_peer_status,
-    pending_op_bytes, stored_ack_dominates, sync_obligation_satisfied, topic_fingerprint_for,
-    validate_batch, validate_heads,
+    SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_reached_op,
+    apply_status_update, ensure_deps_resolvable, journalled_eviction, merged_peer_ack,
+    new_peer_status, pending_op_bytes, stored_ack_dominates, sync_obligation_satisfied,
+    topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[cfg(feature = "fjall")]
@@ -50,6 +50,10 @@ const PENDING_SOURCE_BYTES_PREFIX: &[u8] = b"pq";
 /// Pending payload records, keyed on `po<op id>`.
 #[cfg(feature = "fjall")]
 const PENDING_OP_PREFIX: &[u8] = b"po";
+/// Destructive data epoch per topic, keyed on `ep<topic id>`. A reset keeps
+/// and advances it.
+#[cfg(feature = "fjall")]
+const TOPIC_EPOCH_PREFIX: &[u8] = b"ep";
 
 /// Schema 1 layout of a stored acknowledgement, which did not name the branch
 /// it certified. Kept only to read those records during the upgrade; postcard
@@ -235,7 +239,7 @@ impl FjallStorage {
     }
 
     fn tx_get<T: for<'de> Deserialize<'de>>(
-        tx: &fjall::OptimisticWriteTx,
+        tx: &impl fjall::Readable,
         records: &fjall::OptimisticTxKeyspace,
         key: impl AsRef<[u8]>,
     ) -> Result<Option<T>> {
@@ -785,11 +789,115 @@ impl FjallStorage {
         .expect("fjall orphan op");
     }
 
+    /// The topic as one read sees it, see [`Storage::topic_view`].
+    fn read_topic_view(
+        tx: &impl fjall::Readable,
+        records: &fjall::OptimisticTxKeyspace,
+        topic_id: &TopicId,
+        peer_id: Option<&PeerId>,
+    ) -> Result<Option<TopicView>> {
+        let Some(mut state) =
+            Self::tx_get::<TopicState>(tx, records, Self::key_id(b"ts", topic_id))?
+        else {
+            return Ok(None);
+        };
+        state.heads = Self::tx_get(tx, records, Self::key_id(b"h", topic_id))?.unwrap_or_default();
+        let clock: ActorClock =
+            Self::tx_get(tx, records, Self::key_id(b"ac", topic_id))?.unwrap_or_default();
+        let mut tips = BTreeMap::new();
+        let tip_prefix = [b"at".as_slice(), topic_id.as_ref()].concat();
+        for item in fjall::Readable::prefix(tx, records, tip_prefix) {
+            let (key, value) = item.into_inner()?;
+            let actor = key
+                .get(2 + TopicId::LEN..)
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .ok_or_else(|| Error::Storage("corrupt fjall actor tip key".into()))?;
+            tips.insert(
+                ActorId::from_bytes(actor),
+                postcard::from_bytes(value.as_ref())?,
+            );
+        }
+        let fingerprint = match Self::tx_get(tx, records, Self::key_id(b"fp", topic_id))? {
+            Some(fingerprint) => fingerprint,
+            None => topic_fingerprint_for(&state.heads, &clock)?,
+        };
+        let (ack, owed) = match peer_id {
+            Some(peer_id) => (
+                Self::tx_get(
+                    tx,
+                    records,
+                    [PEER_ACK_PREFIX, peer_id.as_ref(), topic_id.as_ref()].concat(),
+                )?,
+                fjall::Readable::prefix(
+                    tx,
+                    records,
+                    [b"ob".as_slice(), peer_id.as_ref(), topic_id.as_ref()].concat(),
+                )
+                .next()
+                .is_some(),
+            ),
+            None => (None, false),
+        };
+        Ok(Some(TopicView {
+            epoch: Self::tx_get(tx, records, Self::key_id(TOPIC_EPOCH_PREFIX, topic_id))?
+                .unwrap_or_default(),
+            pending_missing: Self::read_pending_missing(tx, records, topic_id)?,
+            state,
+            clock,
+            tips,
+            fingerprint,
+            ack,
+            owed,
+        }))
+    }
+
+    fn read_pending_missing(
+        tx: &impl fjall::Readable,
+        records: &fjall::OptimisticTxKeyspace,
+        topic_id: &TopicId,
+    ) -> Result<BTreeSet<OpId>> {
+        let mut out = BTreeSet::new();
+        for item in fjall::Readable::prefix(tx, records, PENDING_OP_PREFIX) {
+            let value = item.value()?;
+            let (_, _, meta): (PeerId, Op, OpMeta) = postcard::from_bytes(value.as_ref())?;
+            if meta.topic_id != *topic_id {
+                continue;
+            }
+            for dep in &meta.missing_deps {
+                if !fjall::Readable::contains_key(tx, records, Self::key_id(b"o", dep))?
+                    || !fjall::Readable::contains_key(tx, records, Self::key_id(b"m", dep))?
+                {
+                    out.insert(*dep);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Metadata of a stored op and the genesis of the branch holding it.
+    fn read_op_branch(
+        tx: &impl fjall::Readable,
+        records: &fjall::OptimisticTxKeyspace,
+        op_id: &OpId,
+    ) -> Result<Option<(OpMeta, OpId)>> {
+        let Some(meta) = Self::tx_get::<OpMeta>(tx, records, Self::key_id(b"m", op_id))? else {
+            return Ok(None);
+        };
+        let state = Self::tx_get::<TopicState>(tx, records, Self::key_id(b"ts", &meta.topic_id))?;
+        Ok(state.map(|state| (meta, state.genesis)))
+    }
+
     fn tx_reset_topic(
         &self,
         tx: &mut fjall::OptimisticWriteTx,
         topic_id: &TopicId,
     ) -> Result<usize> {
+        let epoch_key = Self::key_id(TOPIC_EPOCH_PREFIX, topic_id);
+        let epoch: u64 = Self::tx_get(tx, &self.records, epoch_key.as_slice())?.unwrap_or_default();
+        let next_epoch = epoch
+            .checked_add(1)
+            .ok_or_else(|| Error::Storage("topic data epoch overflow".into()))?;
+        Self::tx_put(tx, &self.records, epoch_key, &next_epoch)?;
         // Topic op ids come from the `to` index; op records, meta, and the
         // children edges are keyed by op id, not by topic.
         let to_prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
@@ -1088,6 +1196,41 @@ impl Storage for FjallStorage {
         }
         Ok(out)
     }
+    fn topic_view(
+        &self,
+        topic_id: &TopicId,
+        peer_id: Option<&PeerId>,
+    ) -> Result<Option<TopicView>> {
+        Self::read_topic_view(&self.db.read_tx(), &self.records, topic_id, peer_id)
+    }
+    fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
+        let read_tx = self.db.read_tx();
+        let Some((meta, genesis)) = Self::read_op_branch(&read_tx, &self.records, op_id)? else {
+            return Ok(false);
+        };
+        let ack: Option<PeerAck> = Self::tx_get(
+            &read_tx,
+            &self.records,
+            [PEER_ACK_PREFIX, peer_id.as_ref(), meta.topic_id.as_ref()].concat(),
+        )?;
+        Ok(ack.is_some_and(|ack| ack_reached_op(&ack, genesis, &meta)))
+    }
+    fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>> {
+        let read_tx = self.db.read_tx();
+        let Some((meta, genesis)) = Self::read_op_branch(&read_tx, &self.records, op_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut peers = Vec::new();
+        for item in fjall::Readable::prefix(&read_tx, &self.records, PEER_ACK_PREFIX) {
+            let value = item.value()?;
+            let ack: PeerAck = postcard::from_bytes(value.as_ref())?;
+            if ack.topic_id == meta.topic_id && ack_reached_op(&ack, genesis, &meta) {
+                peers.push(ack.peer_id);
+            }
+        }
+        peers.sort();
+        Ok(peers)
+    }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         self.transaction(|tx| {
             // Only a completely stored op is already admitted; a half stored
@@ -1239,24 +1382,7 @@ impl Storage for FjallStorage {
         Ok(out)
     }
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
-        let mut out = BTreeSet::new();
-        let read_tx = self.db.read_tx();
-        for item in fjall::Readable::prefix(&read_tx, &self.records, b"po".as_slice()) {
-            let value = item.value()?;
-            let (_, _, meta): (PeerId, Op, OpMeta) = postcard::from_bytes(value.as_ref())?;
-            if meta.topic_id != *topic_id {
-                continue;
-            }
-            for dep in &meta.missing_deps {
-                if fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", dep))?.is_none()
-                    || fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"m", dep))?
-                        .is_none()
-                {
-                    out.insert(*dep);
-                }
-            }
-        }
-        Ok(out)
+        Self::read_pending_missing(&self.db.read_tx(), &self.records, topic_id)
     }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         self.transaction(|tx| Self::tx_remove_pending_op(tx, &self.records, op_id))
