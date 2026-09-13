@@ -693,3 +693,85 @@ fn backend_failure_retains() {
             .is_empty()
     );
 }
+
+/// Two receives that each release a full topic share of buffered ops drain
+/// at the same time: together they admit every released op and leave no
+/// ready record behind for a later arrival to find.
+fn assert_drains_complete<S: Storage>(storage: S) {
+    const WAITERS: usize = crate::storage::MAX_PENDING_WAITERS_PER_DEP - 1;
+    let owner = Ed25519Signer::from_bytes(&[251; 32]);
+    let authors = (0..2 * (WAITERS + 1))
+        .map(|index| {
+            let mut seed = [252_u8; 32];
+            seed[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            Ed25519Signer::from_bytes(&seed)
+        })
+        .collect::<Vec<_>>();
+    let log = Oplog::with_storage(storage.clone());
+    let mut releases = Vec::new();
+    let mut expected = BTreeSet::new();
+    for topic in 0..2_u8 {
+        let topic_id = TopicId::hash([b"drains-complete".as_slice(), &[topic]].concat());
+        let members = authors.iter().map(Signer::peer_id).chain([owner.peer_id()]);
+        let genesis = log
+            .create_topic_genesis(
+                topic_id,
+                actor_id_for(topic_id, owner.peer_id()),
+                TopicGenesis::new(Note::TYPE_ID, members),
+                &owner,
+            )
+            .unwrap();
+        let mut roots = Vec::new();
+        for (half, chunk) in authors.chunks(WAITERS + 1).enumerate() {
+            let root = event_op(&chunk[0], topic_id, 1, None, &[&genesis], "root");
+            let source = PeerId::hash([b"drain-source".as_slice(), &[topic, half as u8]].concat());
+            let waiters = chunk[1..]
+                .iter()
+                .map(|author| event_op(author, topic_id, 1, None, &[&root], "waiter"))
+                .collect::<Vec<_>>();
+            for batch in waiters.chunks(256) {
+                let admitted = log
+                    .receive_ops_from_peer(Some(source), batch.to_vec())
+                    .unwrap();
+                assert!(admitted.is_empty());
+            }
+            expected.extend(waiters.iter().map(|op| op.id));
+            expected.insert(root.id);
+            roots.push(root);
+        }
+        releases.push(roots);
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let handles = releases
+        .into_iter()
+        .map(|roots| {
+            let log = log.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                log.receive_ops(roots).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut admitted = BTreeSet::new();
+    for handle in handles {
+        admitted.extend(handle.join().unwrap());
+    }
+    assert_eq!(admitted, expected);
+    assert!(storage.ready_pending_after(None, 1).unwrap().is_empty());
+}
+
+#[test]
+fn memory_drains_complete() {
+    assert_drains_complete(MemoryStorage::new());
+}
+
+/// The same on a durable store, where every admission is a synced commit.
+/// Run explicitly: `cargo test --features fjall --lib fjall_drains_complete -- --ignored`.
+#[cfg(feature = "fjall")]
+#[test]
+#[ignore = "about two minutes of synced commits, run explicitly"]
+fn fjall_drains_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_drains_complete(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
