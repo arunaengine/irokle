@@ -26,7 +26,7 @@ const SYNC_ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/2";
 pub const SYNC_PROTOCOL: &str = "irokle/sync/3";
 
 /// Maximum number of sequences a single ActorRangeHint may span. Caps both the
-/// hint a peer can construct via `needed_actor_ranges` and the work
+/// hint a peer can construct via `actor_ranges` and the work
 /// `plan_response_data` is willing to do for a peer-supplied hint, so a
 /// malicious peer cannot push us into walking unbounded sequence ranges.
 pub const MAX_ACTOR_RANGE_HINT_SPAN: u64 = 65_536;
@@ -413,6 +413,53 @@ impl<S: Storage> SyncEngine<S> {
             .topic_view(&remote.topic_id, None)?
             .ok_or(Error::TopicNotFound)?;
         let local_heads = view.state.heads.clone();
+        // Another genesis is another sequence namespace, however equal the actor
+        // positions look. The smaller genesis wins: its holder offers its branch
+        // from the start and the other side asks for that branch from the start.
+        if let Some(remote_genesis) = remote.genesis
+            && remote_genesis != view.state.genesis
+        {
+            let empty = ActorClock::new();
+            let mut plan = SyncPlan {
+                topic_id: remote.topic_id,
+                common: BTreeSet::new(),
+                have: local_heads,
+                send: Vec::new(),
+                need: BTreeSet::new(),
+                actor_range_hints: Vec::new(),
+            };
+            *more = false;
+            if remote_genesis < view.state.genesis {
+                plan.actor_range_hints = actor_ranges(&empty, &remote.actor_clock, 0);
+                return Ok(plan);
+            }
+            plan.send = match send_set {
+                SendSet::Closure => self.missing_closure(&SyncSummary {
+                    topic_id: remote.topic_id,
+                    event_type_id: None,
+                    genesis: None,
+                    fingerprint: [0; 32],
+                    heads: BTreeSet::new(),
+                    actor_clock: empty,
+                    actor_tips: BTreeMap::new(),
+                })?,
+                #[cfg(feature = "iroh")]
+                SendSet::Page(budget) => {
+                    let page = self.plan_page(
+                        &remote.topic_id,
+                        &view.clock,
+                        &empty,
+                        None,
+                        &BTreeSet::new(),
+                        budget,
+                    )?;
+                    *more = page.more;
+                    page.ops
+                }
+                SendSet::Empty => Vec::new(),
+            };
+            return Ok(plan);
+        }
         // A hole moves neither heads nor the clock, so a matching fingerprint
         // does not prove we are whole; keep negotiating until it is repaired.
         let (unresolved, _) = self.oplog.view_unresolved(&view)?;
@@ -489,7 +536,7 @@ impl<S: Storage> SyncEngine<S> {
                     .any(|(actor_id, (seq, tip))| tip == id && view.clock.get(actor_id) < *seq)
             });
         }
-        let actor_range_hints = self.needed_actor_ranges(remote, need.len())?;
+        let actor_range_hints = actor_ranges(&view.clock, &remote.actor_clock, need.len());
         Ok(SyncPlan {
             topic_id: remote.topic_id,
             common,
@@ -583,7 +630,7 @@ impl<S: Storage> SyncEngine<S> {
             .oplog
             .storage()
             .topic_state(&plan.topic_id)?
-            .map(|state| state.genesis);
+            .map(|state| request_genesis(state.genesis, remote.genesis));
         Ok(SyncRequest {
             topic_id: plan.topic_id,
             known: plan.common,
@@ -1059,35 +1106,6 @@ impl<S: Storage> SyncEngine<S> {
         })
     }
 
-    fn needed_actor_ranges(
-        &self,
-        remote: &SyncSummary,
-        wants: usize,
-    ) -> Result<Vec<ActorRangeHint>> {
-        let local_clock = self.oplog.storage().actor_clock(&remote.topic_id)?;
-        let mut remaining = MAX_ACTOR_RANGE_HINT_SPAN.saturating_sub(wants as u64);
-        Ok(remote
-            .actor_clock
-            .iter()
-            .filter_map(|(actor_id, remote_seq)| {
-                let local_seq = local_clock.get(actor_id);
-                if *remote_seq <= local_seq || remaining == 0 {
-                    return None;
-                }
-                let to_inclusive = remote_seq
-                    .saturating_sub(local_seq)
-                    .min(remaining)
-                    .saturating_add(local_seq);
-                remaining -= to_inclusive - local_seq;
-                Some(ActorRangeHint {
-                    actor_id: *actor_id,
-                    from_exclusive: local_seq,
-                    to_inclusive,
-                })
-            })
-            .collect())
-    }
-
     #[cfg(feature = "iroh")]
     /// The next causal page for a peer at `peer`, merging forward actor ranges by generation
     /// (one past the highest dependency), so dependencies come first. Work grows with the
@@ -1336,6 +1354,37 @@ impl<S: Storage> SyncEngine<S> {
         }
         Ok(out)
     }
+}
+
+/// Ranges from `local` up to `remote` for every actor `remote` is ahead on,
+/// spanning at most `MAX_ACTOR_RANGE_HINT_SPAN` positions beside `wants` ids.
+fn actor_ranges(local: &ActorClock, remote: &ActorClock, wants: usize) -> Vec<ActorRangeHint> {
+    let mut remaining = MAX_ACTOR_RANGE_HINT_SPAN.saturating_sub(wants as u64);
+    remote
+        .iter()
+        .filter_map(|(actor_id, remote_seq)| {
+            let local_seq = local.get(actor_id);
+            if *remote_seq <= local_seq || remaining == 0 {
+                return None;
+            }
+            let to_inclusive = remote_seq
+                .saturating_sub(local_seq)
+                .min(remaining)
+                .saturating_add(local_seq);
+            remaining -= to_inclusive - local_seq;
+            Some(ActorRangeHint {
+                actor_id: *actor_id,
+                from_exclusive: local_seq,
+                to_inclusive,
+            })
+        })
+        .collect()
+}
+
+/// The branch a request made against a peer on `remote` names: the smaller
+/// genesis wins, so a local branch that loses asks for the peer's.
+pub(crate) fn request_genesis(local: OpId, remote: Option<OpId>) -> OpId {
+    remote.filter(|remote| *remote < local).unwrap_or(local)
 }
 
 /// Clamp a peer-supplied `ActorRangeHint` against our local knowledge so that

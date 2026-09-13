@@ -12,6 +12,8 @@ mod core;
 mod exchange;
 #[cfg(feature = "iroh")]
 mod fallback;
+#[cfg(feature = "iroh")]
+mod genesis;
 mod holes;
 #[cfg(feature = "iroh")]
 mod iroh;

@@ -859,23 +859,25 @@ fn assert_quarantines_orphan<S: Corrupt>(storage: S) {
         [lost_genesis.id].into()
     );
 
-    // Ordinary anti-entropy against the peer that still holds the replaced
-    // chain must not merge its genesis back into the winner.
+    // Anti-entropy against the peer that still holds the replaced chain offers
+    // the winning branch and asks nothing of the loser; even a served explicit
+    // want of the replaced genesis must not merge it back into the winner.
     let plan = holder
         .negotiate_sync(
             keeper_node.peer_id(),
             &keeper_node.sync_summary(topic_id).unwrap(),
         )
         .unwrap();
-    assert!(plan.need.contains(&lost_genesis.id));
+    assert!(plan.need.is_empty() && plan.actor_range_hints.is_empty());
+    assert_eq!(plan.send[0].id, won_genesis.id);
     let data = keeper_node
         .plan_sync_response_data(
             holder.peer_id(),
             &crate::sync::SyncRequest {
                 topic_id,
-                known: plan.common,
-                wants: plan.need,
-                actor_range_hints: plan.actor_range_hints,
+                known: BTreeSet::new(),
+                wants: [lost_genesis.id].into(),
+                actor_range_hints: Vec::new(),
                 genesis: None,
                 credit: Default::default(),
             },

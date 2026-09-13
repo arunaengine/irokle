@@ -2305,15 +2305,22 @@ impl<S: Storage> SharedNet<S> {
             .ok_or_else(|| invalid_data("topic disappeared while planning"))?;
         // A peer outside the membership is owed nothing and serves nothing.
         let member = view.state.members.contains(&remote_peer_id);
+        // Across two branches only the winner's namespace is a goal: the loser
+        // expects the winner's clock, the winner expects its own certified.
+        let branch = summary
+            .genesis
+            .filter(|remote| *remote != view.state.genesis);
+        let planned = crate::sync::request_genesis(view.state.genesis, branch);
         let mut goal = TopicGoal {
             pull: false,
-            genesis: Some(view.state.genesis),
-            inbound: if member {
+            genesis: Some(planned),
+            replaces: (planned != view.state.genesis).then_some(view.state.genesis),
+            inbound: if member && (branch.is_none() || planned != view.state.genesis) {
                 summary.actor_clock.clone()
             } else {
                 Default::default()
             },
-            outbound: if member {
+            outbound: if member && planned == view.state.genesis {
                 view.clock.clone()
             } else {
                 Default::default()
@@ -2351,7 +2358,8 @@ impl<S: Storage> SharedNet<S> {
         let mut controls = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
         let mut credit_ops = 0;
         if wants {
-            let request = self.page_request(plan).map_err(invalid_data)?;
+            let mut request = self.page_request(plan).map_err(invalid_data)?;
+            request.genesis = Some(planned);
             credit_ops = request.credit.ops as usize;
             controls.push(SyncMessage::Request(request));
         }
@@ -2445,6 +2453,7 @@ impl<S: Storage> SharedNet<S> {
             goal: TopicGoal {
                 pull: true,
                 genesis: Some(genesis),
+                replaces: None,
                 inbound: summary.actor_clock.clone(),
                 outbound: crate::ActorClock::new(),
             },
@@ -3039,6 +3048,9 @@ impl<S: Storage> SharedNet<S> {
                 ..GoalProgress::default()
             });
         };
+        if goal.replaces == Some(view.state.genesis) {
+            return Ok(GoalProgress::default());
+        }
         if goal.genesis != Some(view.state.genesis) {
             return Err(invalid_data("topic branch changed during sync"));
         }
@@ -3299,9 +3311,11 @@ impl<S: Storage> SharedNet<S> {
                 if plan.need.is_empty() && plan.actor_range_hints.is_empty() {
                     return Ok(Vec::new());
                 }
-                Ok(vec![SyncMessage::Request(
-                    self.page_request(plan).map_err(invalid_data)?,
-                )])
+                let mut request = self.page_request(plan).map_err(invalid_data)?;
+                request.genesis = request
+                    .genesis
+                    .map(|local| crate::sync::request_genesis(local, summary.genesis));
+                Ok(vec![SyncMessage::Request(request)])
             }
             SyncMessage::Request(_) => {
                 Err(invalid_data("sync request must be served by the session"))
@@ -3428,6 +3442,9 @@ struct TopicGoal {
     /// Whether the topic was not held locally when planned.
     pull: bool,
     genesis: Option<crate::OpId>,
+    /// The losing local genesis a branch pull replaces; until the winner is
+    /// admitted the topic has made no progress toward the goal.
+    replaces: Option<crate::OpId>,
     /// The peer's clock from its summary.
     inbound: crate::ActorClock,
     /// The local clock the peer should certify.
