@@ -1305,18 +1305,18 @@ impl<S: Storage> IrohNet<S> {
         Ok(Some(handle.spawn(async move {
             let _task = task;
             let _running = running;
-            let mut sweep_pending = match net.upgrade() {
-                Some(current) => current.schedule_startup_resync().await.inspect_err(|error| {
-                    tracing::warn!(%error, "failed to schedule startup resync sweep");
-                }).is_err(),
-                None => false,
-            };
+            // A sweep discovers targets in its own task, so dispatch keeps joining
+            // and refilling peer slots while the sweep waits on storage.
+            let mut sweeps = tokio::task::JoinSet::new();
+            let mut startup = true;
+            if let Some(current) = net.upgrade() {
+                sweeps.spawn(async move { current.schedule_startup_resync().await });
+            }
+            let mut sweep_pending = false;
             let mut sweep_backoff = runtime.resync_initial_backoff.max(Duration::from_millis(1));
-            let mut full_sweep = Box::pin(tokio::time::sleep_until(if sweep_pending {
-                tokio::time::Instant::now() + sweep_backoff
-            } else {
-                next_full_sweep_deadline(runtime.full_sweep_interval, runtime.full_sweep_time_of_day)
-            }));
+            let mut full_sweep = Box::pin(tokio::time::sleep_until(
+                tokio::time::Instant::now() + EMPTY_RESYNC_SLEEP,
+            ));
             let mut syncs = tokio::task::JoinSet::new();
             loop {
                 if !dispatch_due_resyncs(&net, &mut syncs, runtime) {
@@ -1336,22 +1336,38 @@ impl<S: Storage> IrohNet<S> {
                         }
                         continue;
                     }
-                    _ = &mut full_sweep, if sweep_pending || !runtime.full_sweep_interval.is_zero() => {
-                        sweep_pending = match net.upgrade() {
-                            Some(current) => current.schedule_full_sweep_resync().await.inspect_err(|error| {
-                                tracing::warn!(%error, "failed to schedule full resync sweep");
-                            }).is_err(),
-                            None => false,
-                        };
-                        let delay = if sweep_pending {
-                            sweep_backoff = sweep_backoff.saturating_mul(2)
-                                .min(runtime.resync_max_backoff.max(Duration::from_millis(1)));
-                            sweep_backoff
+                    _ = &mut full_sweep, if sweeps.is_empty() && (sweep_pending || !runtime.full_sweep_interval.is_zero()) => {
+                        match net.upgrade() {
+                            Some(current) => {
+                                sweeps.spawn(async move { current.schedule_full_sweep_resync().await });
+                            }
+                            None => break,
+                        }
+                    }
+                    Some(swept) = sweeps.join_next(), if !sweeps.is_empty() => {
+                        let failed = !matches!(swept, Ok(Ok(_)));
+                        if let Ok(Err(error)) = &swept {
+                            tracing::warn!(%error, startup, "failed to schedule resync sweep");
+                        } else if let Err(error) = &swept {
+                            tracing::warn!(%error, startup, "resync sweep task failed");
+                        }
+                        sweep_pending = failed;
+                        let deadline = if failed {
+                            if !startup {
+                                sweep_backoff = sweep_backoff.saturating_mul(2)
+                                    .min(runtime.resync_max_backoff.max(Duration::from_millis(1)));
+                            }
+                            tokio::time::Instant::now() + sweep_backoff
                         } else {
                             sweep_backoff = runtime.resync_initial_backoff.max(Duration::from_millis(1));
-                            runtime.full_sweep_interval
+                            if startup {
+                                next_full_sweep_deadline(runtime.full_sweep_interval, runtime.full_sweep_time_of_day)
+                            } else {
+                                tokio::time::Instant::now() + runtime.full_sweep_interval
+                            }
                         };
-                        full_sweep.as_mut().reset(tokio::time::Instant::now() + delay);
+                        startup = false;
+                        full_sweep.as_mut().reset(deadline);
                     }
                     Some(result) = syncs.join_next(), if !syncs.is_empty() => {
                         if let Err(error) = result {
@@ -1363,9 +1379,11 @@ impl<S: Storage> IrohNet<S> {
                 }
             }
             syncs.abort_all();
+            sweeps.abort_all();
             // Draining lets every aborted batch release its own claims before a
             // replacement loop may start.
             while syncs.join_next().await.is_some() {}
+            while sweeps.join_next().await.is_some() {}
         })))
     }
 }
@@ -1628,13 +1646,19 @@ impl<S: Storage> IrohNet<S> {
         handle.spawn(async move {
             let _task = task;
             let _running = running;
-            let topics = match net.upgrade().map(|current| current.node.list_topics()) {
-                Some(Ok(topics)) => topics,
-                Some(Err(error)) => {
+            let Some(node) = net.upgrade().map(|current| current.node.clone()) else {
+                return;
+            };
+            let topics = match tokio::task::spawn_blocking(move || node.list_topics()).await {
+                Ok(Ok(topics)) => topics,
+                Ok(Err(error)) => {
                     tracing::warn!(%error, "sweep could not list topics to quarantine");
                     return;
                 }
-                None => return,
+                Err(error) => {
+                    tracing::warn!(%error, "sweep topic listing job failed");
+                    return;
+                }
             };
             for (index, topic) in topics.into_iter().enumerate() {
                 let Some(current) = net.upgrade() else {
@@ -5016,6 +5040,54 @@ mod tests {
         assert!(
             !gate.has_left(),
             "the target was dispatched only after maintenance"
+        );
+
+        drop(release);
+        net.shutdown().await;
+    }
+
+    /// Target discovery held inside its storage read does not hold dispatch: a
+    /// target scheduled meanwhile is claimed while the sweep still waits.
+    #[tokio::test]
+    async fn sweep_discovery_isolated() {
+        use crate::tests::support::{Gate, GatePoint, Note, node};
+
+        let (net, storage) = stale_net().await;
+        let remote = node(73).peer_id();
+        let healthy = net
+            .node
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [remote].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Topics, Arc::clone(&gate));
+        net.spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("loop starts");
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+
+        net.schedule_resync(remote, healthy);
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !net
+                .resync_scheduler
+                .target_state(remote, healthy)
+                .is_some_and(|(active, failures, _)| active.is_some() || failures > 0)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the target was not dispatched while discovery was held");
+        assert!(
+            !gate.has_left(),
+            "the target was dispatched only after discovery"
         );
 
         drop(release);

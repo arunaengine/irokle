@@ -139,6 +139,7 @@ pub(crate) enum GatePoint {
     Heads(TopicId),
     Meta(OpId),
     PeerAck(PeerId),
+    Topics,
 }
 
 impl Gate {
@@ -381,6 +382,7 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
         self.inner.topic_state(topic_id)
     }
     fn list_topics(&self) -> Result<Vec<crate::TopicInfo>, Error> {
+        self.gate_read(GatePoint::Topics);
         self.inner.list_topics()
     }
     fn topic_view(
