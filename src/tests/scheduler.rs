@@ -608,3 +608,47 @@ async fn stale_receipt_restarts() {
         bob_net.shutdown().await;
     }
 }
+
+/// A batch of many behind topics plans one stream group at a time: planned
+/// pages held at once stay within two stream budgets instead of every topic's
+/// push page, and every topic still reaches the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn planning_holds_one_group() {
+    let lookup = Lookup::new();
+    let limits = StreamLimits {
+        bytes: 256 * 1024,
+        ..StreamLimits::default()
+    };
+    let (alice, net) = client(&lookup, limits).await;
+    let (bob, bob_net) = server(
+        MemoryStorage::new(),
+        &lookup,
+        alice.peer_id(),
+        StreamLimits::default(),
+    )
+    .await;
+    let topics = (0..24)
+        .map(|_| {
+            let topic_id = shared_topic(&alice, &bob);
+            publish(&alice, topic_id, 60, 1024);
+            topic_id
+        })
+        .collect::<Vec<_>>();
+    for topic_id in &topics {
+        net.resync_scheduler
+            .schedule_now(bob.peer_id(), *topic_id, false);
+    }
+    drain_due(&net, 64).await;
+    for topic_id in &topics {
+        assert_eq!(clock(&bob, *topic_id), clock(&alice, *topic_id));
+    }
+    let peak = net.planned_peak.load(Ordering::Relaxed);
+    assert!(peak > 0);
+    assert!(
+        peak <= 2 * limits.bytes,
+        "{peak} planned bytes held at once for a {} byte stream",
+        limits.bytes
+    );
+    net.shutdown().await;
+    bob_net.shutdown().await;
+}

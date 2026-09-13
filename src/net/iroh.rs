@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -817,6 +817,9 @@ pub struct SharedNet<S: Storage> {
     // payloads under the winning genesis; when unset they are recovered from
     // the eviction journal instead.
     eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
+    /// Most framed bytes of planned topic messages held at once.
+    #[cfg(test)]
+    planned_peak: std::sync::atomic::AtomicUsize,
 }
 
 impl<S: Storage> std::ops::Deref for IrohNet<S> {
@@ -908,6 +911,8 @@ impl<S: Storage> IrohNet<S> {
                 bulk_lane: Arc::new(tokio::sync::Semaphore::new(BULK_JOBS)),
                 attempt_epoch,
                 eviction_sink,
+                #[cfg(test)]
+                planned_peak: Default::default(),
             }),
         })
     }
@@ -2256,122 +2261,150 @@ impl<S: Storage> IrohNet<S> {
             }
         }
 
-        let mut pending = Vec::with_capacity(summaries.len());
-        let summary_topics = summaries.keys().copied().collect::<Vec<_>>();
-        let plans = self
-            .run_job(Lane::Bulk, move |shared| {
-                summaries
-                    .into_iter()
-                    .map(|(topic_id, summary)| {
-                        (
-                            topic_id,
-                            shared.plan_topic_messages(remote_peer_id, topic_id, &summary),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .await
-            .unwrap_or_else(|error| {
-                summary_topics
-                    .into_iter()
-                    .map(|topic_id| (topic_id, Err(clone_error(&error))))
-                    .collect()
-            });
-        for (topic_id, plan) in plans {
-            match plan {
-                Ok(Some(planned)) => pending.push(planned),
-                Ok(None) => {
-                    outcomes.insert(topic_id, Ok(()));
-                }
+        // Topics are planned one group at a time: only the group being sent,
+        // plus the one planned topic that did not fit it, is held in memory.
+        let limits = self.limits;
+        let mut queue = summaries.into_iter().collect::<VecDeque<_>>();
+        let mut carried = None;
+        while !queue.is_empty() || carried.is_some() {
+            let unplanned = queue
+                .iter()
+                .map(|(topic_id, _)| *topic_id)
+                .chain(
+                    carried
+                        .as_ref()
+                        .map(|planned: &PlannedTopicSync| planned.topic_id),
+                )
+                .collect::<Vec<_>>();
+            let taken = std::mem::take(&mut queue);
+            let held = carried.take();
+            let planned = self
+                .run_job(Lane::Bulk, move |shared| {
+                    shared.plan_group(remote_peer_id, taken, held, limits)
+                })
+                .await;
+            let PlannedGroup {
+                group,
+                next,
+                rest,
+                outcomes: planned_outcomes,
+            } = match planned {
+                Ok(planned) => planned,
                 Err(error) => {
-                    outcomes.insert(topic_id, Err(error));
-                }
-            }
-        }
-
-        let mut group = Vec::new();
-        let mut group_messages = 0_usize;
-        let mut group_responses = 0_usize;
-        let mut group_bytes = 0_usize;
-        for planned in pending {
-            let bytes = match planned.messages.iter().try_fold(0usize, |bytes, message| {
-                super::framed_message_len(message).map(|len| bytes.saturating_add(len))
-            }) {
-                Ok(bytes) if bytes <= self.limits.bytes => bytes,
-                Ok(_) => {
-                    outcomes.insert(
-                        planned.topic_id,
-                        Err(invalid_data("sync plan exceeds stream byte limit")),
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    outcomes.insert(planned.topic_id, Err(error));
-                    continue;
+                    for topic_id in unplanned {
+                        outcomes.insert(topic_id, Err(clone_error(&error)));
+                    }
+                    break;
                 }
             };
-            if !group.is_empty()
-                && (group_bytes.saturating_add(bytes) > self.limits.bytes
-                    || group_messages + planned.messages.len() > self.limits.batch_messages
-                    || group_responses + planned.estimated_responses > self.limits.batch_messages)
-            {
-                self.run_topic_batch_exchange(
-                    peer.clone(),
-                    remote_peer_id,
-                    std::mem::take(&mut group),
-                    &mut outcomes,
-                    &mut advanced,
-                )
-                .await;
-                // Each topic's durable outcome is published before the next
-                // exchange awaits, so a later failure or the batch deadline
-                // cannot re-run work this batch already finished.
-                if let Some((lease, runtime)) = settle.as_mut() {
-                    self.settle_known_results(
-                        remote_peer_id,
-                        &outcomes,
-                        &advanced,
-                        &mut settled,
-                        lease,
-                        *runtime,
-                    )
-                    .await;
-                }
-                group_messages = 0;
-                group_responses = 0;
-                group_bytes = 0;
+            outcomes.extend(planned_outcomes);
+            queue = rest;
+            carried = next;
+            if group.is_empty() {
+                continue;
             }
-            group_bytes += bytes;
-            group_messages += planned.messages.len();
-            group_responses += planned.estimated_responses;
-            group.push(planned);
-        }
-        if !group.is_empty() {
             self.run_topic_batch_exchange(
-                peer,
+                peer.clone(),
                 remote_peer_id,
                 group,
                 &mut outcomes,
                 &mut advanced,
             )
             .await;
-        }
-        if let Some((lease, runtime)) = settle.as_mut() {
-            self.settle_known_results(
-                remote_peer_id,
-                &outcomes,
-                &advanced,
-                &mut settled,
-                lease,
-                *runtime,
-            )
-            .await;
+            // Each topic's durable outcome is published before the next
+            // exchange awaits, so a later failure or the batch deadline
+            // cannot re-run work this batch already finished.
+            if let Some((lease, runtime)) = settle.as_mut() {
+                self.settle_known_results(
+                    remote_peer_id,
+                    &outcomes,
+                    &advanced,
+                    &mut settled,
+                    lease,
+                    *runtime,
+                )
+                .await;
+            }
         }
         BatchOutcomes::new(outcomes, advanced, settled)
     }
 }
 
 impl<S: Storage> SharedNet<S> {
+    /// Plans topics from `queue`, after `held`, into one group that fits a
+    /// stream. The first planned topic that does not fit is returned as `next`
+    /// with the unplanned rest, so planning never runs ahead of sending.
+    fn plan_group(
+        &self,
+        remote_peer_id: PeerId,
+        mut queue: VecDeque<(crate::TopicId, SyncSummary)>,
+        mut held: Option<PlannedTopicSync>,
+        limits: StreamLimits,
+    ) -> PlannedGroup {
+        let mut planned_group = PlannedGroup {
+            group: Vec::new(),
+            next: None,
+            rest: VecDeque::new(),
+            outcomes: Vec::new(),
+        };
+        let (mut messages, mut responses, mut bytes) = (0_usize, 0_usize, 0_usize);
+        loop {
+            let planned = match held.take() {
+                Some(planned) => planned,
+                None => {
+                    let Some((topic_id, summary)) = queue.pop_front() else {
+                        break;
+                    };
+                    match self.plan_topic_messages(remote_peer_id, topic_id, &summary) {
+                        Ok(Some(planned)) => planned,
+                        Ok(None) => {
+                            planned_group.outcomes.push((topic_id, Ok(())));
+                            continue;
+                        }
+                        Err(error) => {
+                            planned_group.outcomes.push((topic_id, Err(error)));
+                            continue;
+                        }
+                    }
+                }
+            };
+            let size = match planned.messages.iter().try_fold(0usize, |bytes, message| {
+                super::framed_message_len(message).map(|len| bytes.saturating_add(len))
+            }) {
+                Ok(size) if size <= limits.bytes => size,
+                Ok(_) => {
+                    let error = invalid_data("sync plan exceeds stream byte limit");
+                    planned_group.outcomes.push((planned.topic_id, Err(error)));
+                    continue;
+                }
+                Err(error) => {
+                    planned_group.outcomes.push((planned.topic_id, Err(error)));
+                    continue;
+                }
+            };
+            if !planned_group.group.is_empty()
+                && (bytes.saturating_add(size) > limits.bytes
+                    || messages + planned.messages.len() > limits.batch_messages
+                    || responses + planned.estimated_responses > limits.batch_messages)
+            {
+                #[cfg(test)]
+                self.planned_peak
+                    .fetch_max(bytes + size, std::sync::atomic::Ordering::Relaxed);
+                planned_group.next = Some(planned);
+                break;
+            }
+            bytes += size;
+            messages += planned.messages.len();
+            responses += planned.estimated_responses;
+            planned_group.group.push(planned);
+        }
+        #[cfg(test)]
+        self.planned_peak
+            .fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+        planned_group.rest = queue;
+        planned_group
+    }
+
     fn plan_topic_messages(
         &self,
         remote_peer_id: PeerId,
@@ -3533,6 +3566,15 @@ struct BatchReplies {
     more: BTreeSet<crate::TopicId>,
     /// A response outside the protocol, which fails the whole group.
     unexpected: Option<io::Error>,
+}
+
+/// One group of planned topics that fits a stream, and where planning stopped.
+struct PlannedGroup {
+    group: Vec<PlannedTopicSync>,
+    /// A planned topic that did not fit, first in the next group.
+    next: Option<PlannedTopicSync>,
+    rest: VecDeque<(crate::TopicId, SyncSummary)>,
+    outcomes: Vec<(crate::TopicId, io::Result<()>)>,
 }
 
 struct PlannedTopicSync {
