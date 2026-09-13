@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ack = match bob.receive_sync_outcome(alice.peer_id(), data_for_bob)? {
         ReceiveOutcome::Acked { ack, .. } => ack,
         ReceiveOutcome::Staged(staged) => {
-            return Err(format!("still staged: {} ops", staged.ops).into());
+            return Err(format!("still staged: {} bytes", staged.bytes).into());
         }
     };
     alice.apply_sync_ack(&ack)?;

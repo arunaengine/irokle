@@ -13,12 +13,12 @@ use crate::{
 use super::fjall_provisional::{ACTIVATING, ADMITTED_BYTES};
 use super::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
-    ObligationTarget, OpMeta, PeerAck, ProvisionalTopic, SnapshotRead, StagedTopic, StagingLimits,
-    Storage, StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState,
-    TopicView, ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches,
-    check_namespace, ensure_deps_resolvable, journalled_eviction, merged_obligation,
-    merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes, settled_obligation,
-    stored_ack_dominates, topic_fingerprint_for, validate_batch, validate_heads,
+    ObligationTarget, OpMeta, PeerAck, ProvisionalTopic, SnapshotRead, StagingLimits, Storage,
+    StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView,
+    ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches, check_namespace,
+    ensure_deps_resolvable, journalled_eviction, merged_obligation, merged_peer_ack,
+    new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
+    topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[cfg(feature = "fjall")]
@@ -37,7 +37,7 @@ pub struct FjallStorage {
 }
 
 #[cfg(feature = "fjall")]
-const FJALL_SCHEMA_VERSION: u32 = 4;
+const FJALL_SCHEMA_VERSION: u32 = 5;
 /// Eviction journal records. No other keyspace begins with `e`, so this is the
 /// whole prefix: unlike `ob`, it cannot be shadowed by a single-letter prefix.
 #[cfg(feature = "fjall")]
@@ -214,13 +214,19 @@ impl FjallStorage {
             Some(1) => {
                 self.migrate_to_schema_two()?;
                 self.migrate_to_schema_three()?;
-                self.migrate_to_schema_four()
+                self.migrate_to_schema_four()?;
+                self.migrate_to_schema_five()
             }
             Some(2) => {
                 self.migrate_to_schema_three()?;
-                self.migrate_to_schema_four()
+                self.migrate_to_schema_four()?;
+                self.migrate_to_schema_five()
             }
-            Some(3) => self.migrate_to_schema_four(),
+            Some(3) => {
+                self.migrate_to_schema_four()?;
+                self.migrate_to_schema_five()
+            }
+            Some(4) => self.migrate_to_schema_five(),
             Some(version) => Err(Error::Storage(format!(
                 "unsupported fjall schema version {version}"
             ))),
@@ -432,6 +438,24 @@ impl FjallStorage {
                     }
                 }
                 Self::tx_import_pending(tx, &self.records, source_peer, &op, missing)?;
+            }
+            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &4_u32)?;
+            Ok(())
+        })
+    }
+
+    /// Upgrade a schema 4 database. Its bootstrap staging named neither the
+    /// branch nor a session, so no receipt can be tied to it: those unscoped
+    /// records are discarded as unacknowledged provisional state, never
+    /// assigned to a branch from current data. Active topics, evidence,
+    /// obligations and the eviction journal are untouched.
+    fn migrate_to_schema_five(&self) -> Result<()> {
+        self.transaction(|tx| {
+            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(4) {
+                return Ok(());
+            }
+            for prefix in [b"bm".as_slice(), b"bo".as_slice()] {
+                Self::tx_remove_prefix(tx, &self.records, prefix)?;
             }
             Self::tx_put(
                 tx,
@@ -1713,56 +1737,6 @@ impl Storage for FjallStorage {
 
     fn reset_topic(&self, topic_id: &TopicId) -> Result<usize> {
         self.transaction(|tx| self.tx_reset_topic(tx, topic_id))
-    }
-
-    fn stage_bootstrap_ops(
-        &self,
-        source: PeerId,
-        topic_id: TopicId,
-        ops: Vec<Op>,
-        now_ms: u64,
-    ) -> Result<StagedTopic> {
-        let charges = Self::staged_charges(&topic_id, &ops)?;
-        self.transaction(|tx| {
-            Self::tx_stage_ops(
-                tx,
-                &self.records,
-                (source, topic_id),
-                &ops,
-                &charges,
-                now_ms,
-            )
-        })
-    }
-
-    fn staged_bootstrap_ops(&self, source: &PeerId, topic_id: &TopicId) -> Result<Vec<Op>> {
-        self.read_staged_ops(source, topic_id)
-    }
-
-    fn staged_topic(&self, source: &PeerId, topic_id: &TopicId) -> Result<StagedTopic> {
-        self.read_staged_topic(source, topic_id)
-    }
-
-    fn promote_bootstrap(&self, batch: AdmittedBatch) -> Result<()> {
-        self.transaction(|tx| {
-            if fjall::Readable::contains_key(
-                tx,
-                &self.records,
-                Self::key_id(b"ts", &batch.topic_id),
-            )? {
-                return Err(Error::AdmissionConflict);
-            }
-            self.tx_admit_batch(tx, &batch)?;
-            Self::tx_discard_topic(tx, &self.records, &batch.topic_id)
-        })
-    }
-
-    fn discard_bootstrap(&self, source: &PeerId, topic_id: &TopicId) -> Result<usize> {
-        self.transaction(|tx| Self::tx_discard_session(tx, &self.records, source, topic_id))
-    }
-
-    fn expire_bootstrap(&self, older_than_ms: u64) -> Result<usize> {
-        self.transaction(|tx| Self::tx_expire_sessions(tx, &self.records, older_than_ms))
     }
 
     fn staging_limits(&self) -> StagingLimits {

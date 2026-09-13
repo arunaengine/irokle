@@ -37,7 +37,6 @@ pub const MAX_PENDING_EVICTIONS: usize = 1024;
 /// kept per source and topic until its history proves membership.
 pub const MAX_STAGED_BYTES_TOTAL: u64 = 64 * 1024 * 1024;
 pub const MAX_STAGED_BYTES_PER_SESSION: u64 = 32 * 1024 * 1024;
-pub const MAX_STAGED_OPS_PER_SESSION: u64 = 65536;
 pub const MAX_STAGED_SESSIONS: usize = 64;
 pub const MAX_STAGED_SESSIONS_PER_SOURCE: usize = 8;
 /// A session with no write for this long may be expired.
@@ -250,8 +249,8 @@ pub struct AdmittedBatch {
     pub effects: AdmissionEffects,
 }
 
-/// What one bootstrap staging session holds. It is a receipt, not an ack: it
-/// certifies nothing about an active topic and clears no obligation.
+/// What one source staged for a topic this node does not hold. It is a
+/// receipt, not an ack: it certifies nothing and clears no obligation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StagedTopic {
     /// The branch the namespace holds; `None` when nothing is staged.
@@ -260,7 +259,7 @@ pub struct StagedTopic {
     pub session: u64,
     /// Highest contiguous sequence staged per actor.
     pub clock: ActorClock,
-    pub ops: u64,
+    /// Serialized bytes the namespace holds, admitted and buffered.
     pub bytes: u64,
 }
 
@@ -625,35 +624,6 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// from one view.
     fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>>;
 
-    /// Unscoped staging, replaced by provisional namespaces; kept only until
-    /// every backend dropped it.
-    fn stage_bootstrap_ops(
-        &self,
-        _source: PeerId,
-        _topic_id: TopicId,
-        _ops: Vec<Op>,
-        _now_ms: u64,
-    ) -> Result<StagedTopic> {
-        Err(crate::Error::StagingCapacity(
-            "unscoped staging is replaced by provisional namespaces".into(),
-        ))
-    }
-    fn staged_bootstrap_ops(&self, _source: &PeerId, _topic_id: &TopicId) -> Result<Vec<Op>> {
-        Ok(Vec::new())
-    }
-    fn staged_topic(&self, _source: &PeerId, _topic_id: &TopicId) -> Result<StagedTopic> {
-        Ok(StagedTopic::default())
-    }
-    fn promote_bootstrap(&self, _batch: AdmittedBatch) -> Result<()> {
-        Err(crate::Error::AdmissionConflict)
-    }
-    fn discard_bootstrap(&self, _source: &PeerId, _topic_id: &TopicId) -> Result<usize> {
-        Ok(0)
-    }
-    fn expire_bootstrap(&self, _older_than_ms: u64) -> Result<usize> {
-        Ok(0)
-    }
-
     /// The limits this store applies to provisional bootstraps.
     fn staging_limits(&self) -> StagingLimits;
     /// Every provisional bootstrap namespace.
@@ -703,8 +673,6 @@ mod fjall;
 mod fjall_pending;
 #[cfg(feature = "fjall")]
 mod fjall_provisional;
-#[cfg(feature = "fjall")]
-mod fjall_staging;
 #[cfg(feature = "fjall")]
 pub use fjall::FjallStorage;
 
@@ -839,56 +807,6 @@ pub(super) fn check_pending_quota(
     Ok(())
 }
 
-/// Usage and last write of one bootstrap staging session.
-#[cfg(feature = "fjall")]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct StagedSession {
-    pub(super) ops: u64,
-    pub(super) bytes: u64,
-    pub(super) updated_ms: u64,
-}
-
-/// Refuse a new session past the total or per-source session limit.
-#[cfg(feature = "fjall")]
-pub(super) fn check_staged_session(sessions: usize, source_sessions: usize) -> Result<()> {
-    if sessions >= MAX_STAGED_SESSIONS {
-        return Err(crate::Error::Storage(
-            "bootstrap staging sessions are full".into(),
-        ));
-    }
-    if source_sessions >= MAX_STAGED_SESSIONS_PER_SOURCE {
-        return Err(crate::Error::Storage(
-            "bootstrap staging session quota exceeded for source".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Refuse a staged op of `charge` bytes past the session or total limits.
-#[cfg(feature = "fjall")]
-pub(super) fn check_staged_op(
-    total_bytes: u64,
-    session: &StagedSession,
-    charge: u64,
-) -> Result<()> {
-    if session.ops >= MAX_STAGED_OPS_PER_SESSION {
-        return Err(crate::Error::Storage(
-            "bootstrap staging op quota exceeded".into(),
-        ));
-    }
-    if session.bytes + charge > MAX_STAGED_BYTES_PER_SESSION {
-        return Err(crate::Error::Storage(
-            "bootstrap staging byte quota exceeded".into(),
-        ));
-    }
-    if total_bytes + charge > MAX_STAGED_BYTES_TOTAL {
-        return Err(crate::Error::Storage(
-            "bootstrap staging byte budget is full".into(),
-        ));
-    }
-    Ok(())
-}
-
 /// Refuse a new provisional namespace past the total or per-source count.
 pub(super) fn check_namespaces(
     limits: &StagingLimits,
@@ -916,19 +834,6 @@ pub(super) fn check_namespace(held: u64, charge: u64, limit: u64) -> Result<()> 
         ));
     }
     Ok(())
-}
-
-/// Highest contiguous sequence per actor of `slots`, sorted by actor then
-/// sequence.
-#[cfg(feature = "fjall")]
-pub(super) fn staged_clock(slots: impl IntoIterator<Item = (ActorId, u64)>) -> ActorClock {
-    let mut clock = ActorClock::new();
-    for (actor_id, seq) in slots {
-        if clock.get(&actor_id) + 1 == seq {
-            clock.observe(actor_id, seq);
-        }
-    }
-    clock
 }
 
 pub(crate) fn topic_fingerprint_for(

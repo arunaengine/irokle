@@ -95,7 +95,7 @@ fn check_upgrade(name: &str, certified: bool) {
     let m = Manifest::read(dir.path());
     let path = dir.path().join("db");
     drop(FjallStorage::open(&path).unwrap());
-    assert_eq!(stored_version(&path), 4);
+    assert_eq!(stored_version(&path), 5);
     let storage = FjallStorage::open(&path).unwrap();
 
     let topic: TopicId = m.id("topic");
@@ -257,7 +257,7 @@ fn concurrent_open_agrees() {
             .collect::<Vec<_>>();
         assert_eq!(seen[0], seen[1], "{name}");
         drop(db);
-        assert_eq!(stored_version(&dir.path().join("db")), 4, "{name}");
+        assert_eq!(stored_version(&dir.path().join("db")), 5, "{name}");
     }
 }
 
@@ -280,7 +280,7 @@ fn upgrade_rolls_back() {
 
         raw_write(&path, &key, value);
         drop(FjallStorage::open(&path).unwrap());
-        assert_eq!(stored_version(&path), 4, "{name}");
+        assert_eq!(stored_version(&path), 5, "{name}");
     }
 }
 

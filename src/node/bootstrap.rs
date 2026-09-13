@@ -330,7 +330,6 @@ fn staged_of<S: Storage>(provisional: &ProvisionalTopic, store: &S) -> Result<St
         genesis: Some(provisional.genesis),
         session: provisional.session,
         clock,
-        ops: 0,
         bytes: store.stored_bytes()?,
     })
 }
