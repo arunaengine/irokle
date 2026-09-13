@@ -685,6 +685,80 @@ async fn fjall_expired_staging() {
     assert_expired_staging(crate::storage::FjallStorage::open(dir.path()).unwrap()).await;
 }
 
+/// A claimed attempt is held while more attempts than a status remembers
+/// complete for the same target. Its first completion still counts, without
+/// replacing the newer state and error; its repeat counts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_attempt_counts() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let peer = crate::tests::support::node(90).peer_id();
+    let topic_id = alice
+        .create_topic::<Note>(crate::TopicConfig {
+            initial_peers: [peer].into(),
+            ..crate::TopicConfig::default()
+        })
+        .unwrap()
+        .id();
+    let scheduler = &net.resync_scheduler;
+    scheduler.schedule_now(peer, topic_id, false);
+    let (_, claims) = scheduler.due_targets_by_peer(1, 8).pop().unwrap();
+    let mut lease = scheduler.lease(claims, BACKOFF);
+    let key = ResyncTargetKey {
+        peer_id: peer,
+        topic_id,
+    };
+    let held = lease.take_claim(&key).unwrap();
+    let held_attempt = held.expect_claim().attempt;
+
+    let later = 2 * crate::storage::MAX_RECENT_ATTEMPTS as u64 + 8;
+    for index in 0..later {
+        let attempt_id = next_attempt_id().unwrap();
+        let live = scheduler.begin_attempts([key], attempt_id);
+        let outcome = crate::AttemptOutcome::Failed(format!("later {index}"));
+        let first = live.end(key);
+        alice
+            .record_attempt_result(
+                peer,
+                topic_id,
+                net.attempt_identity(Some(attempt_id)),
+                &outcome,
+                first,
+            )
+            .unwrap();
+    }
+    let newest = status(&alice, peer, topic_id);
+    assert_eq!(
+        (newest.successful_attempts, newest.failed_attempts),
+        (0, later)
+    );
+
+    net.record_results(peer, vec![(topic_id, Ok(()), false, Some(held))], runtime());
+    let counted = status(&alice, peer, topic_id);
+    assert_eq!(
+        (counted.successful_attempts, counted.failed_attempts),
+        (1, later)
+    );
+    assert_eq!(counted.state, newest.state);
+    assert_eq!(counted.last_error, newest.last_error);
+    assert_eq!(counted.latest_attempt, newest.latest_attempt);
+
+    // The same attempt recorded again is no longer live and counts nothing.
+    let first = scheduler.end_attempt(key, held_attempt);
+    assert!(!first);
+    let repeat = alice
+        .record_attempt_result(
+            peer,
+            topic_id,
+            net.attempt_identity(Some(held_attempt)),
+            &crate::AttemptOutcome::Complete,
+            first,
+        )
+        .unwrap();
+    assert_eq!(repeat, counted);
+    net.shutdown().await;
+}
+
 /// A batch of many behind topics plans one stream group at a time: planned
 /// pages held at once stay within two stream budgets instead of every topic's
 /// push page, and every topic still reaches the peer.

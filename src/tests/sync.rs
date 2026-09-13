@@ -2108,7 +2108,7 @@ fn assert_outcome_states<S: Storage>(storage: S) {
     ];
     for (sequence, (outcome, state, error)) in (1..).zip(steps) {
         alice
-            .record_attempt_result(peer, topic_id, (epoch, sequence), &outcome)
+            .record_attempt_result(peer, topic_id, (epoch, sequence), &outcome, true)
             .unwrap();
         let status = alice.sync_status(topic_id).unwrap().remove(0);
         assert_eq!(status.pending_obligations, 0);
@@ -2121,6 +2121,7 @@ fn assert_outcome_states<S: Storage>(storage: S) {
             topic_id,
             (epoch, 2),
             &crate::AttemptOutcome::Failed("late".into()),
+            true,
         )
         .unwrap();
     assert_eq!(old.state, crate_storage::SyncPeerState::Healthy);

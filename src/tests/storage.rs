@@ -2060,9 +2060,9 @@ fn assert_attempt_order<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S) {
     );
 }
 
-/// Replaying every result of more attempts than a status remembers counts
-/// nothing again and leaves the newest outcome in place, before and after a
-/// reopen.
+/// Replaying the results a status remembers counts nothing again and leaves
+/// the newest outcome in place, before and after a reopen; the first result of
+/// an older attempt still counts.
 fn assert_replay_counts_once<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S) {
     let peer = PeerId::hash(b"replay-peer");
     let topic_id = TopicId::hash(b"replay-topic");
@@ -2086,13 +2086,28 @@ fn assert_replay_counts_once<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S
         expected.successful_attempts + expected.failed_attempts,
         attempts
     );
-    for sequence in 0..attempts {
+    let remembered = attempts - crate_storage::MAX_RECENT_ATTEMPTS as u64..attempts;
+    for sequence in remembered.clone() {
         assert_eq!(apply(&storage, sequence), expected, "replay of {sequence}");
     }
     let storage = reopen(storage);
-    for sequence in (0..attempts).rev() {
+    for sequence in remembered.rev() {
         assert_eq!(apply(&storage, sequence), expected, "replay of {sequence}");
     }
+    let older = apply(&storage, attempts + 1_000);
+    let first = storage
+        .update_sync_status(
+            &peer,
+            &topic_id,
+            &attempt_outcome((epoch - 1, 5), attempts + 2_000, false),
+        )
+        .unwrap();
+    assert_eq!(
+        first.successful_attempts + first.failed_attempts,
+        older.successful_attempts + older.failed_attempts + 1,
+        "an older first completion counts"
+    );
+    assert_eq!(first.latest_attempt, older.latest_attempt);
 }
 
 #[test]

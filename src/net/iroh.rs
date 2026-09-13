@@ -297,9 +297,57 @@ struct ScheduledResync {
 struct ResyncScheduler {
     inner: Arc<Mutex<BTreeMap<ResyncTargetKey, ScheduledResync>>>,
     notify: Arc<tokio::sync::Notify>,
+    /// Attempts started and not yet recorded or released. A completion counts
+    /// only while its attempt is live, so a repeat counts nothing however old.
+    live: Arc<Mutex<BTreeSet<(ResyncTargetKey, AttemptId)>>>,
+}
+
+/// Live manual attempts one sync owns; dropping it ends those not recorded.
+struct LiveAttempts {
+    scheduler: ResyncScheduler,
+    attempt: AttemptId,
+}
+
+impl LiveAttempts {
+    /// Ends the attempt of `key`, returning whether it was still live.
+    fn end(&self, key: ResyncTargetKey) -> bool {
+        self.scheduler.end_attempt(key, self.attempt)
+    }
+}
+
+impl Drop for LiveAttempts {
+    fn drop(&mut self) {
+        // Runs from `Drop`: a poisoned registry only loses bookkeeping.
+        if let Ok(mut live) = self.scheduler.live.lock() {
+            live.retain(|(_, attempt)| *attempt != self.attempt);
+        }
+    }
 }
 
 impl ResyncScheduler {
+    /// Registers `attempt` as live for every target of `keys`.
+    fn begin_attempts(
+        &self,
+        keys: impl IntoIterator<Item = ResyncTargetKey>,
+        attempt: AttemptId,
+    ) -> LiveAttempts {
+        if let Ok(mut live) = self.live.lock() {
+            live.extend(keys.into_iter().map(|key| (key, attempt)));
+        }
+        LiveAttempts {
+            scheduler: self.clone(),
+            attempt,
+        }
+    }
+
+    /// Ends a live attempt, returning whether it was live: only its first
+    /// completion is counted.
+    fn end_attempt(&self, key: ResyncTargetKey, attempt: AttemptId) -> bool {
+        self.live
+            .lock()
+            .is_ok_and(|mut live| live.remove(&(key, attempt)))
+    }
+
     fn notifier(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.notify)
     }
@@ -426,6 +474,9 @@ impl ResyncScheduler {
                     break;
                 };
                 target.active = Some(attempt);
+                if let Ok(mut live) = self.live.lock() {
+                    live.insert((key, attempt));
+                }
                 batch.push(ResyncTarget {
                     key,
                     attempt,
@@ -565,6 +616,7 @@ impl ResyncScheduler {
     /// Hands a claim back without judging the peer. Runs from `Drop`, so it
     /// must not panic, await or touch storage.
     fn release_claim(&self, claim: ResyncTarget, after: Duration) {
+        self.end_attempt(claim.key, claim.attempt);
         let Ok(mut targets) = self.inner.lock() else {
             return;
         };
@@ -1855,8 +1907,18 @@ impl<S: Storage> IrohNet<S> {
                     .collect();
             }
         };
-        let attempt = self.attempt_identity(None);
+        let attempt_id = next_attempt_id();
+        let attempt = self.attempt_identity(attempt_id);
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
+        let live = attempt_id.map(|attempt_id| {
+            self.resync_scheduler.begin_attempts(
+                topic_ids.iter().map(|topic_id| ResyncTargetKey {
+                    peer_id: remote_peer_id,
+                    topic_id: *topic_id,
+                }),
+                attempt_id,
+            )
+        });
         let endpoint_id = peer.id;
         // A bounded page is not the goal: keep paging while the exchange really
         // advances, up to a caller budget, so catching up is not reported as an
@@ -1910,11 +1972,18 @@ impl<S: Storage> IrohNet<S> {
             .run_job(Lane::Control, move |shared| {
                 shared.note_outcome(remote_peer_id, noted.iter().map(|noted| noted.as_ref().copied()));
                 for (topic_id, outcome, advancing) in finished {
-                    if let Err(error) =
-                        shared
-                            .node
-                            .record_attempt_result(remote_peer_id, topic_id, attempt, &outcome)
-                    {
+                    let key = ResyncTargetKey {
+                        peer_id: remote_peer_id,
+                        topic_id,
+                    };
+                    let first = live.as_ref().is_some_and(|live| live.end(key));
+                    if let Err(error) = shared.node.record_attempt_result(
+                        remote_peer_id,
+                        topic_id,
+                        attempt,
+                        &outcome,
+                        first,
+                    ) {
                         tracing::warn!(%remote_peer_id, %topic_id, %error, "failed to record sync attempt");
                     }
                     // A manual sync holds no claim, so it reports evidence instead of
@@ -3280,12 +3349,17 @@ impl<S: Storage> SharedNet<S> {
         runtime: IrohRuntimeConfig,
     ) {
         for (topic_id, result, advanced, claim) in results {
+            // A claim's completion counts once; a topic without one takes a new identity.
+            let first = claim.as_ref().is_none_or(|claim| {
+                self.resync_scheduler
+                    .end_attempt(claim.key(), claim.expect_claim().attempt)
+            });
             let attempt =
                 self.attempt_identity(claim.as_ref().map(|claim| claim.expect_claim().attempt));
             let outcome = attempt_outcome(result.as_ref().copied(), advanced);
             if let Err(error) =
                 self.node
-                    .record_attempt_result(remote_peer_id, topic_id, attempt, &outcome)
+                    .record_attempt_result(remote_peer_id, topic_id, attempt, &outcome, first)
             {
                 tracing::warn!(%remote_peer_id, %topic_id, %error, "failed to record sync attempt");
             }

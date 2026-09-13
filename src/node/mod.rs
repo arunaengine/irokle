@@ -1092,13 +1092,23 @@ impl<S: Storage> Irokle<S> {
     /// so a partial pull stays `Behind`; Complete and Advanced count as successes,
     /// Blocked and Failed as failures. Peer health is left to the caller.
     #[cfg(any(feature = "iroh", test))]
+    /// Record the outcome of attempt `attempt`. Only its first completion,
+    /// `first`, counts or moves the state; a repeat returns the stored status.
     pub(crate) fn record_attempt_result(
         &self,
         peer_id: PeerId,
         topic_id: TopicId,
         attempt: (u64, u64),
         outcome: &crate::AttemptOutcome,
+        first: bool,
     ) -> Result<SyncPeerStatus> {
+        if !first {
+            return self.storage().update_sync_status(
+                &peer_id,
+                &topic_id,
+                &SyncStatusUpdate::default(),
+            );
+        }
         let attempt_ms = now_millis()?;
         let pending = self.storage().sync_obligation_count(&peer_id, &topic_id)?;
         let (state, error) = match outcome {

@@ -346,16 +346,16 @@ pub struct SyncPeerStatus {
     /// Newest attempt identity, `(epoch, sequence)`, whose outcome set the
     /// state, error and pending gauge.
     pub latest_attempt: Option<(u64, u64)>,
-    /// The newest identities already counted, so a repeated completion of one
-    /// attempt counts once. Bounded by `MAX_RECENT_ATTEMPTS`; once full, an
-    /// identity older than all of them is treated as already counted.
+    /// The newest identities already counted, so a repeat of one of them
+    /// counts nothing. Bounded by `MAX_RECENT_ATTEMPTS`. An older identity
+    /// counts: the recorder counts each attempt once, see the transport's
+    /// live attempts.
     pub recent_attempts: Vec<(u64, u64)>,
 }
 
-/// Attempt identities a status remembers for duplicate detection. A completion
-/// arriving after this many newer ones of the same peer and topic counts
-/// nothing, so a replay can never count twice. Twice the tested concurrency of
-/// completions for one target.
+/// Attempt identities a status remembers to ignore their repeats. Exactly once
+/// counting of every attempt belongs to the recorder, which ends a live
+/// attempt on its first completion.
 pub(crate) const MAX_RECENT_ATTEMPTS: usize = 32;
 
 /// How one update moves the stored sync state.
@@ -954,15 +954,7 @@ pub(super) fn apply_status_update(status: &mut SyncPeerStatus, update: &SyncStat
     let expected = update.expected_attempts.is_none_or(|want| want == attempts);
     let current = match update.attempt {
         Some(attempt) => {
-            let below_horizon = status.recent_attempts.len() >= MAX_RECENT_ATTEMPTS
-                && status
-                    .recent_attempts
-                    .first()
-                    .is_some_and(|oldest| attempt < *oldest);
-            if status.latest_attempt == Some(attempt)
-                || status.recent_attempts.contains(&attempt)
-                || below_horizon
-            {
+            if status.latest_attempt == Some(attempt) || status.recent_attempts.contains(&attempt) {
                 return false;
             }
             status.recent_attempts.push(attempt);
