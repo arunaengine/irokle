@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     AckCommit, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS, ObligationTarget, OpMeta,
-    PeerAck, StagedTopic, Storage, StorageCounters, SyncObligation, SyncPeerStatus,
+    PeerAck, SnapshotRead, StagedTopic, Storage, StorageCounters, SyncObligation, SyncPeerStatus,
     SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers, ack_reached_op,
     apply_status_update, branch_matches, ensure_deps_resolvable, journalled_eviction,
     merged_obligation, merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes,
@@ -1014,6 +1014,58 @@ impl FjallStorage {
         }))
     }
 
+    fn read_resolvable(
+        tx: &impl fjall::Readable,
+        records: &fjall::OptimisticTxKeyspace,
+        id: &OpId,
+    ) -> Result<bool> {
+        Ok(
+            fjall::Readable::get(tx, records, Self::key_id(b"o", id))?.is_some()
+                && fjall::Readable::get(tx, records, Self::key_id(b"m", id))?.is_some(),
+        )
+    }
+
+    fn read_topic_ids(
+        tx: &impl fjall::Readable,
+        records: &fjall::OptimisticTxKeyspace,
+        topic_id: &TopicId,
+    ) -> Result<BTreeSet<OpId>> {
+        let prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
+        let mut out = BTreeSet::new();
+        for item in fjall::Readable::prefix(tx, records, prefix) {
+            let (key, _) = item.into_inner()?;
+            out.insert(Self::op_id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
+        }
+        Ok(out)
+    }
+
+    /// Up to `limit` indexed positions of an actor after `after`, see [`Storage::actor_range`].
+    fn read_actor_range(
+        tx: &impl fjall::Readable,
+        records: &fjall::OptimisticTxKeyspace,
+        (topic_id, actor_id): (&TopicId, &ActorId),
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, OpId)>> {
+        let Some(start) = after.checked_add(1) else {
+            return Ok(Vec::new());
+        };
+        let prefix = [b"as".as_slice(), topic_id.as_ref(), actor_id.as_ref()].concat();
+        let from = [prefix.as_slice(), &start.to_be_bytes()].concat();
+        let to = [prefix.as_slice(), &u64::MAX.to_be_bytes()].concat();
+        let mut out = Vec::new();
+        for item in fjall::Readable::range(tx, records, from..=to).take(limit) {
+            let (key, value) = item.into_inner()?;
+            let seq = key
+                .get(prefix.len()..)
+                .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                .map(u64::from_be_bytes)
+                .ok_or_else(|| Error::Storage("corrupt fjall actor index key".into()))?;
+            out.push((seq, postcard::from_bytes(value.as_ref())?));
+        }
+        Ok(out)
+    }
+
     /// Metadata of a stored op and the genesis of the branch holding it.
     fn read_op_branch(
         tx: &impl fjall::Readable,
@@ -1115,6 +1167,13 @@ impl FjallStorage {
 
 #[cfg(feature = "fjall")]
 impl Storage for FjallStorage {
+    fn read_snapshot<R>(&self, read: impl FnOnce(&dyn SnapshotRead) -> Result<R>) -> Result<R> {
+        read(&FjallSnapshot {
+            tx: self.db.read_tx(),
+            records: &self.records,
+            counters: &self.counters,
+        })
+    }
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
         self.transaction_once(|tx| self.tx_admit_batch(tx, &batch))
     }
@@ -1211,11 +1270,7 @@ impl Storage for FjallStorage {
         self.get(Self::key_id(b"m", id))
     }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
-        let read_tx = self.db.read_tx();
-        Ok(
-            fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", id))?.is_some()
-                && fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"m", id))?.is_some(),
-        )
+        Self::read_resolvable(&self.db.read_tx(), &self.records, id)
     }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>> {
         let read_tx = self.db.read_tx();
@@ -1231,13 +1286,7 @@ impl Storage for FjallStorage {
         Ok(out)
     }
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
-        let prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
-        let mut out = BTreeSet::new();
-        for item in fjall::Readable::prefix(&self.db.read_tx(), &self.records, prefix) {
-            let (key, _) = item.into_inner()?;
-            out.insert(Self::op_id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
-        }
-        Ok(out)
+        Self::read_topic_ids(&self.db.read_tx(), &self.records, topic_id)
     }
     fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         Ok(self.get(Self::key_id(b"h", topic_id))?.unwrap_or_default())
@@ -1277,23 +1326,9 @@ impl Storage for FjallStorage {
         after: u64,
         limit: usize,
     ) -> Result<Vec<(u64, OpId)>> {
-        let Some(start) = after.checked_add(1) else {
-            return Ok(Vec::new());
-        };
-        let prefix = [b"as".as_slice(), topic_id.as_ref(), actor_id.as_ref()].concat();
-        let from = [prefix.as_slice(), &start.to_be_bytes()].concat();
-        let to = [prefix.as_slice(), &u64::MAX.to_be_bytes()].concat();
         let read_tx = self.db.read_tx();
-        let mut out = Vec::new();
-        for item in fjall::Readable::range(&read_tx, &self.records, from..=to).take(limit) {
-            let (key, value) = item.into_inner()?;
-            let seq = key
-                .get(prefix.len()..)
-                .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
-                .map(u64::from_be_bytes)
-                .ok_or_else(|| Error::Storage("corrupt fjall actor index key".into()))?;
-            out.push((seq, postcard::from_bytes(value.as_ref())?));
-        }
+        let out =
+            Self::read_actor_range(&read_tx, &self.records, (topic_id, actor_id), after, limit)?;
         self.counters.count_index(out.len());
         Ok(out)
     }
@@ -1658,6 +1693,54 @@ impl Storage for FjallStorage {
 }
 
 #[cfg(feature = "fjall")]
+/// One read transaction seen through [`SnapshotRead`].
+struct FjallSnapshot<'a> {
+    tx: fjall::Snapshot,
+    records: &'a fjall::OptimisticTxKeyspace,
+    counters: &'a StorageCounters,
+}
+
+impl SnapshotRead for FjallSnapshot<'_> {
+    fn topic_view(
+        &self,
+        topic_id: &TopicId,
+        peer_id: Option<&PeerId>,
+    ) -> Result<Option<TopicView>> {
+        FjallStorage::read_topic_view(&self.tx, self.records, topic_id, peer_id)
+    }
+    fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
+        self.counters.count_op();
+        FjallStorage::tx_get(&self.tx, self.records, FjallStorage::key_id(b"o", id))
+    }
+    fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
+        self.counters.count_meta();
+        FjallStorage::tx_get(&self.tx, self.records, FjallStorage::key_id(b"m", id))
+    }
+    fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
+        FjallStorage::read_resolvable(&self.tx, self.records, id)
+    }
+    fn actor_range(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, OpId)>> {
+        let out = FjallStorage::read_actor_range(
+            &self.tx,
+            self.records,
+            (topic_id, actor_id),
+            after,
+            limit,
+        )?;
+        self.counters.count_index(out.len());
+        Ok(out)
+    }
+    fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
+        FjallStorage::read_topic_ids(&self.tx, self.records, topic_id)
+    }
+}
+
 fn clear_satisfied_tx(
     tx: &mut fjall::OptimisticWriteTx,
     records: &fjall::OptimisticTxKeyspace,

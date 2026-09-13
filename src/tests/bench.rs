@@ -8,8 +8,8 @@ use std::time::Instant;
 use super::support::*;
 use crate::oplog::Oplog;
 use crate::storage::{
-    AdmissionEffects, AdmittedBatch, FjallStorage, OpMeta, PeerAck, StagedTopic, SyncObligation,
-    SyncStatusUpdate, TopicState, TopicView,
+    AdmissionEffects, AdmittedBatch, FjallStorage, OpMeta, PeerAck, SnapshotRead, StagedTopic,
+    SyncObligation, SyncStatusUpdate, TopicState, TopicView,
 };
 use crate::sync::{PageBudget, SyncData, SyncEngine};
 use crate::{EvictionKey, SyncPeerStatus, TopicEviction, TopicInfo};
@@ -58,7 +58,61 @@ macro_rules! forward {
     };
 }
 
+/// A snapshot of the wrapped store counted like its live reads.
+struct CountingSnapshot<'a> {
+    read: &'a dyn SnapshotRead,
+    reads: &'a Reads,
+}
+
+impl SnapshotRead for CountingSnapshot<'_> {
+    fn topic_view(
+        &self,
+        topic: &TopicId,
+        peer: Option<&PeerId>,
+    ) -> Result<Option<TopicView>, Error> {
+        self.read.topic_view(topic, peer)
+    }
+    fn get_op(&self, id: &OpId) -> Result<Option<Op>, Error> {
+        add(&self.reads.ops, 1);
+        self.read.get_op(id)
+    }
+    fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>, Error> {
+        add(&self.reads.metas, 1);
+        self.read.get_meta(id)
+    }
+    fn dep_resolvable(&self, id: &OpId) -> Result<bool, Error> {
+        self.read.dep_resolvable(id)
+    }
+    fn actor_range(
+        &self,
+        topic: &TopicId,
+        actor: &ActorId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, OpId)>, Error> {
+        let range = self.read.actor_range(topic, actor, after, limit)?;
+        add(&self.reads.index, range.len());
+        Ok(range)
+    }
+    fn list_op_ids(&self, topic: &TopicId) -> Result<BTreeSet<OpId>, Error> {
+        let ids = self.read.list_op_ids(topic)?;
+        add(&self.reads.walks, ids.len());
+        Ok(ids)
+    }
+}
+
 impl<S: Storage> Storage for Counting<S> {
+    fn read_snapshot<R>(
+        &self,
+        read: impl FnOnce(&dyn SnapshotRead) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        self.inner.read_snapshot(|inner| {
+            read(&CountingSnapshot {
+                read: inner,
+                reads: &self.reads,
+            })
+        })
+    }
     fn get_op(&self, id: &OpId) -> Result<Option<Op>, Error> {
         add(&self.reads.ops, 1);
         self.inner.get_op(id)

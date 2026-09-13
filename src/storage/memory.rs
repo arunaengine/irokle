@@ -11,13 +11,13 @@ use crate::{
 use super::{
     AckCommit, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS,
     MAX_PENDING_WAITERS_PER_DEP, MAX_REJECTED_PER_TOPIC, ObligationTarget, OpMeta, PeerAck,
-    PendingRecord, PendingUsage, StagedSession, StagedTopic, Storage, StorageCounters,
-    SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit,
-    ack_covers, ack_reached_op, apply_status_update, branch_matches, check_pending_quota,
-    check_staged_op, check_staged_session, ensure_deps_resolvable, journalled_eviction,
-    merged_obligation, merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes,
-    settled_obligation, staged_clock, stored_ack_dominates, topic_fingerprint_for, validate_batch,
-    validate_heads,
+    PendingRecord, PendingUsage, SnapshotRead, StagedSession, StagedTopic, Storage,
+    StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView,
+    ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches,
+    check_pending_quota, check_staged_op, check_staged_session, ensure_deps_resolvable,
+    journalled_eviction, merged_obligation, merged_peer_ack, new_peer_status, peer_departed,
+    pending_op_bytes, settled_obligation, staged_clock, stored_ack_dominates,
+    topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[derive(Clone, Default)]
@@ -154,6 +154,13 @@ impl MemoryStorage {
 }
 
 impl Storage for MemoryStorage {
+    fn read_snapshot<R>(&self, read: impl FnOnce(&dyn SnapshotRead) -> Result<R>) -> Result<R> {
+        let inner = self.lock()?;
+        read(&MemorySnapshot {
+            inner: &inner,
+            counters: &self.counters,
+        })
+    }
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
         let mut inner = self.lock()?;
         admit_batch_locked(&mut inner, batch)
@@ -182,13 +189,7 @@ impl Storage for MemoryStorage {
             .collect())
     }
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
-        Ok(self
-            .inner
-            .lock()?
-            .topic_ops
-            .get(topic_id)
-            .cloned()
-            .unwrap_or_default())
+        Ok(topic_ids_locked(&*self.lock()?, topic_id))
     }
     fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         Ok(self
@@ -236,16 +237,7 @@ impl Storage for MemoryStorage {
         after: u64,
         limit: usize,
     ) -> Result<Vec<(u64, OpId)>> {
-        let Some(start) = after.checked_add(1) else {
-            return Ok(Vec::new());
-        };
-        let range = self
-            .lock()?
-            .actor_by_seq
-            .range((*topic_id, *actor_id, start)..=(*topic_id, *actor_id, u64::MAX))
-            .take(limit)
-            .map(|((_, _, seq), id)| (*seq, *id))
-            .collect::<Vec<_>>();
+        let range = actor_range_locked(&*self.lock()?, topic_id, actor_id, after, limit);
         self.counters.count_index(range.len());
         Ok(range)
     }
@@ -306,47 +298,7 @@ impl Storage for MemoryStorage {
         topic_id: &TopicId,
         peer_id: Option<&PeerId>,
     ) -> Result<Option<TopicView>> {
-        let inner = self.lock()?;
-        let Some(state) = memory_topic_state_locked(&inner, topic_id) else {
-            return Ok(None);
-        };
-        let clock = inner.actor_clock.get(topic_id).cloned().unwrap_or_default();
-        let tips = inner
-            .actor_tip
-            .range(
-                (*topic_id, ActorId::from_bytes([0; 32]))
-                    ..=(*topic_id, ActorId::from_bytes([0xff; 32])),
-            )
-            .map(|((_, actor_id), tip)| (*actor_id, *tip))
-            .collect();
-        let fingerprint = match inner.topic_fingerprint.get(topic_id) {
-            Some(fingerprint) => *fingerprint,
-            None => topic_fingerprint_for(&state.heads, &clock)?,
-        };
-        let (ack, owed) = match peer_id {
-            Some(peer_id) => (
-                inner.peer_acks.get(&(*peer_id, *topic_id)).cloned(),
-                inner
-                    .obligations
-                    .get(&(*topic_id, *peer_id))
-                    .is_some_and(|records| !records.is_empty()),
-            ),
-            None => (None, false),
-        };
-        Ok(Some(TopicView {
-            epoch: inner
-                .topic_epochs
-                .get(topic_id)
-                .copied()
-                .unwrap_or_default(),
-            pending_missing: pending_missing_locked(&inner, topic_id),
-            state,
-            clock,
-            tips,
-            fingerprint,
-            ack,
-            owed,
-        }))
+        topic_view_locked(&*self.lock()?, topic_id, peer_id)
     }
     fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
         let inner = self.lock()?;
@@ -883,6 +835,116 @@ impl Storage for MemoryStorage {
             .retain(|_, staged| staged.session.updated_ms >= older_than_ms);
         Ok(before - inner.staged.len())
     }
+}
+
+/// One mutex guard seen through [`SnapshotRead`].
+struct MemorySnapshot<'a> {
+    inner: &'a MemoryInner,
+    counters: &'a StorageCounters,
+}
+
+impl SnapshotRead for MemorySnapshot<'_> {
+    fn topic_view(
+        &self,
+        topic_id: &TopicId,
+        peer_id: Option<&PeerId>,
+    ) -> Result<Option<TopicView>> {
+        topic_view_locked(self.inner, topic_id, peer_id)
+    }
+    fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
+        self.counters.count_op();
+        Ok(self.inner.ops.get(id).cloned())
+    }
+    fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
+        self.counters.count_meta();
+        Ok(self.inner.meta.get(id).cloned())
+    }
+    fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
+        Ok(dep_resolvable_locked(self.inner, id))
+    }
+    fn actor_range(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, OpId)>> {
+        let range = actor_range_locked(self.inner, topic_id, actor_id, after, limit);
+        self.counters.count_index(range.len());
+        Ok(range)
+    }
+    fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
+        Ok(topic_ids_locked(self.inner, topic_id))
+    }
+}
+
+fn actor_range_locked(
+    inner: &MemoryInner,
+    topic_id: &TopicId,
+    actor_id: &ActorId,
+    after: u64,
+    limit: usize,
+) -> Vec<(u64, OpId)> {
+    let Some(start) = after.checked_add(1) else {
+        return Vec::new();
+    };
+    inner
+        .actor_by_seq
+        .range((*topic_id, *actor_id, start)..=(*topic_id, *actor_id, u64::MAX))
+        .take(limit)
+        .map(|((_, _, seq), id)| (*seq, *id))
+        .collect()
+}
+
+fn topic_ids_locked(inner: &MemoryInner, topic_id: &TopicId) -> BTreeSet<OpId> {
+    inner.topic_ops.get(topic_id).cloned().unwrap_or_default()
+}
+
+fn topic_view_locked(
+    inner: &MemoryInner,
+    topic_id: &TopicId,
+    peer_id: Option<&PeerId>,
+) -> Result<Option<TopicView>> {
+    let Some(state) = memory_topic_state_locked(inner, topic_id) else {
+        return Ok(None);
+    };
+    let clock = inner.actor_clock.get(topic_id).cloned().unwrap_or_default();
+    let tips = inner
+        .actor_tip
+        .range(
+            (*topic_id, ActorId::from_bytes([0; 32]))
+                ..=(*topic_id, ActorId::from_bytes([0xff; 32])),
+        )
+        .map(|((_, actor_id), tip)| (*actor_id, *tip))
+        .collect();
+    let fingerprint = match inner.topic_fingerprint.get(topic_id) {
+        Some(fingerprint) => *fingerprint,
+        None => topic_fingerprint_for(&state.heads, &clock)?,
+    };
+    let (ack, owed) = match peer_id {
+        Some(peer_id) => (
+            inner.peer_acks.get(&(*peer_id, *topic_id)).cloned(),
+            inner
+                .obligations
+                .get(&(*topic_id, *peer_id))
+                .is_some_and(|records| !records.is_empty()),
+        ),
+        None => (None, false),
+    };
+    Ok(Some(TopicView {
+        epoch: inner
+            .topic_epochs
+            .get(topic_id)
+            .copied()
+            .unwrap_or_default(),
+        pending_missing: pending_missing_locked(inner, topic_id),
+        state,
+        clock,
+        tips,
+        fingerprint,
+        ack,
+        owed,
+    }))
 }
 
 fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<()> {

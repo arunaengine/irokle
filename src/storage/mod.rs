@@ -336,7 +336,33 @@ pub struct SyncStatusUpdate {
     pub attempt: Option<(u64, u64)>,
 }
 
+/// Reads of one coherent snapshot of a store. Every method sees the same commit,
+/// so a planner can authorize a peer, select positions and load records without
+/// mixing a state before and after a concurrent write.
+pub trait SnapshotRead {
+    /// See [`Storage::topic_view`].
+    fn topic_view(&self, topic_id: &TopicId, peer_id: Option<&PeerId>)
+    -> Result<Option<TopicView>>;
+    fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
+    fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
+    /// See [`Storage::dep_resolvable`].
+    fn dep_resolvable(&self, id: &OpId) -> Result<bool>;
+    /// See [`Storage::actor_range`].
+    fn actor_range(
+        &self,
+        topic_id: &TopicId,
+        actor_id: &ActorId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, OpId)>>;
+    fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
+}
+
 pub trait Storage: Clone + Send + Sync + 'static {
+    /// Run `read` over one snapshot: one lock or one read transaction, released
+    /// when `read` returns. `read` must not call back into this store. Required
+    /// rather than defaulted: separate live reads can mix two commits.
+    fn read_snapshot<R>(&self, read: impl FnOnce(&dyn SnapshotRead) -> Result<R>) -> Result<R>;
     /// Durably admit `batch`: each op and its [`OpMeta`] atomically, refusing deps without
     /// metadata, and clearing sync state of members the batch removes. A lost optimistic
     /// commit returns [`crate::Error::AdmissionConflict`]; the caller owns the retry budget.
