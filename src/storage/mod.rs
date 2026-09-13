@@ -295,11 +295,14 @@ pub struct SyncPeerStatus {
     /// state, error and pending gauge.
     pub latest_attempt: Option<(u64, u64)>,
     /// The newest identities already counted, so a repeated completion of one
-    /// attempt counts once. Bounded by `MAX_RECENT_ATTEMPTS`.
+    /// attempt counts once. Bounded by `MAX_RECENT_ATTEMPTS`; once full, an
+    /// identity older than all of them is treated as already counted.
     pub recent_attempts: Vec<(u64, u64)>,
 }
 
-/// Attempt identities a status remembers for duplicate detection.
+/// Attempt identities a status remembers for duplicate detection. A completion
+/// arriving after this many newer ones of the same peer and topic counts
+/// nothing, so a replay can never count twice.
 pub(crate) const MAX_RECENT_ATTEMPTS: usize = 16;
 
 /// How one update moves the stored sync state.
@@ -888,7 +891,15 @@ pub(super) fn apply_status_update(status: &mut SyncPeerStatus, update: &SyncStat
     let expected = update.expected_attempts.is_none_or(|want| want == attempts);
     let current = match update.attempt {
         Some(attempt) => {
-            if status.latest_attempt == Some(attempt) || status.recent_attempts.contains(&attempt) {
+            let below_horizon = status.recent_attempts.len() >= MAX_RECENT_ATTEMPTS
+                && status
+                    .recent_attempts
+                    .first()
+                    .is_some_and(|oldest| attempt < *oldest);
+            if status.latest_attempt == Some(attempt)
+                || status.recent_attempts.contains(&attempt)
+                || below_horizon
+            {
                 return false;
             }
             status.recent_attempts.push(attempt);

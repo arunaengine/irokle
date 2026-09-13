@@ -1990,11 +1990,11 @@ fn assert_attempt_order<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S) {
         (crate_storage::SyncPeerState::Failed, Some(newest))
     );
 
-    // An older identity on the same wall clock counts but installs nothing.
+    // An identity older than every remembered one counts and installs nothing.
     let same = storage
         .update_sync_status(&peer, &topic_id, &attempt_outcome((epoch, 0), 50, true))
         .unwrap();
-    assert_eq!(same.successful_attempts, rounds + 1);
+    assert_eq!(same.successful_attempts, rounds);
     assert_eq!(
         state(&same),
         (crate_storage::SyncPeerState::Failed, Some(newest))
@@ -2034,7 +2034,7 @@ fn assert_attempt_order<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S) {
             Some((epoch, 1_000_000))
         )
     );
-    assert_eq!(old.successful_attempts, rounds + 3);
+    assert_eq!(old.successful_attempts, rounds + 2);
 
     // A repeated completion counts nothing, whether newest or older.
     for duplicate in [(epoch, 1_000_000), (epoch, rounds * 2 + 1)] {
@@ -2058,6 +2058,57 @@ fn assert_attempt_order<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S) {
             Some((epoch, 1_000_000))
         )
     );
+}
+
+/// Replaying every result of more attempts than a status remembers counts
+/// nothing again and leaves the newest outcome in place, before and after a
+/// reopen.
+fn assert_replay_counts_once<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S) {
+    let peer = PeerId::hash(b"replay-peer");
+    let topic_id = TopicId::hash(b"replay-topic");
+    let epoch = storage.next_attempt_epoch().unwrap();
+    let attempts = 3 * crate_storage::MAX_RECENT_ATTEMPTS as u64;
+    let apply = |storage: &S, sequence: u64| {
+        storage
+            .update_sync_status(
+                &peer,
+                &topic_id,
+                &attempt_outcome((epoch, sequence), sequence, !sequence.is_multiple_of(3)),
+            )
+            .unwrap()
+    };
+    let mut expected = None;
+    for sequence in 0..attempts {
+        expected = Some(apply(&storage, sequence));
+    }
+    let expected = expected.unwrap();
+    assert_eq!(
+        expected.successful_attempts + expected.failed_attempts,
+        attempts
+    );
+    for sequence in 0..attempts {
+        assert_eq!(apply(&storage, sequence), expected, "replay of {sequence}");
+    }
+    let storage = reopen(storage);
+    for sequence in (0..attempts).rev() {
+        assert_eq!(apply(&storage, sequence), expected, "replay of {sequence}");
+    }
+}
+
+#[test]
+fn memory_replay_counts_once() {
+    assert_replay_counts_once(MemoryStorage::new(), |storage| storage);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_replay_counts_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    assert_replay_counts_once(storage, |storage| {
+        drop(storage);
+        crate_storage::FjallStorage::open(dir.path()).unwrap()
+    });
 }
 
 #[test]
