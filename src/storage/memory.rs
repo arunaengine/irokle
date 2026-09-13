@@ -989,6 +989,10 @@ impl Storage for MemoryStorage {
         copy_topic_locked(&staged, &mut inner, &topic_id);
         inner.topics.insert(topic_id, expected.clone());
         for obligation in effects.sync_obligations {
+            let ack = inner.peer_acks.get(&(obligation.peer_id, topic_id));
+            if obligation.is_empty() || ack_covers(ack, Some(expected.genesis), &obligation) {
+                continue;
+            }
             let merged = merged_obligation_locked(&inner, &obligation)?;
             put_obligation_locked(&mut inner, merged);
         }
