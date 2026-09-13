@@ -818,8 +818,12 @@ async fn inbound_budget_holds() {
     let topic_id = shared_topic(&alice, &bob);
     let other = shared_topic(&alice, &bob);
     let frame = 6 * 1024 * 1024;
+    // Enough data frames to fill bob's data pool, and one slot left for control.
+    let charge = budget::ByteBudget::frame_charge(frame, true);
+    let notes = bob_net.budget.capacity(budget::Pool::Data) / charge + 1;
+    assert!(notes < MAX_RESYNC_PEER_CONCURRENCY);
     let topic = alice.open_topic::<Note>(topic_id).unwrap();
-    for index in 0..6 {
+    for index in 0..notes {
         let text = format!("{index}{}", "x".repeat(frame));
         topic.publish(Note { text }).unwrap();
     }
@@ -847,7 +851,7 @@ async fn inbound_budget_holds() {
         })
         .collect::<Vec<_>>();
     tokio::time::timeout(Duration::from_secs(60), async {
-        while bob_net.inbound.data.available_permits() >= frame {
+        while bob_net.budget.available(budget::Pool::Data) >= charge {
             tokio::task::yield_now().await;
         }
     })
@@ -866,11 +870,13 @@ async fn inbound_budget_holds() {
     .expect("control waited behind data frames")
     .unwrap();
 
-    let peak = bob_net.inbound.peak.0.load(Ordering::Relaxed);
+    let owned = bob_net.owned_bytes();
+    let frames = owned.peak[&OwnedClass::Frames] as usize;
+    let capacity = bob_net.budget.capacity(budget::Pool::Data)
+        + bob_net.budget.capacity(budget::Pool::Control);
     assert!(
-        peak <= bob_net.inbound.peak.1,
-        "{peak} frame bytes reserved for a {} byte budget",
-        bob_net.inbound.peak.1
+        frames <= capacity,
+        "{frames} frame bytes charged for a {capacity} byte budget"
     );
     drop(workers);
     for push in pushes {
@@ -897,4 +903,9 @@ async fn inbound_budget_holds() {
     assert_eq!(clock(&bob, topic_id), clock(&alice, topic_id));
     net.shutdown().await;
     bob_net.shutdown().await;
+    assert_eq!(bob_net.owned_bytes().current.values().sum::<u64>(), 0);
+    assert_eq!(
+        bob_net.budget.available(budget::Pool::Data),
+        bob_net.budget.capacity(budget::Pool::Data)
+    );
 }

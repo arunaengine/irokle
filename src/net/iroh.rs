@@ -15,6 +15,11 @@ use super::{
     invalid_data,
 };
 
+mod budget;
+
+use budget::{ByteBudget, DATA_TAG};
+pub use budget::{OwnedBytes, OwnedClass};
+
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SYNC_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RESYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -38,11 +43,8 @@ const MAX_SYNC_MESSAGES_PER_STREAM: usize = 4096;
 // reply (which can echo up to two messages per topic) stays under its own cap.
 const MAX_BATCH_STREAM_MESSAGES: usize = MAX_SYNC_MESSAGES_PER_STREAM / 2;
 const MAX_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
-/// Inbound frame bytes all served streams of a net may hold at once.
+/// Bytes of the data pool of a net.
 const MAX_INBOUND_FRAME_BYTES: usize = 256 * 1024 * 1024;
-/// Frames up to this size draw on a separate pool of `CONTROL_INBOUND_BYTES`.
-const CONTROL_FRAME_BYTES: usize = 64 * 1024;
-const CONTROL_INBOUND_BYTES: usize = 16 * 1024 * 1024;
 /// Delay before a topic that advanced but still owes work is served again. It
 /// is due at once but behind every target that became due earlier, so other
 /// work takes its turn first and an idle queue continues immediately.
@@ -67,7 +69,7 @@ pub(crate) struct StreamLimits {
     pub(crate) messages: usize,
     /// Messages one batched request stream may carry.
     pub(crate) batch_messages: usize,
-    /// Inbound data frame bytes all served streams may hold at once.
+    /// Bytes of the net's data pool.
     pub(crate) inbound_bytes: usize,
 }
 
@@ -79,49 +81,6 @@ impl Default for StreamLimits {
             batch_messages: MAX_BATCH_STREAM_MESSAGES,
             inbound_bytes: MAX_INBOUND_FRAME_BYTES,
         }
-    }
-}
-
-/// Node-wide reservations for inbound frames, taken before a frame is
-/// allocated and held until its message was handled. Small frames use their
-/// own pool, so control messages still flow while data frames fill theirs.
-struct InboundBudget {
-    data: Arc<tokio::sync::Semaphore>,
-    control: Arc<tokio::sync::Semaphore>,
-    /// Most data frame bytes reserved at once, and the data pool size.
-    #[cfg(test)]
-    peak: (std::sync::atomic::AtomicUsize, usize),
-}
-
-impl InboundBudget {
-    fn new(limits: StreamLimits) -> Self {
-        Self {
-            data: Arc::new(tokio::sync::Semaphore::new(
-                limits.inbound_bytes.max(MAX_FRAME_LEN),
-            )),
-            control: Arc::new(tokio::sync::Semaphore::new(CONTROL_INBOUND_BYTES)),
-            #[cfg(test)]
-            peak: (Default::default(), limits.inbound_bytes.max(MAX_FRAME_LEN)),
-        }
-    }
-
-    async fn reserve(&self, len: usize) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
-        let pool = if len <= CONTROL_FRAME_BYTES {
-            &self.control
-        } else {
-            &self.data
-        };
-        let bytes = u32::try_from(len).map_err(|_| invalid_data("sync frame length overflow"))?;
-        let permit = Arc::clone(pool)
-            .acquire_many_owned(bytes)
-            .await
-            .map_err(|_| io::Error::other("inbound frame budget closed"))?;
-        #[cfg(test)]
-        if len > CONTROL_FRAME_BYTES {
-            let in_use = self.peak.1 - self.data.available_permits();
-            self.peak.0.fetch_max(in_use, Ordering::Relaxed);
-        }
-        Ok(permit)
     }
 }
 
@@ -904,7 +863,7 @@ pub struct SharedNet<S: Storage> {
     runtime: IrohRuntimeConfig,
     resync_scheduler: ResyncScheduler,
     limits: StreamLimits,
-    inbound: InboundBudget,
+    budget: Arc<ByteBudget>,
     /// Outbound peer attempts, automatic batches and manual syncs alike.
     outbound: Arc<tokio::sync::Semaphore>,
     receipts: Mutex<ReceiptLog>,
@@ -1006,7 +965,7 @@ impl<S: Storage> IrohNet<S> {
                 runtime,
                 resync_scheduler: ResyncScheduler::default(),
                 limits: StreamLimits::default(),
-                inbound: InboundBudget::new(StreamLimits::default()),
+                budget: ByteBudget::new(MAX_INBOUND_FRAME_BYTES),
                 outbound: Arc::new(tokio::sync::Semaphore::new(MAX_RESYNC_PEER_CONCURRENCY)),
                 receipts: Mutex::default(),
                 shutdown,
@@ -1026,7 +985,7 @@ impl<S: Storage> IrohNet<S> {
         let shared =
             Arc::get_mut(&mut self.shared).expect("limits are set before the net is shared");
         shared.limits = limits;
-        shared.inbound = InboundBudget::new(limits);
+        shared.budget = ByteBudget::new(limits.inbound_bytes);
         self
     }
 
@@ -1047,12 +1006,14 @@ impl<S: Storage> IrohNet<S> {
             .await
             .map_err(|_| io::Error::other("storage job lane closed"))?;
         let task = self.tasks.track();
+        let count = self.budget.job();
         let shared = Arc::clone(&self.shared);
         // Locals drop in reverse order: the permit is back before the task
         // stops counting, so a completed shutdown never sees a held permit.
         tokio::task::spawn_blocking(move || {
             let _task = task;
             let _permit = permit;
+            let _count = count;
             job(&shared)
         })
         .await
@@ -1105,6 +1066,12 @@ impl<S: Storage> IrohNet<S> {
         self.outbound_streams.load(Ordering::Relaxed)
     }
 
+    /// Bytes this net's work owns now and at most, by class, and its storage
+    /// jobs. Decoded sizes are conservative estimates, not measured memory.
+    pub fn owned_bytes(&self) -> OwnedBytes {
+        self.budget.owned()
+    }
+
     pub async fn shutdown(&self) {
         // `send` reports failure and leaves the stored value alone when no
         // receiver exists, which loses the intent entirely if shutdown runs
@@ -1113,6 +1080,8 @@ impl<S: Storage> IrohNet<S> {
         // Sealed first: no caller can register work the drain below would miss.
         self.tasks.close();
         self.shutdown.send_replace(true);
+        // Waiting charges fail; held ones stay with their work until it ends.
+        self.budget.close();
         self.endpoint().close().await;
         // Returns only once the loops and every task they spawned have ended.
         // Awaiting this from inside such a task would wait for itself.
@@ -3488,19 +3457,16 @@ impl<S: Storage> IrohNet<S> {
         tokio::time::timeout(self.runtime.sync_io_timeout, async {
             let mut session = SyncSession::new(peer);
             let mut limits = SyncReadLimits::new(self.limits);
-            // The frame's reservation is held until its message was handled.
-            while let Some((frame, _reserved)) =
-                read_next_frame(&mut recv, self.runtime.sync_io_timeout, Some(&self.inbound))
-                    .await?
-            {
-                let frame_index = limits.observe_frame(frame.len())?;
-                let message = decode_sync_message(&frame).map_err(|err| {
-                    invalid_data(format!(
-                        "invalid sync message frame {frame_index} ({} bytes): {err}",
-                        frame.len()
-                    ))
-                })?;
-                // Messages are handled one job at a time, in stream order.
+            let timeout = self.runtime.sync_io_timeout;
+            while let Some((len, tag)) = read_frame_head(&mut recv, timeout).await? {
+                let frame_index = limits.observe_frame(len)?;
+                let data = tag == DATA_TAG;
+                let pool = ByteBudget::frame_pool(len, data);
+                let bytes = ByteBudget::frame_charge(len, data);
+                let charge = self.budget.wait(pool, bytes, OwnedClass::Frames).await?;
+                let message = read_frame_body(&mut recv, len, tag, timeout, frame_index).await?;
+                // Messages are handled one job at a time, in stream order. The
+                // charge moves into the job, so it is held until the job ends.
                 let lane = match message {
                     SyncMessage::Data(_) | SyncMessage::Summary(_) => Lane::Bulk,
                     _ => Lane::Control,
@@ -3508,6 +3474,7 @@ impl<S: Storage> IrohNet<S> {
                 let handled;
                 (session, handled) = self
                     .run_job(lane, move |shared| {
+                        let _charge = charge;
                         let handled = session.handle(shared, message);
                         (session, handled)
                     })
@@ -4412,14 +4379,9 @@ async fn read_sync_messages(
 ) -> io::Result<Vec<SyncMessage>> {
     let mut messages = Vec::new();
     let mut limits = SyncReadLimits::new(stream_limits);
-    while let Some((frame, _)) = read_next_frame(recv, sync_io_timeout, None).await? {
-        let frame_index = limits.observe_frame(frame.len())?;
-        messages.push(decode_sync_message(&frame).map_err(|err| {
-            invalid_data(format!(
-                "invalid sync message frame {frame_index} ({} bytes): {err}",
-                frame.len()
-            ))
-        })?);
+    while let Some((len, tag)) = read_frame_head(recv, sync_io_timeout).await? {
+        let frame_index = limits.observe_frame(len)?;
+        messages.push(read_frame_body(recv, len, tag, sync_io_timeout, frame_index).await?);
     }
     Ok(messages)
 }
@@ -4442,15 +4404,14 @@ async fn write_sync_messages(
     send.finish().map_err(other)
 }
 
-/// Reads one frame. With a `budget`, its bytes are reserved before the frame is
-/// allocated and the reservation is returned with it.
-async fn read_next_frame(
+/// Reads the length of the next frame and its first payload byte, the message
+/// kind, so the frame can be charged before the rest is allocated.
+async fn read_frame_head(
     recv: &mut iroh::endpoint::RecvStream,
     sync_io_timeout: Duration,
-    budget: Option<&InboundBudget>,
-) -> io::Result<Option<(Vec<u8>, Option<tokio::sync::OwnedSemaphorePermit>)>> {
-    let mut len_buf = [0_u8; 4];
-    let Some(first_read) = read_some_with_timeout(recv, &mut len_buf[..1], sync_io_timeout).await?
+) -> io::Result<Option<(usize, u8)>> {
+    let mut head = [0_u8; 5];
+    let Some(first_read) = read_some_with_timeout(recv, &mut head[..1], sync_io_timeout).await?
     else {
         return Ok(None);
     };
@@ -4459,8 +4420,8 @@ async fn read_next_frame(
     }
 
     let mut read = first_read;
-    while read < len_buf.len() {
-        let Some(n) = read_some_with_timeout(recv, &mut len_buf[read..], sync_io_timeout).await?
+    while read < 4 {
+        let Some(n) = read_some_with_timeout(recv, &mut head[read..4], sync_io_timeout).await?
         else {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -4476,25 +4437,42 @@ async fn read_next_frame(
         read += n;
     }
 
-    let len = u32::from_be_bytes(len_buf) as usize;
+    let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
     if len > MAX_FRAME_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "sync frame exceeds maximum length",
         ));
     }
-    let reservation = match budget {
-        Some(budget) if len > 0 => Some(budget.reserve(len).await?),
-        _ => None,
-    };
-    let mut payload = vec![0_u8; len];
-    if len > 0 {
-        tokio::time::timeout(sync_io_timeout, recv.read_exact(&mut payload))
-            .await
-            .map_err(|_| timed_out("sync read timed out"))?
-            .map_err(other)?;
+    if len == 0 {
+        return Err(invalid_data("empty sync message frame"));
     }
-    Ok(Some((payload, reservation)))
+    tokio::time::timeout(sync_io_timeout, recv.read_exact(&mut head[4..]))
+        .await
+        .map_err(|_| timed_out("sync read timed out"))?
+        .map_err(other)?;
+    Ok(Some((len, head[4])))
+}
+
+/// Reads the rest of a frame whose head was read, and decodes it.
+async fn read_frame_body(
+    recv: &mut iroh::endpoint::RecvStream,
+    len: usize,
+    tag: u8,
+    sync_io_timeout: Duration,
+    frame_index: usize,
+) -> io::Result<SyncMessage> {
+    let mut payload = vec![0_u8; len];
+    payload[0] = tag;
+    tokio::time::timeout(sync_io_timeout, recv.read_exact(&mut payload[1..]))
+        .await
+        .map_err(|_| timed_out("sync read timed out"))?
+        .map_err(other)?;
+    decode_sync_message(&payload).map_err(|err| {
+        invalid_data(format!(
+            "invalid sync message frame {frame_index} ({len} bytes): {err}"
+        ))
+    })
 }
 
 async fn read_some_with_timeout(
