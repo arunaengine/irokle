@@ -385,7 +385,7 @@ fn repair_walk_causal() {
 /// A topic whose `actors` writers each publish one op depending on one op of
 /// the writer with the largest actor key, so bounded actor windows taken in key
 /// order select the dependents before their dependency.
-fn late_dependency<S: Storage + Clone>(storage: S, actors: usize) -> Source<S> {
+pub(super) fn late_dependency<S: Storage + Clone>(storage: S, actors: usize) -> Source<S> {
     let owner = Ed25519Signer::from_bytes(&[242; 32]);
     let reader = Ed25519Signer::from_bytes(&[243; 32]).peer_id();
     let topic_id = TopicId::hash([b"late-dependency".as_slice(), &actors.to_le_bytes()].concat());

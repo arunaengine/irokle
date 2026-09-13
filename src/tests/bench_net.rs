@@ -561,3 +561,211 @@ async fn small_window_reconnect() {
         second,
     );
 }
+
+/// A request for every op of `topic_id` a member holding only the genesis lacks.
+fn full_request(node: &Irokle, author: PeerId, topic_id: TopicId) -> Vec<crate::sync::SyncMessage> {
+    let genesis = node
+        .storage()
+        .topic_state(&topic_id)
+        .unwrap()
+        .unwrap()
+        .genesis;
+    let request = crate::sync::SyncRequest {
+        topic_id,
+        known: BTreeSet::new(),
+        wants: BTreeSet::new(),
+        actor_range_hints: vec![crate::sync::ActorRangeHint {
+            actor_id: actor_id_for(topic_id, author),
+            from_exclusive: 1,
+            to_inclusive: u64::MAX,
+        }],
+        genesis: Some(genesis),
+        credit: crate::sync::SyncCredit::default(),
+    };
+    vec![
+        crate::sync::SyncMessage::Open(node.sync_open(topic_id)),
+        crate::sync::SyncMessage::Request(request),
+    ]
+}
+
+/// `callers` concurrent direct exchanges each hold a page of `ops` notes of
+/// 4 KiB while every other caller is cancelled right after it starts.
+async fn held_results(callers: usize, ops: usize) -> Run {
+    let lookup = MemoryLookup::new();
+    let alice = Irokle::builder()
+        .with_write_concern(WriteConcern::Local)
+        .with_iroh_runtime_config(runtime())
+        .with_net(bind(&lookup, None, None).await)
+        .build()
+        .unwrap();
+    let bob_endpoint = bind(&lookup, None, None).await;
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(bob_endpoint.secret_key())
+        .with_peer_whitelist([alice.peer_id()])
+        .build()
+        .unwrap();
+    let alice_addr = ready_addr(alice.endpoint().unwrap()).await;
+    let config = TopicConfig {
+        initial_peers: [bob.peer_id()].into(),
+        ..TopicConfig::default()
+    };
+    let topic = alice.create_topic::<Note>(config).unwrap();
+    let topic_id = topic.id();
+    let genesis = alice.storage().list_ops(&topic_id).unwrap();
+    let data = SyncData {
+        topic_id,
+        ops: genesis,
+    };
+    bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+    for index in 0..ops {
+        let text = format!("{index}{}", "x".repeat(4096));
+        topic.publish(Note { text }).unwrap();
+    }
+    let messages = full_request(&bob, alice.peer_id(), topic_id);
+    let net =
+        Arc::new(net::IrohNet::new_with_config(bob_endpoint, bob.clone(), runtime()).unwrap());
+
+    reset_peak();
+    let rss = status_kb("VmRSS:");
+    let started = Instant::now();
+    let calls = (0..callers)
+        .map(|index| {
+            let (net, addr, messages) = (Arc::clone(&net), alice_addr.clone(), messages.clone());
+            let call = tokio::spawn(async move { net.sync_with(addr, &messages).await });
+            if index % 2 == 1 {
+                call.abort();
+            }
+            call
+        })
+        .collect::<Vec<_>>();
+    let mut held = Vec::new();
+    let mut failed = 0;
+    for call in calls {
+        match tokio::time::timeout(CAP, call).await {
+            Ok(Ok(Ok(responses))) => held.push(responses),
+            Ok(Ok(Err(_))) | Err(_) => failed += 1,
+            Ok(Err(_)) => {}
+        }
+    }
+    let ms = millis(started);
+    let done = held.len() == callers / 2 && failed == 0;
+    let values = vec![
+        ("held", held.len() as u64),
+        (
+            "held_messages",
+            held.iter().map(|responses| responses.len() as u64).sum(),
+        ),
+        ("failed", failed),
+        ("rss_before_kb", rss),
+        ("peak_rss_kb", status_kb("VmHWM:")),
+        ("streams", net.outbound_sync_streams()),
+    ];
+    drop(held);
+    net.shutdown().await;
+    alice.shutdown_iroh().await;
+    Run { ms, done, values }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement, run explicitly"]
+async fn retained_results() {
+    let mut runs = Vec::new();
+    for _ in 0..REPS {
+        runs.push(held_results(32, 1024).await);
+    }
+    report(
+        "held_results",
+        "backend=memory callers=32 cancelled=16 ops=1024 op_bytes=4096",
+        runs,
+    );
+}
+
+/// On a one-worker runtime, a push of `ops` notes into a store that syncs every
+/// commit to disk, and a small control exchange for another topic sent while
+/// the push is admitted. Elapsed is the control exchange.
+async fn slow_control(ops: usize) -> Run {
+    let dir = tempfile::tempdir().unwrap();
+    let lookup = MemoryLookup::new();
+    let alice_endpoint = bind(&lookup, None, None).await;
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .with_write_concern(WriteConcern::Local)
+        .build()
+        .unwrap();
+    let storage =
+        FjallStorage::open_with_persist_mode(dir.path().join("bob"), fjall::PersistMode::SyncAll)
+            .unwrap();
+    let bob = Irokle::builder()
+        .with_storage(storage)
+        .with_peer_whitelist([alice.peer_id()])
+        .with_iroh_runtime_config(runtime())
+        .with_net(bind(&lookup, None, None).await)
+        .build()
+        .unwrap();
+    let bob_addr = ready_addr(bob.endpoint().unwrap()).await;
+    let shared = || {
+        let config = TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        };
+        let topic = alice.create_topic::<Note>(config).unwrap();
+        let data = SyncData {
+            topic_id: topic.id(),
+            ops: alice.storage().list_ops(&topic.id()).unwrap(),
+        };
+        bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+        topic
+    };
+    let (pushed, other) = (shared(), shared());
+    for index in 0..ops {
+        let text = format!("{index:0>256}");
+        pushed.publish(Note { text }).unwrap();
+    }
+    other.publish(Note { text: "o".into() }).unwrap();
+    let net =
+        Arc::new(net::IrohNet::new_with_config(alice_endpoint, alice.clone(), runtime()).unwrap());
+    let push_started = Instant::now();
+    let push = tokio::spawn({
+        let (net, addr, topic_id) = (Arc::clone(&net), bob_addr.clone(), pushed.id());
+        async move { net.sync_now(addr, topic_id).await }
+    });
+    let reached = wait_until(CAP, || {
+        bob.storage()
+            .actor_clock(&pushed.id())
+            .unwrap()
+            .get(&actor_id_for(pushed.id(), alice.peer_id()))
+            > 1
+    })
+    .await;
+    let messages = vec![
+        crate::sync::SyncMessage::Open(alice.sync_open(other.id())),
+        crate::sync::SyncMessage::Fingerprint(alice.sync_fingerprint(other.id()).unwrap()),
+    ];
+    let started = Instant::now();
+    let control = tokio::time::timeout(CAP, net.sync_with(bob_addr, &messages)).await;
+    let ms = millis(started);
+    let pushed_ok = matches!(
+        tokio::time::timeout(CAP, push).await,
+        Ok(Ok(Ok(()) | Err(_)))
+    );
+    let push_ms = millis(push_started);
+    let done = reached && matches!(control, Ok(Ok(_))) && pushed_ok;
+    let values = vec![("push_ms", push_ms as u64)];
+    net.shutdown().await;
+    bob.shutdown_iroh().await;
+    Run { ms, done, values }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[ignore = "measurement, run explicitly"]
+async fn slow_storage_control() {
+    let mut runs = Vec::new();
+    for _ in 0..REPS {
+        runs.push(slow_control(2048).await);
+    }
+    report(
+        "slow_control",
+        "backend=fjall persist=sync_all workers=1 push_ops=2048",
+        runs,
+    );
+}

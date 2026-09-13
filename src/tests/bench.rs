@@ -680,3 +680,227 @@ fn membership_projection() {
     report("projection_cold", &format!("backend=fjall {params}"), cold);
     report("projection_warm", &format!("backend=fjall {params}"), warm);
 }
+
+/// A reader holding only the genesis pages through `source` with the default
+/// credit. The walk is timed; reads are the responder's.
+fn walk_pages<S: Storage>(
+    source: &super::pages::Source<Counting<S>>,
+    storage: &Counting<S>,
+) -> Sample {
+    let before = storage.snapshot();
+    let started = Instant::now();
+    let pages = super::pages::page_through(source, crate::sync::SyncCredit::default());
+    let ms = millis(started);
+    let mut counters = vec![("pages", pages as u64)];
+    counters.extend(read_delta(before, storage.snapshot()));
+    Sample { ms, counters }
+}
+
+/// Writers beyond the page actor window, one of them a dependency of the rest.
+fn window_walk<S: Storage>(storage: Counting<S>) -> Sample {
+    let source = super::pages::late_dependency(storage.clone(), 4097);
+    walk_pages(&source, &storage)
+}
+
+#[test]
+#[ignore = "measurement, run explicitly"]
+fn window_progress() {
+    let params = "actors=4097 credit=default timed=walk";
+    each_backend("window_pages", params, window_walk, window_walk);
+}
+
+/// A reader that lost `lost` consecutive op records of an 8192-op chain repairs
+/// them from explicit wants, page by page. Only the responder's reads count.
+fn repair_walk<S: Storage>(storage: Counting<S>, lost: usize) -> Sample {
+    let reader_id = signer(60).peer_id();
+    let (genesis, chains) = super::pages::independent_chains(&Oplog::new(), reader_id, &[8192]);
+    load(&storage, std::slice::from_ref(&genesis));
+    load(&storage, &chains[0]);
+    let log = Oplog::with_storage(storage.clone());
+    let source = super::pages::Source {
+        engine: SyncEngine::new(log.clone(), signer(244).peer_id()),
+        log,
+        topic_id: genesis.signed.body.topic_id,
+        reader: reader_id,
+        genesis: genesis.clone(),
+    };
+    let reader_store = MemoryStorage::new();
+    let reader = Oplog::with_storage(reader_store.clone());
+    reader.receive_ops(vec![genesis]).unwrap();
+    reader.receive_ops(chains[0].clone()).unwrap();
+    for op in &chains[0][1024..1024 + lost] {
+        damage_op(&reader_store, &op.id, Damage::Op);
+    }
+    reader.recheck_topics().unwrap();
+    let credit = crate::sync::SyncCredit::default();
+    let before = storage.snapshot();
+    let started = Instant::now();
+    let mut pages = 0;
+    loop {
+        let request = super::pages::request_for(&source, &reader, credit);
+        if request.actor_range_hints.is_empty() && request.wants.is_empty() {
+            break;
+        }
+        assert!(pages < 64, "repair stopped advancing");
+        let page = source
+            .engine
+            .response_page(source.reader, &request, PageBudget::from_credit(credit))
+            .unwrap();
+        reader.receive_ops(page.ops).unwrap();
+        reader.recheck_topics().unwrap();
+        pages += 1;
+    }
+    let ms = millis(started);
+    let mut counters = vec![("pages", pages)];
+    counters.extend(read_delta(before, storage.snapshot()));
+    Sample { ms, counters }
+}
+
+#[test]
+#[ignore = "measurement, run explicitly"]
+fn repair_pull() {
+    let params = "chain=8192 lost=2048 timed=walk";
+    each_backend(
+        "repair_pages",
+        params,
+        |s| repair_walk(s, 2048),
+        |s| repair_walk(s, 2048),
+    );
+}
+
+/// A late invitation of `len` notes staged in 256-op fragments: the first and
+/// the last eight fragments and the activating fragment, timed and counted.
+fn staged_fragments<S: Storage>(storage: Counting<S>, len: usize) -> [Sample; 3] {
+    let source = Irokle::new(NodeConfig {
+        signer: signer(61),
+        ..NodeConfig::default()
+    })
+    .unwrap();
+    let reader = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: signer(62),
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
+    for index in 0..len {
+        let text = format!("{index:0>32}");
+        topic.publish(Note { text }).unwrap();
+    }
+    topic.add_peer(reader.peer_id()).unwrap();
+    let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+    let (history, invite) = ops.split_at(ops.len() - 1);
+    let fragments = history.chunks(256).chain([invite]).collect::<Vec<_>>();
+    let count = fragments.len();
+    let mut samples = [(0.0, [0; 4]), (0.0, [0; 4]), (0.0, [0; 4])];
+    for (index, fragment) in fragments.into_iter().enumerate() {
+        let data = SyncData {
+            topic_id: topic.id(),
+            ops: fragment.to_vec(),
+        };
+        let before = storage.snapshot();
+        let started = Instant::now();
+        reader.receive_sync_outcome(source.peer_id(), data).unwrap();
+        let ms = millis(started);
+        let after = storage.snapshot();
+        let slot = match index {
+            _ if index == count - 1 => 2,
+            _ if index < 8 => 0,
+            _ if index >= count - 9 => 1,
+            _ => continue,
+        };
+        samples[slot].0 += ms;
+        samples[slot].1 = std::array::from_fn(|i| samples[slot].1[i] + after[i] - before[i]);
+    }
+    assert_eq!(
+        storage.list_op_ids(&topic.id()).unwrap().len(),
+        ops.len(),
+        "the invitation did not activate"
+    );
+    samples.map(|(ms, reads)| Sample {
+        ms,
+        counters: read_delta([0; 4], reads),
+    })
+}
+
+#[test]
+#[ignore = "measurement, run explicitly"]
+fn staged_history() {
+    let len = 16384;
+    let params = format!("notes={len} fragment_ops=256");
+    let run = |backend: &str, samples: Vec<[Sample; 3]>| {
+        let mut parts: [Vec<Sample>; 3] = Default::default();
+        for sample in samples {
+            for (part, value) in parts.iter_mut().zip(sample) {
+                part.push(value);
+            }
+        }
+        let [early, late, activate] = parts;
+        let params = format!("backend={backend} {params}");
+        report("staged_first8", &params, early);
+        report("staged_last8", &params, late);
+        report("staged_activate", &params, activate);
+    };
+    let memory = (0..REPS)
+        .map(|_| staged_fragments(Counting::new(MemoryStorage::new()), len))
+        .collect();
+    run("memory", memory);
+    let fjall = (0..REPS)
+        .map(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            staged_fragments(Counting::new(FjallStorage::open(dir.path()).unwrap()), len)
+        })
+        .collect();
+    run("fjall", fjall);
+}
+
+/// 64 sources each stage the first 64 ops of their own late invitation.
+fn many_sessions<S: Storage>(storage: Counting<S>) -> Sample {
+    let reader = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: signer(63),
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let fragments = (0..64u8)
+        .map(|index| {
+            let source = Irokle::new(NodeConfig {
+                signer: signer(100 + index),
+                ..NodeConfig::default()
+            })
+            .unwrap();
+            let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
+            for event in 0..128 {
+                let text = format!("{event}");
+                topic.publish(Note { text }).unwrap();
+            }
+            topic.add_peer(reader.peer_id()).unwrap();
+            let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+            let data = SyncData {
+                topic_id: topic.id(),
+                ops: ops[..64].to_vec(),
+            };
+            (source.peer_id(), data)
+        })
+        .collect::<Vec<_>>();
+    let before = storage.snapshot();
+    let started = Instant::now();
+    for (source, data) in fragments {
+        reader.receive_sync_outcome(source, data).unwrap();
+    }
+    let ms = millis(started);
+    let mut counters = read_delta(before, storage.snapshot());
+    counters.push(("staged_topics", reader.list_topics().unwrap().len() as u64));
+    Sample { ms, counters }
+}
+
+#[test]
+#[ignore = "measurement, run explicitly"]
+fn provisional_sessions() {
+    let params = "sources=64 fragment_ops=64";
+    each_backend("sessions", params, many_sessions, many_sessions);
+}
