@@ -241,6 +241,116 @@ fn fragment_work_flat() {
     );
 }
 
+/// Two sources stage one late invitation under a total budget smaller than both
+/// histories. The source behind is refused while the other is ahead; the one
+/// ahead discards it when the budget is full, then activates the topic.
+fn assert_reclaim_behind<S: Limited>(inner: S) {
+    let ahead = node(170);
+    let behind = node(171);
+    let topic = ahead
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [behind.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    for index in 0..40 {
+        topic
+            .publish(Note {
+                text: format!("{index:0>64}"),
+            })
+            .unwrap();
+    }
+    let reader_peer = Ed25519Signer::from_bytes(&[172; 32]).peer_id();
+    topic.add_peer(reader_peer).unwrap();
+    let topic_id = topic.id();
+    let ops = oplog::topological(ahead.storage(), &topic_id).unwrap();
+    let sizes = ops
+        .iter()
+        .map(|op| crate::storage::pending_op_bytes(op).unwrap() as u64)
+        .collect::<Vec<_>>();
+    let history = sizes.iter().sum::<u64>();
+    // The number of first ops holding at least `share` tenths of the history.
+    let prefix = |share: u64| {
+        let mut bytes = 0;
+        sizes
+            .iter()
+            .take_while(|size| {
+                let short = bytes < history * share / 10;
+                bytes += **size;
+                short
+            })
+            .count()
+    };
+    let storage = inner.with_limits(crate::storage::StagingLimits {
+        total_bytes: history * 13 / 10,
+        source_bytes: history * 2,
+        namespace_bytes: history * 2,
+        ..crate::storage::StagingLimits::DISK
+    });
+    let reader = reader_node(storage.clone(), 172);
+    let send = |source: &Irokle, range: std::ops::Range<usize>| {
+        let data = SyncData {
+            topic_id,
+            ops: ops[range].to_vec(),
+        };
+        reader.receive_sync_outcome(source.peer_id(), data)
+    };
+    let (seven, five) = (prefix(7), prefix(5));
+    staged(send(&ahead, 0..seven).unwrap());
+    staged(send(&behind, 0..five).unwrap());
+    let ahead_staged = reader.staged_topic(ahead.peer_id(), topic_id).unwrap();
+
+    let refused = send(&behind, five..prefix(8));
+    assert!(
+        matches!(refused, Err(Error::StagingCapacity(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        reader.staged_topic(ahead.peer_id(), topic_id).unwrap(),
+        ahead_staged
+    );
+    match send(&ahead, seven..ops.len()).unwrap() {
+        ReceiveOutcome::Acked { .. } => {}
+        ReceiveOutcome::Staged(staged) => panic!("still staged: {staged:?}"),
+    }
+    assert_eq!(storage.list_op_ids(&topic_id).unwrap().len(), ops.len());
+    assert!(storage.provisional_topics().unwrap().is_empty());
+    assert!(matches!(
+        send(&behind, five..ops.len()).unwrap(),
+        ReceiveOutcome::Acked { .. }
+    ));
+}
+
+/// Stores whose staging limits a test sets.
+trait Limited: Storage {
+    fn with_limits(self, limits: crate::storage::StagingLimits) -> Self;
+}
+
+impl Limited for MemoryStorage {
+    fn with_limits(self, limits: crate::storage::StagingLimits) -> Self {
+        self.with_staging_limits(limits)
+    }
+}
+
+#[cfg(feature = "fjall")]
+impl Limited for crate::storage::FjallStorage {
+    fn with_limits(self, limits: crate::storage::StagingLimits) -> Self {
+        self.with_staging_limits(limits)
+    }
+}
+
+#[test]
+fn memory_reclaim_behind() {
+    assert_reclaim_behind(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reclaim_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_reclaim_behind(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
 /// Invitations beyond both old fixed caps (65,536 ops and 32 MiB per session),
 /// with non-inviting fragments crossing each, staged in frame-sized messages.
 /// Run explicitly: `cargo test --features fjall --lib invite_beyond_caps -- --ignored`.

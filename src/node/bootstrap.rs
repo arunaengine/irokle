@@ -72,26 +72,59 @@ impl Bootstraps {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Reserve `bytes` for `source` against the total and per-source limits,
+    /// Reserve `bytes` for `current` against the total and per-source limits,
     /// counting what the namespaces hold and what other admissions reserved.
+    /// When the total is full, less advanced stagings of the same topic are
+    /// discarded first, so stagings of one topic cannot block each other.
     fn reserve<S: Storage>(
         &self,
         storage: &S,
-        source: PeerId,
+        current: &ProvisionalTopic,
         bytes: u64,
     ) -> Result<Reservation<'_>> {
         let limits = storage.staging_limits();
-        let (mut total, mut from_source) = (0, 0);
+        let source = current.source;
+        let mut held = Vec::new();
         for provisional in storage.provisional_topics()? {
-            let held = match storage.provisional_store(&provisional)? {
+            let bytes = match storage.provisional_store(&provisional)? {
                 Some(store) => store.stored_bytes()?,
                 None => 0,
             };
-            total += held;
-            if provisional.source == source {
-                from_source += held;
+            held.push((provisional, bytes));
+        }
+        let rank = |(provisional, bytes): &(ProvisionalTopic, u64)| (*bytes, provisional.source);
+        let topic = |provisional: &ProvisionalTopic| provisional.topic_id == current.topic_id;
+        let own = held
+            .iter()
+            .find(|(provisional, _)| topic(provisional) && provisional.source == source)
+            .map(rank)
+            .unwrap_or((0, source));
+        let mut losers = held
+            .iter()
+            .filter(|entry| {
+                let provisional = &entry.0;
+                topic(provisional)
+                    && provisional.source != source
+                    && !provisional.activating
+                    && rank(entry) < own
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        losers.sort_by_key(rank);
+        let mut total = held.iter().map(|(_, bytes)| bytes).sum::<u64>();
+        for (loser, bytes) in losers {
+            if total + self.reserved().total + bytes <= limits.total_bytes {
+                break;
+            }
+            if storage.discard_provisional(&loser)? {
+                total -= bytes;
             }
         }
+        let from_source = held
+            .iter()
+            .filter(|(provisional, _)| provisional.source == source)
+            .map(|(_, bytes)| bytes)
+            .sum::<u64>();
         let mut reserved = self.reserved();
         let source_reserved = reserved.by_source.get(&source).copied().unwrap_or_default();
         if total + reserved.total + bytes > limits.total_bytes {
@@ -168,7 +201,7 @@ impl<S: Storage> Irokle<S> {
         for op in &data.ops {
             bytes += crate::storage::pending_op_bytes(op)? as u64;
         }
-        let reservation = self.bootstraps.reserve(storage, source, bytes)?;
+        let reservation = self.bootstraps.reserve(storage, &provisional, bytes)?;
         let admitted = self
             .oplog
             .sharing_membership(store)
