@@ -74,6 +74,18 @@ impl Corrupt for MemoryStorage {
     }
 }
 
+impl Corrupt for StaleReadStorage {
+    fn drop_op_record(&self, id: &OpId) {
+        self.inner.drop_op_record(id);
+    }
+    fn drop_meta_record(&self, id: &OpId) {
+        self.inner.drop_meta_record(id);
+    }
+    fn orphan_op(&self, op: &Op, meta: &crate::storage::OpMeta) {
+        self.inner.orphan_op(op, meta);
+    }
+}
+
 #[cfg(feature = "fjall")]
 impl Corrupt for crate::storage::FjallStorage {
     fn drop_op_record(&self, id: &OpId) {
@@ -507,6 +519,14 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
         batch: crate::storage::AdmittedBatch,
         eviction: Option<&crate::TopicEviction>,
     ) -> Result<usize, Error> {
+        let lost = self.conflicts.try_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |left| left.checked_sub(1),
+        );
+        if lost.is_ok() {
+            return Err(Error::AdmissionConflict);
+        }
         self.inner
             .reset_topic_and_admit(topic_id, expected_topic_state, batch, eviction)
     }

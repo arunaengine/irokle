@@ -391,7 +391,9 @@ impl<S: Storage> Oplog<S> {
             return Ok(None);
         }
         // The rebuild commits only if the topic still matches the planned
-        // state, so a concurrent tie-break or append makes it replan.
+        // state, so a concurrent tie-break or append makes it replan. A
+        // survivor's signature is checked once, however often the plan repeats.
+        let mut checked = BTreeSet::new();
         for attempt in 0..MAX_ADMISSION_RETRIES {
             conflict_pause(attempt);
             let Some(plan) = self.plan_quarantine(topic_id)? else {
@@ -402,6 +404,12 @@ impl<S: Storage> Oplog<S> {
                 survivors,
                 evicted,
             } = plan;
+            for op in &survivors {
+                if !checked.contains(&op.id) {
+                    op.validate()?;
+                    checked.insert(op.id);
+                }
+            }
             let eviction = TopicEviction {
                 topic_id: *topic_id,
                 losing_genesis: state.genesis,
@@ -412,7 +420,7 @@ impl<S: Storage> Oplog<S> {
                 expected_state: state,
                 eviction: eviction.clone(),
             };
-            match self.admit_ops_batch(None, survivors, &BTreeSet::new(), Some(reset), None) {
+            match self.admit_ops_batch(None, survivors, &checked, Some(reset), None) {
                 Err(Error::AdmissionConflict) => continue,
                 Err(err) => return Err(err),
                 Ok(_) => {}
@@ -560,14 +568,14 @@ impl<S: Storage> Oplog<S> {
             initial_peers: peers,
             ..genesis
         };
+        let mut signed = None;
         for attempt in 0..MAX_ADMISSION_RETRIES {
             conflict_pause(attempt);
             match self.try_genesis_effects(
-                topic_id,
-                actor_id,
-                genesis.clone(),
-                event.clone(),
+                (topic_id, actor_id),
+                (genesis.clone(), event.clone()),
                 signer,
+                &mut signed,
                 &effects,
             ) {
                 Err(err) if is_local_admission_race(&err) => continue,
@@ -1537,11 +1545,10 @@ impl<S: Storage> Oplog<S> {
 
     fn try_genesis_effects<F>(
         &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        genesis: TopicGenesis,
-        event: EventEnvelope,
+        (topic_id, actor_id): (TopicId, ActorId),
+        (genesis, event): (TopicGenesis, EventEnvelope),
         signer: &impl Signer,
+        signed: &mut Option<(Op, Op)>,
         effects: &F,
     ) -> Result<((Op, OpMeta), (Op, OpMeta))>
     where
@@ -1549,35 +1556,65 @@ impl<S: Storage> Oplog<S> {
     {
         let expected_heads = self.storage.heads(&topic_id)?;
         let expected_state = self.storage.topic_state(&topic_id)?;
+        // A retry whose bodies did not change reuses the ops signed before.
+        let (previous_genesis, previous_event) = signed.take().unzip();
         let genesis_op = self.next_local_op(
             topic_id,
             actor_id,
             expected_heads.clone(),
             TopicPayload::Genesis(genesis),
             signer,
-            None,
+            previous_genesis,
         )?;
+        let genesis_meta = self.meta_for(&genesis_op)?;
+        let event_body = OpBody {
+            topic_id,
+            author: signer.peer_id(),
+            actor_id,
+            actor_seq: checked_next(genesis_meta.actor_seq)?,
+            actor_prev: Some(genesis_op.id),
+            deps: [genesis_op.id].into(),
+            generation: checked_next(genesis_meta.generation)?,
+            payload: TopicPayload::Event(event),
+        };
+        let event_op = match previous_event.filter(|op| op.signed.body == event_body) {
+            Some(op) => op,
+            None => {
+                let op = Op::sign(event_body, signer)?;
+                op.validate()?;
+                op
+            }
+        };
+        let admitted = self.admit_genesis_pair(
+            (genesis_op.clone(), genesis_meta),
+            event_op.clone(),
+            (expected_heads, expected_state),
+            effects,
+        );
+        if admitted.is_err() {
+            *signed = Some((genesis_op, event_op));
+        }
+        admitted
+    }
+
+    /// Checks and commits a signed genesis and its first event in one batch.
+    fn admit_genesis_pair<F>(
+        &self,
+        (genesis_op, genesis_meta): (Op, OpMeta),
+        event_op: Op,
+        (expected_heads, expected_state): (BTreeSet<OpId>, Option<TopicState>),
+        effects: &F,
+    ) -> Result<((Op, OpMeta), (Op, OpMeta))>
+    where
+        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
+    {
+        let topic_id = genesis_op.signed.body.topic_id;
+        let actor_id = genesis_op.signed.body.actor_id;
         #[cfg(feature = "iroh")]
         genesis_op.validate_frame()?;
         self.validate_op(&genesis_op)?;
-        let genesis_meta = self.meta_for(&genesis_op)?;
-
-        let event_op = Op::sign(
-            OpBody {
-                topic_id,
-                author: signer.peer_id(),
-                actor_id,
-                actor_seq: checked_next(genesis_meta.actor_seq)?,
-                actor_prev: Some(genesis_op.id),
-                deps: [genesis_op.id].into(),
-                generation: checked_next(genesis_meta.generation)?,
-                payload: TopicPayload::Event(event),
-            },
-            signer,
-        )?;
         #[cfg(feature = "iroh")]
         event_op.validate_frame()?;
-        event_op.validate()?;
 
         let genesis_heads = heads_after(&expected_heads, &genesis_op);
         let mut state = self

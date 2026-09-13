@@ -1132,3 +1132,22 @@ fn fjall_eviction_recovers() {
         crate::storage::FjallStorage::open(dir.path()).unwrap()
     });
 }
+
+/// A quarantine rebuild retried after a lost commit checks each surviving
+/// op's signature once.
+#[test]
+fn quarantine_retry_checks_once() {
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let topic_id = orphaned_topic(&storage, 214);
+    let log = Oplog::with_storage(storage.clone());
+    let survivors = log.storage().list_op_ids(&topic_id).unwrap().len() - 1;
+    storage.conflict_writes(2);
+    let before = crate::op::VERIFICATIONS.with(std::cell::Cell::get);
+    assert!(log.quarantine_orphans(&topic_id).unwrap().is_some());
+    assert_eq!(
+        storage.conflicts.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let checks = crate::op::VERIFICATIONS.with(std::cell::Cell::get) - before;
+    assert_eq!(checks, survivors);
+}

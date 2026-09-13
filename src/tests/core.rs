@@ -544,3 +544,40 @@ fn retry_reuses_signatures() {
     assert_eq!(signer.signs.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(verifications() - before, 1);
 }
+
+/// A genesis created with its first event and retried after a lost commit
+/// signs and checks each of the two ops once.
+#[test]
+fn genesis_retry_signs_once() {
+    let signer = CountingSigner {
+        inner: Ed25519Signer::from_bytes(&[63; 32]),
+        signs: Default::default(),
+    };
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let log = oplog::Oplog::with_storage(storage.clone());
+    let topic_id = TopicId::hash(b"genesis-retry");
+    storage.conflict_writes(2);
+    let before = verifications();
+    let (genesis, event) = log
+        .create_topic_genesis_with_event(
+            topic_id,
+            actor_id_for(topic_id, signer.peer_id()),
+            TopicGenesis::new(Note::TYPE_ID, [signer.peer_id()]),
+            EventEnvelope::encode_event(&Note {
+                text: "first".into(),
+            })
+            .unwrap(),
+            &signer,
+        )
+        .unwrap();
+    assert_eq!(
+        storage.conflicts.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        storage.list_op_ids(&topic_id).unwrap(),
+        [genesis.id, event.id].into()
+    );
+    assert_eq!(signer.signs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(verifications() - before, 2);
+}
