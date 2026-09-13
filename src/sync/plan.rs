@@ -12,7 +12,7 @@ use super::{MAX_PAGE_BYTES, MAX_PAGE_MISSING, PageBudget, PlannedPage, RangeHead
 
 /// How far one actor of a page plan got.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ActorState {
+enum ActorState {
     /// Its next head is in the active set or waiting for a free slot.
     Active,
     /// Its next head waits for another actor's position.
@@ -24,7 +24,7 @@ pub(super) enum ActorState {
 }
 
 /// What an op still needs before it can be sent.
-pub(super) enum Wait {
+enum Wait {
     Ready,
     Blocked,
     Position(ActorId, u64),
@@ -36,36 +36,36 @@ pub(super) enum Wait {
 /// every actor behind gets a slot as others finish. A page that holds more
 /// but carries nothing names a missing record or an operation that is too
 /// large, so a caller never repeats an identical empty page silently.
-pub(super) struct Pager<'a> {
-    pub(super) read: &'a dyn SnapshotRead,
+struct Pager<'a> {
+    read: &'a dyn SnapshotRead,
     topic_id: &'a TopicId,
-    pub(super) local: &'a ActorClock,
+    local: &'a ActorClock,
     goal: Option<&'a ActorClock>,
     window: usize,
     active: BinaryHeap<Reverse<RangeHead>>,
-    pub(super) metas: BTreeMap<OpId, crate::storage::OpMeta>,
+    metas: BTreeMap<OpId, crate::storage::OpMeta>,
     /// Actors behind the goal not activated yet, in clock order.
     deferred: VecDeque<ActorId>,
     /// Suspended heads by the actor they wait for, with the position needed.
-    pub(super) suspended: BTreeMap<ActorId, Vec<(u64, RangeHead)>>,
+    suspended: BTreeMap<ActorId, Vec<(u64, RangeHead)>>,
     /// Suspended heads whose position was sent, waiting for a free slot.
-    pub(super) resumable: VecDeque<RangeHead>,
-    pub(super) states: BTreeMap<ActorId, ActorState>,
-    pub(super) covered: ActorClock,
-    pub(super) blocked: BTreeSet<OpId>,
-    pub(super) missing: BTreeSet<OpId>,
-    pub(super) more: bool,
+    resumable: VecDeque<RangeHead>,
+    states: BTreeMap<ActorId, ActorState>,
+    covered: ActorClock,
+    blocked: BTreeSet<OpId>,
+    missing: BTreeSet<OpId>,
+    more: bool,
 }
 
 impl Pager<'_> {
     /// The highest position of `actor_id` the goal asks for.
-    pub(super) fn limit(&self, actor_id: &ActorId) -> u64 {
+    fn limit(&self, actor_id: &ActorId) -> u64 {
         let local_seq = self.local.get(actor_id);
         self.goal
             .map_or(local_seq, |goal| goal.get(actor_id).min(local_seq))
     }
 
-    pub(super) fn plan(mut self, budget: PageBudget) -> Result<PlannedPage> {
+    fn plan(mut self, budget: PageBudget) -> Result<PlannedPage> {
         let behind = self
             .local
             .iter()
@@ -179,7 +179,7 @@ impl Pager<'_> {
     /// Queue the op after `after` on `actor_id`, up to `limit`; callers keep
     /// `after < limit`. A gap in the index stops the actor and names the
     /// record the next indexed op follows.
-    pub(super) fn activate(&mut self, actor_id: ActorId, after: u64, limit: u64) -> Result<()> {
+    fn activate(&mut self, actor_id: ActorId, after: u64, limit: u64) -> Result<()> {
         let next = self
             .read
             .actor_range(self.topic_id, &actor_id, after, 1)?
@@ -207,6 +207,130 @@ impl Pager<'_> {
             self.states.insert(actor_id, ActorState::Active);
         }
         Ok(())
+    }
+
+    /// What `meta` still waits for: an unsent or blocked dependency, a missing
+    /// record, or a position of another actor the peer does not hold yet.
+    fn wait_for(&mut self, meta: &crate::storage::OpMeta) -> Result<Wait> {
+        for dep in &meta.deps {
+            if self.blocked.contains(dep) {
+                return Ok(Wait::Blocked);
+            }
+            let position = match self.metas.get(dep) {
+                Some(dep_meta) => Some((dep_meta.actor_id, dep_meta.actor_seq)),
+                None => self
+                    .read
+                    .get_meta(dep)?
+                    .map(|dep_meta| (dep_meta.actor_id, dep_meta.actor_seq)),
+            };
+            let Some((dep_actor, dep_seq)) = position else {
+                self.missing.insert(*dep);
+                return Ok(Wait::Blocked);
+            };
+            if self.covered.get(&dep_actor) < dep_seq {
+                return Ok(Wait::Position(dep_actor, dep_seq));
+            }
+        }
+        Ok(Wait::Ready)
+    }
+
+    /// Park `head` until `dep_actor` reaches `dep_seq`, activating that actor
+    /// when it has no head yet. A dependency beyond the goal is ancestry the
+    /// goal needs, so the dependency actor's limit rises to cover it.
+    fn suspend(&mut self, head: RangeHead, dep_actor: ActorId, dep_seq: u64) -> Result<()> {
+        let (_, actor_id, _, id, _) = head;
+        match self.states.get(&dep_actor).copied() {
+            Some(ActorState::Blocked) => {
+                self.block(actor_id, id);
+                return Ok(());
+            }
+            Some(ActorState::Active | ActorState::Suspended) => {}
+            Some(ActorState::Reached(limit)) => {
+                if limit >= dep_seq || dep_seq > self.local.get(&dep_actor) {
+                    self.block(actor_id, id);
+                    return Ok(());
+                }
+                self.activate(dep_actor, limit, dep_seq)?;
+            }
+            None => {
+                let after = self.covered.get(&dep_actor);
+                self.activate(dep_actor, after, dep_seq.max(self.limit(&dep_actor)))?;
+            }
+        }
+        if matches!(self.states.get(&dep_actor), Some(ActorState::Blocked)) {
+            self.block(actor_id, id);
+            return Ok(());
+        }
+        self.states.insert(actor_id, ActorState::Suspended);
+        self.suspended
+            .entry(dep_actor)
+            .or_default()
+            .push((dep_seq, head));
+        Ok(())
+    }
+
+    /// `actor_id` sent `seq`: every head waiting for that position may resume.
+    fn wake(&mut self, actor_id: ActorId, seq: u64) {
+        let Some(waiting) = self.suspended.get_mut(&actor_id) else {
+            return;
+        };
+        let (ready, rest) = std::mem::take(waiting)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(needed, _)| *needed <= seq);
+        *waiting = rest;
+        self.resumable
+            .extend(ready.into_iter().map(|(_, head)| head));
+    }
+
+    /// `actor_id` sent everything up to `limit`. Heads still waiting on it need
+    /// a later position: the actor continues once up to the highest of them,
+    /// and a waiter no stored position can satisfy is blocked.
+    fn reach(&mut self, actor_id: ActorId, limit: u64) -> Result<()> {
+        self.states.insert(actor_id, ActorState::Reached(limit));
+        let waiting = self.suspended.remove(&actor_id).unwrap_or_default();
+        let local_seq = self.local.get(&actor_id);
+        let raised = waiting
+            .iter()
+            .map(|(needed, _)| *needed)
+            .filter(|needed| *needed > limit && *needed <= local_seq)
+            .max();
+        if let Some(raised) = raised {
+            self.activate(actor_id, limit, raised)?;
+        }
+        let continues = matches!(self.states.get(&actor_id), Some(ActorState::Active));
+        for (needed, head) in waiting {
+            if continues && raised.is_some_and(|raised| needed <= raised) {
+                self.suspended
+                    .entry(actor_id)
+                    .or_default()
+                    .push((needed, head));
+            } else {
+                self.block(head.1, head.3);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop `actor_id` at `id`, and every head waiting on it.
+    fn block(&mut self, actor_id: ActorId, id: OpId) {
+        self.blocked.insert(id);
+        self.stop(actor_id);
+    }
+
+    /// Stop `actor_id` and every head suspended on it, transitively.
+    fn stop(&mut self, actor_id: ActorId) {
+        self.states.insert(actor_id, ActorState::Blocked);
+        self.more = true;
+        let mut stopped = vec![actor_id];
+        while let Some(stopped_actor) = stopped.pop() {
+            for (_, (_, waiter, _, id, _)) in
+                self.suspended.remove(&stopped_actor).unwrap_or_default()
+            {
+                self.blocked.insert(id);
+                self.states.insert(waiter, ActorState::Blocked);
+                stopped.push(waiter);
+            }
+        }
     }
 }
 
