@@ -1000,9 +1000,11 @@ impl<S: Storage> IrohNet<S> {
             .map_err(|_| io::Error::other("storage job lane closed"))?;
         let task = self.tasks.track();
         let shared = Arc::clone(&self.shared);
+        // Locals drop in reverse order: the permit is back before the task
+        // stops counting, so a completed shutdown never sees a held permit.
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
             let _task = task;
+            let _permit = permit;
             job(&shared)
         })
         .await
