@@ -21,6 +21,7 @@ mod membership;
 mod pages;
 mod pending;
 mod planning;
+mod progress;
 #[cfg(feature = "iroh")]
 mod protocol;
 mod snapshot;

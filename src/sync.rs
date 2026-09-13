@@ -292,6 +292,13 @@ impl<S: Storage> SyncEngine<S> {
             page_actors: MAX_PAGE_ACTORS,
         }
     }
+
+    /// The same engine planning pages with at most `actors` active actors.
+    #[cfg(test)]
+    pub(crate) fn with_page_actors(mut self, actors: usize) -> Self {
+        self.page_actors = actors.max(1);
+        self
+    }
     pub fn open(topic_id: TopicId, peer_id: PeerId, event_type_id: Option<String>) -> SyncOpen {
         SyncOpen {
             protocol: SYNC_PROTOCOL.into(),

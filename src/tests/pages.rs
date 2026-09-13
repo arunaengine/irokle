@@ -6,12 +6,12 @@ use super::support::*;
 use crate::oplog::Oplog;
 use crate::sync::{PageBudget, SyncCredit, SyncEngine, SyncRequest};
 
-struct Source<S: Storage = MemoryStorage> {
-    log: Oplog<S>,
-    engine: SyncEngine<S>,
-    topic_id: TopicId,
-    reader: PeerId,
-    genesis: Op,
+pub(super) struct Source<S: Storage = MemoryStorage> {
+    pub(super) log: Oplog<S>,
+    pub(super) engine: SyncEngine<S>,
+    pub(super) topic_id: TopicId,
+    pub(super) reader: PeerId,
+    pub(super) genesis: Op,
 }
 
 /// A topic with `actors` writers taking turns, every fifth op joining the
@@ -99,7 +99,11 @@ fn many_actors(actors: u8, per_actor: usize, text: usize) -> Source {
 }
 
 /// The request a reader holding `reader` would send for the source's summary.
-fn request_for<S: Storage>(source: &Source<S>, reader: &Oplog, credit: SyncCredit) -> SyncRequest {
+pub(super) fn request_for<S: Storage>(
+    source: &Source<S>,
+    reader: &Oplog,
+    credit: SyncCredit,
+) -> SyncRequest {
     let reader_engine = SyncEngine::new(reader.clone(), source.reader);
     let summary = source.engine.summary(source.topic_id).unwrap();
     let (plan, _) = reader_engine
@@ -454,7 +458,7 @@ fn late_dependency<S: Storage + Clone>(storage: S, actors: usize) -> Source<S> {
 
 /// Pages a reader at the genesis through `source`, requiring every page to
 /// carry admissible data, and returns the page count.
-fn page_through<S: Storage>(source: &Source<S>, credit: SyncCredit) -> usize {
+pub(super) fn page_through<S: Storage>(source: &Source<S>, credit: SyncCredit) -> usize {
     let reader = Oplog::new();
     reader.receive_ops(vec![source.genesis.clone()]).unwrap();
     // Generous: every op is at least 64 serialized bytes.
@@ -573,7 +577,11 @@ fn public_page_contract() {
 /// Signed chains of `lens.len()` writers on one genesis, each op depending
 /// only on its predecessor, loaded into `source`. Returns the genesis and the
 /// chains in order.
-fn independent_chains(source: &Oplog, reader: PeerId, lens: &[usize]) -> (Op, Vec<Vec<Op>>) {
+pub(super) fn independent_chains(
+    source: &Oplog,
+    reader: PeerId,
+    lens: &[usize],
+) -> (Op, Vec<Vec<Op>>) {
     let owner = Ed25519Signer::from_bytes(&[244; 32]);
     let writers = (0..lens.len())
         .map(|index| Ed25519Signer::from_bytes(&[245 + index as u8; 32]))
