@@ -6,6 +6,7 @@ use std::time::Duration;
 use super::iroh::ready_addr;
 use super::support::*;
 
+#[cfg(feature = "fjall")]
 use crate::sync::{ActorRangeHint, SyncCredit, SyncData, SyncEngine, SyncMessage, SyncRequest};
 
 async fn endpoint(lookup: &iroh::address_lookup::memory::MemoryLookup) -> iroh::Endpoint {
@@ -26,6 +27,7 @@ fn config(signer: Ed25519Signer) -> NodeConfig {
 }
 
 /// A request for everything of `actor_id` on branch `genesis`.
+#[cfg(feature = "fjall")]
 fn request(topic_id: TopicId, actor_id: ActorId, genesis: OpId) -> SyncMessage {
     SyncMessage::Request(SyncRequest {
         topic_id,
@@ -41,6 +43,7 @@ fn request(topic_id: TopicId, actor_id: ActorId, genesis: OpId) -> SyncMessage {
     })
 }
 
+#[cfg(feature = "fjall")]
 fn served_ids(replies: &[SyncMessage], topic_id: TopicId) -> BTreeSet<OpId> {
     replies
         .iter()
@@ -101,31 +104,28 @@ async fn races_beside_topic() {
     let gate = Arc::new(Gate::default());
     let release = gate.releaser();
     storage.arm_read_after(GatePoint::Topic(raced_id), 2, Arc::clone(&gate));
-    let syncing = tokio::spawn({
-        let alice_net = Arc::clone(&alice_net);
-        async move {
-            alice_net
-                .sync_topics_now(bob_addr, &[raced_id, steady_id])
-                .await
-        }
-    });
-    let arrival = Arc::clone(&gate);
-    tokio::task::spawn_blocking(move || arrival.wait_arrival())
+    // Driven beside the race in this task: the batch future is too deep to spawn.
+    let topics = [raced_id, steady_id];
+    let syncing = alice_net.sync_topics_now(bob_addr, &topics);
+    let racing = async {
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+        assert!(gate.arrived(), "the push never planned the raced topic");
+        tokio::task::spawn_blocking(move || {
+            raced.remove_peer(reader).unwrap();
+            raced
+                .publish(Note {
+                    text: "after".into(),
+                })
+                .unwrap();
+        })
         .await
         .unwrap();
-    assert!(gate.arrived(), "the push never planned the raced topic");
-    tokio::task::spawn_blocking(move || {
-        raced.remove_peer(reader).unwrap();
-        raced
-            .publish(Note {
-                text: "after".into(),
-            })
-            .unwrap();
-    })
-    .await
-    .unwrap();
-    drop(release);
-    let results = syncing.await.unwrap();
+        drop(release);
+    };
+    let (results, ()) = tokio::join!(syncing, racing);
     assert!(results[&steady_id].is_ok(), "{results:?}");
     assert_eq!(
         bob.storage().list_op_ids(&steady_id).unwrap(),
