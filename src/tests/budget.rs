@@ -1,0 +1,420 @@
+//! Bytes a net owns while it works stay charged until their data is gone, and
+//! every public entry point is admitted through the same slots and pools.
+
+use super::scheduler_tests::{Lookup, client, publish, ready_addr, server, shared_topic};
+use super::*;
+use crate::TopicId;
+use crate::sync::{SyncAck, SyncCredit, SyncData, SyncRequest};
+use crate::tests::support::{Gate, GatePoint, StaleReadStorage, genesis_of};
+
+/// Every pool is back at capacity and no class or job is still counted.
+fn assert_released<S: Storage>(net: &IrohNet<S>) {
+    for pool in [Pool::Data, Pool::Control, Pool::Session, Pool::Results] {
+        assert_eq!(
+            net.budget.available(pool),
+            net.budget.capacity(pool),
+            "{pool:?}"
+        );
+    }
+    let owned = net.owned_bytes();
+    assert_eq!(owned.current.values().sum::<u64>(), 0, "{owned:?}");
+    assert_eq!(owned.jobs, 0);
+}
+
+/// An open and a fingerprint per topic.
+fn probe(node: &Irokle, topics: &[TopicId]) -> Vec<SyncMessage> {
+    topics
+        .iter()
+        .flat_map(|topic_id| {
+            [
+                SyncMessage::Open(node.sync_open(*topic_id)),
+                SyncMessage::Fingerprint(node.sync_fingerprint(*topic_id).unwrap()),
+            ]
+        })
+        .collect()
+}
+
+fn framed_len(message: &SyncMessage) -> usize {
+    crate::net::framed_message_len(message).unwrap()
+}
+
+async fn owned_settle<S: Storage>(net: &IrohNet<S>, class: OwnedClass, bytes: u64) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while net.owned_bytes().current.get(&class).copied().unwrap_or(0) != bytes {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{class:?} never settled at {bytes} bytes"));
+}
+
+/// On a one-worker runtime, a served stream dropped while its storage job is
+/// held keeps the data frame charged until that job really ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn cancelled_frame_charged() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let limits = StreamLimits::default();
+    let (bob, bob_net) = server(storage.clone(), &lookup, alice.peer_id(), limits).await;
+    let topic_id = shared_topic(&alice, &bob);
+    publish(&alice, topic_id, 1, 1024);
+    let op = crate::oplog::topological(alice.storage(), &topic_id)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    storage.arm_read(GatePoint::Meta(op.id), Arc::clone(&gate));
+    let messages = vec![
+        SyncMessage::Open(alice.sync_open(topic_id)),
+        SyncMessage::Data(SyncData {
+            topic_id,
+            ops: vec![op],
+        }),
+    ];
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    let push = tokio::spawn({
+        let net = Arc::clone(&net);
+        async move { net.sync_with(bob_addr, &messages).await.map(drop) }
+    });
+    let arrival = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || arrival.wait_arrival())
+        .await
+        .unwrap();
+    assert!(gate.arrived());
+    let charged = bob_net.owned_bytes().current[&OwnedClass::Frames];
+    assert!(charged > 0);
+
+    // Shutdown drops the served stream, but not the job it started.
+    let outcome = bob_net
+        .shutdown_with_timeout(Duration::from_millis(200))
+        .await;
+    assert!(
+        matches!(outcome, ShutdownOutcome::Incomplete { .. }),
+        "{outcome:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while bob_net.tasks.running() > 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the served stream was never dropped");
+    assert_eq!(bob_net.owned_bytes().current[&OwnedClass::Frames], charged);
+    assert!(bob_net.budget.available(Pool::Data) < bob_net.budget.capacity(Pool::Data));
+
+    drop(release);
+    assert_eq!(
+        bob_net.shutdown_with_timeout(Duration::from_secs(60)).await,
+        ShutdownOutcome::Complete
+    );
+    assert_released(&bob_net);
+    let _ = push.await.unwrap();
+    net.shutdown().await;
+    assert_released(&net);
+}
+
+/// Responses a caller keeps stay charged while it makes more calls. A later
+/// frame that finds the result pool full fails the exchange instead of
+/// waiting, and dropping the responses releases every byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_results_charged() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let limits = StreamLimits::default();
+    let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
+    let topics = (0..4)
+        .map(|_| {
+            let topic_id = shared_topic(&bob, &alice);
+            publish(&bob, topic_id, 4, 256);
+            topic_id
+        })
+        .collect::<Vec<_>>();
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    let messages = probe(&alice, &topics);
+
+    let held = net.sync_with(bob_addr.clone(), &messages).await.unwrap();
+    assert!(held.len() >= 2, "{} responses", held.len());
+    let decoded = held
+        .iter()
+        .map(|message| ByteBudget::decoded_bound(framed_len(message) - 4, 0) as u64)
+        .sum::<u64>();
+    assert_eq!(net.owned_bytes().current[&OwnedClass::Results], decoded);
+    let more = net.sync_with(bob_addr.clone(), &messages).await.unwrap();
+    assert_eq!(net.owned_bytes().current[&OwnedClass::Results], 2 * decoded);
+    drop(more);
+    assert_eq!(net.owned_bytes().current[&OwnedClass::Results], decoded);
+
+    // Room for the first frame only: the second one cannot be charged.
+    let first = ByteBudget::frame_charge(framed_len(&held.messages()[0]) - 4, false);
+    let free = net.budget.available(Pool::Results);
+    let filler = net
+        .budget
+        .try_take(Pool::Results, free - first, OwnedClass::Results)
+        .unwrap();
+    let error = net
+        .sync_with(bob_addr.clone(), &messages)
+        .await
+        .map(drop)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::OutOfMemory, "{error}");
+    assert_eq!(
+        net.owned_bytes().current[&OwnedClass::Results],
+        decoded + (free - first) as u64
+    );
+    drop((filler, held));
+    net.shutdown().await;
+    bob_net.shutdown().await;
+    assert_released(&net);
+    assert_released(&bob_net);
+}
+
+/// Requests and acks a served stream keeps until it replies are charged to
+/// the session pool. When that pool is full the stream fails without waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_bytes_charged() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let limits = StreamLimits::default();
+    let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
+    let topic_id = shared_topic(&bob, &alice);
+    publish(&bob, topic_id, 8, 256);
+    let genesis = genesis_of(alice.storage(), &topic_id);
+    let request = SyncMessage::Request(SyncRequest {
+        topic_id,
+        known: BTreeSet::new(),
+        wants: BTreeSet::new(),
+        actor_range_hints: Vec::new(),
+        genesis,
+        credit: SyncCredit::default(),
+    });
+    let mut ack = SyncAck {
+        topic_id,
+        peer_id: alice.peer_id(),
+        genesis,
+        accepted: BTreeSet::new(),
+        heads: alice.storage().heads(&topic_id).unwrap(),
+        clock: alice.storage().actor_clock(&topic_id).unwrap(),
+        signature: None,
+    };
+    ack.sign(alice.signer()).unwrap();
+    let mut messages = vec![SyncMessage::Open(alice.sync_open(topic_id))];
+    for _ in 0..4 {
+        messages.push(request.clone());
+        messages.push(SyncMessage::Ack(ack.clone()));
+    }
+    let retained = messages[1..]
+        .iter()
+        .map(|message| ByteBudget::held_bound(framed_len(message)))
+        .sum::<usize>();
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+
+    let replies = net.sync_with(bob_addr.clone(), &messages).await.unwrap();
+    assert!(
+        replies
+            .iter()
+            .any(|reply| matches!(reply, SyncMessage::Page(_)))
+    );
+    drop(replies);
+    owned_settle(&bob_net, OwnedClass::Session, 0).await;
+    let peak = bob_net.owned_bytes().peak[&OwnedClass::Session];
+    assert!(
+        peak >= retained as u64,
+        "{peak} of {retained} bytes charged"
+    );
+
+    let free = bob_net.budget.available(Pool::Session);
+    let filler = bob_net
+        .budget
+        .try_take(Pool::Session, free - retained / 2, OwnedClass::Session)
+        .unwrap();
+    if let Ok(replies) = net.sync_with(bob_addr.clone(), &messages).await {
+        assert!(
+            !replies
+                .iter()
+                .any(|reply| matches!(reply, SyncMessage::Page(_))),
+            "a stream over the session budget was served"
+        );
+    }
+    owned_settle(&bob_net, OwnedClass::Session, filler.bytes() as u64).await;
+    drop(filler);
+    net.shutdown().await;
+    bob_net.shutdown().await;
+    assert_released(&net);
+    assert_released(&bob_net);
+}
+
+/// With data, result and worker capacity taken, a small control exchange
+/// still completes, and shutdown ends while waiting charges cannot be granted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saturated_shutdown() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let limits = StreamLimits::default();
+    let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
+    let pushed = shared_topic(&alice, &bob);
+    publish(&alice, pushed, 1, 1024);
+    let other = shared_topic(&alice, &bob);
+    let op = crate::oplog::topological(alice.storage(), &pushed)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let op_id = op.id;
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+
+    let capacity = bob_net.budget.capacity(Pool::Data);
+    let data = bob_net
+        .budget
+        .try_take(Pool::Data, capacity, OwnedClass::Frames)
+        .unwrap();
+    let workers = Arc::clone(&bob_net.bulk_lane)
+        .acquire_many_owned(BULK_JOBS as u32)
+        .await
+        .unwrap();
+    let push = tokio::spawn({
+        let net = Arc::clone(&net);
+        let addr = bob_addr.clone();
+        let messages = vec![
+            SyncMessage::Open(alice.sync_open(pushed)),
+            SyncMessage::Data(SyncData {
+                topic_id: pushed,
+                ops: vec![op],
+            }),
+        ];
+        async move { net.sync_with(addr, &messages).await.map(drop) }
+    });
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while bob_net.served.available_permits() == MAX_SERVED_STREAMS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the push never reached bob");
+
+    let control = tokio::time::timeout(
+        Duration::from_secs(60),
+        net.sync_with(bob_addr.clone(), &probe(&alice, &[other])),
+    )
+    .await
+    .expect("control waited behind full data capacity")
+    .unwrap();
+    assert!(!control.is_empty());
+    drop(control);
+
+    let results = net
+        .budget
+        .try_take(
+            Pool::Results,
+            net.budget.capacity(Pool::Results),
+            OwnedClass::Results,
+        )
+        .unwrap();
+    let waiting = tokio::spawn({
+        let net = Arc::clone(&net);
+        let messages = probe(&alice, &[other]);
+        async move { net.sync_with(bob_addr, &messages).await.map(drop) }
+    });
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while net.outbound.available_permits() > MAX_RESYNC_PEER_CONCURRENCY - 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second exchange never started");
+
+    assert_eq!(
+        net.shutdown_with_timeout(Duration::from_secs(60)).await,
+        ShutdownOutcome::Complete
+    );
+    assert!(waiting.await.unwrap().is_err());
+    assert_eq!(
+        bob_net.shutdown_with_timeout(Duration::from_secs(60)).await,
+        ShutdownOutcome::Complete
+    );
+    let _ = push.await.unwrap();
+    drop((workers, data, results));
+    assert_released(&net);
+    assert_released(&bob_net);
+    assert!(bob.storage().get_op(&op_id).unwrap().is_none());
+}
+
+/// Direct exchanges share the outbound slots, served and embedded streams
+/// share the served slots, and nothing stays held afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn entry_points_admitted() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let limits = StreamLimits::default();
+    let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
+    let topic_id = shared_topic(&alice, &bob);
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    let messages = probe(&alice, &[topic_id]);
+
+    // Bob's control workers are taken, so every stream reaching bob stays open.
+    let workers = Arc::clone(&bob_net.control_lane)
+        .acquire_many_owned(CONTROL_JOBS as u32)
+        .await
+        .unwrap();
+    let calls = (0..3 * MAX_RESYNC_PEER_CONCURRENCY)
+        .map(|_| {
+            let net = Arc::clone(&net);
+            let addr = bob_addr.clone();
+            let messages = messages.clone();
+            tokio::spawn(async move { net.sync_with(addr, &messages).await.map(drop) })
+        })
+        .collect::<Vec<_>>();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while MAX_SERVED_STREAMS - bob_net.served.available_permits() < MAX_RESYNC_PEER_CONCURRENCY
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the streams never reached bob");
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(net.outbound.available_permits(), 0);
+    assert_eq!(
+        net.outbound_sync_streams(),
+        MAX_RESYNC_PEER_CONCURRENCY as u64
+    );
+
+    // An embedder's stream is refused, not queued, while served slots are full.
+    let free = bob_net.served.available_permits() as u32;
+    let served = Arc::clone(&bob_net.served)
+        .try_acquire_many_owned(free)
+        .unwrap();
+    let alice_id = net.endpoint().id();
+    let refused = bob_net
+        .handle_messages(alice_id, messages.clone())
+        .map(drop)
+        .unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+    drop((served, workers));
+
+    for call in calls {
+        tokio::time::timeout(Duration::from_secs(60), call)
+            .await
+            .expect("an exchange never finished")
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(
+        net.outbound_sync_streams(),
+        3 * MAX_RESYNC_PEER_CONCURRENCY as u64
+    );
+    let replies = bob_net.handle_messages(alice_id, messages).unwrap();
+    assert!(!replies.is_empty());
+    drop(replies);
+    net.shutdown().await;
+    bob_net.shutdown().await;
+    assert_eq!(bob_net.served.available_permits(), MAX_SERVED_STREAMS);
+    assert_eq!(
+        net.outbound.available_permits(),
+        MAX_RESYNC_PEER_CONCURRENCY
+    );
+    assert_released(&net);
+    assert_released(&bob_net);
+}

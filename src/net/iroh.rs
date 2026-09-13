@@ -4815,6 +4815,10 @@ fn other(error: impl std::fmt::Display) -> io::Error {
 mod scheduler_tests;
 
 #[cfg(test)]
+#[path = "../tests/budget.rs"]
+mod budget_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::TopicId;

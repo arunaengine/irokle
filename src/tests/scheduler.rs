@@ -8,7 +8,7 @@ use crate::tests::support::{Gate, GatePoint, Note, StaleReadStorage};
 /// Wide enough that a backoff step cannot pass while a test is running.
 const BACKOFF: Duration = Duration::from_secs(60);
 
-type Lookup = iroh::address_lookup::memory::MemoryLookup;
+pub(super) type Lookup = iroh::address_lookup::memory::MemoryLookup;
 
 fn runtime() -> IrohRuntimeConfig {
     IrohRuntimeConfig {
@@ -22,7 +22,7 @@ fn runtime() -> IrohRuntimeConfig {
     }
 }
 
-async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
+pub(super) async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
     use futures::StreamExt;
     use iroh::Watcher;
     let addr = endpoint.addr();
@@ -52,7 +52,7 @@ async fn bind(lookup: &Lookup) -> iroh::Endpoint {
 }
 
 /// A node that only answers: its net accepts but never runs a resync loop.
-async fn server<S: Storage>(
+pub(super) async fn server<S: Storage>(
     storage: S,
     lookup: &Lookup,
     trusted: PeerId,
@@ -76,7 +76,7 @@ async fn server<S: Storage>(
 }
 
 /// A node whose net starts no loop, so the test owns every claim.
-async fn client(lookup: &Lookup, limits: StreamLimits) -> (Irokle, Arc<IrohNet>) {
+pub(super) async fn client(lookup: &Lookup, limits: StreamLimits) -> (Irokle, Arc<IrohNet>) {
     let endpoint = bind(lookup).await;
     let node = Irokle::builder()
         .with_iroh_secret_key(endpoint.secret_key())
@@ -89,7 +89,7 @@ async fn client(lookup: &Lookup, limits: StreamLimits) -> (Irokle, Arc<IrohNet>)
 }
 
 /// A topic of `owner` shared with `member`, which holds only its genesis.
-fn shared_topic<S: Storage>(owner: &Irokle, member: &Irokle<S>) -> TopicId {
+pub(super) fn shared_topic<S: Storage>(owner: &Irokle, member: &Irokle<S>) -> TopicId {
     let topic = owner
         .create_topic::<Note>(crate::TopicConfig {
             initial_peers: [member.peer_id()].into(),
@@ -109,7 +109,12 @@ fn shared_topic<S: Storage>(owner: &Irokle, member: &Irokle<S>) -> TopicId {
     topic.id()
 }
 
-fn publish<S: Storage>(node: &Irokle<S>, topic_id: TopicId, count: usize, text_len: usize) {
+pub(super) fn publish<S: Storage>(
+    node: &Irokle<S>,
+    topic_id: TopicId,
+    count: usize,
+    text_len: usize,
+) {
     let topic = node.open_topic::<Note>(topic_id).unwrap();
     for index in 0..count {
         topic
