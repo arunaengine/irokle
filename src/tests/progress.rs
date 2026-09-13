@@ -467,3 +467,54 @@ async fn stream_names_missing() {
     assert_eq!(page.missing, [records[1]].into());
     net.shutdown().await;
 }
+
+/// A page never exceeds the credit its request advertises, whatever larger
+/// budget a direct caller passes, in operations or in serialized bytes.
+#[test]
+fn credit_binds_caller() {
+    let reader_id = Ed25519Signer::from_bytes(&[250; 32]).peer_id();
+    let source_log = Oplog::new();
+    let (genesis, chains) = independent_chains(&source_log, reader_id, &[40]);
+    let owner = Ed25519Signer::from_bytes(&[244; 32]).peer_id();
+    let source = Source {
+        engine: SyncEngine::new(source_log.clone(), owner),
+        log: source_log,
+        topic_id: genesis.signed.body.topic_id,
+        reader: reader_id,
+        genesis: genesis.clone(),
+    };
+    let reader = Oplog::new();
+    reader.receive_ops(vec![genesis]).unwrap();
+    let size = postcard::experimental::serialized_size(&chains[0][0]).unwrap() as u64;
+    for credit in [
+        SyncCredit {
+            ops: 3,
+            bytes: u64::MAX,
+        },
+        SyncCredit {
+            ops: 4096,
+            bytes: 2 * size + size / 2,
+        },
+    ] {
+        let request = request_for(&source, &reader, credit);
+        let page = source
+            .engine
+            .response_page(
+                source.reader,
+                &request,
+                PageBudget {
+                    ops: usize::MAX,
+                    bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+        let bytes = page
+            .ops
+            .iter()
+            .map(|op| postcard::experimental::serialized_size(op).unwrap() as u64)
+            .sum::<u64>();
+        assert!(page.ops.len() <= credit.ops as usize, "{credit:?}");
+        assert!(bytes <= credit.bytes, "{credit:?}");
+        assert!(!page.ops.is_empty() && page.more, "{credit:?}");
+    }
+}

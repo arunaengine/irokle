@@ -115,7 +115,9 @@ pub struct SyncRequest {
     pub credit: SyncCredit,
 }
 
-/// What a requester is willing to receive for one page.
+/// What a requester is willing to receive for one page: a number of operations
+/// and their postcard-serialized bytes. Framing is not counted; a transport
+/// fits the page to its own wire limits on top of this credit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncCredit {
     pub ops: u32,
@@ -153,8 +155,9 @@ pub struct SyncReceipt {
     pub clock: ActorClock,
 }
 
-/// Bounds of one planned page: operations, and their serialized bytes. A
-/// transport adds its own framing on top and must fit the page to its limits.
+/// Bounds of one planned page, in the units of [`SyncCredit`]: operations and
+/// their serialized bytes. A transport adds its own framing on top and must fit
+/// the page to its limits; `net::sync_data_page` sizes the wire frames exactly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageBudget {
     pub ops: usize,
@@ -731,10 +734,11 @@ impl<S: Storage> SyncEngine<S> {
         })
     }
 
-    /// Serve one causal page of `request` within `budget`: its explicit wants,
-    /// then its ranges, refusing a request planned on another genesis. `more`
-    /// says the requested goal holds more; the requester asks again. The
-    /// membership check and every record come from one snapshot.
+    /// Serve one causal page of `request` within `budget` and the request's own
+    /// credit, whichever is smaller: its explicit wants, then its ranges,
+    /// refusing a request planned on another genesis. `more` says the requested
+    /// goal holds more; the requester asks again. The membership check and
+    /// every record come from one snapshot.
     pub fn response_page(
         &self,
         peer_id: PeerId,
@@ -773,6 +777,12 @@ impl<S: Storage> SyncEngine<S> {
             return Err(Error::Storage("sync request exceeds work budget".into()));
         }
         let asks = !request.wants.is_empty() || !request.actor_range_hints.is_empty();
+        // The requester's credit binds every caller, not only one transport.
+        let credit = PageBudget::from_credit(request.credit);
+        let budget = PageBudget {
+            ops: budget.ops.min(credit.ops),
+            bytes: budget.bytes.min(credit.bytes),
+        };
         if budget.ops == 0 || budget.bytes == 0 {
             return Ok(PlannedPage {
                 more: asks,
