@@ -6,9 +6,9 @@ use super::support::*;
 use crate::oplog::Oplog;
 use crate::sync::{PageBudget, SyncCredit, SyncEngine, SyncRequest};
 
-struct Source {
-    log: Oplog,
-    engine: SyncEngine<MemoryStorage>,
+struct Source<S: Storage = MemoryStorage> {
+    log: Oplog<S>,
+    engine: SyncEngine<S>,
     topic_id: TopicId,
     reader: PeerId,
     genesis: Op,
@@ -99,7 +99,7 @@ fn many_actors(actors: u8, per_actor: usize, text: usize) -> Source {
 }
 
 /// The request a reader holding `reader` would send for the source's summary.
-fn request_for(source: &Source, reader: &Oplog, credit: SyncCredit) -> SyncRequest {
+fn request_for<S: Storage>(source: &Source<S>, reader: &Oplog, credit: SyncCredit) -> SyncRequest {
     let reader_engine = SyncEngine::new(reader.clone(), source.reader);
     let summary = source.engine.summary(source.topic_id).unwrap();
     let (plan, _) = reader_engine
@@ -328,33 +328,184 @@ fn one_op_cheap() {
 }
 
 /// A want for a head far beyond the reader's clock cannot be served by one
-/// repair walk; what is sent must still be admissible, never a tail whose
-/// ancestors were cut off.
+/// repair walk. Forward ranges still advance on every page, what is sent is
+/// admissible, and the pull completes; the same fixture without the far want
+/// is the positive control and takes the same number of pages.
 #[test]
 fn repair_walk_causal() {
     let source = many_actors(1, 6000, 0);
+    for far_want in [false, true] {
+        let reader = Oplog::new();
+        reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+        let mut pages = 0;
+        loop {
+            let mut request = request_for(&source, &reader, SyncCredit::default());
+            if request.actor_range_hints.is_empty() && request.wants.is_empty() {
+                break;
+            }
+            assert!(pages < 2, "pull with far want {far_want} did not finish");
+            if far_want {
+                request
+                    .wants
+                    .extend(source.log.storage().heads(&source.topic_id).unwrap());
+            }
+            let page = source
+                .engine
+                .response_page(
+                    source.reader,
+                    &request,
+                    PageBudget::from_credit(request.credit),
+                )
+                .unwrap();
+            assert!(!page.ops.is_empty(), "page {pages} carried nothing");
+            assert_eq!(page.more, pages == 0);
+            let ids = page.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+            assert_eq!(reader.receive_ops(page.ops).unwrap(), ids);
+            assert!(
+                reader
+                    .storage()
+                    .pending_missing_deps(&source.topic_id)
+                    .unwrap()
+                    .is_empty()
+            );
+            pages += 1;
+        }
+        assert_eq!(pages, 2);
+        assert_eq!(
+            reader.storage().heads(&source.topic_id).unwrap(),
+            source.log.storage().heads(&source.topic_id).unwrap()
+        );
+    }
+}
+
+/// A topic whose `actors` writers each publish one op depending on one op of
+/// the writer with the largest actor key, so bounded actor windows taken in key
+/// order select the dependents before their dependency.
+fn late_dependency<S: Storage + Clone>(storage: S, actors: usize) -> Source<S> {
+    let owner = Ed25519Signer::from_bytes(&[242; 32]);
+    let reader = Ed25519Signer::from_bytes(&[243; 32]).peer_id();
+    let topic_id = TopicId::hash([b"late-dependency".as_slice(), &actors.to_le_bytes()].concat());
+    let mut writers = (0..actors)
+        .map(|index| {
+            let mut seed = [9_u8; 32];
+            seed[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            Ed25519Signer::from_bytes(&seed)
+        })
+        .collect::<Vec<_>>();
+    writers.sort_by_key(|writer| actor_id_for(topic_id, writer.peer_id()));
+    let late = writers.pop().unwrap();
+    let members = writers
+        .iter()
+        .chain([&late, &owner])
+        .map(Signer::peer_id)
+        .chain([reader])
+        .collect::<BTreeSet<_>>();
+    let genesis = Op::sign(
+        OpBody {
+            topic_id,
+            author: owner.peer_id(),
+            actor_id: actor_id_for(topic_id, owner.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: BTreeSet::new(),
+            generation: 0,
+            payload: TopicPayload::Genesis(TopicGenesis::new(Note::TYPE_ID, members)),
+        },
+        &owner,
+    )
+    .unwrap();
+    let event = |writer: &Ed25519Signer, deps: BTreeSet<OpId>, generation| {
+        Op::sign(
+            OpBody {
+                topic_id,
+                author: writer.peer_id(),
+                actor_id: actor_id_for(topic_id, writer.peer_id()),
+                actor_seq: 1,
+                actor_prev: None,
+                deps,
+                generation,
+                payload: TopicPayload::Event(
+                    EventEnvelope::encode_event(&Note { text: "x".into() }).unwrap(),
+                ),
+            },
+            writer,
+        )
+        .unwrap()
+    };
+    let dependency = event(&late, [genesis.id].into(), 1);
+    let mut ops = vec![genesis.clone(), dependency.clone()];
+    ops.extend(
+        writers
+            .iter()
+            .map(|writer| event(writer, [dependency.id].into(), 2)),
+    );
+    let log = Oplog::with_storage(storage);
+    for batch in ops.chunks(4096) {
+        log.receive_ops(batch.to_vec()).unwrap();
+    }
+    Source {
+        engine: SyncEngine::new(log.clone(), owner.peer_id()),
+        log,
+        topic_id,
+        reader,
+        genesis,
+    }
+}
+
+/// Pages a reader at the genesis through `source`, requiring every page to
+/// carry admissible data, and returns the page count.
+fn page_through<S: Storage>(source: &Source<S>) -> usize {
     let reader = Oplog::new();
     reader.receive_ops(vec![source.genesis.clone()]).unwrap();
-    let mut request = request_for(&source, &reader, SyncCredit::default());
-    request
-        .wants
-        .extend(source.log.storage().heads(&source.topic_id).unwrap());
-    let page = source
-        .engine
-        .response_page(
-            source.reader,
-            &request,
-            PageBudget::from_credit(request.credit),
-        )
-        .unwrap();
-    assert!(page.more);
-    let ids = page.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
-    assert_eq!(reader.receive_ops(page.ops).unwrap(), ids);
-    assert!(
-        reader
-            .storage()
-            .pending_missing_deps(&source.topic_id)
-            .unwrap()
-            .is_empty()
+    let credit = SyncCredit::default();
+    let mut pages = 0;
+    loop {
+        let request = request_for(source, &reader, credit);
+        if request.actor_range_hints.is_empty() && request.wants.is_empty() {
+            break;
+        }
+        assert!(pages < 8, "paging did not finish");
+        let page = source
+            .engine
+            .response_page(source.reader, &request, PageBudget::from_credit(credit))
+            .unwrap();
+        assert!(!page.ops.is_empty(), "page {pages} carried nothing");
+        let ids = page.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+        assert_eq!(
+            reader.receive_ops(page.ops).unwrap(),
+            ids,
+            "page {pages} was not causal"
+        );
+        pages += 1;
+    }
+    assert_eq!(
+        reader.storage().heads(&source.topic_id).unwrap(),
+        source.log.storage().heads(&source.topic_id).unwrap()
     );
+    assert_eq!(
+        reader.storage().actor_clock(&source.topic_id).unwrap(),
+        source.log.storage().actor_clock(&source.topic_id).unwrap()
+    );
+    pages
+}
+
+/// Around the bounded actor window, a dependency actor beyond the window is
+/// brought into the page instead of blocking every dependent.
+#[test]
+fn window_admits_dependency() {
+    for actors in [4095, 4096, 4097, 4098] {
+        let source = late_dependency(MemoryStorage::new(), actors);
+        let pages = page_through(&source);
+        assert!(pages <= 2, "{actors} actors took {pages} pages");
+    }
+}
+
+/// The same deferred dependency window on a durable store.
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_window_admits_dependency() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+    let source = late_dependency(storage, 4097);
+    assert!(page_through(&source) <= 2);
 }

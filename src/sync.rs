@@ -443,6 +443,7 @@ impl<S: Storage> SyncEngine<S> {
                     &view.clock,
                     &remote.actor_clock,
                     None,
+                    &BTreeSet::new(),
                     budget,
                 )?;
                 *more = page.more;
@@ -476,20 +477,19 @@ impl<S: Storage> SyncEngine<S> {
             );
             need.extend(repair);
         }
-        let actor_range_hints = self.needed_actor_ranges(remote, need.len())?;
-        // A page request reaches a remote head through its actor's range; only
-        // a head no range covers stays an explicit want.
+        // A page request reaches a remote tip ahead of this clock through its
+        // actor's ranges, over as many pages as the gap needs; only a head at or
+        // behind the local position is a hole and stays an explicit want.
         #[cfg(feature = "iroh")]
         if matches!(send_set, SendSet::Page(_)) {
             need.retain(|id| {
-                !remote.actor_tips.iter().any(|(actor_id, (seq, tip))| {
-                    tip == id
-                        && actor_range_hints
-                            .iter()
-                            .any(|hint| hint.actor_id == *actor_id && hint.to_inclusive >= *seq)
-                })
+                !remote
+                    .actor_tips
+                    .iter()
+                    .any(|(actor_id, (seq, tip))| tip == id && view.clock.get(actor_id) < *seq)
             });
         }
+        let actor_range_hints = self.needed_actor_ranges(remote, need.len())?;
         Ok(SyncPlan {
             topic_id: remote.topic_id,
             common,
@@ -627,6 +627,13 @@ impl<S: Storage> SyncEngine<S> {
         {
             return Err(Error::Storage("sync request exceeds work budget".into()));
         }
+        let asks = !request.wants.is_empty() || !request.actor_range_hints.is_empty();
+        if budget.ops == 0 || budget.bytes == 0 {
+            return Ok(PlannedPage {
+                ops: Vec::new(),
+                more: asks,
+            });
+        }
         let local = &view.clock;
         let mut peer_clock = local.clone();
         let mut goal = local.clone();
@@ -638,6 +645,14 @@ impl<S: Storage> SyncEngine<S> {
         }
         let (mut ops, repair_more) =
             self.plan_repair(&request.topic_id, &request.wants, &peer_clock, budget)?;
+        // Wants this page could not carry keep their dependents out of the
+        // forward ranges, which still serve every independent actor.
+        let unsent = if repair_more {
+            let sent = ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+            request.wants.difference(&sent).copied().collect()
+        } else {
+            BTreeSet::new()
+        };
         let mut used = 0;
         for op in &ops {
             used += postcard::experimental::serialized_size(op)?;
@@ -650,14 +665,21 @@ impl<S: Storage> SyncEngine<S> {
             ops: budget.ops.saturating_sub(ops.len()),
             bytes: budget.bytes.saturating_sub(used),
         };
-        if repair_more || rest.ops == 0 {
+        if rest.ops == 0 || rest.bytes == 0 {
             return Ok(PlannedPage { ops, more: true });
         }
-        let planned = self.plan_page(&request.topic_id, local, &peer_clock, Some(&goal), rest)?;
+        let planned = self.plan_page(
+            &request.topic_id,
+            local,
+            &peer_clock,
+            Some(&goal),
+            &unsent,
+            rest,
+        )?;
         ops.extend(planned.ops);
         Ok(PlannedPage {
             ops,
-            more: planned.more,
+            more: repair_more || planned.more,
         })
     }
 
@@ -1076,31 +1098,48 @@ impl<S: Storage> SyncEngine<S> {
         local: &ActorClock,
         peer: &ActorClock,
         goal: Option<&ActorClock>,
+        excluded: &BTreeSet<OpId>,
         budget: PageBudget,
     ) -> Result<PlannedPage> {
         let storage = self.oplog.storage();
+        let limit_of = |actor_id: &ActorId, local_seq: u64| {
+            goal.map_or(local_seq, |goal| goal.get(actor_id).min(local_seq))
+        };
+        // A zero allowance reads nothing; whether the goal holds more is known
+        // from the clocks alone.
+        if budget.ops == 0 || budget.bytes == 0 {
+            return Ok(PlannedPage {
+                ops: Vec::new(),
+                more: local
+                    .iter()
+                    .any(|(actor_id, seq)| limit_of(actor_id, *seq) > peer.get(actor_id)),
+            });
+        }
         let mut heads = BinaryHeap::new();
         let mut metas = BTreeMap::new();
         let mut more = false;
+        let mut deferred = BTreeSet::new();
         for (actor_id, local_seq) in local.iter() {
-            let limit = goal.map_or(*local_seq, |goal| goal.get(actor_id).min(*local_seq));
+            let limit = limit_of(actor_id, *local_seq);
             let after = peer.get(actor_id);
             if limit <= after {
                 continue;
             }
             if heads.len() >= MAX_PAGE_ACTORS {
                 more = true;
+                deferred.insert(*actor_id);
                 continue;
             }
             more |=
                 !self.push_range_head(topic_id, *actor_id, after, limit, &mut heads, &mut metas)?;
         }
         let mut covered = peer.clone();
+        let mut blocked = excluded.clone();
         let mut ops = Vec::new();
         let mut bytes = 0_usize;
-        while let Some(Reverse((_, actor_id, seq, id, limit))) = heads.pop() {
+        while let Some(Reverse((generation, actor_id, seq, id, limit))) = heads.pop() {
             let meta = metas.remove(&id).ok_or(Error::MissingDependency(id))?;
-            let mut blocked = false;
+            let mut waits = None;
             for dep in &meta.deps {
                 let dep_position = match metas.get(dep) {
                     Some(dep_meta) => Some((dep_meta.actor_id, dep_meta.actor_seq)),
@@ -1108,19 +1147,44 @@ impl<S: Storage> SyncEngine<S> {
                         .get_meta(dep)?
                         .map(|dep_meta| (dep_meta.actor_id, dep_meta.actor_seq)),
                 };
-                if dep_position.is_none_or(|(actor, dep_seq)| covered.get(&actor) < dep_seq) {
-                    blocked = true;
+                if blocked.contains(dep)
+                    || dep_position.is_none_or(|(actor, dep_seq)| covered.get(&actor) < dep_seq)
+                {
+                    waits = Some(dep_position);
                     break;
                 }
             }
-            // A dependency behind a deferred actor or a hole cannot be sent yet.
-            let Some(op) = (!blocked)
+            // A dependency on an actor left outside the window joins the page
+            // once, within twice the window; its ops have lower generations, so
+            // they pop before this op is tried again.
+            if let Some(Some((dep_actor, _))) = waits
+                && heads.len() < 2 * MAX_PAGE_ACTORS
+                && deferred.remove(&dep_actor)
+            {
+                let dep_limit = limit_of(&dep_actor, local.get(&dep_actor));
+                more |= !self.push_range_head(
+                    topic_id,
+                    dep_actor,
+                    peer.get(&dep_actor),
+                    dep_limit,
+                    &mut heads,
+                    &mut metas,
+                )?;
+                heads.push(Reverse((generation, actor_id, seq, id, limit)));
+                metas.insert(id, meta);
+                continue;
+            }
+            // A dependency behind a hole, an unsent repair or a blocked op stops
+            // this actor only; independent actors keep filling the page.
+            let Some(op) = waits
+                .is_none()
                 .then(|| storage.get_op(&id))
                 .transpose()?
                 .flatten()
             else {
                 more = true;
-                break;
+                blocked.insert(id);
+                continue;
             };
             let size = postcard::experimental::serialized_size(&op)?;
             if size > MAX_PAGE_BYTES {

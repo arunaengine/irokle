@@ -140,3 +140,108 @@ fn catch_up_costs() {
         );
     }
 }
+
+/// Pulls `source` into a reader holding only `genesis` through the reader's
+/// own negotiation, asserting every page carries admissible data, and returns
+/// the page count.
+fn pull_behind(source: &Oplog, peers: (PeerId, PeerId), topic_id: TopicId, genesis: &Op) -> usize {
+    let (author, reader) = peers;
+    let responder = SyncEngine::new(source.clone(), author);
+    let requester = Oplog::new();
+    requester.receive_ops(vec![genesis.clone()]).unwrap();
+    let requester_engine = SyncEngine::new(requester.clone(), reader);
+    let no_push = crate::sync::PageBudget { ops: 0, bytes: 0 };
+    let behind = source
+        .storage()
+        .actor_clock(&topic_id)
+        .unwrap()
+        .iter()
+        .map(|(_, seq)| *seq)
+        .sum::<u64>();
+    let mut pages = 0;
+    loop {
+        let summary = responder.summary(topic_id).unwrap();
+        let (plan, _) = requester_engine
+            .negotiate_page(author, &summary, no_push)
+            .unwrap();
+        if plan.need.is_empty() && plan.actor_range_hints.is_empty() {
+            break;
+        }
+        assert!(
+            pages as u64 <= behind.div_ceil(4096),
+            "pull of {behind} ops did not finish"
+        );
+        let request = SyncRequest {
+            topic_id,
+            known: plan.common,
+            wants: plan.need,
+            actor_range_hints: plan.actor_range_hints,
+            genesis: Some(genesis.id),
+            credit: Default::default(),
+        };
+        let page = responder
+            .response_page(
+                reader,
+                &request,
+                crate::sync::PageBudget::from_credit(request.credit),
+            )
+            .unwrap();
+        assert!(
+            !page.ops.is_empty(),
+            "page {pages} of a pull behind {behind} ops carried nothing"
+        );
+        let ids = page.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+        assert_eq!(
+            requester.receive_ops(page.ops).unwrap(),
+            ids,
+            "page {pages} was not causal"
+        );
+        pages += 1;
+    }
+    assert_eq!(
+        requester.storage().heads(&topic_id).unwrap(),
+        source.storage().heads(&topic_id).unwrap()
+    );
+    assert_eq!(
+        requester.storage().actor_clock(&topic_id).unwrap(),
+        source.storage().actor_clock(&topic_id).unwrap()
+    );
+    pages
+}
+
+/// A reader at the genesis pulls a tip at the last position one range hint
+/// reaches and then one past it: both finish by forward pages, never through
+/// a repair walk from the far tip.
+#[test]
+fn pull_crosses_hint_span() {
+    let span = crate::sync::MAX_ACTOR_RANGE_HINT_SPAN as usize;
+    let (topic_id, signer, reader, ops) = signed_chain(9, span + 1);
+    let source = Oplog::new();
+    for batch in ops[..=span].chunks(4096) {
+        source.receive_ops(batch.to_vec()).unwrap();
+    }
+    let peers = (signer.peer_id(), reader);
+    assert_eq!(
+        pull_behind(&source, peers, topic_id, &ops[0]),
+        span.div_ceil(4096)
+    );
+    source.receive_ops(vec![ops[span + 1].clone()]).unwrap();
+    assert_eq!(
+        pull_behind(&source, peers, topic_id, &ops[0]),
+        (span + 1).div_ceil(4096)
+    );
+}
+
+/// A reader at the genesis pulls 100,000 events page by page. Run explicitly:
+/// `cargo test --features iroh --lib pull_hundred_thousand -- --ignored`.
+#[test]
+#[ignore = "long history acceptance, run explicitly"]
+fn pull_hundred_thousand() {
+    let (topic_id, signer, reader, ops) = signed_chain(10, 100_000);
+    let source = Oplog::new();
+    for batch in ops.chunks(4096) {
+        source.receive_ops(batch.to_vec()).unwrap();
+    }
+    let pages = pull_behind(&source, (signer.peer_id(), reader), topic_id, &ops[0]);
+    assert_eq!(pages, 100_000_usize.div_ceil(4096));
+}
