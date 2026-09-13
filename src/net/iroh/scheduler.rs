@@ -320,11 +320,111 @@ impl ResyncScheduler {
         drop(targets);
         self.notify.notify_one();
     }
+
+    /// Up to `limit` topics queued for `peer_id`.
+    pub(super) fn peer_topics(&self, peer_id: PeerId, limit: usize) -> Vec<crate::TopicId> {
+        let targets = self.inner.lock().expect("resync scheduler lock poisoned");
+        let start = ResyncTargetKey {
+            peer_id,
+            topic_id: crate::TopicId::from_bytes([0; 32]),
+        };
+        targets
+            .range(start..)
+            .take_while(|(key, _)| key.peer_id == peer_id)
+            .take(limit)
+            .map(|(key, _)| key.topic_id)
+            .collect()
+    }
+
+    pub(super) fn peer_reachable(&self, peer_id: PeerId) {
+        let now = tokio::time::Instant::now();
+        let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
+        let mut changed = false;
+        for (key, target) in targets.iter_mut() {
+            if key.peer_id == peer_id && target.failures > 0 {
+                target.failures = 0;
+                if target.active.is_none() && target.next_due > now {
+                    target.next_due = now;
+                }
+                changed = true;
+            }
+        }
+        drop(targets);
+        if changed {
+            self.notify.notify_one();
+        }
+    }
+
+    pub(super) fn complete_failed(
+        &self,
+        claim: ResyncTarget,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) {
+        let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
+        let Some(target) = targets.get_mut(&claim.key) else {
+            return;
+        };
+        if target.active != Some(claim.attempt) {
+            return;
+        }
+        target.failures = target.failures.saturating_add(1);
+        let shift = target.failures.saturating_sub(1).min(20);
+        let multiplier = 1_u32 << shift;
+        let backoff = initial_backoff.saturating_mul(multiplier).min(max_backoff);
+        target.next_due = tokio::time::Instant::now() + backoff;
+        target.active = None;
+        // A failed exchange retries even when local evidence reads clean.
+        target.force = Some(target.requested);
+        drop(targets);
+        self.notify.notify_one();
+    }
+
+    /// Hands a claim back without judging the peer. Runs from `Drop`, so it
+    /// must not panic, await or touch storage.
+    fn release_claim(&self, claim: ResyncTarget, after: Duration) {
+        self.end_attempt(claim.key, claim.attempt);
+        let Ok(mut targets) = self.inner.lock() else {
+            return;
+        };
+        let Some(target) = targets.get_mut(&claim.key) else {
+            return;
+        };
+        if target.active != Some(claim.attempt) {
+            return;
+        }
+        target.active = None;
+        target.next_due = tokio::time::Instant::now() + after;
+        drop(targets);
+        self.notify.notify_one();
+    }
+
+    pub(super) fn lease(&self, claims: Vec<ResyncTarget>, retry_after: Duration) -> ResyncLease {
+        ResyncLease {
+            scheduler: self.clone(),
+            retry_after,
+            claims: claims.into_iter().map(|claim| (claim.key, claim)).collect(),
+        }
+    }
+
+    /// Test-only view of a target's ownership, backoff and pending force.
+    #[cfg(test)]
+    pub(super) fn target_state(
+        &self,
+        peer_id: PeerId,
+        topic_id: crate::TopicId,
+    ) -> Option<(Option<AttemptId>, u32, Option<u64>)> {
+        self.inner
+            .lock()
+            .expect("resync scheduler lock poisoned")
+            .get(&ResyncTargetKey { peer_id, topic_id })
+            .map(|target| (target.active, target.failures, target.force))
+    }
 }
 
 /// Peers that already own a claimed target. A peer takes one turn at a time, so
 /// the rest of its work waits for the next one.
-pub(super) fn busy_peers(targets: &BTreeMap<ResyncTargetKey, ScheduledResync>) -> BTreeSet<PeerId> {
+fn busy_peers(targets: &BTreeMap<ResyncTargetKey, ScheduledResync>) -> BTreeSet<PeerId> {
     targets
         .iter()
         .filter(|(_, target)| target.active.is_some())
@@ -337,7 +437,7 @@ pub(super) fn busy_peers(targets: &BTreeMap<ResyncTargetKey, ScheduledResync>) -
 /// leave a target in flight forever.
 pub(super) struct ResyncLease {
     pub(super) scheduler: ResyncScheduler,
-    pub(super) retry_after: Duration,
+    retry_after: Duration,
     pub(super) claims: BTreeMap<ResyncTargetKey, ResyncTarget>,
 }
 
