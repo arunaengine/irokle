@@ -326,3 +326,156 @@ fn upgrades_staged_schema_four() {
     assert_eq!(stored_version(&path), 5);
     assert_eq!(staging(&raw_records(&path)), 0);
 }
+
+/// A migrated store reopened after staging part of a late invitation, after a
+/// history cursor read part of a topic, and after an admitted event is still
+/// owed to another member: each is kept exactly, the migrated eviction record
+/// stays until it is acknowledged, and the staging then activates.
+#[test]
+fn reopen_keeps_progress() {
+    use crate::history::HistoryOrder;
+    use crate::node::ReceiveOutcome;
+    use crate::sync::SyncData;
+
+    let dir = fixture_copy("fjall-schema2-54db4f9");
+    let m = Manifest::read(dir.path());
+    let path = dir.path().join("db");
+    let local = Ed25519Signer::from_bytes(&[180; 32]);
+    let open = || {
+        let config = NodeConfig {
+            signer: local.clone(),
+            default_write_concern: WriteConcern::Local,
+            peer_whitelist: None,
+        };
+        Irokle::with_storage(FjallStorage::open(&path).unwrap(), config).unwrap()
+    };
+    let (writer, source) = (node(181), node(183));
+    let absent = node(182).peer_id();
+
+    let reader = open();
+    let journal = reader.pending_evictions().unwrap();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].topic_id, m.id::<TopicId>("topic_b"));
+    let migrated: TopicId = m.id("topic");
+    let z: PeerId = m.id("peer_z");
+    let migrated_owed = reader.storage().sync_obligations(&z, &migrated).unwrap();
+    assert!(!migrated_owed.is_empty());
+
+    let topic = reader
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [writer.peer_id(), absent].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let topic_id = topic.id();
+    topic.publish(Note { text: "one".into() }).unwrap();
+    let cursor = topic.actor_clock().unwrap();
+    for text in ["two", "three"] {
+        topic.publish(Note { text: text.into() }).unwrap();
+    }
+    oplog::Oplog::with_storage(writer.storage().clone())
+        .receive_ops(oplog::topological(reader.storage(), &topic_id).unwrap())
+        .unwrap();
+    let written = writer
+        .open_topic::<Note>(topic_id)
+        .unwrap()
+        .publish(Note {
+            text: "written".into(),
+        })
+        .unwrap()
+        .meta
+        .op_id;
+    let op = writer.storage().get_op(&written).unwrap().unwrap();
+    let data = SyncData {
+        topic_id,
+        ops: vec![op],
+    };
+    reader
+        .receive_sync_data_from(writer.peer_id(), data)
+        .unwrap();
+    let owed = reader
+        .storage()
+        .sync_obligations(&absent, &topic_id)
+        .unwrap();
+    assert!(obligation_covers(reader.storage(), &owed, &written));
+    let remaining = |node: &Irokle<FjallStorage>| {
+        node.open_topic::<Note>(topic_id)
+            .unwrap()
+            .history_after(&cursor, HistoryOrder::OldestFirst)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.meta.op_id)
+            .collect::<Vec<_>>()
+    };
+    let after_cursor = remaining(&reader);
+    assert_eq!(after_cursor.len(), 3);
+
+    let invited = source.create_topic::<Note>(TopicConfig::default()).unwrap();
+    for index in 0..20 {
+        invited
+            .publish(Note {
+                text: format!("{index}"),
+            })
+            .unwrap();
+    }
+    invited.add_peer(reader.peer_id()).unwrap();
+    let invited_id = invited.id();
+    let ops = oplog::topological(source.storage(), &invited_id).unwrap();
+    let half = ops.len() / 2;
+    let fragment = |range: std::ops::Range<usize>| SyncData {
+        topic_id: invited_id,
+        ops: ops[range].to_vec(),
+    };
+    reader
+        .receive_sync_outcome(source.peer_id(), fragment(0..half))
+        .unwrap();
+    let staged = reader.staged_topic(source.peer_id(), invited_id).unwrap();
+    assert!(staged.is_some());
+    drop((topic, reader));
+
+    let reader = open();
+    assert_eq!(
+        reader.staged_topic(source.peer_id(), invited_id).unwrap(),
+        staged
+    );
+    assert!(reader.storage().topic_state(&invited_id).unwrap().is_none());
+    assert_eq!(remaining(&reader), after_cursor);
+    assert_eq!(
+        reader
+            .storage()
+            .sync_obligations(&absent, &topic_id)
+            .unwrap(),
+        owed
+    );
+    assert_eq!(
+        reader.storage().sync_obligations(&z, &migrated).unwrap(),
+        migrated_owed
+    );
+    assert_eq!(reader.pending_evictions().unwrap(), journal);
+    reader.clear_eviction(&journal[0].key()).unwrap();
+    assert!(reader.pending_evictions().unwrap().is_empty());
+    let outcome = reader
+        .receive_sync_outcome(source.peer_id(), fragment(half..ops.len()))
+        .unwrap();
+    assert!(
+        matches!(outcome, ReceiveOutcome::Acked { .. }),
+        "{outcome:?}"
+    );
+    drop(reader);
+
+    let reader = open();
+    assert!(reader.pending_evictions().unwrap().is_empty());
+    assert!(reader.storage().provisional_topics().unwrap().is_empty());
+    assert_eq!(
+        reader.storage().list_op_ids(&invited_id).unwrap().len(),
+        ops.len()
+    );
+    assert_eq!(remaining(&reader), after_cursor);
+    assert_eq!(
+        reader
+            .storage()
+            .sync_obligations(&absent, &topic_id)
+            .unwrap(),
+        owed
+    );
+}
