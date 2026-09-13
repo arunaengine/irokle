@@ -9,10 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::sync::{SyncMessage, SyncSummary};
 use crate::{Irokle, MemoryStorage, PeerId, ReceiveOutcome, Storage, TopicEviction};
 
-use super::frame::{MAX_FRAME_LEN, MAX_SYNC_DATA_OPS_PER_MESSAGE};
-use super::{
-    _message_type_name, IROKLE_SYNC_ALPN, decode_sync_message, encode_sync_message, invalid_data,
-};
+use super::frame::MAX_SYNC_DATA_OPS_PER_MESSAGE;
+use super::{_message_type_name, IROKLE_SYNC_ALPN, invalid_data};
 
 mod budget;
 mod exchange;
@@ -22,7 +20,10 @@ mod scheduler;
 
 use budget::{ByteBudget, Charge, DATA_TAG, Pool};
 pub use budget::{OwnedBytes, OwnedClass};
-use exchange::{SyncReadLimits, reply_fits};
+use exchange::{
+    SyncReadLimits, read_frame_body, read_frame_head, read_responses, reply_fits,
+    write_sync_messages,
+};
 pub use exchange::{SyncResponses, SyncResponsesIter};
 use pool::ConnectionPool;
 pub use runtime::{IrohRuntimeConfig, ShutdownOutcome};
@@ -3741,166 +3742,6 @@ impl<S: Storage> Drop for IrohNet<S> {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
     }
-}
-
-/// Reads the responses of an exchange, charging each frame to the result pool
-/// before it is allocated. Only the first frame may wait: waiting while this
-/// exchange holds result bytes could wait on itself, so a later frame that
-/// finds the pool full fails the exchange.
-async fn read_responses(
-    recv: &mut iroh::endpoint::RecvStream,
-    sync_io_timeout: Duration,
-    stream_limits: StreamLimits,
-    budget: &Arc<ByteBudget>,
-) -> io::Result<SyncResponses> {
-    let mut messages = Vec::new();
-    let mut held: Option<Charge> = None;
-    let mut limits = SyncReadLimits::new(stream_limits);
-    while let Some((len, tag)) = read_frame_head(recv, sync_io_timeout).await? {
-        let frame_index = limits.observe_frame(len)?;
-        let data = tag == DATA_TAG;
-        let bytes = ByteBudget::frame_charge(len, data);
-        let mut charge = match held {
-            None => {
-                budget
-                    .wait(Pool::Results, bytes, OwnedClass::Results)
-                    .await?
-            }
-            Some(_) => budget.try_take(Pool::Results, bytes, OwnedClass::Results)?,
-        };
-        let message = read_frame_body(recv, len, tag, sync_io_timeout, frame_index).await?;
-        let ops = match &message {
-            SyncMessage::Data(data) => data.ops.len(),
-            _ => 0,
-        };
-        charge.shrink(ByteBudget::decoded_bound(len, ops));
-        match &mut held {
-            Some(held) => held.merge(charge),
-            None => held = Some(charge),
-        }
-        messages.push(message);
-    }
-    Ok(SyncResponses {
-        messages,
-        charges: held.into_iter().collect(),
-    })
-}
-
-/// Writes `messages` as frames. With a `budget`, each encoding buffer is
-/// charged while it exists; a served reply with an output grant passes none.
-async fn write_sync_messages(
-    send: &mut iroh::endpoint::SendStream,
-    messages: &[SyncMessage],
-    sync_io_timeout: Duration,
-    stream_limits: StreamLimits,
-    budget: Option<&Arc<ByteBudget>>,
-) -> io::Result<()> {
-    reply_fits(messages, stream_limits)?;
-    for message in messages {
-        let _encoding = match budget {
-            Some(budget) => {
-                let len = super::framed_message_len(message)?;
-                let pool = ByteBudget::frame_pool(len, matches!(message, SyncMessage::Data(_)));
-                Some(budget.wait(pool, len, OwnedClass::Output).await?)
-            }
-            None => None,
-        };
-        let payload = encode_sync_message(message)?;
-        if payload.len() > MAX_FRAME_LEN {
-            return Err(invalid_data("sync frame exceeds maximum length"));
-        }
-        let prefix = (payload.len() as u32).to_be_bytes();
-        tokio::time::timeout(sync_io_timeout, async {
-            send.write_all(&prefix).await?;
-            send.write_all(&payload).await
-        })
-        .await
-        .map_err(|_| timed_out("sync write timed out"))?
-        .map_err(other)?;
-    }
-    send.finish().map_err(other)
-}
-
-/// Reads the length of the next frame and its first payload byte, the message
-/// kind, so the frame can be charged before the rest is allocated.
-async fn read_frame_head(
-    recv: &mut iroh::endpoint::RecvStream,
-    sync_io_timeout: Duration,
-) -> io::Result<Option<(usize, u8)>> {
-    let mut head = [0_u8; 5];
-    let Some(first_read) = read_some_with_timeout(recv, &mut head[..1], sync_io_timeout).await?
-    else {
-        return Ok(None);
-    };
-    if first_read == 0 {
-        return Ok(None);
-    }
-
-    let mut read = first_read;
-    while read < 4 {
-        let Some(n) = read_some_with_timeout(recv, &mut head[read..4], sync_io_timeout).await?
-        else {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "incomplete sync frame length",
-            ));
-        };
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "incomplete sync frame length",
-            ));
-        }
-        read += n;
-    }
-
-    let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "sync frame exceeds maximum length",
-        ));
-    }
-    if len == 0 {
-        return Err(invalid_data("empty sync message frame"));
-    }
-    tokio::time::timeout(sync_io_timeout, recv.read_exact(&mut head[4..]))
-        .await
-        .map_err(|_| timed_out("sync read timed out"))?
-        .map_err(other)?;
-    Ok(Some((len, head[4])))
-}
-
-/// Reads the rest of a frame whose head was read, and decodes it.
-async fn read_frame_body(
-    recv: &mut iroh::endpoint::RecvStream,
-    len: usize,
-    tag: u8,
-    sync_io_timeout: Duration,
-    frame_index: usize,
-) -> io::Result<SyncMessage> {
-    let mut payload = vec![0_u8; len];
-    payload[0] = tag;
-    tokio::time::timeout(sync_io_timeout, recv.read_exact(&mut payload[1..]))
-        .await
-        .map_err(|_| timed_out("sync read timed out"))?
-        .map_err(other)?;
-    decode_sync_message(&payload).map_err(|err| {
-        invalid_data(format!(
-            "invalid sync message frame {frame_index} ({len} bytes): {err}"
-        ))
-    })
-}
-
-async fn read_some_with_timeout(
-    recv: &mut iroh::endpoint::RecvStream,
-    buf: &mut [u8],
-    sync_io_timeout: Duration,
-) -> io::Result<Option<usize>> {
-    tokio::time::timeout(sync_io_timeout, recv.read(buf))
-        .await
-        .map_err(|_| timed_out("sync read timed out"))?
-        .map_err(other)
 }
 
 fn peer_id_from_endpoint_id(peer: iroh::EndpointId) -> PeerId {

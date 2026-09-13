@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::TopicId;
+use crate::net::frame::MAX_FRAME_LEN;
 use crate::tests::support::{Gate, GatePoint, Note, StaleReadStorage};
 
 /// Wide enough that a backoff step cannot pass while a test is running.
