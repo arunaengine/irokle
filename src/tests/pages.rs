@@ -454,17 +454,19 @@ fn late_dependency<S: Storage + Clone>(storage: S, actors: usize) -> Source<S> {
 
 /// Pages a reader at the genesis through `source`, requiring every page to
 /// carry admissible data, and returns the page count.
-fn page_through<S: Storage>(source: &Source<S>) -> usize {
+fn page_through<S: Storage>(source: &Source<S>, credit: SyncCredit) -> usize {
     let reader = Oplog::new();
     reader.receive_ops(vec![source.genesis.clone()]).unwrap();
-    let credit = SyncCredit::default();
+    // Generous: every op is at least 64 serialized bytes.
+    let per_page = (credit.ops as usize).min(credit.bytes as usize / 64).max(1);
+    let cap = 4 + 3 * 8192 / per_page;
     let mut pages = 0;
     loop {
         let request = request_for(source, &reader, credit);
         if request.actor_range_hints.is_empty() && request.wants.is_empty() {
             break;
         }
-        assert!(pages < 8, "paging did not finish");
+        assert!(pages < cap, "paging did not finish");
         let page = source
             .engine
             .response_page(source.reader, &request, PageBudget::from_credit(credit))
@@ -495,7 +497,7 @@ fn page_through<S: Storage>(source: &Source<S>) -> usize {
 fn window_admits_dependency() {
     for actors in [4095, 4096, 4097, 4098] {
         let source = late_dependency(MemoryStorage::new(), actors);
-        let pages = page_through(&source);
+        let pages = page_through(&source, SyncCredit::default());
         assert!(pages <= 2, "{actors} actors took {pages} pages");
     }
 }
@@ -507,7 +509,7 @@ fn fjall_window_admits_dependency() {
     let dir = tempfile::tempdir().unwrap();
     let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
     let source = late_dependency(storage, 4097);
-    assert!(page_through(&source) <= 2);
+    assert!(page_through(&source, SyncCredit::default()) <= 2);
 }
 
 /// The public page contract without a transport: a one-op credit serves one
@@ -566,4 +568,157 @@ fn public_page_contract() {
         reader.storage().actor_clock(&source.topic_id).unwrap(),
         source.log.storage().actor_clock(&source.topic_id).unwrap()
     );
+}
+
+/// Signed chains of `lens.len()` writers on one genesis, each op depending
+/// only on its predecessor, loaded into `source`. Returns the genesis and the
+/// chains in order.
+fn independent_chains(source: &Oplog, reader: PeerId, lens: &[usize]) -> (Op, Vec<Vec<Op>>) {
+    let owner = Ed25519Signer::from_bytes(&[244; 32]);
+    let writers = (0..lens.len())
+        .map(|index| Ed25519Signer::from_bytes(&[245 + index as u8; 32]))
+        .collect::<Vec<_>>();
+    let topic_id = TopicId::hash(b"independent-chains");
+    let members = writers
+        .iter()
+        .map(Signer::peer_id)
+        .chain([owner.peer_id(), reader])
+        .collect::<BTreeSet<_>>();
+    let genesis = Op::sign(
+        OpBody {
+            topic_id,
+            author: owner.peer_id(),
+            actor_id: actor_id_for(topic_id, owner.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: BTreeSet::new(),
+            generation: 0,
+            payload: TopicPayload::Genesis(TopicGenesis::new(Note::TYPE_ID, members)),
+        },
+        &owner,
+    )
+    .unwrap();
+    source.receive_ops(vec![genesis.clone()]).unwrap();
+    let chains = writers
+        .iter()
+        .zip(lens)
+        .map(|(writer, len)| {
+            let mut chain: Vec<Op> = Vec::with_capacity(*len);
+            for index in 0..*len {
+                let prev = chain.last();
+                let op = Op::sign(
+                    OpBody {
+                        topic_id,
+                        author: writer.peer_id(),
+                        actor_id: actor_id_for(topic_id, writer.peer_id()),
+                        actor_seq: index as u64 + 1,
+                        actor_prev: prev.map(|op| op.id),
+                        deps: [prev.map_or(genesis.id, |op| op.id)].into(),
+                        generation: index as u64 + 1,
+                        payload: TopicPayload::Event(
+                            EventEnvelope::encode_event(&Note {
+                                text: index.to_string(),
+                            })
+                            .unwrap(),
+                        ),
+                    },
+                    writer,
+                )
+                .unwrap();
+                chain.push(op);
+            }
+            for batch in chain.chunks(4096) {
+                source.receive_ops(batch.to_vec()).unwrap();
+            }
+            chain
+        })
+        .collect();
+    (genesis, chains)
+}
+
+/// A behind-only pull of a long chain, a deep repair of a record the reader
+/// lost, and a hole no peer can serve, in one topic: every page before the
+/// goal carries data, the long chain and the repair complete, and only the
+/// unavailable record is left, reported unresolved, with nothing more to serve.
+#[test]
+fn mixed_repair_pull() {
+    let reader_id = Ed25519Signer::from_bytes(&[250; 32]).peer_id();
+    let source_store = MemoryStorage::new();
+    let source_log = Oplog::with_storage(source_store.clone());
+    let (genesis, chains) = independent_chains(&source_log, reader_id, &[3000, 40, 9000]);
+    let (repaired, blocked, long) = (&chains[0], &chains[1], &chains[2]);
+    let owner = Ed25519Signer::from_bytes(&[244; 32]).peer_id();
+    let source = Source {
+        engine: SyncEngine::new(source_log.clone(), owner),
+        log: source_log,
+        topic_id: genesis.signed.body.topic_id,
+        reader: reader_id,
+        genesis: genesis.clone(),
+    };
+    let reader_store = MemoryStorage::new();
+    let reader = Oplog::with_storage(reader_store.clone());
+    reader.receive_ops(vec![genesis]).unwrap();
+    reader.receive_ops(repaired.clone()).unwrap();
+    reader.receive_ops(blocked.clone()).unwrap();
+    let lost = repaired[5].id;
+    let unavailable = blocked[10].id;
+    damage_op(&reader_store, &lost, Damage::Op);
+    damage_op(&reader_store, &unavailable, Damage::Op);
+    damage_op(&source_store, &unavailable, Damage::Both);
+    reader.recheck_topics().unwrap();
+    source.log.recheck_topics().unwrap();
+
+    let mut pages = 0;
+    loop {
+        let request = request_for(&source, &reader, SyncCredit::default());
+        if request.actor_range_hints.is_empty() && request.wants == [unavailable].into() {
+            break;
+        }
+        assert!(pages <= 4, "the mixed pull did not reach its goal");
+        let page = source
+            .engine
+            .response_page(
+                source.reader,
+                &request,
+                PageBudget::from_credit(request.credit),
+            )
+            .unwrap();
+        assert!(!page.ops.is_empty(), "page {pages} carried nothing");
+        reader.receive_ops(page.ops).unwrap();
+        reader.recheck_topics().unwrap();
+        pages += 1;
+    }
+    let long_actor = long[0].signed.body.actor_id;
+    assert_eq!(
+        reader
+            .storage()
+            .actor_clock(&source.topic_id)
+            .unwrap()
+            .get(&long_actor),
+        long.len() as u64
+    );
+    assert!(reader.storage().get_op(&lost).unwrap().is_some());
+    assert_eq!(
+        reader.topic_unresolved(&source.topic_id).unwrap(),
+        [unavailable].into()
+    );
+    let last = request_for(&source, &reader, SyncCredit::default());
+    let page = source
+        .engine
+        .response_page(source.reader, &last, PageBudget::from_credit(last.credit))
+        .unwrap();
+    assert!(page.ops.is_empty() && !page.more);
+}
+
+/// The deferred dependency window under a tight credit: pages cut by op
+/// count and by bytes still reach the frontier, each carrying admissible data.
+#[test]
+fn window_tight_credit() {
+    let source = late_dependency(MemoryStorage::new(), 4097);
+    let credit = SyncCredit {
+        ops: 1024,
+        bytes: 64 * 1024,
+    };
+    let pages = page_through(&source, credit);
+    assert!(pages > 4097 / 1024, "{pages} pages for 4097 ops");
 }
