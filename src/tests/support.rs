@@ -153,6 +153,12 @@ impl Gate {
         self.left.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Whether a reader reached the gate.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn arrived(&self) -> bool {
+        self.state.lock().unwrap().0
+    }
+
     /// Whether a reader went on past the gate, released or timed out.
     #[cfg(feature = "iroh")]
     pub(crate) fn has_left(&self) -> bool {

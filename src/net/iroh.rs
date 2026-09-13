@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -83,22 +83,60 @@ pub enum ShutdownOutcome {
     Incomplete { running: usize },
 }
 
-/// Counts the tasks a net spawned that have not ended yet.
+/// Owns the tasks a net runs. Root work registers and shutdown seals under one
+/// lock, so once shutdown has closed registration and seen zero tasks, no work
+/// a caller starts later can run.
 #[derive(Default)]
 struct TaskTracker {
-    running: AtomicUsize,
+    state: Mutex<TrackerState>,
     idle: tokio::sync::Notify,
 }
 
+#[derive(Default)]
+struct TrackerState {
+    running: usize,
+    closed: bool,
+}
+
 impl TaskTracker {
-    /// Taken before a task is spawned and moved into its future.
+    fn state(&self) -> std::sync::MutexGuard<'_, TrackerState> {
+        // The state is two plain fields updated atomically, so a poisoned lock is still consistent.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Registers work started by a caller outside the net. Refused once
+    /// shutdown has begun.
+    fn enter(self: &Arc<Self>) -> io::Result<TaskGuard> {
+        let mut state = self.state();
+        if state.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "irokle net is shut down",
+            ));
+        }
+        state.running += 1;
+        Ok(TaskGuard(Arc::clone(self)))
+    }
+
+    /// Registers work an already registered task starts, which may still run
+    /// while shutdown drains it.
     fn track(self: &Arc<Self>) -> TaskGuard {
-        self.running.fetch_add(1, Ordering::SeqCst);
+        self.state().running += 1;
         TaskGuard(Arc::clone(self))
     }
 
+    fn close(&self) {
+        self.state().closed = true;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state().closed
+    }
+
     fn running(&self) -> usize {
-        self.running.load(Ordering::SeqCst)
+        self.state().running
     }
 
     async fn wait_idle(&self) {
@@ -119,7 +157,10 @@ struct TaskGuard(Arc<TaskTracker>);
 
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        if self.0.running.fetch_sub(1, Ordering::SeqCst) == 1 {
+        let mut state = self.0.state();
+        state.running -= 1;
+        if state.running == 0 {
+            drop(state);
             self.0.idle.notify_waiters();
         }
     }
@@ -957,6 +998,8 @@ impl<S: Storage> IrohNet<S> {
         // receiver exists, which loses the intent entirely if shutdown runs
         // before any loop subscribes. `send_replace` always stores it, so a
         // loop started afterwards still sees the terminal state.
+        // Sealed first: no caller can register work the drain below would miss.
+        self.tasks.close();
         self.shutdown.send_replace(true);
         self.endpoint().close().await;
         // Returns only once the loops and every task they spawned have ended.
@@ -976,7 +1019,7 @@ impl<S: Storage> IrohNet<S> {
     }
 
     fn is_shutdown(&self) -> bool {
-        *self.shutdown.borrow()
+        self.tasks.is_closed()
     }
 
     pub async fn sync_peer_now(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<()> {
@@ -991,6 +1034,9 @@ impl<S: Storage> SharedNet<S> {
     }
 
     pub fn note_peer_reachable(&self, peer_id: PeerId) {
+        if self.tasks.is_closed() {
+            return;
+        }
         self.resync_scheduler.peer_reachable(peer_id);
         self.note_outcome(peer_id, [Ok(())]);
     }
@@ -1019,6 +1065,7 @@ impl<S: Storage> SharedNet<S> {
     /// Marks the peer on an externally accepted connection as reachable.
     /// Outbound sync dials separately because reverse stream support is not guaranteed.
     pub fn register_connection(&self, connection: iroh::endpoint::Connection) -> io::Result<()> {
+        let _task = self.tasks.enter()?;
         self.note_peer_reachable(peer_id_from_endpoint_id(connection.remote_id()));
         Ok(())
     }
@@ -1051,6 +1098,7 @@ impl<S: Storage> IrohNet<S> {
     pub fn spawn_accept_loop(self: &Arc<Self>) -> io::Result<Option<tokio::task::JoinHandle<()>>> {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| io::Error::other("iroh auto accept requires a Tokio runtime"))?;
+        let task = self.tasks.enter()?;
         if self.accept_started.swap(true, Ordering::SeqCst) {
             return Ok(None);
         }
@@ -1071,7 +1119,6 @@ impl<S: Storage> IrohNet<S> {
             .unwrap_or(MAX_ACCEPT_CONNECTIONS);
         #[cfg(test)]
         let hold = self.accept_hooks.handshakes.clone();
-        let task = tracker.track();
         let endpoint = self.endpoint().clone();
         let mut shutdown = self.shutdown.subscribe();
         Ok(Some(handle.spawn(async move {
@@ -1238,6 +1285,7 @@ impl<S: Storage> IrohNet<S> {
     ) -> io::Result<Option<tokio::task::JoinHandle<()>>> {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| io::Error::other("iroh resync requires a Tokio runtime"))?;
+        let task = self.tasks.enter()?;
         if self.resync_started.swap(true, Ordering::SeqCst) {
             return Ok(None);
         }
@@ -1254,7 +1302,6 @@ impl<S: Storage> IrohNet<S> {
             net: Weak::clone(&net),
             latch: |net| &net.resync_started,
         };
-        let task = self.tasks.track();
         Ok(Some(handle.spawn(async move {
             let _task = task;
             let _running = running;
@@ -1569,7 +1616,7 @@ impl<S: Storage> IrohNet<S> {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        if self.quarantine_started.swap(true, Ordering::SeqCst) {
+        if self.tasks.is_closed() || self.quarantine_started.swap(true, Ordering::SeqCst) {
             return;
         }
         let net = Arc::downgrade(self);
@@ -1627,7 +1674,7 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         messages: &[SyncMessage],
     ) -> io::Result<Vec<SyncMessage>> {
-        let _task = self.tasks.track();
+        let _task = self.tasks.enter()?;
         let mut last_error = None;
         for _ in 0..2 {
             let connection = match self
@@ -1679,7 +1726,7 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         topic_id: crate::TopicId,
     ) -> io::Result<()> {
-        let _task = self.tasks.track();
+        let _task = self.tasks.enter()?;
         let attempt = self.attempt_identity(None);
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
         let endpoint_id = peer.id;
@@ -3100,7 +3147,7 @@ impl<S: Storage> SharedNet<S> {
 
 impl<S: Storage> IrohNet<S> {
     pub async fn accept_one(&self) -> io::Result<Option<iroh::EndpointId>> {
-        let _task = self.tasks.track();
+        let _task = self.tasks.enter()?;
         let Some(incoming) = self.endpoint().accept().await else {
             return Ok(None);
         };
@@ -3131,7 +3178,7 @@ impl<S: Storage> IrohNet<S> {
         mut recv: iroh::endpoint::RecvStream,
         mut send: iroh::endpoint::SendStream,
     ) -> io::Result<()> {
-        let _task = self.tasks.track();
+        let _task = self.tasks.enter()?;
         tokio::time::timeout(self.runtime.sync_io_timeout, async {
             let mut session = SyncSession::new(peer);
             let mut limits = SyncReadLimits::new(self.limits);
@@ -3181,6 +3228,7 @@ impl<S: Storage> SharedNet<S> {
         peer: iroh::EndpointId,
         messages: Vec<SyncMessage>,
     ) -> io::Result<Vec<SyncMessage>> {
+        let _task = self.tasks.enter()?;
         let mut session = SyncSession::new(peer);
         for message in messages {
             session.handle(self, message)?;
@@ -5356,6 +5404,90 @@ mod tests {
             let replacement = replacement.expect("an exited loop can be started again");
             replacement.await.unwrap();
         }
+    }
+
+    /// Once shutdown completes no caller can start network-owned work: every
+    /// root entry point refuses, a loop start runs no startup storage job, and
+    /// nothing new is registered. A repeated shutdown still completes.
+    #[tokio::test]
+    async fn closed_refuses_roots() {
+        use crate::tests::support::{Gate, GatePoint, Note, node};
+
+        let (net, storage) = stale_net().await;
+        let remote = node(72).peer_id();
+        let topic_id = net
+            .node
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [remote].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+        assert_eq!(
+            net.shutdown_with_timeout(Duration::from_secs(60)).await,
+            ShutdownOutcome::Complete
+        );
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::View(topic_id), Arc::clone(&gate));
+        let refused = |error: io::Error| error.kind() == io::ErrorKind::NotConnected;
+        assert!(net.spawn_resync_loop(BACKOFF).is_err_and(refused));
+        assert!(net.spawn_accept_loop().is_err_and(refused));
+        let addr = peer_id_to_endpoint_addr(remote).unwrap();
+        assert!(
+            net.sync_now(addr.clone(), topic_id)
+                .await
+                .is_err_and(refused)
+        );
+        assert!(net.sync_with(addr, &[]).await.is_err_and(refused));
+        assert!(net.accept_one().await.is_err_and(refused));
+        let endpoint_id = iroh::EndpointId::from_bytes(remote.as_bytes()).unwrap();
+        assert!(
+            net.handle_messages(endpoint_id, Vec::new())
+                .is_err_and(refused)
+        );
+        assert_eq!(net.tasks.running(), 0);
+        assert!(
+            !gate.arrived(),
+            "a storage job ran after shutdown completed"
+        );
+        drop(release);
+        assert_eq!(
+            net.shutdown_with_timeout(Duration::from_secs(60)).await,
+            ShutdownOutcome::Complete
+        );
+    }
+
+    /// Callers racing shutdown are either registered before the seal and
+    /// drained by it, or refused; none is left running after completion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registration_races_shutdown() {
+        let net = test_net().await;
+        let peer = iroh::SecretKey::generate().public();
+        let barrier = Arc::new(tokio::sync::Barrier::new(33));
+        let callers = (0..32)
+            .map(|_| {
+                let net = Arc::clone(&net);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    net.handle_messages(peer, Vec::new()).map(drop)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait().await;
+        assert_eq!(
+            net.shutdown_with_timeout(Duration::from_secs(60)).await,
+            ShutdownOutcome::Complete
+        );
+        assert_eq!(net.tasks.running(), 0);
+        for caller in callers {
+            if let Err(error) = caller.await.unwrap() {
+                assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+            }
+        }
+        assert_eq!(net.tasks.running(), 0);
+        assert!(net.handle_messages(peer, Vec::new()).is_err());
     }
 
     /// A loop that panics clears its latch on unwind and leaves no owned
