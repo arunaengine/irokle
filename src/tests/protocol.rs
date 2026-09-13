@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use super::iroh::ready_addr;
@@ -573,4 +574,167 @@ async fn old_protocol_refused() {
     assert!(connected.is_err());
     old.close().await;
     alice.net.shutdown().await;
+}
+
+/// Wire bytes of `messages` as the stream writer frames them.
+fn framed_bytes(messages: &[SyncMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| crate::net::framed_message_len(message).unwrap())
+        .sum()
+}
+
+/// Serves `alice`'s first `keep` events to a member whose stream budget holds
+/// the reply controls plus `data` bytes. Returns the served ids, the page
+/// result, the reply bytes and the budget.
+async fn serve_within(
+    events: usize,
+    text_len: usize,
+    data: impl FnOnce(&[Op]) -> usize,
+) -> (Vec<OpId>, Vec<Op>, Option<bool>, usize, usize) {
+    let endpoint = bind(None).await;
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(endpoint.secret_key())
+        .build()
+        .unwrap();
+    let bob = peer(
+        bind(None).await,
+        net::IrohRuntimeConfig::default(),
+        StreamLimits::default(),
+    );
+    let topic_id = topic(71);
+    let ops = seed_topic(&alice, &bob.node, topic_id, events, text_len);
+    let controls = framed_bytes(&[
+        SyncMessage::Summary(alice.sync_summary(topic_id).unwrap()),
+        SyncMessage::Page(crate::sync::SyncPage {
+            topic_id,
+            more: false,
+        }),
+    ]);
+    let limits = StreamLimits {
+        bytes: controls + data(&ops[1..]),
+        ..StreamLimits::default()
+    };
+    let alice_net = net::IrohNet::new_with_config(endpoint, alice.clone(), Default::default())
+        .unwrap()
+        .with_stream_limits(limits);
+    let messages = vec![
+        open(&bob.node, topic_id),
+        SyncMessage::Request(events_request(&alice, topic_id, SyncCredit::default())),
+    ];
+    let replies = alice_net
+        .handle_messages(bob.net.endpoint().id(), messages)
+        .unwrap();
+    assert!(replies.len() <= limits.messages);
+    let result = (
+        data_ids(&replies, topic_id),
+        ops,
+        page_more(&replies, topic_id),
+        framed_bytes(&replies),
+        limits.bytes,
+    );
+    alice_net.shutdown().await;
+    bob.net.shutdown().await;
+    result
+}
+
+/// A reply is budgeted in framed wire bytes: raw operations that fit the share
+/// are cut once their frame prefix, tag, topic and count bytes do not, at the
+/// exact fit, one byte under it, across the count width change at 128 and the
+/// message split at 256 operations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_fits_framed_bytes() {
+    let raw = |keep: usize| {
+        move |ops: &[Op]| {
+            ops[..keep]
+                .iter()
+                .map(|op| postcard::experimental::serialized_size(op).unwrap())
+                .sum()
+        }
+    };
+    let framed = |keep: usize, slack: usize| {
+        move |ops: &[Op]| {
+            framed_bytes(&push(ops[0].signed.body.topic_id, ops[..keep].to_vec())) - slack
+        }
+    };
+    let (served, ops, more, bytes, limit) = serve_within(20, 300, raw(10)).await;
+    assert!(bytes <= limit, "reply of {bytes} bytes exceeds {limit}");
+    assert_eq!(served.len(), 9, "raw bytes of ten ops do not frame ten ops");
+    assert_eq!(more, Some(true));
+    assert_eq!(
+        served,
+        ops[1..10].iter().map(|op| op.id).collect::<Vec<_>>()
+    );
+
+    for (events, keep) in [(20, 10), (300, 128), (300, 256), (300, 257)] {
+        let (served, _, more, bytes, limit) = serve_within(events, 8, framed(keep, 0)).await;
+        assert!(
+            bytes <= limit,
+            "exact reply of {bytes} bytes exceeds {limit}"
+        );
+        assert_eq!(
+            served.len(),
+            keep,
+            "an exact fit of {keep} ops is served whole"
+        );
+        assert_eq!(more, Some(true));
+        let (served, _, more, bytes, limit) = serve_within(events, 8, framed(keep, 1)).await;
+        assert!(bytes <= limit, "reply of {bytes} bytes exceeds {limit}");
+        assert_eq!(
+            served.len(),
+            keep - 1,
+            "one byte under {keep} ops keeps one less"
+        );
+        assert_eq!(more, Some(true));
+    }
+}
+
+/// Forty topics whose next op is larger than an equal share of the stream:
+/// leftover capacity still serves them, every reply stays within the budget,
+/// and repeated requests finish every topic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_topics_progress() {
+    let limits = StreamLimits {
+        bytes: 64 * 1024,
+        messages: 256,
+        batch_messages: 128,
+    };
+    let (alice, bob) = stream_pair(limits).await;
+    let topics = (100..140).map(topic).collect::<Vec<_>>();
+    let mut served = BTreeMap::new();
+    for topic_id in &topics {
+        let ops = seed_topic(&alice.node, &bob.node, *topic_id, 3, 6 * 1024);
+        served.insert(*topic_id, (ops[1..].to_vec(), 0_usize));
+    }
+    let mut rounds = 0;
+    while served.values().any(|(ops, sent)| *sent < ops.len()) {
+        rounds += 1;
+        assert!(rounds <= 40, "large topics did not finish");
+        let mut messages = Vec::new();
+        for (topic_id, (ops, sent)) in &served {
+            if *sent == ops.len() {
+                continue;
+            }
+            let mut request = events_request(&alice.node, *topic_id, SyncCredit::default());
+            request.actor_range_hints[0].from_exclusive = 1 + *sent as u64;
+            messages.push(open(&bob.node, *topic_id));
+            messages.push(SyncMessage::Request(request));
+        }
+        let replies = serve_stream(&alice, &bob, messages);
+        assert!(framed_bytes(&replies) <= limits.bytes);
+        let mut progressed = false;
+        for (topic_id, (ops, sent)) in served.iter_mut() {
+            let ids = data_ids(&replies, *topic_id);
+            let expected = ops[*sent..*sent + ids.len()]
+                .iter()
+                .map(|op| op.id)
+                .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "a page continues where the last one ended");
+            *sent += ids.len();
+            progressed |= !ids.is_empty();
+        }
+        assert!(progressed, "round {rounds} served no topic");
+    }
+    alice.net.shutdown().await;
+    bob.net.shutdown().await;
 }

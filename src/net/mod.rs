@@ -24,38 +24,95 @@ pub(crate) use iroh::StreamLimits;
 #[cfg(feature = "iroh")]
 pub use iroh::{IrohNet, IrohRuntimeConfig, ShutdownOutcome};
 
-#[cfg(any(feature = "iroh", test))]
+#[cfg(test)]
 pub(crate) fn sync_data_messages(topic_id: TopicId, ops: Vec<Op>) -> io::Result<Vec<SyncMessage>> {
-    let mut messages = Vec::new();
-    let mut data = SyncData {
+    Ok(sync_data_page(topic_id, ops, usize::MAX, usize::MAX)?.messages)
+}
+
+#[cfg(any(feature = "iroh", test))]
+/// Data messages for a causal prefix of some operations, within a wire budget.
+#[cfg_attr(not(feature = "iroh"), allow(dead_code))]
+pub(crate) struct DataPage {
+    pub(crate) messages: Vec<SyncMessage>,
+    /// Framed wire bytes of `messages`, prefixes, tags, topics and counts included.
+    pub(crate) bytes: usize,
+    /// Whether operations were left out to stay within the budget.
+    pub(crate) cut: bool,
+}
+
+#[cfg(any(feature = "iroh", test))]
+/// Frames the longest prefix of `ops` whose data messages fit `max_messages`
+/// and `max_bytes` exactly as the stream writer encodes them. Each operation
+/// is sized once; nothing is serialized twice to find the cut.
+pub(crate) fn sync_data_page(
+    topic_id: TopicId,
+    ops: Vec<Op>,
+    max_messages: usize,
+    max_bytes: usize,
+) -> io::Result<DataPage> {
+    let count_len =
+        |count: usize| postcard::experimental::serialized_size(&count).map_err(invalid_data);
+    let empty = SyncMessage::Data(SyncData {
         topic_id,
         ops: Vec::new(),
-    };
-    let overhead = framed_message_len(&SyncMessage::Data(data.clone()))? - 1;
-    let mut data_len = 0;
+    });
+    let overhead = framed_message_len(&empty)? - count_len(0)?;
+    let mut messages = Vec::new();
+    let mut current = Vec::new();
+    let mut current_len = 0;
+    let mut closed_bytes = 0_usize;
+    let mut cut = false;
     for op in ops {
         let op_len = postcard::experimental::serialized_size(&op).map_err(invalid_data)?;
-        if overhead + 1 + op_len > frame::MAX_FRAME_LEN + 4 {
+        if overhead + count_len(1)? + op_len > frame::MAX_FRAME_LEN + 4 {
             return Err(invalid_data("operation exceeds sync frame size limit"));
         }
-        let count_len =
-            postcard::experimental::serialized_size(&(data.ops.len() + 1)).map_err(invalid_data)?;
-        if data.ops.len() == MAX_SYNC_DATA_OPS_PER_MESSAGE
-            || overhead + count_len + data_len + op_len > frame::MAX_FRAME_LEN + 4
-        {
+        let joined = overhead + count_len(current.len() + 1)? + current_len + op_len;
+        let joins = !current.is_empty()
+            && current.len() < MAX_SYNC_DATA_OPS_PER_MESSAGE
+            && joined <= frame::MAX_FRAME_LEN + 4;
+        let open_bytes = if current.is_empty() {
+            0
+        } else {
+            overhead + count_len(current.len())? + current_len
+        };
+        let (count, bytes) = if joins {
+            (messages.len() + 1, closed_bytes.saturating_add(joined))
+        } else {
+            (
+                messages.len() + usize::from(!current.is_empty()) + 1,
+                closed_bytes
+                    .saturating_add(open_bytes)
+                    .saturating_add(overhead + count_len(1)? + op_len),
+            )
+        };
+        if count > max_messages || bytes > max_bytes {
+            cut = true;
+            break;
+        }
+        if !joins && !current.is_empty() {
+            closed_bytes += open_bytes;
+            current_len = 0;
             messages.push(SyncMessage::Data(SyncData {
                 topic_id,
-                ops: std::mem::take(&mut data.ops),
+                ops: std::mem::take(&mut current),
             }));
-            data_len = 0;
         }
-        data_len += op_len;
-        data.ops.push(op);
+        current_len += op_len;
+        current.push(op);
     }
-    if !data.ops.is_empty() {
-        messages.push(SyncMessage::Data(data));
+    if !current.is_empty() {
+        closed_bytes += overhead + count_len(current.len())? + current_len;
+        messages.push(SyncMessage::Data(SyncData {
+            topic_id,
+            ops: current,
+        }));
     }
-    Ok(messages)
+    Ok(DataPage {
+        messages,
+        bytes: closed_bytes,
+        cut,
+    })
 }
 
 #[cfg(any(feature = "iroh", test))]

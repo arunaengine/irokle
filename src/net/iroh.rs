@@ -12,7 +12,7 @@ use crate::{Irokle, MemoryStorage, PeerId, ReceiveOutcome, Storage, TopicEvictio
 use super::frame::{MAX_FRAME_LEN, MAX_SYNC_DATA_OPS_PER_MESSAGE};
 use super::{
     _message_type_name, IROKLE_SYNC_ALPN, decode_sync_message, encode_frame, encode_sync_message,
-    invalid_data, sync_data_messages,
+    invalid_data,
 };
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2331,24 +2331,38 @@ impl<S: Storage> SharedNet<S> {
                 goal.outbound.observe(meta.actor_id, meta.actor_seq);
             }
         }
-        let mut messages = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
-        messages.extend(sync_data_messages(
-            plan.topic_id,
-            std::mem::take(&mut plan.send),
-        )?);
-        let pushes = messages.len() > 1;
+        let send = std::mem::take(&mut plan.send);
         let wants = !plan.need.is_empty() || !plan.actor_range_hints.is_empty();
+        let mut controls = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
         let mut credit_ops = 0;
         if wants {
             let request = self.page_request(plan).map_err(invalid_data)?;
             credit_ops = request.credit.ops as usize;
-            messages.push(SyncMessage::Request(request));
+            controls.push(SyncMessage::Request(request));
         }
         if !terminal {
-            messages.push(SyncMessage::Summary(
+            controls.push(SyncMessage::Summary(
                 self.node.sync_summary(topic_id).map_err(invalid_data)?,
             ));
         }
+        // The pushed page is cut to what one stream holds beside this topic's controls.
+        let mut control_bytes = 0_usize;
+        for message in &controls {
+            control_bytes = control_bytes.saturating_add(super::framed_message_len(message)?);
+        }
+        let data = super::sync_data_page(
+            topic_id,
+            send,
+            self.limits.messages.saturating_sub(controls.len()),
+            self.limits.bytes.saturating_sub(control_bytes),
+        )?;
+        push_more |= data.cut;
+        let pushes = !data.messages.is_empty();
+        let mut messages = Vec::with_capacity(controls.len() + data.messages.len());
+        let mut controls = controls.into_iter();
+        messages.extend(controls.next());
+        messages.extend(data.messages);
+        messages.extend(controls);
         // A summary for the open, one ack for the pushed data, the peer's own
         // request, and at most one page of data frames plus its page result.
         let estimated_responses = 3 + if wants {
@@ -2801,6 +2815,7 @@ impl<S: Storage> SharedNet<S> {
     ) -> BatchReplies {
         let mut acks = Vec::new();
         let mut followups: BTreeMap<crate::TopicId, Vec<SyncMessage>> = BTreeMap::new();
+        let mut pages = BTreeMap::new();
         let mut outcomes = BTreeMap::new();
         for response in responses {
             match response {
@@ -2838,19 +2853,15 @@ impl<S: Storage> SharedNet<S> {
                 SyncMessage::Request(request) if group_topics.contains(&request.topic_id) => {
                     let topic_id = request.topic_id;
                     let budget = crate::sync::PageBudget::from_credit(request.credit);
-                    match self
-                        .node
-                        .response_page(remote_peer_id, &request, budget)
-                        .map_err(invalid_data)
-                        .and_then(|page| {
+                    match self.node.response_page(remote_peer_id, &request, budget) {
+                        Ok(page) => {
                             if page.more {
                                 more.insert(topic_id);
                             }
-                            sync_data_messages(topic_id, page.ops)
-                        }) {
-                        Ok(messages) => followups.entry(topic_id).or_default().extend(messages),
+                            pages.insert(topic_id, page.ops);
+                        }
                         Err(error) => {
-                            outcomes.insert(topic_id, Err(error));
+                            outcomes.insert(topic_id, Err(invalid_data(error)));
                         }
                     }
                 }
@@ -2901,6 +2912,35 @@ impl<S: Storage> SharedNet<S> {
                         more,
                         unexpected: Some(error),
                     };
+                }
+            }
+        }
+        // Each follow-up stream carries an open, the topic's ack and its page,
+        // so the page is cut to what the stream holds beside the other two.
+        for (topic_id, ops) in pages {
+            let replies = followups.entry(topic_id).or_default();
+            let mut used =
+                super::framed_message_len(&SyncMessage::Open(self.node.sync_open(topic_id)));
+            for reply in replies.iter() {
+                used = used.and_then(|used| Ok(used + super::framed_message_len(reply)?));
+            }
+            let data = used.and_then(|used| {
+                super::sync_data_page(
+                    topic_id,
+                    ops,
+                    self.limits.messages.saturating_sub(replies.len() + 1),
+                    self.limits.bytes.saturating_sub(used),
+                )
+            });
+            match data {
+                Ok(data) => {
+                    if data.cut {
+                        more.insert(topic_id);
+                    }
+                    replies.extend(data.messages);
+                }
+                Err(error) => {
+                    outcomes.insert(topic_id, Err(error));
                 }
             }
         }
@@ -3566,34 +3606,50 @@ impl SyncSession {
         if bytes > limits.bytes || messages > limits.messages {
             return Err(invalid_data("sync reply controls exceed the stream budget"));
         }
+        // Data is sized in framed wire bytes against what the controls and one
+        // page result per request left. A request whose next op does not fit
+        // its share is served again from what every other request left over.
         let mut left = requests.len();
-        for (topic_id, request) in requests {
-            let share_bytes = (limits.bytes - bytes) / left;
-            let share_messages = (limits.messages - messages) / left;
-            left -= 1;
-            let mut budget = crate::sync::PageBudget::from_credit(request.credit);
-            budget.bytes = budget.bytes.min(share_bytes);
-            budget.ops = budget
-                .ops
-                .min(share_messages * MAX_SYNC_DATA_OPS_PER_MESSAGE);
-            let (data, more) = match net.node.response_page(peer_id, &request, budget) {
-                Ok(page) => fit_page(topic_id, page.ops, page.more, share_messages)?,
-                Err(error) => {
-                    tracing::warn!(%topic_id, %error, "failing one sync request");
-                    responses.push(SyncMessage::Failure(crate::sync::SyncFailure {
-                        topic_id,
-                        code: crate::sync::SyncFailureCode::Request,
-                    }));
+        let mut queue = requests.into_iter().collect::<Vec<_>>();
+        let mut deferred = Vec::new();
+        for pass in [false, true] {
+            if pass {
+                left = deferred.len();
+                queue = std::mem::take(&mut deferred);
+            }
+            for (topic_id, request) in std::mem::take(&mut queue) {
+                let share_bytes = (limits.bytes - bytes) / left;
+                let share_messages = (limits.messages - messages) / left;
+                left -= 1;
+                let mut budget = crate::sync::PageBudget::from_credit(request.credit);
+                budget.bytes = budget.bytes.min(share_bytes);
+                budget.ops = budget
+                    .ops
+                    .min(share_messages.saturating_mul(MAX_SYNC_DATA_OPS_PER_MESSAGE));
+                let page = match net.node.response_page(peer_id, &request, budget) {
+                    Ok(page) => page,
+                    Err(error) => {
+                        tracing::warn!(%topic_id, %error, "failing one sync request");
+                        responses.push(SyncMessage::Failure(crate::sync::SyncFailure {
+                            topic_id,
+                            code: crate::sync::SyncFailureCode::Request,
+                        }));
+                        continue;
+                    }
+                };
+                let data = super::sync_data_page(topic_id, page.ops, share_messages, share_bytes)?;
+                let more = page.more || data.cut;
+                if !pass && data.messages.is_empty() && more {
+                    deferred.push((topic_id, request));
                     continue;
                 }
-            };
-            for message in &data {
-                bytes += super::framed_message_len(message)?;
+                bytes += data.bytes;
+                messages += data.messages.len();
+                responses.extend(data.messages);
+                responses.push(SyncMessage::Page(crate::sync::SyncPage { topic_id, more }));
             }
-            messages += data.len();
-            responses.extend(data);
-            responses.push(SyncMessage::Page(crate::sync::SyncPage { topic_id, more }));
         }
+        reply_fits(&responses, limits)?;
         Ok(responses)
     }
 
@@ -3641,22 +3697,13 @@ impl SyncSession {
     }
 }
 
-/// Data messages for a causal page cut to `max_messages`. Cutting the tail
-/// keeps a causal prefix, and whatever is cut is reported as more.
-fn fit_page(
-    topic_id: crate::TopicId,
-    mut ops: Vec<crate::Op>,
-    mut more: bool,
-    max_messages: usize,
-) -> io::Result<(Vec<SyncMessage>, bool)> {
-    loop {
-        let messages = sync_data_messages(topic_id, ops.clone())?;
-        if messages.len() <= max_messages {
-            return Ok((messages, more));
-        }
-        more = true;
-        ops.truncate(ops.len() * max_messages / messages.len());
+/// Refuses a reply the stream writer would refuse, before any of it is queued.
+fn reply_fits(messages: &[SyncMessage], stream_limits: StreamLimits) -> io::Result<()> {
+    let mut limits = SyncReadLimits::new(stream_limits);
+    for message in messages {
+        limits.observe_frame(super::framed_message_len(message)? - 4)?;
     }
+    Ok(())
 }
 
 struct SyncReadLimits {
@@ -3883,10 +3930,7 @@ async fn write_sync_messages(
     sync_io_timeout: Duration,
     stream_limits: StreamLimits,
 ) -> io::Result<()> {
-    let mut limits = SyncReadLimits::new(stream_limits);
-    for message in messages {
-        limits.observe_frame(super::framed_message_len(message)? - 4)?;
-    }
+    reply_fits(messages, stream_limits)?;
     for message in messages {
         let payload = encode_sync_message(message)?;
         let frame = encode_frame(&payload)?;
@@ -4291,14 +4335,15 @@ mod tests {
             topic.publish(Ping).unwrap();
         }
         let ops = crate::oplog::topological(node.storage(), &topic.id()).unwrap();
-        let (whole, more) = fit_page(topic.id(), ops.clone(), false, 8).unwrap();
-        assert!(!more);
-        assert_eq!(whole.len(), 4);
+        let whole = super::super::sync_data_page(topic.id(), ops.clone(), 8, usize::MAX).unwrap();
+        assert!(!whole.cut);
+        assert_eq!(whole.messages.len(), 4);
 
-        let (cut, more) = fit_page(topic.id(), ops.clone(), false, 2).unwrap();
-        assert!(more, "a cut page must report the rest");
-        assert!(cut.len() <= 2);
+        let cut = super::super::sync_data_page(topic.id(), ops.clone(), 2, usize::MAX).unwrap();
+        assert!(cut.cut, "a cut page must report the rest");
+        assert!(cut.messages.len() <= 2);
         let sent = cut
+            .messages
             .iter()
             .flat_map(|message| match message {
                 SyncMessage::Data(data) => data.ops.clone(),
