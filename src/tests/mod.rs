@@ -1,3 +1,5 @@
+#[cfg(feature = "iroh")]
+mod acceptance;
 mod ack;
 #[cfg(all(feature = "fjall", feature = "iroh"))]
 mod bench;
