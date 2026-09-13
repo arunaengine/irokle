@@ -229,17 +229,25 @@ impl<S: Storage> Storage for Counting<S> {
 /// Buffered payloads a backend decoded, where the revision can count them.
 trait PayloadReads {
     fn payload_reads(&self) -> Option<u64>;
+    /// Write transactions attempted; each Fjall attempt requests a disk sync.
+    fn transaction_attempts(&self) -> u64;
 }
 
 impl PayloadReads for MemoryStorage {
     fn payload_reads(&self) -> Option<u64> {
         Some(self.counters().pending_payload_reads)
     }
+    fn transaction_attempts(&self) -> u64 {
+        self.counters().transaction_attempts
+    }
 }
 
 impl PayloadReads for FjallStorage {
     fn payload_reads(&self) -> Option<u64> {
         Some(self.counters().pending_payload_reads)
+    }
+    fn transaction_attempts(&self) -> u64 {
+        self.counters().transaction_attempts
     }
 }
 
@@ -378,7 +386,7 @@ fn load<S: Storage>(storage: &S, ops: &[Op]) {
 
 /// Local publishing with one replication target per peer per publish, as the
 /// facade's `AsyncReplication` admission effects write them.
-fn publish<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
+fn publish<S: Storage + PayloadReads>(storage: Counting<S>, len: usize) -> Sample {
     let owner = signer(11);
     let peers = [signer(12).peer_id(), signer(13).peer_id()];
     let topic = TopicId::hash("bench-publish");
@@ -387,6 +395,7 @@ fn publish<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
     let genesis = TopicGenesis::new(Note::TYPE_ID, peers);
     log.create_topic_genesis(topic, actor, genesis, &owner)
         .unwrap();
+    let attempts = storage.inner.transaction_attempts();
     let started = Instant::now();
     for index in 0..len {
         let TopicPayload::Event(event) = note(index) else {
@@ -403,10 +412,11 @@ fn publish<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
         .unwrap();
     }
     let ms = millis(started);
+    let attempts = storage.inner.transaction_attempts() - attempts;
     let rows = storage.all_sync_obligations().unwrap().len() as u64;
     Sample {
         ms,
-        counters: vec![("rows", rows)],
+        counters: vec![("rows", rows), ("tx_attempts", attempts)],
     }
 }
 
@@ -420,7 +430,7 @@ fn offline_publish() {
 }
 
 /// A received backlog in pages of 256 while two other selected peers exist.
-fn forward_backlog<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
+fn forward_backlog<S: Storage + PayloadReads>(storage: Counting<S>, len: usize) -> Sample {
     let (source, local) = (signer(21), signer(22));
     let peers = [local.peer_id(), signer(23).peer_id(), signer(24).peer_id()];
     let ops = signed_chain(&source, "bench-forward", &peers, len, note);
@@ -434,6 +444,7 @@ fn forward_backlog<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
     )
     .unwrap();
     let topic_id = ops[0].signed.body.topic_id;
+    let attempts = storage.inner.transaction_attempts();
     let started = Instant::now();
     for page in ops.chunks(256) {
         let data = SyncData {
@@ -443,10 +454,11 @@ fn forward_backlog<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
         node.receive_sync_data_from(source.peer_id(), data).unwrap();
     }
     let ms = millis(started);
+    let attempts = storage.inner.transaction_attempts() - attempts;
     let rows = storage.all_sync_obligations().unwrap().len() as u64;
     Sample {
         ms,
-        counters: vec![("rows", rows)],
+        counters: vec![("rows", rows), ("tx_attempts", attempts)],
     }
 }
 
@@ -484,6 +496,7 @@ fn pending_pool<S: Storage + PayloadReads>(storage: Counting<S>) -> Sample {
     let engine = SyncEngine::new(log.clone(), signer(34).peer_id());
 
     let (before, payloads) = (storage.snapshot(), storage.inner.payload_reads());
+    let attempts = storage.inner.transaction_attempts();
     let started = Instant::now();
     for op in &healthy[1..] {
         log.receive_ops(vec![op.clone()]).unwrap();
@@ -495,6 +508,10 @@ fn pending_pool<S: Storage + PayloadReads>(storage: Counting<S>) -> Sample {
     if let (Some(before), Some(after)) = (payloads, storage.inner.payload_reads()) {
         counters.push(("pending_payload_reads", after - before));
     }
+    counters.push((
+        "tx_attempts",
+        storage.inner.transaction_attempts() - attempts,
+    ));
     Sample { ms, counters }
 }
 
@@ -770,7 +787,7 @@ fn repair_pull() {
 
 /// A late invitation of `len` notes staged in 256-op fragments: the first and
 /// the last eight fragments and the activating fragment, timed and counted.
-fn staged_fragments<S: Storage>(storage: Counting<S>, len: usize) -> [Sample; 3] {
+fn staged_fragments<S: Storage + PayloadReads>(storage: Counting<S>, len: usize) -> [Sample; 3] {
     let source = Irokle::new(NodeConfig {
         signer: signer(61),
         ..NodeConfig::default()
@@ -794,17 +811,18 @@ fn staged_fragments<S: Storage>(storage: Counting<S>, len: usize) -> [Sample; 3]
     let (history, invite) = ops.split_at(ops.len() - 1);
     let fragments = history.chunks(256).chain([invite]).collect::<Vec<_>>();
     let count = fragments.len();
-    let mut samples = [(0.0, [0; 4]), (0.0, [0; 4]), (0.0, [0; 4])];
+    let mut samples = [(0.0, [0; 4], 0), (0.0, [0; 4], 0), (0.0, [0; 4], 0)];
     for (index, fragment) in fragments.into_iter().enumerate() {
         let data = SyncData {
             topic_id: topic.id(),
             ops: fragment.to_vec(),
         };
-        let before = storage.snapshot();
+        let (before, attempts) = (storage.snapshot(), storage.inner.transaction_attempts());
         let started = Instant::now();
         reader.receive_sync_outcome(source.peer_id(), data).unwrap();
         let ms = millis(started);
         let after = storage.snapshot();
+        let attempts = storage.inner.transaction_attempts() - attempts;
         let slot = match index {
             _ if index == count - 1 => 2,
             _ if index < 8 => 0,
@@ -813,15 +831,17 @@ fn staged_fragments<S: Storage>(storage: Counting<S>, len: usize) -> [Sample; 3]
         };
         samples[slot].0 += ms;
         samples[slot].1 = std::array::from_fn(|i| samples[slot].1[i] + after[i] - before[i]);
+        samples[slot].2 += attempts;
     }
     assert_eq!(
         storage.list_op_ids(&topic.id()).unwrap().len(),
         ops.len(),
         "the invitation did not activate"
     );
-    samples.map(|(ms, reads)| Sample {
-        ms,
-        counters: read_delta([0; 4], reads),
+    samples.map(|(ms, reads, attempts)| {
+        let mut counters = read_delta([0; 4], reads);
+        counters.push(("tx_attempts", attempts));
+        Sample { ms, counters }
     })
 }
 
@@ -857,7 +877,7 @@ fn staged_history() {
 }
 
 /// 64 sources each stage the first 64 ops of their own late invitation.
-fn many_sessions<S: Storage>(storage: Counting<S>) -> Sample {
+fn many_sessions<S: Storage + PayloadReads>(storage: Counting<S>) -> Sample {
     let reader = Irokle::with_storage(
         storage.clone(),
         NodeConfig {
@@ -887,13 +907,17 @@ fn many_sessions<S: Storage>(storage: Counting<S>) -> Sample {
             (source.peer_id(), data)
         })
         .collect::<Vec<_>>();
-    let before = storage.snapshot();
+    let (before, attempts) = (storage.snapshot(), storage.inner.transaction_attempts());
     let started = Instant::now();
     for (source, data) in fragments {
         reader.receive_sync_outcome(source, data).unwrap();
     }
     let ms = millis(started);
     let mut counters = read_delta(before, storage.snapshot());
+    counters.push((
+        "tx_attempts",
+        storage.inner.transaction_attempts() - attempts,
+    ));
     counters.push(("staged_topics", reader.list_topics().unwrap().len() as u64));
     Sample { ms, counters }
 }
