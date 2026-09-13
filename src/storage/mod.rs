@@ -625,30 +625,34 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// from one view.
     fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>>;
 
-    /// Keep verified `ops` of a topic this store does not hold in the session of
-    /// `source`, invisible to topic queries. Duplicates are free, a call past a
-    /// limit stores nothing, an existing topic is an admission conflict.
+    /// Unscoped staging, replaced by provisional namespaces; kept only until
+    /// every backend dropped it.
     fn stage_bootstrap_ops(
         &self,
-        source: PeerId,
-        topic_id: TopicId,
-        ops: Vec<Op>,
-        now_ms: u64,
-    ) -> Result<StagedTopic>;
-    /// Every op of the session, ordered by actor and sequence.
-    fn staged_bootstrap_ops(&self, source: &PeerId, topic_id: &TopicId) -> Result<Vec<Op>>;
-    /// The session's contiguous per-actor prefix and usage, read from one view
-    /// without decoding a staged op. An absent session is empty.
-    fn staged_topic(&self, source: &PeerId, topic_id: &TopicId) -> Result<StagedTopic>;
-    /// In one transaction: refuse with [`crate::Error::AdmissionConflict`]
-    /// once the topic exists, otherwise admit `batch` against a fresh topic
-    /// and drop every staging session of the topic.
-    fn promote_bootstrap(&self, batch: AdmittedBatch) -> Result<()>;
-    /// Drop one session. Returns the number of staged ops removed.
-    fn discard_bootstrap(&self, source: &PeerId, topic_id: &TopicId) -> Result<usize>;
-    /// Drop sessions last written before `older_than_ms`. Returns the number
-    /// of sessions removed.
-    fn expire_bootstrap(&self, older_than_ms: u64) -> Result<usize>;
+        _source: PeerId,
+        _topic_id: TopicId,
+        _ops: Vec<Op>,
+        _now_ms: u64,
+    ) -> Result<StagedTopic> {
+        Err(crate::Error::StagingCapacity(
+            "unscoped staging is replaced by provisional namespaces".into(),
+        ))
+    }
+    fn staged_bootstrap_ops(&self, _source: &PeerId, _topic_id: &TopicId) -> Result<Vec<Op>> {
+        Ok(Vec::new())
+    }
+    fn staged_topic(&self, _source: &PeerId, _topic_id: &TopicId) -> Result<StagedTopic> {
+        Ok(StagedTopic::default())
+    }
+    fn promote_bootstrap(&self, _batch: AdmittedBatch) -> Result<()> {
+        Err(crate::Error::AdmissionConflict)
+    }
+    fn discard_bootstrap(&self, _source: &PeerId, _topic_id: &TopicId) -> Result<usize> {
+        Ok(0)
+    }
+    fn expire_bootstrap(&self, _older_than_ms: u64) -> Result<usize> {
+        Ok(0)
+    }
 
     /// The limits this store applies to provisional bootstraps.
     fn staging_limits(&self) -> StagingLimits;
@@ -836,6 +840,7 @@ pub(super) fn check_pending_quota(
 }
 
 /// Usage and last write of one bootstrap staging session.
+#[cfg(feature = "fjall")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct StagedSession {
     pub(super) ops: u64,
@@ -844,6 +849,7 @@ pub(super) struct StagedSession {
 }
 
 /// Refuse a new session past the total or per-source session limit.
+#[cfg(feature = "fjall")]
 pub(super) fn check_staged_session(sessions: usize, source_sessions: usize) -> Result<()> {
     if sessions >= MAX_STAGED_SESSIONS {
         return Err(crate::Error::Storage(
@@ -859,6 +865,7 @@ pub(super) fn check_staged_session(sessions: usize, source_sessions: usize) -> R
 }
 
 /// Refuse a staged op of `charge` bytes past the session or total limits.
+#[cfg(feature = "fjall")]
 pub(super) fn check_staged_op(
     total_bytes: u64,
     session: &StagedSession,
@@ -913,6 +920,7 @@ pub(super) fn check_namespace(held: u64, charge: u64, limit: u64) -> Result<()> 
 
 /// Highest contiguous sequence per actor of `slots`, sorted by actor then
 /// sequence.
+#[cfg(feature = "fjall")]
 pub(super) fn staged_clock(slots: impl IntoIterator<Item = (ActorId, u64)>) -> ActorClock {
     let mut clock = ActorClock::new();
     for (actor_id, seq) in slots {

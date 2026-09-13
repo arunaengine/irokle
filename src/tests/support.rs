@@ -695,35 +695,6 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
     fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize, Error> {
         self.inner.reject_pending_subtree(op_id)
     }
-    fn stage_bootstrap_ops(
-        &self,
-        source: PeerId,
-        topic_id: TopicId,
-        ops: Vec<Op>,
-        now_ms: u64,
-    ) -> Result<crate::storage::StagedTopic, Error> {
-        self.inner
-            .stage_bootstrap_ops(source, topic_id, ops, now_ms)
-    }
-    fn staged_bootstrap_ops(&self, source: &PeerId, topic_id: &TopicId) -> Result<Vec<Op>, Error> {
-        self.inner.staged_bootstrap_ops(source, topic_id)
-    }
-    fn staged_topic(
-        &self,
-        source: &PeerId,
-        topic_id: &TopicId,
-    ) -> Result<crate::storage::StagedTopic, Error> {
-        self.inner.staged_topic(source, topic_id)
-    }
-    fn promote_bootstrap(&self, batch: crate::storage::AdmittedBatch) -> Result<(), Error> {
-        self.inner.promote_bootstrap(batch)
-    }
-    fn discard_bootstrap(&self, source: &PeerId, topic_id: &TopicId) -> Result<usize, Error> {
-        self.inner.discard_bootstrap(source, topic_id)
-    }
-    fn expire_bootstrap(&self, older_than_ms: u64) -> Result<usize, Error> {
-        self.inner.expire_bootstrap(older_than_ms)
-    }
     fn staging_limits(&self) -> crate::storage::StagingLimits {
         self.inner.staging_limits()
     }

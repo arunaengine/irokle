@@ -571,23 +571,13 @@ fn saturated_pools_serve_healthy() {
     for session in 0..crate::storage::MAX_STAGED_SESSIONS_PER_SOURCE {
         let other = members(40 + session as u8 * 4);
         storage
-            .stage_bootstrap_ops(
-                staging_source,
-                other.topic_id,
-                vec![other.genesis.clone()],
-                1,
-            )
+            .open_provisional(staging_source, other.topic_id, other.genesis.id, 1)
             .unwrap();
     }
     let refused = members(200);
     assert!(
         storage
-            .stage_bootstrap_ops(
-                staging_source,
-                refused.topic_id,
-                vec![refused.genesis.clone()],
-                1
-            )
+            .open_provisional(staging_source, refused.topic_id, refused.genesis.id, 1)
             .is_err()
     );
 
@@ -641,17 +631,13 @@ fn saturated_pools_serve_healthy() {
     let after = storage.pending_usage(&sources[0]);
     assert_eq!(after.0, before.0 - 2048);
     assert_eq!((after.2, after.3), (0, 0));
-    assert_eq!(
-        storage.expire_bootstrap(2).unwrap(),
-        crate::storage::MAX_STAGED_SESSIONS_PER_SOURCE
-    );
+    let mut ended = 0;
+    for provisional in storage.provisional_topics().unwrap() {
+        ended += usize::from(storage.discard_provisional(&provisional).unwrap());
+    }
+    assert_eq!(ended, crate::storage::MAX_STAGED_SESSIONS_PER_SOURCE);
     storage
-        .stage_bootstrap_ops(
-            staging_source,
-            refused.topic_id,
-            vec![refused.genesis.clone()],
-            3,
-        )
+        .open_provisional(staging_source, refused.topic_id, refused.genesis.id, 3)
         .unwrap();
     storage.reset_topic(&busy[1].topic_id).unwrap();
     assert_eq!(storage.pending_usage(&sources[2]), (0, 0, 0, 0));

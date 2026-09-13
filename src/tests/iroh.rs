@@ -1792,10 +1792,9 @@ async fn unlisted_never_pulls() {
     assert!(error.to_string().contains("whitelist"), "{error}");
     assert!(bob.storage().topic_state(&topic_id).unwrap().is_none());
     assert!(
-        bob.storage()
-            .staged_bootstrap_ops(&alice.peer_id(), &topic_id)
+        bob.staged_topic(alice.peer_id(), topic_id)
             .unwrap()
-            .is_empty()
+            .is_none()
     );
     alice_net.shutdown().await;
     bob.shutdown_iroh().await;
@@ -1810,10 +1809,9 @@ async fn unlisted_never_stages() {
     assert!(alice_net.sync_now(bob_addr, topic_id).await.is_err());
     assert!(bob.storage().topic_state(&topic_id).unwrap().is_none());
     assert!(
-        bob.storage()
-            .staged_bootstrap_ops(&alice.peer_id(), &topic_id)
+        bob.staged_topic(alice.peer_id(), topic_id)
             .unwrap()
-            .is_empty()
+            .is_none()
     );
     assert!(
         alice

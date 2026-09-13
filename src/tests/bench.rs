@@ -8,8 +8,8 @@ use std::time::Instant;
 use super::support::*;
 use crate::oplog::Oplog;
 use crate::storage::{
-    AdmissionEffects, AdmittedBatch, FjallStorage, OpMeta, PeerAck, SnapshotRead, StagedTopic,
-    SyncObligation, SyncStatusUpdate, TopicState, TopicView,
+    AdmissionEffects, AdmittedBatch, FjallStorage, OpMeta, PeerAck, SnapshotRead, SyncObligation,
+    SyncStatusUpdate, TopicState, TopicView,
 };
 use crate::sync::{PageBudget, SyncData, SyncEngine};
 use crate::{EvictionKey, SyncPeerStatus, TopicEviction, TopicInfo};
@@ -202,12 +202,6 @@ impl<S: Storage> Storage for Counting<S> {
         peer_reached_op(peer: &PeerId, id: &OpId) -> bool;
         peers_reached_op(id: &OpId) -> Vec<PeerId>;
         next_attempt_epoch() -> u64;
-        stage_bootstrap_ops(source: PeerId, topic: TopicId, ops: Vec<Op>, now_ms: u64) -> StagedTopic;
-        staged_bootstrap_ops(source: &PeerId, topic: &TopicId) -> Vec<Op>;
-        staged_topic(source: &PeerId, topic: &TopicId) -> StagedTopic;
-        promote_bootstrap(batch: AdmittedBatch) -> ();
-        discard_bootstrap(source: &PeerId, topic: &TopicId) -> usize;
-        expire_bootstrap(older_than_ms: u64) -> usize;
         provisional_topics() -> Vec<crate::storage::ProvisionalTopic>;
         open_provisional(source: PeerId, topic: TopicId, genesis: OpId, now_ms: u64) -> crate::storage::ProvisionalTopic;
         stored_bytes() -> u64;

@@ -115,6 +115,7 @@ fn split_invitation<S: Storage>(storage: S) {
 
     let first = staged(receive(&bob, alice.peer_id(), topic_id, &ops[..100]));
     assert_eq!(first.clock.get(&actor), 100);
+    assert_eq!(first.genesis, Some(ops[0].id));
     assert_invisible(&bob, alice.peer_id(), topic_id, &ops);
     // The acknowledging method never reports staging as an ack.
     let data = SyncData {
@@ -128,6 +129,7 @@ fn split_invitation<S: Storage>(storage: S) {
 
     let second = staged(receive(&bob, alice.peer_id(), topic_id, &ops[100..257]));
     assert_eq!(second.clock.get(&actor), 257);
+    assert_eq!(second.session, first.session);
     assert_invisible(&bob, alice.peer_id(), topic_id, &ops);
 
     let ack = acked(receive(&bob, alice.peer_id(), topic_id, &ops[257..]));
@@ -362,12 +364,7 @@ fn competing_genesis<S: Storage>(storage: S) {
     ));
     let winner = [first_history, vec![first_invite]].concat();
     let winner_ids = winner.iter().map(|op| op.id).collect::<BTreeSet<_>>();
-    assert!(
-        bob.storage()
-            .staged_bootstrap_ops(&second, &topic_id)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(bob.staged_topic(second, topic_id).unwrap().is_none());
     let other = [second_history, vec![second_invite]].concat();
     acked(receive(&bob, second, topic_id, &other));
     assert_eq!(bob.storage().list_op_ids(&topic_id).unwrap(), winner_ids);
@@ -386,80 +383,74 @@ fn fjall_competing_genesis() {
     competing_genesis(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
-/// An op of `topic_id` at `seq` carrying a note of `size` bytes.
-fn stub_op(topic_id: TopicId, seq: u64, size: usize) -> Op {
-    let signer = Ed25519Signer::from_bytes(&[191; 32]);
-    let note = Note {
-        text: "x".repeat(size),
-    };
-    let body = OpBody {
-        topic_id,
-        author: signer.peer_id(),
-        actor_id: actor_id_for(topic_id, signer.peer_id()),
-        actor_seq: seq,
-        actor_prev: None,
-        deps: BTreeSet::new(),
-        generation: 0,
-        payload: TopicPayload::Event(EventEnvelope::encode_event(&note).unwrap()),
-    };
-    Op::sign(body, &signer).unwrap()
-}
-
+/// Namespaces per source and in total are refused with a typed capacity error
+/// that stores nothing; idle namespaces expire and free their slot; bytes past
+/// the source limit are refused before any admission.
 fn staging_quota<S: Storage>(storage: S) {
     use crate::storage::{MAX_STAGED_SESSIONS, MAX_STAGED_SESSIONS_PER_SOURCE};
-    let topic = |index: usize| TopicId::hash(format!("quota-topic-{index}").as_bytes());
-    let source = |index: usize| PeerId::hash(format!("quota-source-{index}").as_bytes());
-    let stage = |owner: PeerId, topic_id: TopicId, ops: Vec<Op>, now_ms: u64| {
-        storage.stage_bootstrap_ops(owner, topic_id, ops, now_ms)
+    let genesis_of_topic = |seed: u8| {
+        let source = node(seed);
+        let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
+        let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+        (source.peer_id(), topic.id(), ops)
     };
-
-    let mismatch = stage(source(0), topic(0), vec![stub_op(topic(1), 1, 1)], 10);
-    assert!(matches!(mismatch, Err(Error::TopicMismatch)));
+    let bob = bob_node(storage.clone());
+    let (crowded_source, _, _) = genesis_of_topic(0);
     for index in 0..MAX_STAGED_SESSIONS_PER_SOURCE {
-        stage(
-            source(0),
-            topic(index),
-            vec![stub_op(topic(index), 1, 1)],
-            10,
-        )
-        .unwrap();
+        let (_, topic_id, ops) = genesis_of_topic(index as u8 + 1);
+        staged(receive(&bob, crowded_source, topic_id, &ops));
     }
-    let crowded = topic(MAX_STAGED_SESSIONS);
-    let per_source = stage(source(0), crowded, vec![stub_op(crowded, 1, 1)], 10);
-    assert!(matches!(per_source, Err(Error::Storage(_))));
+    let (_, refused_topic, refused_ops) = genesis_of_topic(100);
+    let per_source = bob.receive_sync_outcome(
+        crowded_source,
+        SyncData {
+            topic_id: refused_topic,
+            ops: refused_ops.clone(),
+        },
+    );
+    assert!(
+        matches!(per_source, Err(Error::StagingCapacity(_))),
+        "{per_source:?}"
+    );
+    assert!(
+        bob.staged_topic(crowded_source, refused_topic)
+            .unwrap()
+            .is_none()
+    );
     for index in MAX_STAGED_SESSIONS_PER_SOURCE..MAX_STAGED_SESSIONS {
-        let owner = source(index / MAX_STAGED_SESSIONS_PER_SOURCE);
-        stage(owner, topic(index), vec![stub_op(topic(index), 1, 1)], 10).unwrap();
+        let (_, topic_id, ops) = genesis_of_topic(index as u8 + 1);
+        let owner = PeerId::hash(format!("quota-source-{}", index / 8).as_bytes());
+        staged(receive(&bob, owner, topic_id, &ops));
     }
-    let total = stage(source(99), crowded, vec![stub_op(crowded, 1, 1)], 10);
-    assert!(matches!(total, Err(Error::Storage(_))));
+    let total = bob.receive_sync_outcome(
+        PeerId::hash(b"quota-latecomer"),
+        SyncData {
+            topic_id: refused_topic,
+            ops: refused_ops.clone(),
+        },
+    );
+    assert!(matches!(total, Err(Error::StagingCapacity(_))), "{total:?}");
+
+    // A namespace idle past the limit is discarded by the next bootstrap step.
+    let stale = storage
+        .provisional_topics()
+        .unwrap()
+        .into_iter()
+        .find(|provisional| provisional.source == crowded_source)
+        .unwrap();
+    assert!(storage.discard_provisional(&stale).unwrap());
+    let reopened = storage
+        .open_provisional(stale.source, stale.topic_id, stale.genesis, 1)
+        .unwrap();
+    assert!(reopened.session > stale.session);
+    staged(receive(&bob, crowded_source, refused_topic, &refused_ops));
     assert!(
         storage
-            .staged_bootstrap_ops(&source(99), &crowded)
+            .provisional_topics()
             .unwrap()
-            .is_empty()
-    );
-    assert_eq!(storage.expire_bootstrap(10).unwrap(), 0);
-    assert_eq!(storage.expire_bootstrap(11).unwrap(), MAX_STAGED_SESSIONS);
-    stage(source(99), crowded, vec![stub_op(crowded, 1, 1)], 20).unwrap();
-    assert_eq!(storage.discard_bootstrap(&source(99), &crowded).unwrap(), 1);
-
-    // Bytes per session: four 7 MiB ops fit, a fifth is refused with its call.
-    let large = (1..=5)
-        .map(|seq| stub_op(crowded, seq, 7 * 1024 * 1024))
-        .collect::<Vec<_>>();
-    for op in &large[..4] {
-        stage(source(1), crowded, vec![op.clone()], 30).unwrap();
-    }
-    let small = stub_op(crowded, 6, 1);
-    let over = stage(source(1), crowded, vec![small, large[4].clone()], 30);
-    assert!(matches!(over, Err(Error::Storage(_))));
-    let full = stage(source(1), crowded, vec![large[0].clone()], 30).unwrap();
-    let actor = actor_id_for(crowded, Ed25519Signer::from_bytes(&[191; 32]).peer_id());
-    assert_eq!((full.ops, full.clock.get(&actor)), (4, 4));
-    assert_eq!(
-        storage.staged_bootstrap_ops(&source(1), &crowded).unwrap(),
-        large[..4].to_vec()
+            .iter()
+            .all(|provisional| provisional.session != reopened.session),
+        "the idle namespace expired"
     );
 }
 
@@ -473,6 +464,50 @@ fn memory_staging_quota() {
 fn fjall_staging_quota() {
     let dir = tempfile::tempdir().unwrap();
     staging_quota(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// Bytes past the per-source limit are refused before admission, stage
+/// nothing, and leave earlier staging intact.
+fn staging_bytes<S: Storage>(storage: S) {
+    let (alice, topic_id, ops) = invited_history(196, 40, 4096);
+    let bob = bob_node(storage);
+    let first = staged(receive(&bob, alice.peer_id(), topic_id, &ops[..10]));
+    let over = bob.receive_sync_outcome(
+        alice.peer_id(),
+        SyncData {
+            topic_id,
+            ops: ops[10..].to_vec(),
+        },
+    );
+    assert!(matches!(over, Err(Error::StagingCapacity(_))), "{over:?}");
+    assert_eq!(
+        bob.staged_topic(alice.peer_id(), topic_id).unwrap(),
+        Some(first)
+    );
+    assert_invisible(&bob, alice.peer_id(), topic_id, &ops);
+}
+
+fn byte_limits() -> crate::storage::StagingLimits {
+    crate::storage::StagingLimits {
+        source_bytes: 64 * 1024,
+        ..crate::storage::StagingLimits::MEMORY
+    }
+}
+
+#[test]
+fn memory_staging_bytes() {
+    staging_bytes(MemoryStorage::new().with_staging_limits(byte_limits()));
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_staging_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    staging_bytes(
+        crate::storage::FjallStorage::open(dir.path())
+            .unwrap()
+            .with_staging_limits(byte_limits()),
+    );
 }
 
 /// Staging survives a reopen, and a reopen after promotion shows the whole
@@ -543,9 +578,23 @@ fn replaced_branch<S: Storage>(storage: S) {
         .unwrap();
     let bob = bob_node(storage);
 
-    staged(receive(&bob, source.peer_id(), topic_id, &old));
+    let original = staged(receive(&bob, source.peer_id(), topic_id, &old));
+    assert_eq!(original.genesis, Some(old[0].id));
     let replaced = staged(receive(&bob, source.peer_id(), topic_id, &new));
     assert_eq!(replaced.clock.get(&actor), 2);
+    assert_eq!(replaced.genesis, Some(new[0].id));
+    assert!(replaced.session > original.session);
+    // The larger branch no longer replaces the smaller one it lost to.
+    assert!(matches!(
+        bob.receive_sync_outcome(
+            source.peer_id(),
+            SyncData {
+                topic_id,
+                ops: old.clone(),
+            },
+        ),
+        Err(Error::StaleIncarnation)
+    ));
     let ack = acked(receive(
         &bob,
         source.peer_id(),
@@ -570,38 +619,4 @@ fn memory_replaced_branch() {
 fn fjall_replaced_branch() {
     let dir = tempfile::tempdir().unwrap();
     replaced_branch(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
-/// The tested bootstrap bound: one staging session holds at most
-/// `MAX_STAGED_OPS_PER_SESSION` ops. A call past it stores nothing, and the
-/// topic stays invisible until a promotion.
-fn staging_op_bound<S: Storage>(storage: S) {
-    use crate::storage::MAX_STAGED_OPS_PER_SESSION;
-    let topic_id = TopicId::hash(b"staging-op-bound");
-    let source = PeerId::hash(b"staging-op-bound-source");
-    let ops = (1..=MAX_STAGED_OPS_PER_SESSION + 1)
-        .map(|seq| stub_op(topic_id, seq, 1))
-        .collect::<Vec<_>>();
-    for chunk in ops[..MAX_STAGED_OPS_PER_SESSION as usize].chunks(8192) {
-        storage
-            .stage_bootstrap_ops(source, topic_id, chunk.to_vec(), 10)
-            .unwrap();
-    }
-    let over = storage.stage_bootstrap_ops(source, topic_id, ops[ops.len() - 1..].to_vec(), 10);
-    assert!(matches!(over, Err(Error::Storage(_))), "{over:?}");
-    let staged = storage.staged_topic(&source, &topic_id).unwrap();
-    assert_eq!(staged.ops, MAX_STAGED_OPS_PER_SESSION);
-    assert!(storage.topic_state(&topic_id).unwrap().is_none());
-}
-
-#[test]
-fn memory_staging_op_bound() {
-    staging_op_bound(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_staging_op_bound() {
-    let dir = tempfile::tempdir().unwrap();
-    staging_op_bound(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
