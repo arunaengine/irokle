@@ -798,22 +798,18 @@ impl ConnectionPool {
 }
 
 /// The newest staging receipt each peer returned for a topic it does not hold,
-/// kept in memory only so the next push continues where staging stands.
+/// kept in memory only to measure staged progress within an attempt. Plans
+/// continue from the staged state the peer's own summary names.
 #[derive(Default)]
 struct ReceiptLog {
-    /// The branch the receipted pages were planned on, and the staged clock.
-    clocks: BTreeMap<(PeerId, crate::TopicId), (crate::OpId, crate::ActorClock)>,
+    clocks: BTreeMap<(PeerId, crate::TopicId), crate::sync::SyncReceipt>,
     order: std::collections::VecDeque<(PeerId, crate::TopicId)>,
 }
 
 impl ReceiptLog {
-    fn record(
-        &mut self,
-        key: (PeerId, crate::TopicId),
-        genesis: crate::OpId,
-        clock: crate::ActorClock,
-    ) {
-        if self.clocks.insert(key, (genesis, clock)).is_none() {
+    fn record(&mut self, peer_id: PeerId, receipt: crate::sync::SyncReceipt) {
+        let key = (peer_id, receipt.topic_id);
+        if self.clocks.insert(key, receipt).is_none() {
             self.order.push_back(key);
             if self.order.len() > MAX_BOOTSTRAP_RECEIPTS
                 && let Some(oldest) = self.order.pop_front()
@@ -2491,11 +2487,7 @@ impl<S: Storage> SharedNet<S> {
         summary: &SyncSummary,
     ) -> io::Result<Option<PlannedTopicSync>> {
         let budget = crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default());
-        let receipt = self
-            .receipt_log()
-            .clocks
-            .get(&(remote_peer_id, topic_id))
-            .cloned();
+        let receipt = summary.staged.clone();
         // Authorization, branch, pages and the summary sent all come from one
         // snapshot; the evidence write below re-checks its own preconditions.
         let Some(read) = self
@@ -2513,16 +2505,10 @@ impl<S: Storage> SharedNet<S> {
             clock,
             mut plan,
             mut push_more,
-            stale_receipt,
             converged,
             leave,
             local_summary,
         } = read;
-        // A receipt covering everything without a promotion is stale: the peer
-        // lost or replaced that staging, so this branch is offered from the start.
-        if stale_receipt {
-            self.receipt_log().clear(&(remote_peer_id, topic_id));
-        }
         // A peer outside the membership is owed nothing and serves nothing.
         let member = state.members.contains(&remote_peer_id);
         // Both sides may have converged since the fingerprints were compared,
@@ -2625,7 +2611,7 @@ impl<S: Storage> SharedNet<S> {
         read: &dyn crate::storage::SnapshotRead,
         remote_peer_id: PeerId,
         summary: &SyncSummary,
-        receipt: Option<(crate::OpId, crate::ActorClock)>,
+        receipt: Option<crate::sync::SyncReceipt>,
         budget: crate::sync::PageBudget,
     ) -> crate::Result<Option<SnapshotPlan>> {
         let topic_id = summary.topic_id;
@@ -2636,22 +2622,18 @@ impl<S: Storage> SharedNet<S> {
         // A peer still staging this topic continues from its newest receipt on
         // this branch.
         let staged = match (summary.genesis, receipt) {
-            (None, Some((genesis, clock))) if genesis == view.state.genesis => Some(SyncSummary {
-                actor_clock: clock,
+            (None, Some(receipt)) if receipt.genesis == view.state.genesis => Some(SyncSummary {
+                actor_clock: receipt.clock,
                 ..summary.clone()
             }),
             _ => None,
         };
-        let (mut plan, mut push_more) = sync.negotiate_in(
+        let (plan, push_more) = sync.negotiate_in(
             read,
             remote_peer_id,
             staged.as_ref().unwrap_or(summary),
             budget,
         )?;
-        let stale_receipt = staged.is_some() && plan.send.is_empty() && !push_more;
-        if stale_receipt {
-            (plan, push_more) = sync.negotiate_in(read, remote_peer_id, summary, budget)?;
-        }
         let converged = view.state.members.contains(&remote_peer_id)
             && summary.genesis == Some(view.state.genesis)
             && summary.heads == view.state.heads
@@ -2680,7 +2662,6 @@ impl<S: Storage> SharedNet<S> {
             clock: view.clock,
             plan,
             push_more,
-            stale_receipt,
             converged,
             leave,
             local_summary,
@@ -3173,12 +3154,8 @@ impl<S: Storage> SharedNet<S> {
                 SyncMessage::Receipt(receipt) if group_topics.contains(&receipt.topic_id) => {
                     owed_acks.remove(&receipt.topic_id);
                     more.insert(receipt.topic_id);
-                    if let Some(genesis) = geneses.get(&receipt.topic_id).copied().flatten() {
-                        self.receipt_log().record(
-                            (remote_peer_id, receipt.topic_id),
-                            genesis,
-                            receipt.clock,
-                        );
+                    if geneses.get(&receipt.topic_id).copied().flatten() == Some(receipt.genesis) {
+                        self.receipt_log().record(remote_peer_id, receipt);
                     }
                 }
                 SyncMessage::Failure(failure) if group_topics.contains(&failure.topic_id) => {
@@ -3395,8 +3372,8 @@ impl<S: Storage> SharedNet<S> {
         self.receipt_log()
             .clocks
             .get(&(peer_id, topic_id))
-            .filter(|(receipted, _)| *receipted == genesis)
-            .map(|(_, clock)| clock.clone())
+            .filter(|receipt| receipt.genesis == genesis)
+            .map(|receipt| receipt.clock.clone())
     }
 }
 
@@ -3559,7 +3536,25 @@ impl<S: Storage> SharedNet<S> {
                             .map(Some)
                     })
                     .map_err(invalid_data)?;
-                Ok(summary.map(SyncMessage::Summary).into_iter().collect())
+                let Some(mut summary) = summary else {
+                    return Ok(Vec::new());
+                };
+                // A topic not held here names what this peer already staged.
+                if summary.genesis.is_none()
+                    && let Some(staged) = self
+                        .node
+                        .staged_topic(peer_id, open.topic_id)
+                        .map_err(invalid_data)?
+                    && let Some(genesis) = staged.genesis
+                {
+                    summary.staged = Some(crate::sync::SyncReceipt {
+                        topic_id: open.topic_id,
+                        genesis,
+                        session: staged.session,
+                        clock: staged.clock,
+                    });
+                }
+                Ok(vec![SyncMessage::Summary(summary)])
             }
             SyncMessage::Fingerprint(fingerprint) => {
                 let peer_id = remote_peer_id.ok_or_else(|| {
@@ -3656,8 +3651,14 @@ impl<S: Storage> SharedNet<S> {
                 let (ack, evictions) = match outcome {
                     ReceiveOutcome::Acked { ack, evictions } => (*ack, evictions),
                     ReceiveOutcome::Staged(staged) => {
+                        // Data no staged branch anchors fails its topic visibly.
+                        let genesis = staged
+                            .genesis
+                            .ok_or_else(|| invalid_data("sync data names no staged branch"))?;
                         return Ok(vec![SyncMessage::Receipt(crate::sync::SyncReceipt {
                             topic_id: data_topic_id,
+                            genesis,
+                            session: staged.session,
                             clock: staged.clock,
                         })]);
                     }
@@ -3752,8 +3753,6 @@ struct SnapshotPlan {
     clock: crate::ActorClock,
     plan: crate::sync::SyncPlan,
     push_more: bool,
-    /// The peer's receipt named this branch but covered everything unpromoted.
-    stale_receipt: bool,
     /// The summary matches this branch's whole frontier, pending the write.
     converged: bool,
     /// This node's leave page and its position, when it left the topic.

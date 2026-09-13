@@ -76,6 +76,9 @@ pub struct SyncSummary {
     pub heads: BTreeSet<OpId>,
     pub actor_clock: ActorClock,
     pub actor_tips: BTreeMap<ActorId, (u64, OpId)>,
+    /// What the summary's author staged from the peer it answers, when it does
+    /// not hold the topic: the branch, session and contiguous clock to continue.
+    pub staged: Option<SyncReceipt>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -139,10 +142,14 @@ pub struct SyncPage {
 }
 
 /// Staged progress of data for a topic the receiver does not hold yet. It is
-/// never an ack: it certifies nothing and clears no obligation.
+/// never an ack: it certifies nothing and clears no obligation. It names the
+/// branch and staging session it describes, so a receipt of a replaced or
+/// expired staging is not read as progress of the current one.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncReceipt {
     pub topic_id: TopicId,
+    pub genesis: OpId,
+    pub session: u64,
     pub clock: ActorClock,
 }
 
@@ -331,6 +338,7 @@ impl<S: Storage> SyncEngine<S> {
                 heads: BTreeSet::new(),
                 actor_clock: ActorClock::new(),
                 actor_tips: BTreeMap::new(),
+                staged: None,
             });
         };
         let fingerprint = self.digest_in(read, &view)?;
@@ -348,6 +356,7 @@ impl<S: Storage> SyncEngine<S> {
             heads: view.state.heads,
             actor_clock: view.clock,
             actor_tips,
+            staged: None,
         })
     }
 
@@ -488,6 +497,7 @@ impl<S: Storage> SyncEngine<S> {
                         heads: BTreeSet::new(),
                         actor_clock: empty,
                         actor_tips: BTreeMap::new(),
+                        staged: None,
                     },
                     &view.state.heads,
                 )?,

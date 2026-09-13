@@ -582,9 +582,13 @@ async fn stale_receipt_restarts() {
                 .genesis
         };
         net.receipt_log().record(
-            (bob.peer_id(), topic.id()),
-            genesis,
-            clock(&alice, topic.id()),
+            bob.peer_id(),
+            crate::sync::SyncReceipt {
+                topic_id: topic.id(),
+                genesis,
+                session: 1,
+                clock: clock(&alice, topic.id()),
+            },
         );
         let addr = ready_addr(bob_net.endpoint()).await;
         let mut attempts = 0;

@@ -22,6 +22,7 @@ fn genesis_summary<S: Storage>(storage: &S, topic_id: TopicId, owner: PeerId) ->
         heads: [genesis].into(),
         actor_clock: clock,
         actor_tips: BTreeMap::new(),
+        staged: None,
     }
 }
 

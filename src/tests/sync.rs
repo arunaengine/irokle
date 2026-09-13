@@ -1046,6 +1046,7 @@ fn unknown_topic_empty_plan() {
         heads: [OpId::hash(b"forged-head-1"), OpId::hash(b"forged-head-2")].into(),
         actor_clock: ActorClock::new(),
         actor_tips: std::collections::BTreeMap::new(),
+        staged: None,
     };
     let plan = alice
         .negotiate_sync(PeerId::hash(b"some-remote"), &summary)
@@ -1720,6 +1721,7 @@ fn request_skips_bodies() {
         heads: BTreeSet::new(),
         actor_clock: ActorClock::new(),
         actor_tips: std::collections::BTreeMap::new(),
+        staged: None,
     };
     // Each side gets its own store so both measurements start from the same
     // cached state; a second call on one store would not rescan for holes.
