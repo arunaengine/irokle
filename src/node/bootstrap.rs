@@ -11,7 +11,7 @@ use crate::storage::{
     AdmissionEffects, MAX_STAGED_IDLE_MS, ProvisionalTopic, StagedTopic, SyncObligation, TopicState,
 };
 use crate::sync::SyncData;
-use crate::{ActorClock, Error, OpId, PeerId, Result, Storage, TopicId};
+use crate::{ActorClock, Error, OpId, PeerId, Result, Storage, TopicId, TopicPayload};
 
 use super::{Bootstrap, Irokle, now_millis};
 
@@ -172,11 +172,20 @@ impl<S: Storage> Irokle<S> {
         }
         let now_ms = now_millis()?;
         self.expire_bootstraps(now_ms)?;
-        let fragment = data
-            .ops
-            .iter()
-            .find(|op| is_structural_genesis(op))
-            .map(|op| op.id);
+        let genesis = data.ops.iter().find(|op| is_structural_genesis(op));
+        let fragment = genesis.map(|op| op.id);
+        // A genesis that already names this node and the source proves nothing
+        // more when staged: with no staging of the topic, admit it directly.
+        if let Some(TopicPayload::Genesis(created)) = genesis.map(|op| &op.signed.body.payload)
+            && created.initial_peers.contains(&self.peer_id())
+            && created.initial_peers.contains(&source)
+            && !storage
+                .provisional_topics()?
+                .iter()
+                .any(|provisional| provisional.topic_id == topic_id)
+        {
+            return Ok(Bootstrap::Active(BTreeSet::new()));
+        }
         let current = self.provisional_of(source, topic_id)?;
         let provisional = match (current, fragment) {
             (Some(current), _) if current.activating => {

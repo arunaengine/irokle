@@ -351,6 +351,78 @@ fn fjall_reclaim_behind() {
     assert_reclaim_behind(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
+/// A history whose genesis already names the reader and the source is admitted
+/// directly, opening no staging namespace, while a late invitation still stages.
+fn assert_direct_genesis<S: Limited>(storage: S) {
+    let source = node(173);
+    let other = node(174);
+    let reader = reader_node(storage.clone(), 175);
+    let topic = source
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [reader.peer_id(), other.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    topic.publish(Note { text: "one".into() }).unwrap();
+    let topic_id = topic.id();
+    let ops = oplog::topological(source.storage(), &topic_id).unwrap();
+    let data = |ops: &[Op]| SyncData {
+        topic_id,
+        ops: ops.to_vec(),
+    };
+    let outcome = reader
+        .receive_sync_outcome(source.peer_id(), data(&ops))
+        .unwrap();
+    assert!(
+        matches!(outcome, ReceiveOutcome::Acked { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(storage.list_op_ids(&topic_id).unwrap().len(), ops.len());
+    assert!(storage.provisional_topics().unwrap().is_empty());
+
+    // A late invitation still stages, in the first namespace this store opened.
+    let late = other.create_topic::<Note>(TopicConfig::default()).unwrap();
+    late.add_peer(source.peer_id()).unwrap();
+    late.add_peer(reader.peer_id()).unwrap();
+    let late_ops = oplog::topological(other.storage(), &late.id()).unwrap();
+    let partial = SyncData {
+        topic_id: late.id(),
+        ops: late_ops[..2].to_vec(),
+    };
+    let first = staged(
+        reader
+            .receive_sync_outcome(other.peer_id(), partial)
+            .unwrap(),
+    );
+    assert_eq!(first.session, 1);
+    let outcome = reader
+        .receive_sync_outcome(
+            other.peer_id(),
+            SyncData {
+                topic_id: late.id(),
+                ops: late_ops[2..].to_vec(),
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, ReceiveOutcome::Acked { .. }),
+        "{outcome:?}"
+    );
+    assert!(storage.provisional_topics().unwrap().is_empty());
+}
+
+#[test]
+fn memory_direct_genesis() {
+    assert_direct_genesis(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_direct_genesis() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_direct_genesis(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
 /// Invitations beyond both old fixed caps (65,536 ops and 32 MiB per session),
 /// with non-inviting fragments crossing each, staged in frame-sized messages.
 /// Run explicitly: `cargo test --features fjall --lib invite_beyond_caps -- --ignored`.
