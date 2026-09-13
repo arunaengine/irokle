@@ -2488,54 +2488,44 @@ impl<S: Storage> SharedNet<S> {
         topic_id: crate::TopicId,
         summary: &SyncSummary,
     ) -> io::Result<Option<PlannedTopicSync>> {
-        let Some(state) = self
+        let budget = crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default());
+        let receipt = self
+            .receipt_log()
+            .clocks
+            .get(&(remote_peer_id, topic_id))
+            .cloned();
+        // Authorization, branch, pages and the summary sent all come from one
+        // snapshot; the evidence write below re-checks its own preconditions.
+        let Some(read) = self
             .node
             .storage()
-            .topic_state(&topic_id)
+            .read_snapshot(|read| {
+                self.snapshot_plan(read, remote_peer_id, summary, receipt, budget)
+            })
             .map_err(invalid_data)?
         else {
             return self.plan_pull(remote_peer_id, topic_id, summary);
         };
-        let budget = crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default());
-        // A peer still staging this topic continues from its newest receipt on
-        // this branch.
-        let staged = match (
-            summary.genesis,
-            self.receipt_clock(remote_peer_id, topic_id, state.genesis),
-        ) {
-            (None, Some(clock)) => Some(SyncSummary {
-                actor_clock: clock,
-                ..summary.clone()
-            }),
-            _ => None,
-        };
-        let (mut plan, mut push_more) = self
-            .node
-            .negotiate_page(remote_peer_id, staged.as_ref().unwrap_or(summary), budget)
-            .map_err(invalid_data)?;
+        let SnapshotPlan {
+            state,
+            clock,
+            mut plan,
+            mut push_more,
+            stale_receipt,
+            converged,
+            leave,
+            local_summary,
+        } = read;
         // A receipt covering everything without a promotion is stale: the peer
         // lost or replaced that staging, so this branch is offered from the start.
-        if staged.is_some() && plan.send.is_empty() && !push_more {
+        if stale_receipt {
             self.receipt_log().clear(&(remote_peer_id, topic_id));
-            (plan, push_more) = self
-                .node
-                .negotiate_page(remote_peer_id, summary, budget)
-                .map_err(invalid_data)?;
         }
-        let view = self
-            .node
-            .storage()
-            .topic_view(&topic_id, None)
-            .map_err(invalid_data)?
-            .ok_or_else(|| invalid_data("topic disappeared while planning"))?;
         // A peer outside the membership is owed nothing and serves nothing.
-        let member = view.state.members.contains(&remote_peer_id);
+        let member = state.members.contains(&remote_peer_id);
         // Both sides may have converged since the fingerprints were compared,
         // through the peer's own push; the summary then proves the same match.
-        if member
-            && summary.genesis == Some(view.state.genesis)
-            && summary.heads == view.state.heads
-            && self.topic_is_whole(topic_id)
+        if converged
             && self
                 .node
                 .record_fingerprint(remote_peer_id, topic_id, summary.fingerprint)
@@ -2545,66 +2535,51 @@ impl<S: Storage> SharedNet<S> {
         }
         // Across two branches only the winner's namespace is a goal: the loser
         // expects the winner's clock, the winner expects its own certified.
-        let branch = summary
-            .genesis
-            .filter(|remote| *remote != view.state.genesis);
-        let planned = crate::sync::request_genesis(view.state.genesis, branch);
+        let branch = summary.genesis.filter(|remote| *remote != state.genesis);
+        let planned = crate::sync::request_genesis(state.genesis, branch);
         let mut goal = TopicGoal {
             pull: false,
             genesis: Some(planned),
-            replaces: (planned != view.state.genesis).then_some(view.state.genesis),
-            inbound: if member && (branch.is_none() || planned != view.state.genesis) {
+            replaces: (planned != state.genesis).then_some(state.genesis),
+            inbound: if member && (branch.is_none() || planned != state.genesis) {
                 summary.actor_clock.clone()
             } else {
                 Default::default()
             },
-            outbound: if member && planned == view.state.genesis {
-                view.clock.clone()
+            outbound: if member && planned == state.genesis {
+                clock
             } else {
                 Default::default()
             },
         };
-        let mut terminal = false;
-        if !view.state.members.contains(&self.node.peer_id())
-            && let Some(op_id) = self.local_leave_op(&view.state)?
-        {
-            terminal = true;
-            let leave = crate::sync::SyncRequest {
-                topic_id,
-                known: BTreeSet::new(),
-                wants: BTreeSet::from([op_id]),
-                actor_range_hints: Vec::new(),
-                genesis: None,
-                credit: crate::sync::SyncCredit::default(),
-            };
-            let page = self
-                .node
-                .response_page(remote_peer_id, &leave, budget)
-                .map_err(invalid_data)?;
+        let terminal = leave.is_some();
+        if let Some((page, position)) = leave {
             plan.send = page.ops;
             push_more = page.more;
             plan.need.clear();
             plan.actor_range_hints.clear();
             goal.inbound = crate::ActorClock::new();
             goal.outbound = crate::ActorClock::new();
-            if let Some(meta) = self.node.storage().get_meta(&op_id).map_err(invalid_data)? {
-                goal.outbound.observe(meta.actor_id, meta.actor_seq);
+            if let Some((actor_id, seq)) = position {
+                goal.outbound.observe(actor_id, seq);
             }
         }
         let send = std::mem::take(&mut plan.send);
         let wants = !plan.need.is_empty() || !plan.actor_range_hints.is_empty();
-        let mut controls = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
+        let open = crate::sync::SyncEngine::<S>::open(
+            topic_id,
+            self.node.peer_id(),
+            Some(state.event_type_id),
+        );
+        let mut controls = vec![SyncMessage::Open(open)];
         let mut credit_ops = 0;
         if wants {
-            let mut request = self.page_request(plan).map_err(invalid_data)?;
-            request.genesis = Some(planned);
+            let request = crate::sync::page_request(plan, Some(planned));
             credit_ops = request.credit.ops as usize;
             controls.push(SyncMessage::Request(request));
         }
-        if !terminal {
-            controls.push(SyncMessage::Summary(
-                self.node.sync_summary(topic_id).map_err(invalid_data)?,
-            ));
+        if let Some(local_summary) = local_summary.filter(|_| !terminal) {
+            controls.push(SyncMessage::Summary(local_summary));
         }
         // The pushed page is cut to what one stream holds beside this topic's controls.
         let mut control_bytes = 0_usize;
@@ -2639,6 +2614,92 @@ impl<S: Storage> SharedNet<S> {
             messages,
             estimated_responses,
         }))
+    }
+
+    /// Everything one topic's push, request and summary read, from `read`.
+    /// `None` when the topic is not held here.
+    fn snapshot_plan(
+        &self,
+        read: &dyn crate::storage::SnapshotRead,
+        remote_peer_id: PeerId,
+        summary: &SyncSummary,
+        receipt: Option<(crate::OpId, crate::ActorClock)>,
+        budget: crate::sync::PageBudget,
+    ) -> crate::Result<Option<SnapshotPlan>> {
+        let topic_id = summary.topic_id;
+        let Some(view) = read.topic_view(&topic_id, None)? else {
+            return Ok(None);
+        };
+        let sync = self.node.sync_engine();
+        // A peer still staging this topic continues from its newest receipt on
+        // this branch.
+        let staged = match (summary.genesis, receipt) {
+            (None, Some((genesis, clock))) if genesis == view.state.genesis => Some(SyncSummary {
+                actor_clock: clock,
+                ..summary.clone()
+            }),
+            _ => None,
+        };
+        let (mut plan, mut push_more) = sync.negotiate_in(
+            read,
+            remote_peer_id,
+            staged.as_ref().unwrap_or(summary),
+            budget,
+        )?;
+        let stale_receipt = staged.is_some() && plan.send.is_empty() && !push_more;
+        if stale_receipt {
+            (plan, push_more) = sync.negotiate_in(read, remote_peer_id, summary, budget)?;
+        }
+        let converged = view.state.members.contains(&remote_peer_id)
+            && summary.genesis == Some(view.state.genesis)
+            && summary.heads == view.state.heads
+            && self.node.unresolved_in(read, &view)?.is_empty();
+        let mut leave = None;
+        if !view.state.members.contains(&self.node.peer_id())
+            && let Some((op_id, position)) = self.leave_in(read, &view.state)?
+        {
+            let request = crate::sync::SyncRequest {
+                topic_id,
+                known: BTreeSet::new(),
+                wants: BTreeSet::from([op_id]),
+                actor_range_hints: Vec::new(),
+                genesis: None,
+                credit: crate::sync::SyncCredit::default(),
+            };
+            let page = sync.response_in(read, remote_peer_id, &request, budget)?;
+            leave = Some((page, position));
+        }
+        let local_summary = match leave {
+            Some(_) => None,
+            None => Some(sync.summary_in(read, topic_id)?),
+        };
+        Ok(Some(SnapshotPlan {
+            state: view.state,
+            clock: view.clock,
+            plan,
+            push_more,
+            stale_receipt,
+            converged,
+            leave,
+            local_summary,
+        }))
+    }
+
+    /// This node's own signed leave, and its actor position when stored, read
+    /// from `read`.
+    #[allow(clippy::type_complexity)]
+    fn leave_in(
+        &self,
+        read: &dyn crate::storage::SnapshotRead,
+        state: &crate::storage::TopicState,
+    ) -> crate::Result<Option<(crate::OpId, Option<(crate::ActorId, u64)>)>> {
+        let Some((key, false)) = state.membership_controls.get(&self.node.peer_id()) else {
+            return Ok(None);
+        };
+        let meta = read.get_meta(&key.op_id)?;
+        Ok(meta
+            .filter(|meta| meta.ready && meta.author == self.node.peer_id())
+            .map(|meta| (key.op_id, Some((meta.actor_id, meta.actor_seq)))))
     }
 
     /// Pull a topic this node does not hold from a peer that does. Its pages are
@@ -2683,8 +2744,7 @@ impl<S: Storage> SharedNet<S> {
             need: BTreeSet::new(),
             actor_range_hints,
         };
-        let mut request = self.page_request(plan).map_err(invalid_data)?;
-        request.genesis = Some(genesis);
+        let request = crate::sync::page_request(plan, Some(genesis));
         let credit_ops = request.credit.ops as usize;
         Ok(Some(PlannedTopicSync {
             topic_id,
@@ -2718,16 +2778,6 @@ impl<S: Storage> SharedNet<S> {
             .staged_topic(&peer_id, &topic_id)
             .map(|staged| staged.clock)
             .map_err(invalid_data)
-    }
-
-    /// The request for the next page of `plan`, sized to what it asks for.
-    fn page_request(&self, plan: crate::sync::SyncPlan) -> crate::Result<crate::sync::SyncRequest> {
-        let genesis = self
-            .node
-            .storage()
-            .topic_state(&plan.topic_id)?
-            .map(|state| state.genesis);
-        Ok(crate::sync::page_request(plan, genesis))
     }
 }
 
@@ -3459,66 +3509,78 @@ impl<S: Storage> SharedNet<S> {
             SyncMessage::Open(open) => {
                 let peer_id = remote_peer_id
                     .ok_or_else(|| invalid_data("sync open requires authenticated peer context"))?;
-                if let Some(state) = self
-                    .node
-                    .storage()
-                    .topic_state(&open.topic_id)
-                    .map_err(invalid_data)?
-                    && !peer_may_open_topic(&state, peer_id)
-                {
-                    return Ok(Vec::new());
-                }
                 // Unknown topics return an empty local summary so an inviter can
                 // bootstrap a new member by pushing the signed genesis/history.
-                self.node
-                    .sync_summary(open.topic_id)
-                    .map(SyncMessage::Summary)
-                    .map(|message| vec![message])
-                    .map_err(invalid_data)
+                // The permission and the summary come from one snapshot.
+                let summary = self
+                    .node
+                    .storage()
+                    .read_snapshot(|read| {
+                        if let Some(view) = read.topic_view(&open.topic_id, None)?
+                            && !peer_may_open_topic(&view.state, peer_id)
+                        {
+                            return Ok(None);
+                        }
+                        self.node
+                            .sync_engine()
+                            .summary_in(read, open.topic_id)
+                            .map(Some)
+                    })
+                    .map_err(invalid_data)?;
+                Ok(summary.map(SyncMessage::Summary).into_iter().collect())
             }
             SyncMessage::Fingerprint(fingerprint) => {
                 let peer_id = remote_peer_id.ok_or_else(|| {
                     invalid_data("sync fingerprint requires a preceding SyncOpen with peer_id")
                 })?;
-                let Some(state) = self
+                let topic_id = fingerprint.topic_id;
+                let sync = self.node.sync_engine();
+                let compared = self
                     .node
                     .storage()
-                    .topic_state(&fingerprint.topic_id)
-                    .map_err(invalid_data)?
-                else {
+                    .read_snapshot(|read| {
+                        let Some(view) = read.topic_view(&topic_id, None)? else {
+                            return Ok(None);
+                        };
+                        if !peer_may_open_topic(&view.state, peer_id) {
+                            return Ok(None);
+                        }
+                        let local = sync.digest_in(read, &view)?;
+                        let whole = self.node.unresolved_in(read, &view)?.is_empty();
+                        let member = view.state.members.contains(&peer_id);
+                        Ok(Some((
+                            local,
+                            whole,
+                            member,
+                            sync.summary_in(read, topic_id)?,
+                        )))
+                    })
+                    .map_err(invalid_data)?;
+                let Some((local, whole, member, summary)) = compared else {
                     return Ok(Vec::new());
                 };
-                if !peer_may_open_topic(&state, peer_id) {
-                    return Ok(Vec::new());
-                }
-                let local = self
-                    .node
-                    .sync_fingerprint(fingerprint.topic_id)
-                    .map_err(invalid_data)?;
                 // A damaged responder must fall through to the summary path so
-                // the requester can serve what this side cannot resolve.
-                if local.fingerprint == fingerprint.fingerprint
-                    && self.topic_is_whole(fingerprint.topic_id)
-                    && (!state.members.contains(&peer_id)
+                // the requester can serve what this side cannot resolve. The
+                // evidence write re-checks the frontier it certifies.
+                if local == fingerprint.fingerprint
+                    && whole
+                    && (!member
                         || self
                             .node
-                            .record_fingerprint(
-                                peer_id,
-                                fingerprint.topic_id,
-                                fingerprint.fingerprint,
-                            )
+                            .record_fingerprint(peer_id, topic_id, fingerprint.fingerprint)
                             .map_err(invalid_data)?)
                 {
-                    if state.members.contains(&peer_id) {
-                        self.reconsider_target(peer_id, fingerprint.topic_id);
+                    if member {
+                        self.reconsider_target(peer_id, topic_id);
                     }
-                    Ok(vec![SyncMessage::Fingerprint(local)])
+                    Ok(vec![SyncMessage::Fingerprint(
+                        crate::sync::SyncFingerprint {
+                            topic_id,
+                            fingerprint: local,
+                        },
+                    )])
                 } else {
-                    self.node
-                        .sync_summary(fingerprint.topic_id)
-                        .map(SyncMessage::Summary)
-                        .map(|message| vec![message])
-                        .map_err(invalid_data)
+                    Ok(vec![SyncMessage::Summary(summary)])
                 }
             }
             SyncMessage::Summary(summary) => {
@@ -3527,18 +3589,13 @@ impl<S: Storage> SharedNet<S> {
                 })?;
                 // A summary only yields a request: data the peer lacks is served
                 // against its own request, so nothing is sent twice.
-                let no_push = crate::sync::PageBudget { ops: 0, bytes: 0 };
-                let (plan, _) = self
+                let request = self
                     .node
-                    .negotiate_page(peer_id, &summary, no_push)
+                    .plan_sync_request(peer_id, &summary)
                     .map_err(invalid_data)?;
-                if plan.need.is_empty() && plan.actor_range_hints.is_empty() {
+                if request.wants.is_empty() && request.actor_range_hints.is_empty() {
                     return Ok(Vec::new());
                 }
-                let mut request = self.page_request(plan).map_err(invalid_data)?;
-                request.genesis = request
-                    .genesis
-                    .map(|local| crate::sync::request_genesis(local, summary.genesis));
                 Ok(vec![SyncMessage::Request(request)])
             }
             SyncMessage::Request(_) => {
@@ -3655,6 +3712,21 @@ struct PlannedGroup {
     next: Option<PlannedTopicSync>,
     rest: VecDeque<(crate::TopicId, SyncSummary)>,
     outcomes: Vec<(crate::TopicId, io::Result<()>)>,
+}
+
+/// What one topic plan read from a single snapshot.
+struct SnapshotPlan {
+    state: crate::storage::TopicState,
+    clock: crate::ActorClock,
+    plan: crate::sync::SyncPlan,
+    push_more: bool,
+    /// The peer's receipt named this branch but covered everything unpromoted.
+    stale_receipt: bool,
+    /// The summary matches this branch's whole frontier, pending the write.
+    converged: bool,
+    /// This node's leave page and its position, when it left the topic.
+    leave: Option<(crate::sync::PlannedPage, Option<(crate::ActorId, u64)>)>,
+    local_summary: Option<SyncSummary>,
 }
 
 struct PlannedTopicSync {

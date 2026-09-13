@@ -471,6 +471,22 @@ impl<S: Storage> Irokle<S> {
         self.oplog.topic_unresolved(&topic_id)
     }
 
+    /// The sync engine, for transport planners that read one snapshot.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn sync_engine(&self) -> &SyncEngine<S> {
+        &self.sync
+    }
+
+    /// Ids `view`'s topic cannot resolve, where `view` came from `read`.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn unresolved_in(
+        &self,
+        read: &dyn crate::storage::SnapshotRead,
+        view: &crate::storage::TopicView,
+    ) -> Result<BTreeSet<OpId>> {
+        self.oplog.unresolved_in(read, view)
+    }
+
     /// Ids `view`'s topic cannot resolve, with any hole scan recorded under the
     /// view's own branch and epoch.
     #[cfg(feature = "iroh")]
