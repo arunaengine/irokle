@@ -10,6 +10,7 @@ place, because opening a database changes it.
 | `fjall-schema1-24417de` | 24417de220b2c9964f9622eec97834a9b68c5bf7 | schema 1 |
 | `fjall-schema2-fb5ea2b` | fb5ea2b | schema 2 without pending byte counters |
 | `fjall-schema2-54db4f9` | 54db4f95e8f7a654da4a75eafc1eebdbcebdb4c9 | schema 2 with pending byte counters |
+| `fjall-schema4-e112523` | e112523afc69764e4bfbba61f687f4498acf0772 | schema 4 with unscoped bootstrap staging |
 
 ## Contents
 
@@ -44,3 +45,8 @@ its preallocated 64 MiB journal down to the written content.
 
 The ids are the same for all three commits, because the signing keys, the
 signed content and the signing domain did not change between them.
+
+`fjall-schema4-e112523` was made the same way with its own example. Its
+`manifest.json` names an active topic (`active`, with `genesis`, `e1`, `e2`)
+and a topic staged from `source` through the old unscoped staging API
+(`staged`, `staged_genesis`, `staged_event`). It has no `dep.op`.

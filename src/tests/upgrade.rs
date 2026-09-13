@@ -296,3 +296,33 @@ fn refuses_future_version() {
     ));
     assert_eq!(raw_records(&path), before);
 }
+
+/// Schema 4 staging named no branch or session: the upgrade discards it as
+/// unacknowledged provisional state and keeps the active topic whole.
+#[test]
+fn upgrades_staged_schema_four() {
+    let dir = fixture_copy("fjall-schema4-e112523");
+    let m = Manifest::read(dir.path());
+    let path = dir.path().join("db");
+    let staging = |records: &BTreeMap<Vec<u8>, Vec<u8>>| {
+        records
+            .keys()
+            .filter(|key| key.starts_with(b"bm") || key.starts_with(b"bo"))
+            .count()
+    };
+    assert_eq!(stored_version(&path), 4);
+    assert_eq!(staging(&raw_records(&path)), 3);
+    let storage = FjallStorage::open(&path).unwrap();
+    let active: TopicId = m.id("active");
+    let expected = ["genesis", "e1", "e2"]
+        .into_iter()
+        .map(|key| m.id::<OpId>(key))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(storage.list_op_ids(&active).unwrap(), expected);
+    assert!(storage.provisional_topics().unwrap().is_empty());
+    let staged: TopicId = m.id("staged");
+    assert!(storage.topic_state(&staged).unwrap().is_none());
+    drop(storage);
+    assert_eq!(stored_version(&path), 5);
+    assert_eq!(staging(&raw_records(&path)), 0);
+}
