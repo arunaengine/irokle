@@ -712,6 +712,8 @@ mod fjall;
 #[cfg(feature = "fjall")]
 mod fjall_pending;
 #[cfg(feature = "fjall")]
+mod fjall_provisional;
+#[cfg(feature = "fjall")]
 mod fjall_staging;
 #[cfg(feature = "fjall")]
 pub use fjall::FjallStorage;

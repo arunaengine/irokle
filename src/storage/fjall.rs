@@ -10,14 +10,15 @@ use crate::{
     TopicInfo,
 };
 
+use super::fjall_provisional::ADMITTED_BYTES;
 use super::{
     AckCommit, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS, ObligationTarget, OpMeta,
-    PeerAck, SnapshotRead, StagedTopic, Storage, StorageCounters, SyncObligation, SyncPeerStatus,
-    SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers, ack_reached_op,
-    apply_status_update, branch_matches, ensure_deps_resolvable, journalled_eviction,
-    merged_obligation, merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes,
-    settled_obligation, stored_ack_dominates, topic_fingerprint_for, validate_batch,
-    validate_heads,
+    PeerAck, ProvisionalTopic, SnapshotRead, StagedTopic, StagingLimits, Storage, StorageCounters,
+    SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit,
+    ack_covers, ack_reached_op, apply_status_update, branch_matches, check_namespace,
+    ensure_deps_resolvable, journalled_eviction, merged_obligation, merged_peer_ack,
+    new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
+    topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[cfg(feature = "fjall")]
@@ -27,6 +28,9 @@ pub struct FjallStorage {
     pub(super) records: fjall::OptimisticTxKeyspace,
     persist_mode: fjall::PersistMode,
     pub(super) counters: std::sync::Arc<StorageCounters>,
+    pub(super) limits: StagingLimits,
+    /// Byte limit of a provisional namespace store; `None` for the main store.
+    namespace: Option<u64>,
     /// Key a test rewrites before every single-attempt commit, forcing a conflict.
     #[cfg(test)]
     conflict_key: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
@@ -164,11 +168,33 @@ impl FjallStorage {
             db,
             persist_mode,
             counters: Default::default(),
+            limits: StagingLimits::DISK,
+            namespace: None,
             #[cfg(test)]
             conflict_key: Default::default(),
         };
         storage.ensure_schema_version()?;
         Ok(storage)
+    }
+
+    /// The same store applying `limits` to provisional bootstraps.
+    pub fn with_staging_limits(mut self, limits: StagingLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// This store over the keyspace of a provisional namespace.
+    pub(super) fn namespace_view(&self, records: fjall::OptimisticTxKeyspace) -> Self {
+        Self {
+            db: self.db.clone(),
+            records,
+            persist_mode: self.persist_mode,
+            counters: std::sync::Arc::clone(&self.counters),
+            limits: self.limits,
+            namespace: Some(self.limits.namespace_bytes),
+            #[cfg(test)]
+            conflict_key: Default::default(),
+        }
     }
 
     /// Work this store and its clones performed so far.
@@ -417,7 +443,7 @@ impl FjallStorage {
         })
     }
 
-    fn transaction<R>(
+    pub(super) fn transaction<R>(
         &self,
         mut f: impl FnMut(&mut fjall::OptimisticWriteTx) -> Result<R>,
     ) -> Result<R> {
@@ -523,7 +549,7 @@ impl FjallStorage {
             .count()
     }
 
-    fn ack_key(topic_id: &TopicId, peer_id: &PeerId) -> Vec<u8> {
+    pub(super) fn ack_key(topic_id: &TopicId, peer_id: &PeerId) -> Vec<u8> {
         [PEER_ACK_PREFIX, topic_id.as_ref(), peer_id.as_ref()].concat()
     }
 
@@ -561,7 +587,7 @@ impl FjallStorage {
         Ok(removed)
     }
 
-    fn tx_put_obligation(
+    pub(super) fn tx_put_obligation(
         tx: &mut fjall::OptimisticWriteTx,
         records: &fjall::OptimisticTxKeyspace,
         obligation: &SyncObligation,
@@ -580,7 +606,10 @@ impl FjallStorage {
 
     // Every read goes through a snapshot: a plain keyspace read also sees the
     // items of a commit that is still being applied.
-    fn get<T: for<'de> Deserialize<'de>>(&self, key: impl AsRef<[u8]>) -> Result<Option<T>> {
+    pub(super) fn get<T: for<'de> Deserialize<'de>>(
+        &self,
+        key: impl AsRef<[u8]>,
+    ) -> Result<Option<T>> {
         Ok(
             fjall::Readable::get(&self.db.read_tx(), &self.records, key)?
                 .map(|v| postcard::from_bytes(v.as_ref()))
@@ -667,7 +696,6 @@ impl FjallStorage {
             if current_topic_state.as_ref() != expected_topic_state.as_ref() {
                 return Err(Error::AdmissionConflict);
             }
-
             let mut actor_tips = BTreeMap::new();
             let mut new_entries = Vec::new();
             let mut accounted_entries = BTreeSet::new();
@@ -772,6 +800,26 @@ impl FjallStorage {
                             .is_some(),
                 )
             })?;
+            if let Some(limit) = self.namespace {
+                let mut charge = 0;
+                for (op, _) in &new_entries {
+                    if !fjall::Readable::contains_key(
+                        tx,
+                        &self.records,
+                        Self::key_id(b"o", &op.id),
+                    )? {
+                        charge += pending_op_bytes(op)? as u64;
+                    }
+                }
+                let admitted: u64 =
+                    Self::tx_get(tx, &self.records, ADMITTED_BYTES)?.unwrap_or_default();
+                check_namespace(
+                    admitted + Self::tx_pending_bytes(tx, &self.records)?,
+                    charge,
+                    limit,
+                )?;
+                Self::tx_put(tx, &self.records, ADMITTED_BYTES, &(admitted + charge))?;
+            }
 
             let mut clock: ActorClock =
                 Self::tx_get(tx, &self.records, Self::key_id(b"ac", &topic_id))?
@@ -1185,6 +1233,10 @@ impl Storage for FjallStorage {
         batch: AdmittedBatch,
         eviction: Option<&TopicEviction>,
     ) -> Result<usize> {
+        // A namespace holds one candidate branch; replacing it is the node's decision.
+        if self.namespace.is_some() {
+            return Err(Error::StaleIncarnation);
+        }
         self.transaction_once(|tx| {
             if Self::tx_get::<bool>(
                 tx,
@@ -1411,6 +1463,17 @@ impl Storage for FjallStorage {
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         let charge = Self::pending_charge(&op, &meta)?;
         self.transaction(|tx| {
+            if let Some(limit) = self.namespace
+                && Self::tx_pending_record(tx, &self.records, &op.id)?.is_none()
+            {
+                let admitted: u64 =
+                    Self::tx_get(tx, &self.records, ADMITTED_BYTES)?.unwrap_or_default();
+                check_namespace(
+                    admitted + Self::tx_pending_bytes(tx, &self.records)?,
+                    charge,
+                    limit,
+                )?;
+            }
             Self::tx_put_pending(tx, &self.records, source_peer, &op, &meta, charge)
         })
     }
@@ -1689,6 +1752,43 @@ impl Storage for FjallStorage {
 
     fn expire_bootstrap(&self, older_than_ms: u64) -> Result<usize> {
         self.transaction(|tx| Self::tx_expire_sessions(tx, &self.records, older_than_ms))
+    }
+
+    fn staging_limits(&self) -> StagingLimits {
+        self.limits
+    }
+
+    fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>> {
+        self.read_provisional_topics()
+    }
+
+    fn open_provisional(
+        &self,
+        source: PeerId,
+        topic_id: TopicId,
+        genesis: OpId,
+        now_ms: u64,
+    ) -> Result<ProvisionalTopic> {
+        self.open_namespace(source, topic_id, genesis, now_ms)
+    }
+
+    fn provisional_store(&self, provisional: &ProvisionalTopic) -> Result<Option<Self>> {
+        self.namespace_store(provisional)
+    }
+
+    fn stored_bytes(&self) -> Result<u64> {
+        let read_tx = self.db.read_tx();
+        let admitted: u64 =
+            Self::tx_get(&read_tx, &self.records, ADMITTED_BYTES)?.unwrap_or_default();
+        Ok(admitted + Self::tx_pending_bytes(&read_tx, &self.records)?)
+    }
+
+    fn touch_provisional(&self, provisional: &ProvisionalTopic, now_ms: u64) -> Result<()> {
+        self.touch_namespace(provisional, now_ms)
+    }
+
+    fn discard_provisional(&self, provisional: &ProvisionalTopic) -> Result<bool> {
+        self.discard_namespace(provisional)
     }
 }
 

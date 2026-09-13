@@ -58,6 +58,11 @@ impl FjallStorage {
         Self::tx_get(tx, records, key(&[RECORD, op_id.as_ref()]))
     }
 
+    /// Serialized bytes of every buffered op.
+    pub(super) fn tx_pending_bytes(tx: &impl fjall::Readable, records: &Records) -> Result<u64> {
+        Ok(Self::tx_usage(tx, records, TOTAL_USAGE)?.bytes)
+    }
+
     fn tx_usage(tx: &impl fjall::Readable, records: &Records, key: &[u8]) -> Result<PendingUsage> {
         Ok(Self::tx_get(tx, records, key)?.unwrap_or_default())
     }
