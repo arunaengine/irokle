@@ -1750,63 +1750,107 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         topic_id: crate::TopicId,
     ) -> io::Result<()> {
-        let _task = self.tasks.enter()?;
+        self.sync_topics_now(peer, &[topic_id])
+            .await
+            .remove(&topic_id)
+            .unwrap_or(Ok(()))
+    }
+
+    /// Manually syncs `topic_ids` with one peer through the same batched page
+    /// exchange the resync loop uses, paging each topic while it advances up to
+    /// a page budget. Per topic: `Ok` when its goal completed, `WouldBlock`
+    /// when it advanced but the budget ran out and the rest is scheduled, and
+    /// the error of an exchange that failed or made no progress.
+    pub async fn sync_topics_now(
+        &self,
+        peer: iroh::EndpointAddr,
+        topic_ids: &[crate::TopicId],
+    ) -> BTreeMap<crate::TopicId, io::Result<()>> {
+        let _task = match self.tasks.enter() {
+            Ok(task) => task,
+            Err(error) => {
+                return topic_ids
+                    .iter()
+                    .map(|topic_id| (*topic_id, Err(clone_error(&error))))
+                    .collect();
+            }
+        };
         let attempt = self.attempt_identity(None);
         let remote_peer_id = peer_id_from_endpoint_id(peer.id);
         let endpoint_id = peer.id;
         // A bounded page is not the goal: keep paging while the exchange really
         // advances, up to a caller budget, so catching up is not reported as an
         // I/O error merely because another page is needed.
-        let mut result = Ok(());
-        let mut advancing = false;
+        let mut settled = BTreeMap::new();
+        let mut paging = topic_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         for _ in 0..MAX_SYNC_NOW_PAGES {
-            let mut outcomes = self.run_topic_batch(peer.clone(), &[topic_id], None).await;
-            result = outcomes.results.remove(&topic_id).unwrap_or(Ok(()));
-            advancing = outcomes.advanced.contains(&topic_id);
-            if result.is_err() || !advancing {
+            if paging.is_empty() {
                 break;
             }
+            let mut outcomes = self.run_topic_batch(peer.clone(), &paging, None).await;
+            for topic_id in std::mem::take(&mut paging) {
+                let result = outcomes.results.remove(&topic_id).unwrap_or(Ok(()));
+                let advancing = outcomes.advanced.contains(&topic_id);
+                if result.is_ok() && advancing {
+                    paging.push(topic_id);
+                }
+                settled.insert(topic_id, (result, advancing));
+            }
         }
-        // An exhausted budget is progress, not an unreachable peer.
-        let outcome = attempt_outcome(result.as_ref().copied(), advancing);
-        // Work still outstanding after the page budget is not a completed sync.
-        if result.is_ok() && advancing {
-            result = Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "sync page budget exhausted; the rest is scheduled",
-            ));
+        let mut results = BTreeMap::new();
+        let mut finished = Vec::with_capacity(settled.len());
+        let mut noted = Vec::with_capacity(settled.len());
+        for (topic_id, (mut result, advancing)) in settled {
+            // An exhausted budget is progress, not an unreachable peer.
+            let outcome = attempt_outcome(result.as_ref().copied(), advancing);
+            // Work still outstanding after the page budget is not a completed sync.
+            if result.is_ok() && advancing {
+                result = Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "sync page budget exhausted; the rest is scheduled",
+                ));
+            }
+            noted.push(match &result {
+                Err(error) if !advancing => Err(clone_error(error)),
+                _ => Ok(()),
+            });
+            finished.push((topic_id, outcome, advancing));
+            results.insert(topic_id, result);
         }
-        if result.is_err() {
+        if results.values().any(Result::is_err) {
             // Drops the pooled connection only when it is already closed.
             let _ = self.pool.get(&endpoint_id);
         }
-        let noted = match &result {
-            Err(error) if !advancing => Err(clone_error(error)),
-            _ => Ok(()),
-        };
-        let finished = self
+        let recorded = self
             .run_job(Lane::Control, move |shared| {
-                shared.note_outcome(remote_peer_id, [noted.as_ref().copied()]);
-                if let Err(error) =
-                    shared
-                        .node
-                        .record_attempt_result(remote_peer_id, topic_id, attempt, &outcome)
-                {
-                    tracing::warn!(%remote_peer_id, %topic_id, %error, "failed to record sync attempt");
-                }
-                // A manual sync holds no claim, so it reports evidence instead of
-                // completing an attempt the resync loop may own.
-                if advancing {
-                    shared.resync_scheduler.reconsider(remote_peer_id, topic_id);
-                } else {
-                    shared.reconsider_target(remote_peer_id, topic_id);
+                shared.note_outcome(remote_peer_id, noted.iter().map(|noted| noted.as_ref().copied()));
+                for (topic_id, outcome, advancing) in finished {
+                    if let Err(error) =
+                        shared
+                            .node
+                            .record_attempt_result(remote_peer_id, topic_id, attempt, &outcome)
+                    {
+                        tracing::warn!(%remote_peer_id, %topic_id, %error, "failed to record sync attempt");
+                    }
+                    // A manual sync holds no claim, so it reports evidence instead of
+                    // completing an attempt the resync loop may own.
+                    if advancing {
+                        shared.resync_scheduler.reconsider(remote_peer_id, topic_id);
+                    } else {
+                        shared.reconsider_target(remote_peer_id, topic_id);
+                    }
                 }
             })
             .await;
-        if let Err(error) = finished {
-            tracing::warn!(%remote_peer_id, %topic_id, %error, "failed to finish manual sync");
+        if let Err(error) = recorded {
+            tracing::warn!(%remote_peer_id, %error, "failed to finish manual sync");
         }
-        result
+        results
     }
 
     /// Services a peer's due resync targets as multi-topic batches over the

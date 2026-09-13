@@ -738,3 +738,46 @@ async fn large_topics_progress() {
     alice.net.shutdown().await;
     bob.net.shutdown().await;
 }
+
+/// One manual call syncs several topics with a peer through the batched page
+/// exchange: small topics finish at once, a long one pages until its budget
+/// and reports `WouldBlock` instead of failing, and repeating finishes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topics_now_page_together() {
+    let runtime = net::IrohRuntimeConfig::default();
+    let alice = peer(bind(None).await, runtime, StreamLimits::default());
+    let bob = peer(bind(None).await, runtime, StreamLimits::default());
+    let alice_addr = serve(&alice).await;
+    let small = (80..83).map(topic).collect::<Vec<_>>();
+    let long = topic(83);
+    for topic_id in &small {
+        seed_topic(&alice.node, &bob.node, *topic_id, 20, 8);
+    }
+    seed_topic(&alice.node, &bob.node, long, 9000, 8);
+    let mut topics = small.clone();
+    topics.push(long);
+
+    let first = bob.net.sync_topics_now(alice_addr.clone(), &topics).await;
+    assert_eq!(first.len(), topics.len());
+    for topic_id in &small {
+        assert!(first[topic_id].is_ok(), "{:?}", first[topic_id]);
+    }
+    let mut calls = 1;
+    let mut result = first
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    while let Some(Err(error)) = result.remove(&long) {
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+        calls += 1;
+        assert!(calls <= 4, "the long topic did not finish");
+        result = bob.net.sync_topics_now(alice_addr.clone(), &[long]).await;
+    }
+    for topic_id in &topics {
+        assert_eq!(
+            bob.node.storage().actor_clock(topic_id).unwrap(),
+            alice.node.storage().actor_clock(topic_id).unwrap()
+        );
+    }
+    alice.net.shutdown().await;
+    bob.net.shutdown().await;
+}
