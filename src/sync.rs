@@ -20,10 +20,10 @@ use crate::{
 
 const SYNC_ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/2";
 
-/// Wire contract this build speaks. Version 3 adds receive credits, page results
-/// and branch names to summaries and requests; older peers are refused by the
-/// transport before any message is exchanged.
-pub const SYNC_PROTOCOL: &str = "irokle/sync/3";
+/// Wire contract this build speaks. Version 3 added receive credits, page results
+/// and branch names; version 4 names missing records in page results and accepts
+/// zero-span position hints. Older peers are refused before any message.
+pub const SYNC_PROTOCOL: &str = "irokle/sync/4";
 
 /// Maximum number of sequences a single ActorRangeHint may span. Caps both the
 /// hint a peer can construct via `actor_ranges` and the work
@@ -33,18 +33,27 @@ pub const MAX_ACTOR_RANGE_HINT_SPAN: u64 = 65_536;
 const MAX_REQUEST_ITEMS: usize = 65_536;
 const MAX_PAGE_OPS: usize = 4096;
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
-/// Actors one page plan keeps range heads for; the rest wait for a later page.
+/// Actors one page plan keeps active range heads for; the rest wait for a free
+/// slot in the same page or for a later page.
 const MAX_PAGE_ACTORS: usize = 4096;
+/// Records one page names as missing, at most.
+pub const MAX_PAGE_MISSING: usize = 256;
 
 /// A queued range position: generation, actor, sequence, id and range limit.
 type RangeHead = (u64, ActorId, u64, OpId, u64);
 
 /// One planned page and whether the goal still holds more after it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlannedPage {
     /// A causal prefix: every op's dependencies precede it or the peer holds them.
     pub ops: Vec<Op>,
+    /// Whether this store holds more of the goal than the page carries.
     pub more: bool,
+    /// Records the goal depends on that this store does not hold, at most
+    /// [`MAX_PAGE_MISSING`]. No later page from this store carries them.
+    pub missing: BTreeSet<OpId>,
+    /// An operation that alone exceeds the page's byte budget.
+    pub too_large: Option<OpId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -121,10 +130,12 @@ impl Default for SyncCredit {
 
 /// Ends the data a responder served for one topic's request. `more` means the
 /// requested goal holds more than this page; the requester asks again.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncPage {
     pub topic_id: TopicId,
     pub more: bool,
+    /// Records the requested goal depends on that the responder does not hold.
+    pub missing: BTreeSet<OpId>,
 }
 
 /// Staged progress of data for a topic the receiver does not hold yet. It is
@@ -553,6 +564,12 @@ impl<S: Storage> SyncEngine<S> {
                     .any(|(actor_id, (seq, tip))| tip == id && view.clock.get(actor_id) < *seq)
             });
         }
+        // A request past the item limit is refused whole, so the wants are cut
+        // to what one request may carry and the rest follow once these resolve.
+        let need = need
+            .into_iter()
+            .take(MAX_REQUEST_ITEMS)
+            .collect::<BTreeSet<_>>();
         let actor_range_hints = actor_ranges(&view.clock, &remote.actor_clock, need.len());
         Ok(SyncPlan {
             topic_id: remote.topic_id,
@@ -714,10 +731,7 @@ impl<S: Storage> SyncEngine<S> {
         request: &SyncRequest,
         budget: PageBudget,
     ) -> Result<PlannedPage> {
-        let empty = PlannedPage {
-            ops: Vec::new(),
-            more: false,
-        };
+        let empty = PlannedPage::default();
         let Some(view) = read.topic_view(&request.topic_id, None)? else {
             return Ok(empty);
         };
@@ -738,8 +752,8 @@ impl<S: Storage> SyncEngine<S> {
         let asks = !request.wants.is_empty() || !request.actor_range_hints.is_empty();
         if budget.ops == 0 || budget.bytes == 0 {
             return Ok(PlannedPage {
-                ops: Vec::new(),
                 more: asks,
+                ..PlannedPage::default()
             });
         }
         let local = &view.clock;
@@ -751,18 +765,10 @@ impl<S: Storage> SyncEngine<S> {
                 goal.set(hint.actor_id, to);
             }
         }
-        let (mut ops, repair_more) =
+        let repair =
             Self::plan_repair(read, &request.topic_id, &request.wants, &peer_clock, budget)?;
-        // Wants this page could not carry keep their dependents out of the
-        // forward ranges, which still serve every independent actor.
-        let unsent = if repair_more {
-            let sent = ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
-            request.wants.difference(&sent).copied().collect()
-        } else {
-            BTreeSet::new()
-        };
         let mut used = 0;
-        for op in &ops {
+        for op in &repair.ops {
             used += postcard::experimental::serialized_size(op)?;
             let body = &op.signed.body;
             if peer_clock.get(&body.actor_id) + 1 == body.actor_seq {
@@ -770,26 +776,38 @@ impl<S: Storage> SyncEngine<S> {
             }
         }
         let rest = PageBudget {
-            ops: budget.ops.saturating_sub(ops.len()),
+            ops: budget.ops.saturating_sub(repair.ops.len()),
             bytes: budget.bytes.saturating_sub(used),
         };
-        if rest.ops == 0 || rest.bytes == 0 {
-            return Ok(PlannedPage { ops, more: true });
+        let mut page = PlannedPage {
+            ops: repair.ops,
+            more: !repair.unsent.is_empty(),
+            missing: repair.missing,
+            too_large: repair.too_large,
+        };
+        if rest.ops == 0 || rest.bytes == 0 || page.too_large.is_some() {
+            return Ok(page);
         }
+        // Wants this page could not carry keep their dependents out of the
+        // forward ranges, which still serve every independent actor.
         let planned = self.plan_page(
             read,
             &request.topic_id,
             local,
             &peer_clock,
             Some(&goal),
-            &unsent,
+            &repair.unsent,
             rest,
         )?;
-        ops.extend(planned.ops);
-        Ok(PlannedPage {
-            ops,
-            more: repair_more || planned.more,
-        })
+        let forwarded = planned.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+        page.more = planned.more || !repair.unsent.is_subset(&forwarded);
+        page.ops.extend(planned.ops);
+        page.missing.extend(planned.missing);
+        page.too_large = page.too_large.or(planned.too_large);
+        while page.missing.len() > MAX_PAGE_MISSING {
+            page.missing.pop_last();
+        }
+        Ok(page)
     }
 
     pub fn receive_data(
@@ -1130,10 +1148,10 @@ impl<S: Storage> SyncEngine<S> {
         // from the clocks alone.
         if budget.ops == 0 || budget.bytes == 0 {
             return Ok(PlannedPage {
-                ops: Vec::new(),
                 more: local
                     .iter()
                     .any(|(actor_id, seq)| limit_of(actor_id, *seq) > peer.get(actor_id)),
+                ..PlannedPage::default()
             });
         }
         let mut heads = BinaryHeap::new();
@@ -1229,6 +1247,7 @@ impl<S: Storage> SyncEngine<S> {
         Ok(PlannedPage {
             ops,
             more: more || !heads.is_empty(),
+            ..PlannedPage::default()
         })
     }
 
@@ -1257,80 +1276,97 @@ impl<S: Storage> SyncEngine<S> {
         Ok(true)
     }
 
-    /// Requested repair ids and the ancestry the peer's clock does not cover,
-    /// oldest first, bounded by the page.
+    /// Requested repair ids this store holds, oldest generation first. An id
+    /// whose dependency is neither held by the peer nor sent before it waits,
+    /// and so do its dependents: its ancestors come from the forward ranges.
     fn plan_repair(
         read: &dyn SnapshotRead,
         topic_id: &TopicId,
         wants: &BTreeSet<OpId>,
         peer: &ActorClock,
         budget: PageBudget,
-    ) -> Result<(Vec<Op>, bool)> {
-        let mut closure = BTreeSet::new();
-        let mut covered = BTreeSet::new();
-        let mut stack = wants.iter().copied().collect::<Vec<_>>();
-        let mut more = false;
-        while let Some(id) = stack.pop() {
-            if closure.contains(&id) || covered.contains(&id) {
-                continue;
+    ) -> Result<RepairPage> {
+        let mut page = RepairPage::default();
+        let mut ordered = Vec::with_capacity(wants.len());
+        for id in wants {
+            match read.get_meta(id)? {
+                Some(meta) if meta.topic_id == *topic_id => {
+                    ordered.push((meta.generation, *id, meta.deps))
+                }
+                Some(_) => {}
+                None => {
+                    page.missing.insert(*id);
+                }
             }
-            if closure.len() >= MAX_PAGE_OPS {
-                more = true;
-                continue;
-            }
-            let Some(meta) = read.get_meta(&id)? else {
-                continue;
-            };
-            if meta.topic_id != *topic_id {
-                continue;
-            }
-            // An explicit want overrides what the clock implies; ancestry does not.
-            if !wants.contains(&id) && peer.get(&meta.actor_id) >= meta.actor_seq {
-                covered.insert(id);
-                continue;
-            }
-            closure.insert(id);
-            stack.extend(meta.deps.iter().copied());
         }
-        let mut ordered = subset_in(read, &closure)?;
-        // Wants unconnected inside the closure still depend on each other through
-        // covered ops, so a cut page must keep the oldest generations first.
-        ordered.sort_by_key(|op| op.signed.body.generation);
-        let mut ops = Vec::new();
+        // Generations order ancestors first, whatever order the ids sort in.
+        ordered.sort_unstable_by_key(|(generation, id, _)| (*generation, *id));
         let mut sent = BTreeSet::new();
         let mut bytes = 0;
-        for op in ordered {
-            // A walk cut short leaves ancestors unsent; an op above them waits.
-            let deps = &op.signed.body.deps;
-            if !deps
-                .iter()
-                .all(|dep| sent.contains(dep) || covered.contains(dep))
-            {
-                more = true;
+        for (index, (_, id, deps)) in ordered.iter().enumerate() {
+            let mut ready = true;
+            for dep in deps {
+                if sent.contains(dep) {
+                    continue;
+                }
+                if wants.contains(dep) {
+                    ready = false;
+                    break;
+                }
+                let covered = read
+                    .get_meta(dep)?
+                    .is_some_and(|meta| peer.get(&meta.actor_id) >= meta.actor_seq);
+                if !covered {
+                    ready = false;
+                    break;
+                }
+            }
+            if !ready {
+                page.unsent.insert(*id);
                 continue;
             }
+            let Some(op) = read.get_op(id)? else {
+                page.missing.insert(*id);
+                continue;
+            };
             let size = postcard::experimental::serialized_size(&op)?;
-            if ops.len() >= budget.ops || bytes + size > budget.bytes {
-                more = true;
+            if page.ops.len() >= budget.ops || bytes + size > budget.bytes {
+                if page.ops.is_empty() && size > budget.bytes {
+                    page.too_large = Some(*id);
+                }
+                page.unsent
+                    .extend(ordered[index..].iter().map(|(_, id, _)| *id));
                 break;
             }
             bytes += size;
-            sent.insert(op.id);
-            ops.push(op);
+            sent.insert(*id);
+            page.ops.push(op);
         }
-        Ok((ops, more))
+        Ok(page)
     }
+}
+
+/// What the repair part of a page carried and left.
+#[derive(Default)]
+struct RepairPage {
+    ops: Vec<Op>,
+    /// Held wants not carried, whose dependents must wait.
+    unsent: BTreeSet<OpId>,
+    missing: BTreeSet<OpId>,
+    too_large: Option<OpId>,
 }
 
 /// Ranges from `local` up to `remote` for every actor `remote` is ahead on,
 /// spanning at most `MAX_ACTOR_RANGE_HINT_SPAN` positions beside `wants` ids.
+/// Actors past the span still get a zero-span hint naming their position, so a
+/// responder never takes an actor this node is behind on as held.
 fn actor_ranges(local: &ActorClock, remote: &ActorClock, wants: usize) -> Vec<ActorRangeHint> {
     let mut remaining = MAX_ACTOR_RANGE_HINT_SPAN.saturating_sub(wants as u64);
     remote
         .iter()
         .filter_map(|(actor_id, remote_seq)| {
             let local_seq = local.get(actor_id);
-            if *remote_seq <= local_seq || remaining == 0 {
+            if *remote_seq <= local_seq {
                 return None;
             }
             let to_inclusive = remote_seq
@@ -1344,6 +1380,7 @@ fn actor_ranges(local: &ActorClock, remote: &ActorClock, wants: usize) -> Vec<Ac
                 to_inclusive,
             })
         })
+        .take(MAX_REQUEST_ITEMS.saturating_sub(wants))
         .collect()
 }
 
@@ -1378,18 +1415,15 @@ pub(crate) fn request_genesis(local: OpId, remote: Option<OpId>) -> OpId {
 }
 
 /// Clamp a peer-supplied `ActorRangeHint` against our local knowledge so that
-/// `from_exclusive < to_inclusive`, `to_inclusive <= local_seq` (we only walk
+/// `from_exclusive <= to_inclusive`, `to_inclusive <= local_seq` (we only walk
 /// sequences we actually have), and the resulting span never exceeds
-/// `MAX_ACTOR_RANGE_HINT_SPAN`. Returns `None` if the range is empty,
-/// reversed, or otherwise unsalvageable.
+/// `MAX_ACTOR_RANGE_HINT_SPAN`. An empty or reversed range still names the
+/// peer's position. Returns `None` when the peer holds everything local.
 fn clamp_actor_range_hint(hint: &ActorRangeHint, local_seq: u64) -> Option<(u64, u64)> {
     if hint.from_exclusive >= local_seq {
         return None;
     }
-    let upper = hint.to_inclusive.min(local_seq);
-    if upper <= hint.from_exclusive {
-        return None;
-    }
+    let upper = hint.to_inclusive.min(local_seq).max(hint.from_exclusive);
     let span = upper - hint.from_exclusive;
     let span = span.min(MAX_ACTOR_RANGE_HINT_SPAN);
     let to_inclusive = hint.from_exclusive.checked_add(span)?;
