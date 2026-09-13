@@ -24,7 +24,7 @@ use helpers::{
     pending_meta_for,
 };
 pub(crate) use topology::topological_ids;
-use topology::{complete_ops, topological_ops};
+use topology::topological_ops;
 pub(crate) use topology::{subset_in, topological_subset_entries};
 pub use topology::{topological, topological_subset};
 
@@ -177,7 +177,7 @@ fn conflict_pause(attempt: usize) {
     std::thread::sleep(std::time::Duration::from_micros(micros));
 }
 
-fn is_structural_genesis(op: &Op) -> bool {
+pub(crate) fn is_structural_genesis(op: &Op) -> bool {
     let body = &op.signed.body;
     matches!(body.payload, TopicPayload::Genesis(_))
         && body.actor_seq == 1
@@ -285,6 +285,16 @@ impl<S: Storage> Oplog<S> {
     }
     pub fn storage(&self) -> &S {
         &self.storage
+    }
+
+    /// An oplog over `storage` sharing this oplog's membership projections,
+    /// which are keyed by op id and filtered by topic and genesis on use.
+    pub(crate) fn sharing_membership<T: Storage>(&self, storage: T) -> Oplog<T> {
+        Oplog {
+            storage,
+            whole_topics: Arc::new(Mutex::new(BTreeMap::new())),
+            membership_cache: Arc::clone(&self.membership_cache),
+        }
     }
 
     /// Ids this topic references but cannot resolve: admitted ops whose own
@@ -1452,33 +1462,6 @@ impl<S: Storage> Oplog<S> {
     /// The batch promoting verified `staged` ops, validated like any admission
     /// against a fresh topic. `None` until their causally complete part makes
     /// both `local` and `source` members.
-    pub(crate) fn bootstrap_batch(
-        &self,
-        local: PeerId,
-        source: PeerId,
-        staged: Vec<Op>,
-        effects: Option<ReceiveEffects<'_>>,
-    ) -> Result<Option<AdmittedBatch>> {
-        let complete = complete_ops(staged);
-        let invited = complete.iter().any(|op| match &op.signed.body.payload {
-            TopicPayload::Genesis(genesis) => genesis.initial_peers.contains(&local),
-            TopicPayload::Control(TopicControl::AddPeer { peer }) => *peer == local,
-            _ => false,
-        });
-        if !invited {
-            return Ok(None);
-        }
-        let verified = complete.iter().map(|op| op.id).collect();
-        let Some(built) = self.build_batch(Some(source), complete, &verified, true, effects)?
-        else {
-            return Ok(None);
-        };
-        let members = built.batch.topic_state.as_ref().map(|state| &state.members);
-        Ok(members
-            .is_some_and(|members| members.contains(&local) && members.contains(&source))
-            .then_some(built.batch))
-    }
-
     pub fn observed_clock(&self, topic_id: &TopicId) -> Result<crate::ActorClock> {
         self.storage.actor_clock(topic_id)
     }

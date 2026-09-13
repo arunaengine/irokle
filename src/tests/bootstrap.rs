@@ -95,11 +95,11 @@ fn assert_promoted<S: Storage>(bob: &Irokle<S>, source: &Irokle, topic_id: Topic
     let state = storage.topic_state(&topic_id).unwrap().unwrap();
     assert!(state.members.contains(&bob.peer_id()));
     assert!(
-        storage
-            .staged_bootstrap_ops(&source.peer_id(), &topic_id)
+        bob.staged_topic(source.peer_id(), topic_id)
             .unwrap()
-            .is_empty()
+            .is_none()
     );
+    assert!(storage.provisional_topics().unwrap().is_empty());
     bob.open_topic::<Note>(topic_id).unwrap();
 }
 
@@ -114,7 +114,7 @@ fn split_invitation<S: Storage>(storage: S) {
     let actor = actor_of(&alice, topic_id);
 
     let first = staged(receive(&bob, alice.peer_id(), topic_id, &ops[..100]));
-    assert_eq!((first.clock.get(&actor), first.ops), (100, 100));
+    assert_eq!(first.clock.get(&actor), 100);
     assert_invisible(&bob, alice.peer_id(), topic_id, &ops);
     // The acknowledging method never reports staging as an ack.
     let data = SyncData {
@@ -127,7 +127,7 @@ fn split_invitation<S: Storage>(storage: S) {
     }
 
     let second = staged(receive(&bob, alice.peer_id(), topic_id, &ops[100..257]));
-    assert_eq!((second.clock.get(&actor), second.ops), (257, 257));
+    assert_eq!(second.clock.get(&actor), 257);
     assert_invisible(&bob, alice.peer_id(), topic_id, &ops);
 
     let ack = acked(receive(&bob, alice.peer_id(), topic_id, &ops[257..]));
@@ -214,6 +214,9 @@ fn fjall_large_stages() {
     large_stages(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
+/// Segments no staged branch anchors yet are not kept; once the genesis
+/// anchors the namespace, a segment ahead of its dependencies waits there for
+/// them, and a repeated segment changes nothing.
 fn reordered_segments<S: Storage>(storage: S) {
     let (alice, topic_id, ops) = invited_history(185, 20, 1);
     let bob = bob_node(storage);
@@ -221,20 +224,23 @@ fn reordered_segments<S: Storage>(storage: S) {
     let (head, rest) = ops.split_at(8);
     let (middle, tail) = rest.split_at(8);
 
-    let first = staged(receive(&bob, alice.peer_id(), topic_id, tail));
-    assert_eq!(first.clock.get(&actor), 0);
-    let second = staged(receive(&bob, alice.peer_id(), topic_id, middle));
-    let repeated = staged(receive(&bob, alice.peer_id(), topic_id, middle));
-    assert_eq!(second, repeated);
-    let mixed = [tail, middle].concat();
-    assert_eq!(
-        staged(receive(&bob, alice.peer_id(), topic_id, &mixed)),
-        second
-    );
-    assert_eq!(second.ops, (tail.len() + middle.len()) as u64);
+    let unanchored = staged(receive(&bob, alice.peer_id(), topic_id, tail));
+    assert_eq!(unanchored, StagedTopic::default());
     assert_invisible(&bob, alice.peer_id(), topic_id, &ops);
 
-    let ack = acked(receive(&bob, alice.peer_id(), topic_id, head));
+    let anchored = staged(receive(&bob, alice.peer_id(), topic_id, head));
+    assert_eq!(anchored.clock.get(&actor), 8);
+    let waiting = staged(receive(&bob, alice.peer_id(), topic_id, tail));
+    assert_eq!(waiting.clock, anchored.clock);
+    assert!(
+        waiting.bytes > anchored.bytes,
+        "the tail waits in the namespace"
+    );
+    let repeated = staged(receive(&bob, alice.peer_id(), topic_id, tail));
+    assert_eq!(repeated, waiting);
+    assert_invisible(&bob, alice.peer_id(), topic_id, &ops);
+
+    let ack = acked(receive(&bob, alice.peer_id(), topic_id, middle));
     assert_promoted(&bob, &alice, topic_id, &ack);
 }
 
@@ -269,15 +275,16 @@ fn source_mismatch<S: Storage>(storage: S) {
     staged(receive(&bob, carol, topic_id, std::slice::from_ref(invite)));
     assert_invisible(&bob, carol, topic_id, &ops);
 
-    let ack = acked(receive(&bob, alice.peer_id(), topic_id, history));
+    staged(receive(&bob, alice.peer_id(), topic_id, history));
+    let ack = acked(receive(
+        &bob,
+        alice.peer_id(),
+        topic_id,
+        std::slice::from_ref(invite),
+    ));
     assert_promoted(&bob, &alice, topic_id, &ack);
-    // Promotion drops every session of the topic.
-    assert!(
-        bob.storage()
-            .staged_bootstrap_ops(&carol, &topic_id)
-            .unwrap()
-            .is_empty()
-    );
+    // Activation ends every namespace of the topic.
+    assert!(bob.staged_topic(carol, topic_id).unwrap().is_none());
 }
 
 #[test]
@@ -304,7 +311,10 @@ fn revoked_invitation<S: Storage>(storage: S) {
     let bob = bob_node(storage);
 
     let staged = staged(receive(&bob, alice.peer_id(), topic.id(), &ops));
-    assert_eq!(staged.ops, ops.len() as u64);
+    assert_eq!(
+        staged.clock.get(&actor_id_for(topic.id(), alice.peer_id())),
+        ops.len() as u64
+    );
     assert_invisible(&bob, alice.peer_id(), topic.id(), &ops);
 }
 
@@ -481,11 +491,13 @@ fn fjall_reopen_promotion() {
     }
 
     let bob = bob_node(open());
+    let staged = bob
+        .staged_topic(alice.peer_id(), topic_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        bob.storage()
-            .staged_bootstrap_ops(&alice.peer_id(), &topic_id)
-            .unwrap(),
-        history.to_vec()
+        staged.clock.get(&actor_of(&alice, topic_id)),
+        history.len() as u64
     );
     assert_invisible(&bob, alice.peer_id(), topic_id, &ops);
     let ack = acked(receive(
@@ -511,8 +523,15 @@ fn replaced_branch<S: Storage>(storage: S) {
             forked_side(MemoryStorage::new(), topic_id, 193, [other], "branch");
         (log, signer, vec![genesis, event])
     };
-    let (_, source, old) = branch(194);
-    let (log, _, new) = branch(195);
+    let (_, source, first) = branch(194);
+    let (second_log, _, second) = branch(195);
+    // A source moves only to a smaller genesis, which is what the tie-break keeps.
+    let (old, (log, new)) = if first[0].id > second[0].id {
+        (first, (second_log, second))
+    } else {
+        let (first_log, _, first_ops) = branch(194);
+        (second, (first_log, first_ops))
+    };
     let actor = actor_id_for(topic_id, source.peer_id());
     let invite = log
         .create_control_op(
@@ -524,12 +543,9 @@ fn replaced_branch<S: Storage>(storage: S) {
         .unwrap();
     let bob = bob_node(storage);
 
-    assert_eq!(
-        staged(receive(&bob, source.peer_id(), topic_id, &old)).ops,
-        2
-    );
+    staged(receive(&bob, source.peer_id(), topic_id, &old));
     let replaced = staged(receive(&bob, source.peer_id(), topic_id, &new));
-    assert_eq!((replaced.clock.get(&actor), replaced.ops), (2, 2));
+    assert_eq!(replaced.clock.get(&actor), 2);
     let ack = acked(receive(
         &bob,
         source.peer_id(),

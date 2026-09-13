@@ -4,17 +4,49 @@
 //! becomes the topic once that history makes this node and the source members.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use crate::storage::{AdmissionEffects, ProvisionalTopic, StagedTopic, SyncObligation, TopicState};
-use crate::{ActorClock, Error, PeerId, Result, Storage, TopicId};
+use crate::oplog::is_structural_genesis;
+use crate::storage::{
+    AdmissionEffects, MAX_STAGED_IDLE_MS, ProvisionalTopic, StagedTopic, SyncObligation, TopicState,
+};
+use crate::sync::SyncData;
+use crate::{ActorClock, Error, OpId, PeerId, Result, Storage, TopicId};
 
-use super::{Bootstrap, Irokle};
+use super::{Bootstrap, Irokle, now_millis};
 
-/// Owner locks per topic. The registry lock is never held while storage work runs.
+/// Owner locks per topic and byte reservations of admissions in flight. The
+/// registry lock is never held while storage work runs.
 #[derive(Default)]
 pub(crate) struct Bootstraps {
     owners: Mutex<BTreeMap<TopicId, Weak<Mutex<()>>>>,
+    reserved: Mutex<Reserved>,
+}
+
+#[derive(Default)]
+struct Reserved {
+    total: u64,
+    by_source: BTreeMap<PeerId, u64>,
+}
+
+/// Bytes an admission in flight holds against the staging limits until dropped.
+struct Reservation<'a> {
+    bootstraps: &'a Bootstraps,
+    source: PeerId,
+    bytes: u64,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        let mut reserved = self.bootstraps.reserved();
+        reserved.total = reserved.total.saturating_sub(self.bytes);
+        if let Some(bytes) = reserved.by_source.get_mut(&self.source) {
+            *bytes = bytes.saturating_sub(self.bytes);
+            if *bytes == 0 {
+                reserved.by_source.remove(&self.source);
+            }
+        }
+    }
 }
 
 impl Bootstraps {
@@ -32,9 +64,144 @@ impl Bootstraps {
         owners.insert(topic_id, Arc::downgrade(&owner));
         owner
     }
+
+    fn reserved(&self) -> MutexGuard<'_, Reserved> {
+        // Counters only, so a poisoned lock is still consistent.
+        self.reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Reserve `bytes` for `source` against the total and per-source limits,
+    /// counting what the namespaces hold and what other admissions reserved.
+    fn reserve<S: Storage>(
+        &self,
+        storage: &S,
+        source: PeerId,
+        bytes: u64,
+    ) -> Result<Reservation<'_>> {
+        let limits = storage.staging_limits();
+        let (mut total, mut from_source) = (0, 0);
+        for provisional in storage.provisional_topics()? {
+            let held = match storage.provisional_store(&provisional)? {
+                Some(store) => store.stored_bytes()?,
+                None => 0,
+            };
+            total += held;
+            if provisional.source == source {
+                from_source += held;
+            }
+        }
+        let mut reserved = self.reserved();
+        let source_reserved = reserved.by_source.get(&source).copied().unwrap_or_default();
+        if total + reserved.total + bytes > limits.total_bytes {
+            return Err(Error::StagingCapacity(
+                "bootstrap staging byte budget is full".into(),
+            ));
+        }
+        if from_source + source_reserved + bytes > limits.source_bytes {
+            return Err(Error::StagingCapacity(
+                "bootstrap staging byte quota exceeded for source".into(),
+            ));
+        }
+        reserved.total += bytes;
+        *reserved.by_source.entry(source).or_default() += bytes;
+        Ok(Reservation {
+            bootstraps: self,
+            source,
+            bytes,
+        })
+    }
 }
 
 impl<S: Storage> Irokle<S> {
+    /// Stage data for a topic this node does not hold in the namespace of its
+    /// source, and activate the namespace once its history makes this node and
+    /// the source members. A fragment of a smaller genesis replaces the
+    /// namespace; one of a larger genesis is refused as stale.
+    pub(super) fn bootstrap_unknown(
+        &self,
+        source: PeerId,
+        data: &SyncData,
+        verified: &BTreeSet<OpId>,
+    ) -> Result<Bootstrap> {
+        let storage = self.storage();
+        let topic_id = data.topic_id;
+        if storage.topic_state(&topic_id)?.is_some() {
+            return Ok(Bootstrap::Active(BTreeSet::new()));
+        }
+        let owner = self.bootstraps.owner(topic_id);
+        let _owned = owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if storage.topic_state(&topic_id)?.is_some() {
+            return Ok(Bootstrap::Active(BTreeSet::new()));
+        }
+        let now_ms = now_millis()?;
+        self.expire_bootstraps(now_ms)?;
+        let fragment = data
+            .ops
+            .iter()
+            .find(|op| is_structural_genesis(op))
+            .map(|op| op.id);
+        let current = self.provisional_of(source, topic_id)?;
+        let provisional = match (current, fragment) {
+            (Some(current), _) if current.activating => {
+                return self.activate_proven(&current, current.source);
+            }
+            (Some(current), Some(genesis)) if genesis < current.genesis => {
+                storage.discard_provisional(&current)?;
+                storage.open_provisional(source, topic_id, genesis, now_ms)?
+            }
+            (Some(current), Some(genesis)) if genesis > current.genesis => {
+                return Err(Error::StaleIncarnation);
+            }
+            (Some(current), _) => current,
+            (None, Some(genesis)) => storage.open_provisional(source, topic_id, genesis, now_ms)?,
+            // Nothing anchors the fragment to a branch yet; a later pull asks again.
+            (None, None) => return Ok(Bootstrap::Staged(StagedTopic::default())),
+        };
+        let store = storage
+            .provisional_store(&provisional)?
+            .ok_or(Error::StaleIncarnation)?;
+        let mut bytes = 0;
+        for op in &data.ops {
+            bytes += crate::storage::pending_op_bytes(op)? as u64;
+        }
+        let reservation = self.bootstraps.reserve(storage, source, bytes)?;
+        let admitted = self
+            .oplog
+            .sharing_membership(store)
+            .receive_ops_from_peer_preverified(Some(source), data.ops.clone(), verified, None);
+        drop(reservation);
+        storage.touch_provisional(&provisional, now_ms)?;
+        // The ack of an activating fragment names its ops the topic now holds.
+        let outcome = match self.activate_proven(&provisional, source) {
+            Ok(Bootstrap::Active(_)) => {
+                let mut held = BTreeSet::new();
+                for id in verified {
+                    if storage.dep_resolvable(id)? {
+                        held.insert(*id);
+                    }
+                }
+                Ok(Bootstrap::Active(held))
+            }
+            other => other,
+        };
+        match admitted {
+            Ok(_) => outcome,
+            // What committed still counts; the refused rest fails this data.
+            Err(Error::AdmissionCommitted { source, .. }) => {
+                outcome?;
+                Err(*source)
+            }
+            Err(error) => {
+                outcome?;
+                Err(error)
+            }
+        }
+    }
+
     /// Activate every namespace whose activation began or whose history
     /// already proves membership, as a restart after the last write requires.
     pub(super) fn resume_bootstraps(&self) -> Result<()> {
@@ -140,6 +307,19 @@ impl<S: Storage> Irokle<S> {
                 .map(|peer_id| SyncObligation::clock(peer_id, state.topic_id, clock.clone()))
                 .collect(),
         }
+    }
+
+    /// End namespaces with no write for `MAX_STAGED_IDLE_MS`, unless activating.
+    fn expire_bootstraps(&self, now_ms: u64) -> Result<()> {
+        let storage = self.storage();
+        for provisional in storage.provisional_topics()? {
+            if !provisional.activating
+                && provisional.updated_ms < now_ms.saturating_sub(MAX_STAGED_IDLE_MS)
+            {
+                storage.discard_provisional(&provisional)?;
+            }
+        }
+        Ok(())
     }
 }
 

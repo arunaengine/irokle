@@ -20,9 +20,7 @@ use crate::ActorClock;
 use crate::history::{DagQuery, HistoryOrder, ordered};
 use crate::oplog::{Oplog, topological_subset_entries};
 use crate::reducer::EventRecord;
-use crate::storage::{
-    AdmissionEffects, MAX_STAGED_IDLE_MS, OpMeta, StagedTopic, SyncObligation, TopicState,
-};
+use crate::storage::{AdmissionEffects, OpMeta, StagedTopic, SyncObligation, TopicState};
 use crate::storage::{
     MemoryStorage, Storage, SyncPeerState, SyncPeerStatus, SyncStateUpdate, SyncStatusUpdate,
 };
@@ -59,8 +57,8 @@ pub enum ReceiveOutcome {
         ack: Box<SyncAck>,
         evictions: Vec<TopicEviction>,
     },
-    /// The topic is not held here and its staged history does not prove
-    /// membership yet. This is no ack and certifies nothing.
+    /// The topic is not held here and the history staged from this source does
+    /// not prove membership yet. This is no ack and certifies nothing.
     Staged(StagedTopic),
 }
 
@@ -706,7 +704,7 @@ impl<S: Storage> Irokle<S> {
             forwarded.borrow_mut().insert(state.topic_id);
             self.forward_effects(source, entries, state)
         };
-        let promoted = match self.bootstrap_unknown(source_peer_id, &data, &forward)? {
+        let promoted = match self.bootstrap_unknown(source_peer_id, &data, &verified)? {
             Bootstrap::Active(promoted) => promoted,
             Bootstrap::Staged(staged) => return Ok(ReceiveOutcome::Staged(staged)),
         };
@@ -868,87 +866,6 @@ impl<S: Storage> Irokle<S> {
             return Err(Error::PeerNotWhitelisted(source_peer_id));
         }
         Ok(())
-    }
-
-    /// Stage data for a topic this node does not hold, and promote the staged
-    /// history of the source once it makes this node and the source members.
-    fn bootstrap_unknown(
-        &self,
-        source_peer_id: PeerId,
-        data: &SyncData,
-        forward: crate::oplog::ReceiveEffects<'_>,
-    ) -> Result<Bootstrap> {
-        let storage = self.storage();
-        let topic_id = data.topic_id;
-        if storage.topic_state(&topic_id)?.is_some() {
-            return Ok(Bootstrap::Active(BTreeSet::new()));
-        }
-        let now_ms = now_millis()?;
-        storage.expire_bootstrap(now_ms.saturating_sub(MAX_STAGED_IDLE_MS))?;
-        // Data that already completes the proof is promoted without a staging write.
-        let mut history = storage.staged_bootstrap_ops(&source_peer_id, &topic_id)?;
-        // An op at a staged position with another id comes from a replaced
-        // branch of the source; that branch's staging is dropped, not mixed in.
-        let slots = history
-            .iter()
-            .map(|op| ((op.signed.body.actor_id, op.signed.body.actor_seq), op.id))
-            .collect::<BTreeMap<_, _>>();
-        if data.ops.iter().any(|op| {
-            slots
-                .get(&(op.signed.body.actor_id, op.signed.body.actor_seq))
-                .is_some_and(|staged| *staged != op.id)
-        }) {
-            storage.discard_bootstrap(&source_peer_id, &topic_id)?;
-            history.clear();
-        }
-        let known = history.iter().map(|op| op.id).collect::<BTreeSet<_>>();
-        history.extend(
-            data.ops
-                .iter()
-                .filter(|op| !known.contains(&op.id))
-                .cloned(),
-        );
-        let batch =
-            match self
-                .oplog
-                .bootstrap_batch(self.peer_id(), source_peer_id, history, Some(forward))
-            {
-                Ok(Some(batch)) => batch,
-                Ok(None) => {
-                    return match storage.stage_bootstrap_ops(
-                        source_peer_id,
-                        topic_id,
-                        data.ops.clone(),
-                        now_ms,
-                    ) {
-                        Err(Error::AdmissionConflict) => self.bootstrap_raced(topic_id),
-                        staged => Ok(Bootstrap::Staged(staged?)),
-                    };
-                }
-                Err(error) => {
-                    // Invalid signed history never becomes valid; drop the session.
-                    if !is_backend_failure(&error) {
-                        storage.discard_bootstrap(&source_peer_id, &topic_id)?;
-                    }
-                    return Err(error);
-                }
-            };
-        let promoted = batch.entries.iter().map(|(op, _)| op.id).collect();
-        match storage.promote_bootstrap(batch) {
-            Ok(()) => Ok(Bootstrap::Active(promoted)),
-            Err(Error::AdmissionConflict) => self.bootstrap_raced(topic_id),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// A staging write refused because the topic became active meanwhile. The
-    /// normal receive then decides between branches; it must never admit an
-    /// unknown topic without staging, so a conflict on a missing topic fails.
-    fn bootstrap_raced(&self, topic_id: TopicId) -> Result<Bootstrap> {
-        if self.storage().topic_state(&topic_id)?.is_none() {
-            return Err(Error::AdmissionConflict);
-        }
-        Ok(Bootstrap::Active(BTreeSet::new()))
     }
 
     pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {
@@ -1446,17 +1363,6 @@ impl Irokle<crate::FjallStorage> {
 }
 
 /// Whether `error` is a failure of the store rather than of the data.
-fn is_backend_failure(error: &Error) -> bool {
-    #[cfg(feature = "fjall")]
-    if matches!(error, Error::Fjall(_)) {
-        return true;
-    }
-    matches!(
-        error,
-        Error::Storage(_) | Error::AdmissionConflict | Error::Encode(_) | Error::Decode(_)
-    )
-}
-
 fn now_millis() -> Result<u64> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)

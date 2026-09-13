@@ -2722,7 +2722,26 @@ impl<S: Storage> SharedNet<S> {
         self.node
             .ensure_iroh_peer_whitelisted(remote_peer_id, &probe)
             .map_err(invalid_data)?;
-        let staged = self.staged_clock(remote_peer_id, topic_id)?;
+        // Staging of another branch from this peer is continued only by a
+        // smaller genesis, whose first fragment replaces it.
+        let staged = match self
+            .node
+            .staged_topic(remote_peer_id, topic_id)
+            .map_err(invalid_data)?
+            .and_then(|staged| {
+                staged
+                    .genesis
+                    .map(|staged_genesis| (staged_genesis, staged))
+            }) {
+            Some((staged_genesis, staged)) if staged_genesis == genesis => staged.clock,
+            Some((staged_genesis, _)) if genesis < staged_genesis => crate::ActorClock::new(),
+            Some(_) => {
+                return Err(invalid_data(
+                    "peer offers a larger branch than the one staged from it",
+                ));
+            }
+            None => crate::ActorClock::new(),
+        };
         let actor_range_hints = summary
             .actor_clock
             .iter()
@@ -2733,7 +2752,16 @@ impl<S: Storage> SharedNet<S> {
                 to_inclusive: *seq,
             })
             .collect::<Vec<_>>();
+        // Everything the peer holds is staged: finish the activation that
+        // history owes instead of reporting nothing left to pull.
         if actor_range_hints.is_empty() {
+            if self
+                .node
+                .finish_bootstrap(remote_peer_id, topic_id)
+                .map_err(invalid_data)?
+            {
+                return self.plan_topic_messages(remote_peer_id, topic_id, summary);
+            }
             return Err(invalid_data(
                 "staged topic history does not make this node a member",
             ));
@@ -2768,18 +2796,20 @@ impl<S: Storage> SharedNet<S> {
     }
 
     /// The contiguous prefix per actor that `peer_id` staged here for
-    /// `topic_id`. A staged position past a hole is not held: the hole is
-    /// requested before anything after it counts.
+    /// `topic_id` on `genesis`. Staging of another branch holds nothing of it.
     fn staged_clock(
         &self,
         peer_id: PeerId,
         topic_id: crate::TopicId,
+        genesis: Option<crate::OpId>,
     ) -> io::Result<crate::ActorClock> {
-        self.node
-            .storage()
-            .staged_topic(&peer_id, &topic_id)
+        Ok(self
+            .node
+            .staged_topic(peer_id, topic_id)
+            .map_err(invalid_data)?
+            .filter(|staged| staged.genesis.is_some() && staged.genesis == genesis)
             .map(|staged| staged.clock)
-            .map_err(invalid_data)
+            .unwrap_or_default())
     }
 }
 
@@ -3314,7 +3344,7 @@ impl<S: Storage> SharedNet<S> {
                 return Err(invalid_data("topic disappeared during sync"));
             }
             // Until promotion a pull moves only by staging more of the peer's history.
-            let staged = self.staged_clock(peer_id, topic_id)?;
+            let staged = self.staged_clock(peer_id, topic_id, goal.genesis)?;
             return Ok(GoalProgress {
                 staged: covered(&staged, &goal.inbound),
                 ..GoalProgress::default()
