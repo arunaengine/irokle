@@ -709,13 +709,19 @@ impl ConnectionPool {
 /// kept in memory only so the next push continues where staging stands.
 #[derive(Default)]
 struct ReceiptLog {
-    clocks: BTreeMap<(PeerId, crate::TopicId), crate::ActorClock>,
+    /// The branch the receipted pages were planned on, and the staged clock.
+    clocks: BTreeMap<(PeerId, crate::TopicId), (crate::OpId, crate::ActorClock)>,
     order: std::collections::VecDeque<(PeerId, crate::TopicId)>,
 }
 
 impl ReceiptLog {
-    fn record(&mut self, key: (PeerId, crate::TopicId), clock: crate::ActorClock) {
-        if self.clocks.insert(key, clock).is_none() {
+    fn record(
+        &mut self,
+        key: (PeerId, crate::TopicId),
+        genesis: crate::OpId,
+        clock: crate::ActorClock,
+    ) {
+        if self.clocks.insert(key, (genesis, clock)).is_none() {
             self.order.push_back(key);
             if self.order.len() > MAX_BOOTSTRAP_RECEIPTS
                 && let Some(oldest) = self.order.pop_front()
@@ -2257,20 +2263,20 @@ impl<S: Storage> SharedNet<S> {
         topic_id: crate::TopicId,
         summary: &SyncSummary,
     ) -> io::Result<Option<PlannedTopicSync>> {
-        if self
+        let Some(state) = self
             .node
             .storage()
             .topic_state(&topic_id)
             .map_err(invalid_data)?
-            .is_none()
-        {
+        else {
             return self.plan_pull(remote_peer_id, topic_id, summary);
-        }
+        };
         let budget = crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default());
-        // A peer still staging this topic continues from its newest receipt.
+        // A peer still staging this topic continues from its newest receipt on
+        // this branch.
         let staged = match (
             summary.genesis,
-            self.receipt_clock(remote_peer_id, topic_id),
+            self.receipt_clock(remote_peer_id, topic_id, state.genesis),
         ) {
             (None, Some(clock)) => Some(SyncSummary {
                 actor_clock: clock,
@@ -2282,6 +2288,15 @@ impl<S: Storage> SharedNet<S> {
             .node
             .negotiate_page(remote_peer_id, staged.as_ref().unwrap_or(summary), budget)
             .map_err(invalid_data)?;
+        // A receipt covering everything without a promotion is stale: the peer
+        // lost or replaced that staging, so this branch is offered from the start.
+        if staged.is_some() && plan.send.is_empty() && !push_more {
+            self.receipt_log().clear(&(remote_peer_id, topic_id));
+            (plan, push_more) = self
+                .node
+                .negotiate_page(remote_peer_id, summary, budget)
+                .map_err(invalid_data)?;
+        }
         let view = self
             .node
             .storage()
@@ -2443,22 +2458,19 @@ impl<S: Storage> SharedNet<S> {
         }))
     }
 
-    /// The highest position per actor that `peer_id` staged here for `topic_id`.
+    /// The contiguous prefix per actor that `peer_id` staged here for
+    /// `topic_id`. A staged position past a hole is not held: the hole is
+    /// requested before anything after it counts.
     fn staged_clock(
         &self,
         peer_id: PeerId,
         topic_id: crate::TopicId,
     ) -> io::Result<crate::ActorClock> {
-        let mut clock = crate::ActorClock::new();
-        let staged = self
-            .node
+        self.node
             .storage()
-            .staged_bootstrap_ops(&peer_id, &topic_id)
-            .map_err(invalid_data)?;
-        for op in staged {
-            clock.observe(op.signed.body.actor_id, op.signed.body.actor_seq);
-        }
-        Ok(clock)
+            .staged_topic(&peer_id, &topic_id)
+            .map(|staged| staged.clock)
+            .map_err(invalid_data)
     }
 
     /// The request for the next page of `plan`, sized to what it asks for.
@@ -2561,9 +2573,20 @@ impl<S: Storage> IrohNet<S> {
         };
 
         let topics = group_topics.clone();
+        let geneses = goals
+            .iter()
+            .map(|(topic_id, (goal, _))| (*topic_id, goal.genesis))
+            .collect::<BTreeMap<_, _>>();
         let replies = self
             .run_job(Lane::Bulk, move |shared| {
-                shared.batch_replies(remote_peer_id, &topics, responses, owed_acks, more)
+                shared.batch_replies(
+                    remote_peer_id,
+                    &topics,
+                    &geneses,
+                    responses,
+                    owed_acks,
+                    more,
+                )
             })
             .await;
         let BatchReplies {
@@ -2809,6 +2832,7 @@ impl<S: Storage> SharedNet<S> {
         &self,
         remote_peer_id: PeerId,
         group_topics: &BTreeSet<crate::TopicId>,
+        geneses: &BTreeMap<crate::TopicId, Option<crate::OpId>>,
         responses: Vec<SyncMessage>,
         mut owed_acks: BTreeSet<crate::TopicId>,
         mut more: BTreeSet<crate::TopicId>,
@@ -2838,8 +2862,13 @@ impl<S: Storage> SharedNet<S> {
                 SyncMessage::Receipt(receipt) if group_topics.contains(&receipt.topic_id) => {
                     owed_acks.remove(&receipt.topic_id);
                     more.insert(receipt.topic_id);
-                    self.receipt_log()
-                        .record((remote_peer_id, receipt.topic_id), receipt.clock);
+                    if let Some(genesis) = geneses.get(&receipt.topic_id).copied().flatten() {
+                        self.receipt_log().record(
+                            (remote_peer_id, receipt.topic_id),
+                            genesis,
+                            receipt.clock,
+                        );
+                    }
                 }
                 SyncMessage::Failure(failure) if group_topics.contains(&failure.topic_id) => {
                     outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
@@ -3020,7 +3049,7 @@ impl<S: Storage> SharedNet<S> {
             .map(|ack| ack.clock.clone())
             .unwrap_or_default();
         let staged = self
-            .receipt_clock(peer_id, topic_id)
+            .receipt_clock(peer_id, topic_id, view.state.genesis)
             .map_or(0, |clock| covered(&clock, &goal.outbound));
         Ok(GoalProgress {
             inbound: covered(&view.clock, &goal.inbound),
@@ -3041,12 +3070,19 @@ impl<S: Storage> SharedNet<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// The peer's staged clock for pages planned on `genesis`. A receipt for
+    /// pages of a replaced branch says nothing about this one.
     fn receipt_clock(
         &self,
         peer_id: PeerId,
         topic_id: crate::TopicId,
+        genesis: crate::OpId,
     ) -> Option<crate::ActorClock> {
-        self.receipt_log().clocks.get(&(peer_id, topic_id)).cloned()
+        self.receipt_log()
+            .clocks
+            .get(&(peer_id, topic_id))
+            .filter(|(receipted, _)| *receipted == genesis)
+            .map(|(_, clock)| clock.clone())
     }
 }
 

@@ -533,6 +533,13 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
     fn staged_bootstrap_ops(&self, source: &PeerId, topic_id: &TopicId) -> Result<Vec<Op>, Error> {
         self.inner.staged_bootstrap_ops(source, topic_id)
     }
+    fn staged_topic(
+        &self,
+        source: &PeerId,
+        topic_id: &TopicId,
+    ) -> Result<crate::storage::StagedTopic, Error> {
+        self.inner.staged_topic(source, topic_id)
+    }
     fn promote_bootstrap(&self, batch: crate::storage::AdmittedBatch) -> Result<(), Error> {
         self.inner.promote_bootstrap(batch)
     }

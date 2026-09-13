@@ -150,6 +150,7 @@ impl<S: Storage> Storage for Counting<S> {
         next_attempt_epoch() -> u64;
         stage_bootstrap_ops(source: PeerId, topic: TopicId, ops: Vec<Op>, now_ms: u64) -> StagedTopic;
         staged_bootstrap_ops(source: &PeerId, topic: &TopicId) -> Vec<Op>;
+        staged_topic(source: &PeerId, topic: &TopicId) -> StagedTopic;
         promote_bootstrap(batch: AdmittedBatch) -> ();
         discard_bootstrap(source: &PeerId, topic: &TopicId) -> usize;
         expire_bootstrap(older_than_ms: u64) -> usize;

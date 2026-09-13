@@ -837,6 +837,23 @@ impl Storage for MemoryStorage {
             .unwrap_or_default())
     }
 
+    fn staged_topic(&self, source: &PeerId, topic_id: &TopicId) -> Result<StagedTopic> {
+        let inner = self.lock()?;
+        let Some(staged) = inner.staged.get(&(*source, *topic_id)) else {
+            return Ok(StagedTopic::default());
+        };
+        Ok(StagedTopic {
+            clock: staged_clock(
+                staged
+                    .ops
+                    .keys()
+                    .map(|(actor_id, seq, _)| (*actor_id, *seq)),
+            ),
+            ops: staged.session.ops,
+            bytes: staged.session.bytes,
+        })
+    }
+
     fn promote_bootstrap(&self, batch: AdmittedBatch) -> Result<()> {
         let topic_id = batch.topic_id;
         let mut inner = self.lock()?;

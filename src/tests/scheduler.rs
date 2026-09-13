@@ -553,3 +553,58 @@ async fn manual_keeps_claim() {
     net.shutdown().await;
     bob_net.shutdown().await;
 }
+
+/// A cached receipt planned on another branch, or one claiming the whole topic
+/// while the peer staged nothing, does not stall a pushed bootstrap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_receipt_restarts() {
+    for other_branch in [true, false] {
+        let lookup = Lookup::new();
+        let (alice, net) = client(&lookup, StreamLimits::default()).await;
+        let (bob, bob_net) = server(
+            MemoryStorage::new(),
+            &lookup,
+            alice.peer_id(),
+            StreamLimits::default(),
+        )
+        .await;
+        let topic = alice.create_topic::<Note>(Default::default()).unwrap();
+        publish(&alice, topic.id(), 20, 8);
+        topic.add_peer(bob.peer_id()).unwrap();
+        let genesis = if other_branch {
+            crate::OpId::hash(b"replaced branch")
+        } else {
+            alice
+                .storage()
+                .topic_state(&topic.id())
+                .unwrap()
+                .unwrap()
+                .genesis
+        };
+        net.receipt_log().record(
+            (bob.peer_id(), topic.id()),
+            genesis,
+            clock(&alice, topic.id()),
+        );
+        let addr = ready_addr(bob_net.endpoint()).await;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            assert!(
+                attempts <= 8,
+                "bootstrap behind a stale receipt did not finish"
+            );
+            match net.sync_now(addr.clone(), topic.id()).await {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("bootstrap behind a stale receipt failed: {error}"),
+            }
+        }
+        assert_eq!(
+            bob.storage().list_op_ids(&topic.id()).unwrap(),
+            alice.storage().list_op_ids(&topic.id()).unwrap()
+        );
+        net.shutdown().await;
+        bob_net.shutdown().await;
+    }
+}

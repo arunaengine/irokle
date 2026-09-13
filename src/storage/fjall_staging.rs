@@ -155,6 +155,25 @@ impl FjallStorage {
         Ok(ops)
     }
 
+    pub(super) fn read_staged_topic(
+        &self,
+        source: &PeerId,
+        topic_id: &TopicId,
+    ) -> Result<StagedTopic> {
+        let read_tx = self.db.read_tx();
+        let Some(session) =
+            fjall::Readable::get(&read_tx, &self.records, session_key(source, topic_id))?
+        else {
+            return Ok(StagedTopic::default());
+        };
+        let session: StagedSession = postcard::from_bytes(session.as_ref())?;
+        Ok(StagedTopic {
+            clock: Self::tx_staged_clock(&read_tx, &self.records, &ops_prefix(source, topic_id))?,
+            ops: session.ops,
+            bytes: session.bytes,
+        })
+    }
+
     pub(super) fn tx_discard_session(
         tx: &mut Tx,
         records: &Records,

@@ -1825,3 +1825,81 @@ async fn unlisted_never_stages() {
     alice_net.shutdown().await;
     bob.shutdown_iroh().await;
 }
+
+/// Stages positions 1 and 3 of `alice`'s topic on `bob`, then pulls the rest.
+async fn pull_behind_hole<S: Storage>(
+    alice: &Irokle,
+    alice_addr: iroh::EndpointAddr,
+    bob: Irokle<S>,
+    topic_id: TopicId,
+    ops: &[Op],
+) {
+    let staged_hole = sync::SyncData {
+        topic_id,
+        ops: vec![ops[0].clone(), ops[2].clone()],
+    };
+    let outcome = bob
+        .receive_sync_outcome(alice.peer_id(), staged_hole)
+        .unwrap();
+    assert!(matches!(outcome, crate::node::ReceiveOutcome::Staged(_)));
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        assert!(attempts <= 8, "pull behind a staged hole did not finish");
+        match bob.sync_addr_now(alice_addr.clone(), topic_id).await {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("pull behind a staged hole failed: {error}"),
+        }
+    }
+    assert_eq!(
+        bob.storage().list_op_ids(&topic_id).unwrap(),
+        alice.storage().list_op_ids(&topic_id).unwrap()
+    );
+    bob.shutdown_iroh().await;
+}
+
+/// A pull behind a staged hole asks for the hole: staged positions 1 and 3
+/// are a prefix of 1, never of 3.
+async fn pull_fills_hole(bob_fjall: bool) {
+    let (alice, alice_net, _, _) = bootstrap_pair(true).await;
+    alice_net.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice_net.endpoint()).await;
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let bob_peer = PeerId::from_bytes(*bob_endpoint.id().as_bytes());
+    let (topic_id, ops) = invite_last(&alice, bob_peer, 20);
+    let builder = Irokle::builder().with_peer_whitelist(vec![alice.peer_id()]);
+    let dir = tempfile::tempdir().unwrap();
+    if bob_fjall {
+        #[cfg(feature = "fjall")]
+        {
+            let bob = builder
+                .with_fjall_path(dir.path())
+                .unwrap()
+                .with_net(bob_endpoint)
+                .build()
+                .unwrap();
+            pull_behind_hole(&alice, alice_addr, bob, topic_id, &ops).await;
+        }
+    } else {
+        let bob = builder.with_net(bob_endpoint).build().unwrap();
+        pull_behind_hole(&alice, alice_addr, bob, topic_id, &ops).await;
+    }
+    alice_net.shutdown().await;
+}
+
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_pull_fills_hole() {
+    pull_fills_hole(false).await;
+}
+
+#[cfg(all(feature = "iroh", feature = "fjall"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fjall_pull_fills_hole() {
+    pull_fills_hole(true).await;
+}

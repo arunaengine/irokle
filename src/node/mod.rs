@@ -820,6 +820,20 @@ impl<S: Storage> Irokle<S> {
         storage.expire_bootstrap(now_ms.saturating_sub(MAX_STAGED_IDLE_MS))?;
         // Data that already completes the proof is promoted without a staging write.
         let mut history = storage.staged_bootstrap_ops(&source_peer_id, &topic_id)?;
+        // An op at a staged position with another id comes from a replaced
+        // branch of the source; that branch's staging is dropped, not mixed in.
+        let slots = history
+            .iter()
+            .map(|op| ((op.signed.body.actor_id, op.signed.body.actor_seq), op.id))
+            .collect::<BTreeMap<_, _>>();
+        if data.ops.iter().any(|op| {
+            slots
+                .get(&(op.signed.body.actor_id, op.signed.body.actor_seq))
+                .is_some_and(|staged| *staged != op.id)
+        }) {
+            storage.discard_bootstrap(&source_peer_id, &topic_id)?;
+            history.clear();
+        }
         let known = history.iter().map(|op| op.id).collect::<BTreeSet<_>>();
         history.extend(
             data.ops

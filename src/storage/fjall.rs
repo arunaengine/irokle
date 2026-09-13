@@ -1630,6 +1630,10 @@ impl Storage for FjallStorage {
         self.read_staged_ops(source, topic_id)
     }
 
+    fn staged_topic(&self, source: &PeerId, topic_id: &TopicId) -> Result<StagedTopic> {
+        self.read_staged_topic(source, topic_id)
+    }
+
     fn promote_bootstrap(&self, batch: AdmittedBatch) -> Result<()> {
         self.transaction(|tx| {
             if fjall::Readable::contains_key(

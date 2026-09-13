@@ -499,3 +499,59 @@ fn fjall_reopen_promotion() {
     let bob = bob_node(open());
     assert_promoted(&bob, &alice, topic_id, &ack);
 }
+
+/// A source that replaced its branch pushes the new one: the staged ops of the
+/// old branch at the same positions are dropped, and the new branch promotes
+/// alone once it proves the invitation.
+fn replaced_branch<S: Storage>(storage: S) {
+    let topic_id = TopicId::hash(b"bootstrap-replaced-branch");
+    let branch = |other: u8| {
+        let other = Ed25519Signer::from_bytes(&[other; 32]).peer_id();
+        let (log, signer, genesis, event) =
+            forked_side(MemoryStorage::new(), topic_id, 193, [other], "branch");
+        (log, signer, vec![genesis, event])
+    };
+    let (_, source, old) = branch(194);
+    let (log, _, new) = branch(195);
+    let actor = actor_id_for(topic_id, source.peer_id());
+    let invite = log
+        .create_control_op(
+            topic_id,
+            actor,
+            TopicControl::AddPeer { peer: bob_peer() },
+            &source,
+        )
+        .unwrap();
+    let bob = bob_node(storage);
+
+    assert_eq!(
+        staged(receive(&bob, source.peer_id(), topic_id, &old)).ops,
+        2
+    );
+    let replaced = staged(receive(&bob, source.peer_id(), topic_id, &new));
+    assert_eq!((replaced.clock.get(&actor), replaced.ops), (2, 2));
+    let ack = acked(receive(
+        &bob,
+        source.peer_id(),
+        topic_id,
+        std::slice::from_ref(&invite),
+    ));
+    let history = [new, vec![invite]].concat();
+    assert_eq!(ack.genesis, Some(history[0].id));
+    assert_eq!(
+        bob.storage().list_op_ids(&topic_id).unwrap(),
+        history.iter().map(|op| op.id).collect()
+    );
+}
+
+#[test]
+fn memory_replaced_branch() {
+    replaced_branch(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_replaced_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    replaced_branch(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}

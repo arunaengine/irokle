@@ -554,6 +554,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     ) -> Result<StagedTopic>;
     /// Every op of the session, ordered by actor and sequence.
     fn staged_bootstrap_ops(&self, source: &PeerId, topic_id: &TopicId) -> Result<Vec<Op>>;
+    /// The session's contiguous per-actor prefix and usage, read from one view
+    /// without decoding a staged op. An absent session is empty.
+    fn staged_topic(&self, source: &PeerId, topic_id: &TopicId) -> Result<StagedTopic>;
     /// In one transaction: refuse with [`crate::Error::AdmissionConflict`]
     /// once the topic exists, otherwise admit `batch` against a fresh topic
     /// and drop every staging session of the topic.
