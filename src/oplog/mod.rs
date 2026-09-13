@@ -30,7 +30,8 @@ pub use topology::{topological, topological_subset};
 
 /// Attempts one admission job makes; storage writes on this path try once each.
 pub(crate) const MAX_ADMISSION_RETRIES: usize = 64;
-/// Buffered ops one admission call attempts, and how many it reads at once.
+/// Buffered ops one admission call visits without admitting any, and how many
+/// it reads at once. A window that admits something starts another.
 const MAX_DRAIN_OPS: usize = 4096;
 const READY_SLICE: usize = 256;
 const MAX_CACHED_PROJECTIONS: usize = 4096;
@@ -159,8 +160,9 @@ impl TopicEviction {
 pub struct Admitted {
     pub accepted: BTreeSet<OpId>,
     pub evictions: Vec<TopicEviction>,
-    /// Buffered ops that became ready were left for a later pass because this
-    /// one reached its work limit; [`Oplog::reconcile_pending_ops`] drains them.
+    /// Ready buffered ops were left because a whole visit window admitted
+    /// none of them: each failed with a retryable error. A later admission or
+    /// [`Oplog::reconcile_pending_ops`] retries them.
     pub ready_remaining: bool,
 }
 
@@ -720,8 +722,10 @@ impl<S: Storage> Oplog<S> {
         let mut accepted = BTreeSet::new();
         loop {
             let pass = self.receive_ops_admission(None, Vec::new(), &BTreeSet::new(), None)?;
+            // A pass that admitted nothing met only retained ops; repeating it now spins.
+            let progressed = !pass.accepted.is_empty();
             accepted.extend(pass.accepted);
-            if !pass.ready_remaining {
+            if !pass.ready_remaining || !progressed {
                 return Ok(accepted);
             }
         }
@@ -751,9 +755,21 @@ impl<S: Storage> Oplog<S> {
             let mut drained = 0;
             let mut cursor = None;
             let mut pass_admitted = false;
+            let mut window_admitted = false;
+            // Ops retained in this call are not tried again until a later call.
+            let mut held_back = BTreeSet::new();
             loop {
                 if queue.is_empty() {
                     if drained >= MAX_DRAIN_OPS {
+                        // Visits spent re-reading retained ops must not strand
+                        // work released later: an admitting window starts another.
+                        if window_admitted {
+                            drained = 0;
+                            window_admitted = false;
+                            cursor = None;
+                            pass_admitted = false;
+                            continue;
+                        }
                         admitted.ready_remaining =
                             !self.storage.ready_pending_after(None, 1)?.is_empty();
                         break;
@@ -774,7 +790,9 @@ impl<S: Storage> Oplog<S> {
                     cursor = Some(last.id);
                     drained += slice.len();
                     for (source, op) in slice {
-                        queue.push_back((Some(source), vec![op], true));
+                        if !held_back.contains(&op.id) {
+                            queue.push_back((Some(source), vec![op], true));
+                        }
                     }
                 }
                 let Some((batch_source_peer, ops, from_pending)) = queue.pop_front() else {
@@ -808,6 +826,7 @@ impl<S: Storage> Oplog<S> {
                             // must not fail the ops the caller actually sent.
                             PendingVerdict::Retain => {
                                 tracing::debug!(op_id = %op.id, error = %err, "retaining pending op");
+                                held_back.insert(op.id);
                             }
                         }
                         continue;
@@ -826,6 +845,7 @@ impl<S: Storage> Oplog<S> {
                     admitted.evictions.push(eviction);
                 }
                 pass_admitted |= !batch_accepted.is_empty();
+                window_admitted |= !batch_accepted.is_empty();
                 admitted.accepted.extend(batch_accepted.iter().copied());
             }
 

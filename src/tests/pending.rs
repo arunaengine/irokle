@@ -761,3 +761,104 @@ fn fjall_drains_complete() {
     let dir = tempfile::tempdir().unwrap();
     assert_drains_complete(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
+
+/// Ready ops retained by a retryable write fault stay in the ready index while
+/// one receive releases a long chain one op at a time, each readied behind the
+/// drain cursor half the time. The receive admits the whole chain however many
+/// visits the retained ops cost, and reconciling afterwards stops instead of
+/// spinning on work that cannot be admitted yet.
+fn assert_retained_drain<S: Storage>(inner: S) {
+    // Enough retained visits that one visit window holds a few passes only.
+    const RETAINED: usize = 511;
+    const CHAIN: usize = 400;
+    let storage = StaleReadStorage::new(inner);
+    let log = Oplog::with_storage(storage.clone());
+    let owner = Ed25519Signer::from_bytes(&[233; 32]);
+    let authors = (0..=RETAINED)
+        .map(|index| {
+            let mut seed = [234_u8; 32];
+            seed[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            Ed25519Signer::from_bytes(&seed)
+        })
+        .collect::<Vec<_>>();
+    let genesis = |label: &[u8]| {
+        let topic_id = TopicId::hash([b"retained-drain".as_slice(), label].concat());
+        let members = authors.iter().map(Signer::peer_id).chain([owner.peer_id()]);
+        let genesis = log
+            .create_topic_genesis(
+                topic_id,
+                actor_id_for(topic_id, owner.peer_id()),
+                TopicGenesis::new(Note::TYPE_ID, members),
+                &owner,
+            )
+            .unwrap();
+        (topic_id, genesis)
+    };
+    let (faulty, faulty_genesis) = genesis(b"faulty");
+    let (chained, chained_genesis) = genesis(b"chained");
+
+    let root = event_op(&authors[0], faulty, 1, None, &[&faulty_genesis], "root");
+    let retained = authors[1..]
+        .iter()
+        .map(|author| event_op(author, faulty, 1, None, &[&root], "retained"))
+        .collect::<Vec<_>>();
+    let faulty_source = PeerId::hash(b"retained-source");
+    log.receive_ops_from_peer(Some(faulty_source), retained.clone())
+        .unwrap();
+    *storage.failed_ops.lock().unwrap() = retained.iter().map(|op| op.id).collect();
+    log.receive_ops(vec![root]).unwrap();
+    let retained_ids = retained.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+    let ready = |storage: &StaleReadStorage<S>| {
+        storage
+            .ready_pending_after(None, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(_, op)| op.id)
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        ready(&storage),
+        retained_ids,
+        "the faulty ops are retained ready"
+    );
+
+    let mut chain: Vec<Op> = Vec::with_capacity(CHAIN);
+    for seq in 1..=CHAIN as u64 {
+        let deps = chain
+            .last()
+            .map_or(vec![&chained_genesis], |prev| vec![prev]);
+        let op = event_op(&authors[0], chained, seq, chain.last(), &deps, "chain");
+        chain.push(op);
+    }
+    log.receive_ops_from_peer(Some(PeerId::hash(b"chain-source")), chain[1..].to_vec())
+        .unwrap();
+    let admitted = log.receive_ops(vec![chain[0].clone()]).unwrap();
+    assert_eq!(
+        admitted,
+        chain.iter().map(|op| op.id).collect::<BTreeSet<_>>(),
+        "a receive left released chain ops behind"
+    );
+    assert_eq!(ready(&storage), retained_ids);
+    assert!(log.reconcile_pending_ops().unwrap().is_empty());
+
+    storage.failed_ops.lock().unwrap().clear();
+    assert_eq!(log.reconcile_pending_ops().unwrap(), retained_ids);
+}
+
+#[test]
+fn memory_retained_drain() {
+    assert_retained_drain(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_retained_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_retained_drain(
+        crate::storage::FjallStorage::open_with_persist_mode(
+            dir.path(),
+            fjall::PersistMode::Buffer,
+        )
+        .unwrap(),
+    );
+}

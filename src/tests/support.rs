@@ -282,6 +282,8 @@ pub(crate) struct StaleReadStorage<S = MemoryStorage> {
     pub(crate) hidden_index: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
     pub(crate) mid_commit_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
     pub(crate) failed_writes: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
+    /// Admission writes holding any of these ops fail with a retryable error.
+    pub(crate) failed_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
     pub(crate) failed_status: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
     pub(crate) obligation_gate: Arc<std::sync::Mutex<Option<Arc<Rendezvous>>>>,
     pub(crate) failed_heads: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
@@ -302,6 +304,7 @@ impl<S: Storage> StaleReadStorage<S> {
             hidden_index: Arc::default(),
             mid_commit_ops: Arc::default(),
             failed_writes: Arc::default(),
+            failed_ops: Arc::default(),
             failed_status: Arc::default(),
             obligation_gate: Arc::default(),
             failed_heads: Arc::default(),
@@ -458,6 +461,15 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
         if self.failed_writes.lock().unwrap().contains(&batch.topic_id) {
             return Err(Error::Storage("injected admission write failure".into()));
         }
+        let failed_ops = self.failed_ops.lock().unwrap();
+        if batch
+            .entries
+            .iter()
+            .any(|(op, _)| failed_ops.contains(&op.id))
+        {
+            return Err(Error::Storage("injected op write failure".into()));
+        }
+        drop(failed_ops);
         let lost = self.conflicts.try_update(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
