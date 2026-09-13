@@ -135,18 +135,27 @@ async fn assert_fallback(fanout: usize, topics: usize) {
             .all(|(topic_id, spare)| holds(&up[spare - 1], &alice, *topic_id))
     })
     .await;
+    // Targets of the down peer found by discovery after its first failed
+    // batch may be served by the alternate before their own attempt fails.
+    wait_until("the down peer was not attempted for every topic", || {
+        chosen.iter().all(|(topic_id, _)| {
+            alice
+                .sync_status(*topic_id)
+                .unwrap()
+                .into_iter()
+                .any(|status| {
+                    status.peer_id == down
+                        && status.failed_attempts > 0
+                        && status.last_error.is_some()
+                })
+        })
+    })
+    .await;
     for (topic_id, _) in &chosen {
         assert!(
             storage.has_sync_obligations(&down, topic_id).unwrap(),
             "the down peer's own work must stay owed"
         );
-        let owed = alice
-            .sync_status(*topic_id)
-            .unwrap()
-            .into_iter()
-            .find(|status| status.peer_id == down)
-            .expect("the down peer was attempted");
-        assert!(owed.failed_attempts > 0 && owed.last_error.is_some());
     }
     assert!(alice.peer_health().failures(&down) > 0);
 

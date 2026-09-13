@@ -2376,6 +2376,19 @@ impl<S: Storage> SharedNet<S> {
             .ok_or_else(|| invalid_data("topic disappeared while planning"))?;
         // A peer outside the membership is owed nothing and serves nothing.
         let member = view.state.members.contains(&remote_peer_id);
+        // Both sides may have converged since the fingerprints were compared,
+        // through the peer's own push; the summary then proves the same match.
+        if member
+            && summary.genesis == Some(view.state.genesis)
+            && summary.heads == view.state.heads
+            && self.topic_is_whole(topic_id)
+            && self
+                .node
+                .record_fingerprint(remote_peer_id, topic_id, summary.fingerprint)
+                .map_err(invalid_data)?
+        {
+            return Ok(None);
+        }
         // Across two branches only the winner's namespace is a goal: the loser
         // expects the winner's clock, the winner expects its own certified.
         let branch = summary
