@@ -613,6 +613,78 @@ async fn stale_receipt_restarts() {
     }
 }
 
+/// Staging on the peer expired and restarted while this node still holds a
+/// receipt of the expired session. The push continues from what the peer's
+/// own summary says it stages now, so the delayed receipt cannot skip history.
+async fn assert_expired_staging<S: Storage>(storage: S) {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let (bob, bob_net) = server(storage, &lookup, alice.peer_id(), StreamLimits::default()).await;
+    let topic = alice.create_topic::<Note>(Default::default()).unwrap();
+    publish(&alice, topic.id(), 120, 8);
+    topic.add_peer(bob.peer_id()).unwrap();
+    let ops = crate::oplog::topological(alice.storage(), &topic.id()).unwrap();
+    let receive = |ops: &[crate::Op]| match bob
+        .receive_sync_outcome(
+            alice.peer_id(),
+            crate::sync::SyncData {
+                topic_id: topic.id(),
+                ops: ops.to_vec(),
+            },
+        )
+        .unwrap()
+    {
+        crate::node::ReceiveOutcome::Staged(staged) => staged,
+        crate::node::ReceiveOutcome::Acked { .. } => panic!("not staged"),
+    };
+    let expired = receive(&ops[..100]);
+    let provisional = bob.storage().provisional_topics().unwrap().remove(0);
+    assert!(bob.storage().discard_provisional(&provisional).unwrap());
+    let restarted = receive(&ops[..10]);
+    assert!(restarted.session > expired.session);
+    net.receipt_log().record(
+        bob.peer_id(),
+        crate::sync::SyncReceipt {
+            topic_id: topic.id(),
+            genesis: expired.genesis.unwrap(),
+            session: expired.session,
+            clock: expired.clock,
+        },
+    );
+    let addr = ready_addr(bob_net.endpoint()).await;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        assert!(
+            attempts <= 2,
+            "the push did not continue from the restarted staging"
+        );
+        match net.sync_now(addr.clone(), topic.id()).await {
+            Ok(()) => break,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("bootstrap behind an expired staging failed: {error}"),
+        }
+    }
+    assert_eq!(
+        bob.storage().list_op_ids(&topic.id()).unwrap(),
+        alice.storage().list_op_ids(&topic.id()).unwrap()
+    );
+    net.shutdown().await;
+    bob_net.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_expired_staging() {
+    assert_expired_staging(MemoryStorage::new()).await;
+}
+
+#[cfg(feature = "fjall")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fjall_expired_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_expired_staging(crate::storage::FjallStorage::open(dir.path()).unwrap()).await;
+}
+
 /// A batch of many behind topics plans one stream group at a time: planned
 /// pages held at once stay within two stream budgets instead of every topic's
 /// push page, and every topic still reaches the peer.
