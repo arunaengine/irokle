@@ -915,3 +915,160 @@ async fn inbound_budget_holds() {
         bob_net.budget.capacity(budget::Pool::Data)
     );
 }
+
+/// A carol net over `path` with the key of `secret` that accepts `peers`.
+#[cfg(feature = "fjall")]
+async fn staging_server(
+    path: &std::path::Path,
+    secret: &iroh::SecretKey,
+    lookup: &Lookup,
+    peers: [PeerId; 2],
+    limits: crate::storage::StagingLimits,
+) -> (
+    Irokle<crate::storage::FjallStorage>,
+    Arc<IrohNet<crate::storage::FjallStorage>>,
+) {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .secret_key(secret.clone())
+        .address_lookup(lookup.clone())
+        .alpns(vec![IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let storage = crate::storage::FjallStorage::open(path)
+        .unwrap()
+        .with_staging_limits(limits);
+    let node = Irokle::builder()
+        .with_storage(storage)
+        .with_iroh_secret_key(endpoint.secret_key())
+        .with_peer_whitelist(peers)
+        .build()
+        .unwrap();
+    let net = Arc::new(IrohNet::new(endpoint, node.clone()).unwrap());
+    net.start_accept_loop().unwrap();
+    lookup.add_endpoint_info(ready_addr(net.endpoint()).await);
+    (node, net)
+}
+
+/// A late invitation spanning many small pages is staged from two sources under
+/// a total staging budget that holds less than both complete histories. After
+/// part of it is staged the receiver restarts, an old receipt arrives late, and
+/// both sources send their final fragments at once: one activation makes the
+/// whole topic visible, the other source completes against it, and no staging
+/// is left behind.
+#[cfg(feature = "fjall")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_invite_restart() {
+    let lookup = Lookup::new();
+    let limits = StreamLimits {
+        bytes: 16 * 1024,
+        ..StreamLimits::default()
+    };
+    let (alice, net) = client(&lookup, limits).await;
+    let (dave, dave_net) = client(&lookup, limits).await;
+    let secret = iroh::SecretKey::generate();
+    let carol_peer = crate::Signer::peer_id(&crate::Ed25519Signer::from_iroh_secret_key(&secret));
+    let topic = alice
+        .create_topic::<Note>(crate::TopicConfig {
+            initial_peers: [dave.peer_id()].into(),
+            ..crate::TopicConfig::default()
+        })
+        .unwrap();
+    let topic_id = topic.id();
+    publish(&alice, topic_id, 8000, 32);
+    topic.add_peer(carol_peer).unwrap();
+    let ops = crate::oplog::topological(alice.storage(), &topic_id).unwrap();
+    crate::oplog::Oplog::with_storage(dave.storage().clone())
+        .receive_ops(ops.clone())
+        .unwrap();
+    let history = ops
+        .iter()
+        .map(|op| crate::storage::pending_op_bytes(op).unwrap() as u64)
+        .sum::<u64>();
+    let staging = crate::storage::StagingLimits {
+        total_bytes: history * 8 / 5,
+        source_bytes: history * 6 / 5,
+        namespace_bytes: history * 6 / 5,
+        ..crate::storage::StagingLimits::DISK
+    };
+    let sources = [alice.peer_id(), dave.peer_id()];
+    let dir = tempfile::tempdir().unwrap();
+    let (carol, carol_net) = staging_server(dir.path(), &secret, &lookup, sources, staging).await;
+    let carol_addr = iroh::EndpointAddr::from(carol_net.endpoint().id());
+
+    // Part of the history from each source; one call's page budget ends first.
+    for source in [&net, &dave_net] {
+        let result = source.sync_now(carol_addr.clone(), topic_id).await;
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock),
+            "{result:?}"
+        );
+    }
+    assert!(carol.storage().topic_state(&topic_id).unwrap().is_none());
+    let staged = sources.map(|source| carol.staged_topic(source, topic_id).unwrap().unwrap());
+    assert!(staged.iter().all(|staged| staged.bytes > history / 4));
+
+    carol_net.shutdown().await;
+    drop((carol, carol_net));
+    let (carol, carol_net) = staging_server(dir.path(), &secret, &lookup, sources, staging).await;
+    for (source, before) in sources.iter().zip(&staged) {
+        let after = carol.staged_topic(*source, topic_id).unwrap().unwrap();
+        assert_eq!(
+            (after.session, &after.clock),
+            (before.session, &before.clock)
+        );
+    }
+
+    // A receipt from early in the first session arrives after later progress.
+    let mut early = crate::ActorClock::new();
+    early.observe(crate::actor_id_for(topic_id, alice.peer_id()), 8);
+    net.receipt_log().record(
+        carol_peer,
+        crate::sync::SyncReceipt {
+            topic_id,
+            genesis: ops[0].id,
+            session: staged[0].session,
+            clock: early,
+        },
+    );
+
+    let finish = |source: Arc<IrohNet>| {
+        let addr = carol_addr.clone();
+        async move {
+            match source.sync_now(addr, topic_id).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(%error, "a final fragment was not completed");
+                    false
+                }
+            }
+        }
+    };
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        assert!(
+            rounds <= 8,
+            "staging stalled: active {}, staged {:?}",
+            carol.storage().topic_state(&topic_id).unwrap().is_some(),
+            sources.map(|source| carol.staged_topic(source, topic_id).unwrap())
+        );
+        let (alice_done, dave_done) =
+            tokio::join!(finish(Arc::clone(&net)), finish(Arc::clone(&dave_net)));
+        if alice_done && dave_done {
+            break;
+        }
+    }
+    let state = carol.storage().topic_state(&topic_id).unwrap().unwrap();
+    assert!(state.members.contains(&carol_peer));
+    assert_eq!(
+        carol.storage().list_op_ids(&topic_id).unwrap(),
+        alice.storage().list_op_ids(&topic_id).unwrap()
+    );
+    assert!(carol.storage().provisional_topics().unwrap().is_empty());
+    net.shutdown().await;
+    dave_net.shutdown().await;
+    carol_net.shutdown().await;
+}
