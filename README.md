@@ -61,6 +61,8 @@ fn main() -> irokle::Result<()> {
 
 This example uses the transport-neutral sync API directly. Iroh examples can use `sync_now(peer_id, topic_id)` instead.
 
+`plan_sync_data` and `negotiate_sync` export the whole missing closure in one call; they are for small histories and tests, not bounded sync. A custom transport pages instead: `plan_sync_request` builds a request that walks no history and names the branch it plans on, and `Irokle::response_page` serves one causal page within the request's credit, reporting whether the goal holds more. `plan_sync_response_data` returns the same page without that flag. A request planned on another genesis is refused with `Error::StaleIncarnation`. Iroh uses these same planners.
+
 Bob does not hold the topic before the first receive. Data for an unknown topic is staged first and becomes visible only when its history makes both Bob and the sender members, as it does here. See "Joining A Topic" below.
 
 For persisted or replicated topics, set an explicit, stable `#[irokle(type_id = "...")]` identifier and preserve it across compatible releases. The derive fallback uses the Rust module path and type name, so crate renames, module moves, or type renames change the wire identifier and prevent opening or syncing existing topics as that event type.

@@ -2568,30 +2568,12 @@ impl<S: Storage> SharedNet<S> {
 
     /// The request for the next page of `plan`, sized to what it asks for.
     fn page_request(&self, plan: crate::sync::SyncPlan) -> crate::Result<crate::sync::SyncRequest> {
-        let requested = plan.need.len() as u64
-            + plan
-                .actor_range_hints
-                .iter()
-                .map(|hint| hint.to_inclusive.saturating_sub(hint.from_exclusive))
-                .sum::<u64>();
-        let mut credit = crate::sync::SyncCredit::default();
-        credit.ops = credit
-            .ops
-            .min(u32::try_from(requested).unwrap_or(u32::MAX))
-            .max(1);
         let genesis = self
             .node
             .storage()
             .topic_state(&plan.topic_id)?
             .map(|state| state.genesis);
-        Ok(crate::sync::SyncRequest {
-            topic_id: plan.topic_id,
-            known: plan.common,
-            wants: plan.need,
-            actor_range_hints: plan.actor_range_hints,
-            genesis,
-            credit,
-        })
+        Ok(crate::sync::page_request(plan, genesis))
     }
 }
 

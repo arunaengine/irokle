@@ -18,10 +18,8 @@ mod holes;
 #[cfg(feature = "iroh")]
 mod iroh;
 mod membership;
-#[cfg(feature = "iroh")]
 mod pages;
 mod pending;
-#[cfg(feature = "iroh")]
 mod planning;
 #[cfg(feature = "iroh")]
 mod protocol;

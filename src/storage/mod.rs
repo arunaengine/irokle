@@ -302,8 +302,9 @@ pub struct SyncPeerStatus {
 
 /// Attempt identities a status remembers for duplicate detection. A completion
 /// arriving after this many newer ones of the same peer and topic counts
-/// nothing, so a replay can never count twice.
-pub(crate) const MAX_RECENT_ATTEMPTS: usize = 16;
+/// nothing, so a replay can never count twice. Twice the tested concurrency of
+/// completions for one target.
+pub(crate) const MAX_RECENT_ATTEMPTS: usize = 32;
 
 /// How one update moves the stored sync state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

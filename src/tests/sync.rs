@@ -209,7 +209,8 @@ fn request_converges() {
         .unwrap();
 
     assert_eq!(data_for_bob.ops.len(), 1);
-    assert_eq!(request_for_alice.wants.len(), 1);
+    // Bob's tip is ahead of alice's clock, so it is asked for by range.
+    assert!(request_for_alice.wants.is_empty());
     assert_eq!(request_for_alice.actor_range_hints.len(), 1);
 
     let bob_ack = bob
@@ -1738,6 +1739,10 @@ fn request_skips_bodies() {
     let before = storage.op_reads.load(std::sync::atomic::Ordering::Relaxed);
     let request = engine.plan_request(source.peer_id(), &remote).unwrap();
     let request_reads = reads_since(&storage, before);
+    // Once the integrity scan is cached, a request reads no body at all.
+    let before = storage.op_reads.load(std::sync::atomic::Ordering::Relaxed);
+    engine.plan_request(source.peer_id(), &remote).unwrap();
+    assert_eq!(reads_since(&storage, before), 0);
 
     let (engine, storage) = counted_engine();
     let before = storage.op_reads.load(std::sync::atomic::Ordering::Relaxed);
@@ -1747,32 +1752,37 @@ fn request_skips_bodies() {
     assert_eq!(request.topic_id, topic_id);
     assert_eq!(plan.send.len(), ops.len());
     // Full negotiation loads every missing body and probes its resolvability;
-    // request planning needs neither.
-    assert_eq!(full_reads - request_reads, 2 * ops.len());
+    // request planning walks no history, beyond the one integrity scan.
+    assert!(request_reads <= 2 * ops.len());
+    assert!(full_reads >= request_reads + ops.len());
 }
 
 #[test]
 fn request_matches_negotiation() {
-    // The request-only path must stay byte-identical to the request the full
-    // negotiation produced, for a plain chain and for a fork that merged.
+    // The request asks for exactly what the full negotiation found missing,
+    // for a plain chain and for a fork that merged, without walking history:
+    // served page by page it brings the requester to the remote frontier.
     let alice = node(172);
     let bob = node(173);
     let same_request = |peer, remote: &crate_sync::SyncSummary| {
         let plan = alice.negotiate_sync(peer, remote).unwrap();
         let request = alice.plan_sync_request(peer, remote).unwrap();
-        let expected = crate_sync::SyncRequest {
-            topic_id: plan.topic_id,
-            known: plan.common,
-            wants: plan.need,
-            actor_range_hints: plan.actor_range_hints,
-            genesis: genesis_of(alice.storage(), &plan.topic_id),
-            credit: Default::default(),
-        };
-        assert_eq!(request, expected);
-        assert_eq!(
-            crate::canonical_bytes(&request).unwrap(),
-            crate::canonical_bytes(&expected).unwrap()
-        );
+        assert!(request.known.is_empty());
+        assert_eq!(request.genesis, genesis_of(alice.storage(), &plan.topic_id));
+        let local = alice.storage().actor_clock(&plan.topic_id).unwrap();
+        let ahead = remote
+            .actor_clock
+            .iter()
+            .filter(|(actor, seq)| local.get(actor) < **seq)
+            .map(|(actor, seq)| (*actor, local.get(actor), *seq))
+            .collect::<Vec<_>>();
+        let ranges = request
+            .actor_range_hints
+            .iter()
+            .map(|hint| (hint.actor_id, hint.from_exclusive, hint.to_inclusive))
+            .collect::<Vec<_>>();
+        assert_eq!(ranges, ahead);
+        assert!(request.wants.is_subset(&plan.need));
         request
     };
 
@@ -1824,10 +1834,15 @@ fn request_matches_negotiation() {
         })
         .unwrap();
 
-    let request = same_request(bob.peer_id(), &bob.sync_summary(forked.id()).unwrap());
-    assert!(!request.known.is_empty());
-    assert!(!request.wants.is_empty());
+    let bob_summary = bob.sync_summary(forked.id()).unwrap();
+    let request = same_request(bob.peer_id(), &bob_summary);
     assert!(!request.actor_range_hints.is_empty());
+    let data = bob
+        .plan_sync_response_data(alice.peer_id(), &request)
+        .unwrap();
+    alice.receive_sync_data_from(bob.peer_id(), data).unwrap();
+    let alice_clock = alice.storage().actor_clock(&forked.id()).unwrap();
+    assert!(alice_clock.dominates(&bob_summary.actor_clock));
 }
 
 /// Runtime reachability reaches production selection: a preferred peer that

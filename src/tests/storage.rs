@@ -1990,7 +1990,7 @@ fn assert_attempt_order<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S) {
         (crate_storage::SyncPeerState::Failed, Some(newest))
     );
 
-    // An identity older than every remembered one counts and installs nothing.
+    // A replayed identity counts and installs nothing.
     let same = storage
         .update_sync_status(&peer, &topic_id, &attempt_outcome((epoch, 0), 50, true))
         .unwrap();

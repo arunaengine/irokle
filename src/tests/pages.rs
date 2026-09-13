@@ -509,3 +509,61 @@ fn fjall_window_admits_dependency() {
     let source = late_dependency(storage, 4097);
     assert!(page_through(&source) <= 2);
 }
+
+/// The public page contract without a transport: a one-op credit serves one
+/// op, a request planned on another genesis is refused rather than served from
+/// this branch, and the requester's own request brings it to the frontier.
+#[test]
+fn public_page_contract() {
+    let source = many_actors(3, 4, 0);
+    let reader = Oplog::new();
+    reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+    let reader_engine = SyncEngine::new(reader.clone(), source.reader);
+    let summary = source.engine.summary(source.topic_id).unwrap();
+
+    let mut request = reader_engine.plan_request(source.reader, &summary).unwrap();
+    assert!(request.known.is_empty());
+    assert_eq!(request.genesis, Some(source.genesis.id));
+    request.credit.ops = 1;
+    let data = source
+        .engine
+        .plan_response_data(source.reader, &request)
+        .unwrap();
+    assert_eq!(data.ops.len(), 1);
+
+    let mut other = request.clone();
+    other.genesis = Some(OpId::hash(b"another branch"));
+    assert!(matches!(
+        source.engine.plan_response_data(source.reader, &other),
+        Err(Error::StaleIncarnation)
+    ));
+
+    let mut pages = 0;
+    loop {
+        let request = reader_engine
+            .plan_request(
+                source.reader,
+                &source.engine.summary(source.topic_id).unwrap(),
+            )
+            .unwrap();
+        if request.wants.is_empty() && request.actor_range_hints.is_empty() {
+            break;
+        }
+        assert!(pages < 2, "public paging did not finish");
+        let page = source
+            .engine
+            .response_page(
+                source.reader,
+                &request,
+                PageBudget::from_credit(request.credit),
+            )
+            .unwrap();
+        assert!(!page.more);
+        reader.receive_ops(page.ops).unwrap();
+        pages += 1;
+    }
+    assert_eq!(
+        reader.storage().actor_clock(&source.topic_id).unwrap(),
+        source.log.storage().actor_clock(&source.topic_id).unwrap()
+    );
+}
