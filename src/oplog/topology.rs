@@ -44,6 +44,14 @@ pub(crate) fn topological_subset_entries<S: Storage>(
     storage.read_snapshot(|read| subset_entries_in(read, ids))
 }
 
+/// [`topological_subset`] over one snapshot a planner already holds.
+pub(crate) fn subset_in(read: &dyn SnapshotRead, ids: &BTreeSet<crate::OpId>) -> Result<Vec<Op>> {
+    Ok(subset_entries_in(read, ids)?
+        .into_iter()
+        .map(|(op, _)| op)
+        .collect())
+}
+
 fn subset_entries_in(
     read: &dyn SnapshotRead,
     ids: &BTreeSet<crate::OpId>,

@@ -9,8 +9,10 @@ use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::oplog::{Oplog, ReceiveEffects, TopicEviction, topological_subset};
-use crate::storage::{PeerAck, Storage, SyncObligation, TopicState, TopicView};
+use crate::oplog::{Oplog, ReceiveEffects, TopicEviction, subset_in};
+use crate::storage::{
+    PeerAck, SnapshotRead, Storage, SyncObligation, TopicState, TopicView, topic_fingerprint_for,
+};
 use crate::{
     ActorClock, ActorId, Error, Op, OpId, PeerId, Result, Signer, TopicId, actor_id_for,
     canonical_bytes, verify,
@@ -282,21 +284,32 @@ impl<S: Storage> SyncEngine<S> {
         }
     }
 
-    /// The topic as one view reads it. Heads, clock, tips and the digest all
-    /// describe the same commit, so no part can come from a replaced branch.
+    /// The topic as one snapshot reads it. Heads, clock, tips and the digest
+    /// all describe the same commit, so no part can come from a replaced branch.
     pub fn summary(&self, topic_id: TopicId) -> Result<SyncSummary> {
-        let Some(view) = self.oplog.storage().topic_view(&topic_id, None)? else {
+        self.oplog
+            .storage()
+            .read_snapshot(|read| self.summary_in(read, topic_id))
+    }
+
+    /// [`Self::summary`] read from a snapshot the caller already holds.
+    pub(crate) fn summary_in(
+        &self,
+        read: &dyn SnapshotRead,
+        topic_id: TopicId,
+    ) -> Result<SyncSummary> {
+        let Some(view) = read.topic_view(&topic_id, None)? else {
             return Ok(SyncSummary {
                 topic_id,
                 event_type_id: None,
                 genesis: None,
-                fingerprint: self.oplog.storage().topic_fingerprint(&topic_id)?,
+                fingerprint: topic_fingerprint_for(&BTreeSet::new(), &ActorClock::new())?,
                 heads: BTreeSet::new(),
                 actor_clock: ActorClock::new(),
                 actor_tips: BTreeMap::new(),
             });
         };
-        let fingerprint = self.view_digest(&view)?;
+        let fingerprint = self.digest_in(read, &view)?;
         let actor_tips = view
             .tips
             .iter()
@@ -315,10 +328,12 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     pub fn fingerprint(&self, topic_id: TopicId) -> Result<SyncFingerprint> {
-        let fingerprint = match self.oplog.storage().topic_view(&topic_id, None)? {
-            Some(view) => self.view_digest(&view)?,
-            None => self.oplog.storage().topic_fingerprint(&topic_id)?,
-        };
+        let fingerprint = self.oplog.storage().read_snapshot(|read| {
+            match read.topic_view(&topic_id, None)? {
+                Some(view) => self.digest_in(read, &view),
+                None => topic_fingerprint_for(&BTreeSet::new(), &ActorClock::new()),
+            }
+        })?;
         Ok(SyncFingerprint {
             topic_id,
             fingerprint,
@@ -331,8 +346,8 @@ impl<S: Storage> SyncEngine<S> {
     /// a whole one, which is exactly what the matched-fingerprint fast path
     /// assumes. Callers must still refuse that fast path while their own topic
     /// is incomplete, since two identically damaged stores do match.
-    fn view_digest(&self, view: &TopicView) -> Result<[u8; 32]> {
-        let unresolved = self.oplog.view_unresolved(view)?;
+    pub(crate) fn digest_in(&self, read: &dyn SnapshotRead, view: &TopicView) -> Result<[u8; 32]> {
+        let unresolved = self.oplog.unresolved_in(read, view)?;
         if unresolved.is_empty() {
             return Ok(view.fingerprint);
         }
@@ -342,7 +357,9 @@ impl<S: Storage> SyncEngine<S> {
     /// The whole missing closure against `remote`, unbounded: an export of
     /// history, not a sync step. Sync uses [`Self::negotiate_page`].
     pub fn negotiate(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
-        self.negotiate_inner(peer_id, remote, SendSet::Closure, &mut false)
+        self.oplog.storage().read_snapshot(|read| {
+            self.negotiate_inner(read, peer_id, remote, SendSet::Closure, &mut false)
+        })
     }
 
     /// Plan a causal push page within `budget` and the request for what the
@@ -355,13 +372,29 @@ impl<S: Storage> SyncEngine<S> {
         remote: &SyncSummary,
         budget: PageBudget,
     ) -> Result<(SyncPlan, bool)> {
+        self.oplog
+            .storage()
+            .read_snapshot(|read| self.negotiate_in(read, peer_id, remote, budget))
+    }
+
+    /// [`Self::negotiate_page`] over a snapshot the caller already holds.
+    pub(crate) fn negotiate_in(
+        &self,
+        read: &dyn SnapshotRead,
+        peer_id: PeerId,
+        remote: &SyncSummary,
+        budget: PageBudget,
+    ) -> Result<(SyncPlan, bool)> {
         let mut more = false;
-        let plan = self.negotiate_inner(peer_id, remote, SendSet::Page(budget), &mut more)?;
+        let plan = self.negotiate_inner(read, peer_id, remote, SendSet::Page(budget), &mut more)?;
         Ok((plan, more))
     }
 
+    /// Authorization, branch choice and selection all read `read`, so a plan
+    /// never pairs a membership verdict with records of a later commit.
     fn negotiate_inner(
         &self,
+        read: &dyn SnapshotRead,
         peer_id: PeerId,
         remote: &SyncSummary,
         send_set: SendSet,
@@ -370,7 +403,7 @@ impl<S: Storage> SyncEngine<S> {
         // An unknown topic's remote heads are unauthenticated, so they never become
         // `need`. Bootstrap stages pages the inviter pushes or the transport pulls
         // with range hints, which the responder clamps and serves to members only.
-        let Some(state) = self.oplog.storage().topic_state(&remote.topic_id)? else {
+        let Some(view) = read.topic_view(&remote.topic_id, None)? else {
             return Ok(SyncPlan {
                 topic_id: remote.topic_id,
                 common: BTreeSet::new(),
@@ -380,30 +413,25 @@ impl<S: Storage> SyncEngine<S> {
                 actor_range_hints: Vec::new(),
             });
         };
-        if !state.members.contains(&peer_id) {
+        if !view.state.members.contains(&peer_id) {
             return Ok(SyncPlan {
                 topic_id: remote.topic_id,
                 common: BTreeSet::new(),
-                have: state.heads,
+                have: view.state.heads,
                 send: Vec::new(),
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
             });
         }
         if let Some(remote_event_type_id) = &remote.event_type_id
-            && *remote_event_type_id != state.event_type_id
+            && *remote_event_type_id != view.state.event_type_id
         {
             return Err(Error::EventTypeMismatch {
-                expected: state.event_type_id,
+                expected: view.state.event_type_id,
                 actual: remote_event_type_id.clone(),
             });
         }
 
-        let view = self
-            .oplog
-            .storage()
-            .topic_view(&remote.topic_id, None)?
-            .ok_or(Error::TopicNotFound)?;
         let local_heads = view.state.heads.clone();
         // Another genesis is another sequence namespace, however equal the actor
         // positions look. The smaller genesis wins: its holder offers its branch
@@ -426,17 +454,22 @@ impl<S: Storage> SyncEngine<S> {
                 return Ok(plan);
             }
             plan.send = match send_set {
-                SendSet::Closure => self.missing_closure(&SyncSummary {
-                    topic_id: remote.topic_id,
-                    event_type_id: None,
-                    genesis: None,
-                    fingerprint: [0; 32],
-                    heads: BTreeSet::new(),
-                    actor_clock: empty,
-                    actor_tips: BTreeMap::new(),
-                })?,
+                SendSet::Closure => self.missing_closure_in(
+                    read,
+                    &SyncSummary {
+                        topic_id: remote.topic_id,
+                        event_type_id: None,
+                        genesis: None,
+                        fingerprint: [0; 32],
+                        heads: BTreeSet::new(),
+                        actor_clock: empty,
+                        actor_tips: BTreeMap::new(),
+                    },
+                    &view.state.heads,
+                )?,
                 SendSet::Page(budget) => {
                     let page = self.plan_page(
+                        read,
                         &remote.topic_id,
                         &view.clock,
                         &empty,
@@ -452,7 +485,7 @@ impl<S: Storage> SyncEngine<S> {
         }
         // A hole moves neither heads nor the clock, so a matching fingerprint
         // does not prove we are whole; keep negotiating until it is repaired.
-        let unresolved = self.oplog.view_unresolved(&view)?;
+        let unresolved = self.oplog.unresolved_in(read, &view)?;
         if unresolved.is_empty() && view.fingerprint == remote.fingerprint {
             return Ok(SyncPlan {
                 topic_id: remote.topic_id,
@@ -467,13 +500,14 @@ impl<S: Storage> SyncEngine<S> {
         // A page plan needs no walk from the heads: the peer's clock says what
         // it holds, and holes come from the integrity check above.
         let (common, dangling) = match send_set {
-            SendSet::Closure => self.survey_local(remote)?,
+            SendSet::Closure => Self::survey_in(read, remote, &view.state.heads)?,
             SendSet::Page(_) => Default::default(),
         };
         let send = match send_set {
-            SendSet::Closure => self.missing_closure(remote)?,
+            SendSet::Closure => self.missing_closure_in(read, remote, &view.state.heads)?,
             SendSet::Page(budget) => {
                 let page = self.plan_page(
+                    read,
                     &remote.topic_id,
                     &view.clock,
                     &remote.actor_clock,
@@ -487,7 +521,7 @@ impl<S: Storage> SyncEngine<S> {
         };
         let mut need = BTreeSet::new();
         for id in &remote.heads {
-            if !self.oplog.storage().dep_resolvable(id)? {
+            if !read.dep_resolvable(id)? {
                 need.insert(*id);
             }
         }
@@ -531,29 +565,34 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     pub fn find_common_ancestors(&self, remote: &SyncSummary) -> Result<BTreeSet<OpId>> {
-        Ok(self.survey_local(remote)?.0)
+        self.oplog.storage().read_snapshot(|read| {
+            let heads = read
+                .topic_view(&remote.topic_id, None)?
+                .map(|view| view.state.heads)
+                .unwrap_or_default();
+            Ok(Self::survey_in(read, remote, &heads)?.0)
+        })
     }
 
     /// Walk local heads down to the frontier the remote already has, reporting
     /// the common ancestors found there and every id the walk found stored
     /// incompletely. The second set is what anti-entropy repair asks the peer
     /// for; collecting it here costs no extra traversal.
-    fn survey_local(&self, remote: &SyncSummary) -> Result<(BTreeSet<OpId>, BTreeSet<OpId>)> {
+    fn survey_in(
+        read: &dyn SnapshotRead,
+        remote: &SyncSummary,
+        heads: &BTreeSet<OpId>,
+    ) -> Result<(BTreeSet<OpId>, BTreeSet<OpId>)> {
         let mut common = BTreeSet::new();
         let mut dangling = BTreeSet::new();
-        let mut queue: VecDeque<_> = self
-            .oplog
-            .storage()
-            .heads(&remote.topic_id)?
-            .into_iter()
-            .collect();
+        let mut queue: VecDeque<_> = heads.iter().copied().collect();
         let mut seen = BTreeSet::new();
 
         while let Some(id) = queue.pop_front() {
             if !seen.insert(id) {
                 continue;
             }
-            let Some(meta) = self.oplog.storage().get_meta(&id)? else {
+            let Some(meta) = read.get_meta(&id)? else {
                 dangling.insert(id);
                 continue;
             };
@@ -562,7 +601,7 @@ impl<S: Storage> SyncEngine<S> {
             }
             // Metadata alone lets the walk continue but cannot be served, so the
             // op record is requested while the traversal still uses the meta.
-            if self.oplog.storage().get_op(&id)?.is_none() {
+            if read.get_op(&id)?.is_none() {
                 dangling.insert(id);
             }
             if remote_contains(remote, &meta) {
@@ -576,18 +615,28 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     pub fn missing_closure(&self, remote: &SyncSummary) -> Result<Vec<Op>> {
+        self.oplog.storage().read_snapshot(|read| {
+            let heads = read
+                .topic_view(&remote.topic_id, None)?
+                .map(|view| view.state.heads)
+                .unwrap_or_default();
+            self.missing_closure_in(read, remote, &heads)
+        })
+    }
+
+    fn missing_closure_in(
+        &self,
+        read: &dyn SnapshotRead,
+        remote: &SyncSummary,
+        heads: &BTreeSet<OpId>,
+    ) -> Result<Vec<Op>> {
         let mut missing = BTreeSet::new();
-        let mut stack: SmallVec<[OpId; 8]> = self
-            .oplog
-            .storage()
-            .heads(&remote.topic_id)?
-            .into_iter()
-            .collect();
+        let mut stack: SmallVec<[OpId; 8]> = heads.iter().copied().collect();
         while let Some(id) = stack.pop() {
             if missing.contains(&id) {
                 continue;
             }
-            let Some(meta) = self.oplog.storage().get_meta(&id)? else {
+            let Some(meta) = read.get_meta(&id)? else {
                 continue;
             };
             if meta.topic_id != remote.topic_id || remote_contains(remote, &meta) {
@@ -596,7 +645,7 @@ impl<S: Storage> SyncEngine<S> {
             missing.insert(id);
             stack.extend(meta.deps.iter().copied());
         }
-        topological_subset(self.oplog.storage(), &missing)
+        subset_in(read, &missing)
     }
 
     pub fn plan_data(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncData> {
@@ -611,13 +660,24 @@ impl<S: Storage> SyncEngine<S> {
     /// holes and ranges for positions ahead, with a credit sized to them. It
     /// walks no local history. The request names the branch it plans on.
     pub fn plan_request(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncRequest> {
-        let no_push = PageBudget { ops: 0, bytes: 0 };
-        let (plan, _) = self.negotiate_page(peer_id, remote, no_push)?;
-        let genesis = self
-            .oplog
+        self.oplog
             .storage()
-            .topic_state(&plan.topic_id)?
-            .map(|state| request_genesis(state.genesis, remote.genesis));
+            .read_snapshot(|read| self.request_in(read, peer_id, remote))
+    }
+
+    /// [`Self::plan_request`] over a snapshot the caller already holds; the
+    /// branch it names is the one that snapshot planned on.
+    pub(crate) fn request_in(
+        &self,
+        read: &dyn SnapshotRead,
+        peer_id: PeerId,
+        remote: &SyncSummary,
+    ) -> Result<SyncRequest> {
+        let no_push = PageBudget { ops: 0, bytes: 0 };
+        let (plan, _) = self.negotiate_in(read, peer_id, remote, no_push)?;
+        let genesis = read
+            .topic_view(&plan.topic_id, None)?
+            .map(|view| request_genesis(view.state.genesis, remote.genesis));
         Ok(page_request(plan, genesis))
     }
 
@@ -633,9 +693,23 @@ impl<S: Storage> SyncEngine<S> {
 
     /// Serve one causal page of `request` within `budget`: its explicit wants,
     /// then its ranges, refusing a request planned on another genesis. `more`
-    /// says the requested goal holds more; the requester asks again.
+    /// says the requested goal holds more; the requester asks again. The
+    /// membership check and every record come from one snapshot.
     pub fn response_page(
         &self,
+        peer_id: PeerId,
+        request: &SyncRequest,
+        budget: PageBudget,
+    ) -> Result<PlannedPage> {
+        self.oplog
+            .storage()
+            .read_snapshot(|read| self.response_in(read, peer_id, request, budget))
+    }
+
+    /// [`Self::response_page`] over a snapshot the caller already holds.
+    pub(crate) fn response_in(
+        &self,
+        read: &dyn SnapshotRead,
         peer_id: PeerId,
         request: &SyncRequest,
         budget: PageBudget,
@@ -644,7 +718,7 @@ impl<S: Storage> SyncEngine<S> {
             ops: Vec::new(),
             more: false,
         };
-        let Some(view) = self.oplog.storage().topic_view(&request.topic_id, None)? else {
+        let Some(view) = read.topic_view(&request.topic_id, None)? else {
             return Ok(empty);
         };
         if !view.state.members.contains(&peer_id) {
@@ -678,7 +752,7 @@ impl<S: Storage> SyncEngine<S> {
             }
         }
         let (mut ops, repair_more) =
-            self.plan_repair(&request.topic_id, &request.wants, &peer_clock, budget)?;
+            Self::plan_repair(read, &request.topic_id, &request.wants, &peer_clock, budget)?;
         // Wants this page could not carry keep their dependents out of the
         // forward ranges, which still serve every independent actor.
         let unsent = if repair_more {
@@ -703,6 +777,7 @@ impl<S: Storage> SyncEngine<S> {
             return Ok(PlannedPage { ops, more: true });
         }
         let planned = self.plan_page(
+            read,
             &request.topic_id,
             local,
             &peer_clock,
@@ -917,9 +992,13 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     fn validate_ack(&self, ack: &SyncAck) -> Result<()> {
-        let view = self
-            .oplog
+        self.oplog
             .storage()
+            .read_snapshot(|read| self.validate_ack_in(read, ack))
+    }
+
+    fn validate_ack_in(&self, read: &dyn SnapshotRead, ack: &SyncAck) -> Result<()> {
+        let view = read
             .topic_view(&ack.topic_id, None)?
             .ok_or(Error::TopicNotFound)?;
         let state = &view.state;
@@ -950,7 +1029,7 @@ impl<S: Storage> SyncEngine<S> {
 
         for op_id in ack.accepted.iter().chain(ack.heads.iter()) {
             // History we have not learned yet makes no locally checkable claim.
-            let Some(meta) = self.oplog.storage().get_meta(op_id)? else {
+            let Some(meta) = read.get_meta(op_id)? else {
                 continue;
             };
             if meta.topic_id != ack.topic_id {
@@ -1033,8 +1112,10 @@ impl<S: Storage> SyncEngine<S> {
     /// The next causal page for a peer at `peer`, merging forward actor ranges by generation
     /// (one past the highest dependency), so dependencies come first. Work grows with the
     /// page and the number of actors behind, never with history the peer holds.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn plan_page(
         &self,
+        read: &dyn SnapshotRead,
         topic_id: &TopicId,
         local: &ActorClock,
         peer: &ActorClock,
@@ -1042,7 +1123,6 @@ impl<S: Storage> SyncEngine<S> {
         excluded: &BTreeSet<OpId>,
         budget: PageBudget,
     ) -> Result<PlannedPage> {
-        let storage = self.oplog.storage();
         let limit_of = |actor_id: &ActorId, local_seq: u64| {
             goal.map_or(local_seq, |goal| goal.get(actor_id).min(local_seq))
         };
@@ -1071,8 +1151,9 @@ impl<S: Storage> SyncEngine<S> {
                 deferred.insert(*actor_id);
                 continue;
             }
-            more |=
-                !self.push_range_head(topic_id, *actor_id, after, limit, &mut heads, &mut metas)?;
+            more |= !Self::push_range_head(
+                read, topic_id, *actor_id, after, limit, &mut heads, &mut metas,
+            )?;
         }
         let mut covered = peer.clone();
         let mut blocked = excluded.clone();
@@ -1084,7 +1165,7 @@ impl<S: Storage> SyncEngine<S> {
             for dep in &meta.deps {
                 let dep_position = match metas.get(dep) {
                     Some(dep_meta) => Some((dep_meta.actor_id, dep_meta.actor_seq)),
-                    None => storage
+                    None => read
                         .get_meta(dep)?
                         .map(|dep_meta| (dep_meta.actor_id, dep_meta.actor_seq)),
                 };
@@ -1103,7 +1184,8 @@ impl<S: Storage> SyncEngine<S> {
                 && deferred.remove(&dep_actor)
             {
                 let dep_limit = limit_of(&dep_actor, local.get(&dep_actor));
-                more |= !self.push_range_head(
+                more |= !Self::push_range_head(
+                    read,
                     topic_id,
                     dep_actor,
                     peer.get(&dep_actor),
@@ -1119,7 +1201,7 @@ impl<S: Storage> SyncEngine<S> {
             // this actor only; independent actors keep filling the page.
             let Some(op) = waits
                 .is_none()
-                .then(|| storage.get_op(&id))
+                .then(|| read.get_op(&id))
                 .transpose()?
                 .flatten()
             else {
@@ -1139,8 +1221,9 @@ impl<S: Storage> SyncEngine<S> {
             covered.observe(actor_id, seq);
             ops.push(op);
             if seq < limit {
-                more |= !self
-                    .push_range_head(topic_id, actor_id, seq, limit, &mut heads, &mut metas)?;
+                more |= !Self::push_range_head(
+                    read, topic_id, actor_id, seq, limit, &mut heads, &mut metas,
+                )?;
             }
         }
         Ok(PlannedPage {
@@ -1152,7 +1235,7 @@ impl<S: Storage> SyncEngine<S> {
     /// Queue the op after `after` on `actor_id`, up to `limit`. Returns false
     /// when the index skips a position: the actor stops at that hole.
     fn push_range_head(
-        &self,
+        read: &dyn SnapshotRead,
         topic_id: &TopicId,
         actor_id: ActorId,
         after: u64,
@@ -1160,14 +1243,13 @@ impl<S: Storage> SyncEngine<S> {
         heads: &mut BinaryHeap<Reverse<RangeHead>>,
         metas: &mut BTreeMap<OpId, crate::storage::OpMeta>,
     ) -> Result<bool> {
-        let storage = self.oplog.storage();
-        let Some((seq, id)) = storage.actor_range(topic_id, &actor_id, after, 1)?.pop() else {
+        let Some((seq, id)) = read.actor_range(topic_id, &actor_id, after, 1)?.pop() else {
             return Ok(false);
         };
         if seq != after + 1 || seq > limit {
             return Ok(seq > limit);
         }
-        let Some(meta) = storage.get_meta(&id)? else {
+        let Some(meta) = read.get_meta(&id)? else {
             return Ok(false);
         };
         heads.push(Reverse((meta.generation, actor_id, seq, id, limit)));
@@ -1178,13 +1260,12 @@ impl<S: Storage> SyncEngine<S> {
     /// Requested repair ids and the ancestry the peer's clock does not cover,
     /// oldest first, bounded by the page.
     fn plan_repair(
-        &self,
+        read: &dyn SnapshotRead,
         topic_id: &TopicId,
         wants: &BTreeSet<OpId>,
         peer: &ActorClock,
         budget: PageBudget,
     ) -> Result<(Vec<Op>, bool)> {
-        let storage = self.oplog.storage();
         let mut closure = BTreeSet::new();
         let mut covered = BTreeSet::new();
         let mut stack = wants.iter().copied().collect::<Vec<_>>();
@@ -1197,7 +1278,7 @@ impl<S: Storage> SyncEngine<S> {
                 more = true;
                 continue;
             }
-            let Some(meta) = storage.get_meta(&id)? else {
+            let Some(meta) = read.get_meta(&id)? else {
                 continue;
             };
             if meta.topic_id != *topic_id {
@@ -1211,7 +1292,7 @@ impl<S: Storage> SyncEngine<S> {
             closure.insert(id);
             stack.extend(meta.deps.iter().copied());
         }
-        let mut ordered = topological_subset(storage, &closure)?;
+        let mut ordered = subset_in(read, &closure)?;
         // Wants unconnected inside the closure still depend on each other through
         // covered ops, so a cut page must keep the oldest generations first.
         ordered.sort_by_key(|op| op.signed.body.generation);

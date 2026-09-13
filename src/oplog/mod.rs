@@ -24,8 +24,8 @@ use helpers::{
     pending_meta_for,
 };
 pub(crate) use topology::topological_ids;
-pub(crate) use topology::topological_subset_entries;
 use topology::{complete_ops, topological_ops};
+pub(crate) use topology::{subset_in, topological_subset_entries};
 pub use topology::{topological, topological_subset};
 
 /// Attempts one admission job makes; storage writes on this path try once each.
@@ -303,6 +303,7 @@ impl<S: Storage> Oplog<S> {
     /// Ids `view`'s topic cannot resolve, scanned in a later snapshot when the
     /// cache has no verdict. The verdict is recorded only when that snapshot
     /// still holds the view's branch and epoch.
+    #[cfg(feature = "iroh")]
     pub(crate) fn view_unresolved(&self, view: &TopicView) -> Result<BTreeSet<OpId>> {
         if self.whole_topics()?.get(&view.state.topic_id) == Some(&view_key(view)) {
             return Ok(view.pending_missing.clone());

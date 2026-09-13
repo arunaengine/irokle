@@ -5062,10 +5062,11 @@ mod tests {
             .receive_sync_data_from(alice.peer_id(), crate::sync::SyncData { topic_id, ops })
             .unwrap();
 
-        // The older attempt pauses while preparing its fingerprints.
+        // The older attempt pauses while preparing its fingerprints, at the open's
+        // live state read after the digest's snapshot, so the newer one can read.
         let gate = Arc::new(Gate::default());
         let release = gate.releaser();
-        storage.arm_read(GatePoint::View(topic_id), Arc::clone(&gate));
+        storage.arm_read_after(GatePoint::Topic(topic_id), 1, Arc::clone(&gate));
         let older = {
             let net = Arc::clone(&bob_net);
             let addr = alice_addr.clone();
