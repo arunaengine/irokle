@@ -24,6 +24,7 @@ mod planning;
 mod progress;
 #[cfg(feature = "iroh")]
 mod protocol;
+mod provisional;
 mod snapshot;
 mod storage;
 pub(crate) mod support;

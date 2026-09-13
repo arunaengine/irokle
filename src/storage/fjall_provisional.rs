@@ -312,6 +312,17 @@ impl FjallStorage {
         self.reclaim_slots()
     }
 
+    /// Stop an activation after its copies, as a crash there would.
+    #[cfg(test)]
+    pub(crate) fn interrupt_activation(&self, provisional: &ProvisionalTopic) {
+        let store = self.namespace_store(provisional).unwrap().unwrap();
+        let state =
+            Self::tx_namespace_state(&self.db.read_tx(), &store.records, &provisional.topic_id)
+                .unwrap()
+                .unwrap();
+        self.copy_namespace(provisional, &state).unwrap();
+    }
+
     /// Mark the namespace activating and copy its records into the active
     /// records in bounded transactions. Returns the namespace store.
     fn copy_namespace(

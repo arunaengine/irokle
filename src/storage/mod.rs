@@ -647,13 +647,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn expire_bootstrap(&self, older_than_ms: u64) -> Result<usize>;
 
     /// The limits this store applies to provisional bootstraps.
-    fn staging_limits(&self) -> StagingLimits {
-        StagingLimits::MEMORY
-    }
+    fn staging_limits(&self) -> StagingLimits;
     /// Every provisional bootstrap namespace.
-    fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>> {
-        Ok(Vec::new())
-    }
+    fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>>;
     /// The namespace of `source` for `topic_id`, opened empty for `genesis` when
     /// the source has none. An existing namespace is returned unchanged, whatever
     /// genesis it holds. Refuses an active topic with
@@ -661,29 +657,19 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// with [`crate::Error::StagingCapacity`].
     fn open_provisional(
         &self,
-        _source: PeerId,
-        _topic_id: TopicId,
-        _genesis: OpId,
-        _now_ms: u64,
-    ) -> Result<ProvisionalTopic> {
-        Err(crate::Error::StagingCapacity(
-            "this store keeps no provisional bootstraps yet".into(),
-        ))
-    }
+        source: PeerId,
+        topic_id: TopicId,
+        genesis: OpId,
+        now_ms: u64,
+    ) -> Result<ProvisionalTopic>;
     /// The store holding the history of `provisional`, or `None` once its
     /// session ended. It sees only that namespace and refuses a write past the
     /// namespace byte limit with [`crate::Error::StagingCapacity`].
-    fn provisional_store(&self, _provisional: &ProvisionalTopic) -> Result<Option<Self>> {
-        Ok(None)
-    }
+    fn provisional_store(&self, provisional: &ProvisionalTopic) -> Result<Option<Self>>;
     /// Serialized op bytes this store holds, admitted and buffered.
-    fn stored_bytes(&self) -> Result<u64> {
-        Ok(0)
-    }
+    fn stored_bytes(&self) -> Result<u64>;
     /// Record a write to the namespace while its session is current.
-    fn touch_provisional(&self, _provisional: &ProvisionalTopic, _now_ms: u64) -> Result<()> {
-        Ok(())
-    }
+    fn touch_provisional(&self, provisional: &ProvisionalTopic, now_ms: u64) -> Result<()>;
     /// Make the history of `provisional` the active topic: copy it into the
     /// active records in bounded steps, then in one transaction refuse when the
     /// topic is active or the namespace state is not `expected`, install the
@@ -691,17 +677,13 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// An interrupted activation resumes when called again.
     fn activate_provisional(
         &self,
-        _provisional: &ProvisionalTopic,
-        _expected: &TopicState,
-        _effects: AdmissionEffects,
-    ) -> Result<()> {
-        Err(crate::Error::StaleIncarnation)
-    }
+        provisional: &ProvisionalTopic,
+        expected: &TopicState,
+        effects: AdmissionEffects,
+    ) -> Result<()>;
     /// End the namespace of `provisional` while its session is current and it
     /// is not activating. Returns whether it ended.
-    fn discard_provisional(&self, _provisional: &ProvisionalTopic) -> Result<bool> {
-        Ok(false)
-    }
+    fn discard_provisional(&self, provisional: &ProvisionalTopic) -> Result<bool>;
 }
 
 mod memory;
