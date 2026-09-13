@@ -857,6 +857,8 @@ pub struct SharedNet<S: Storage> {
     resync_scheduler: ResyncScheduler,
     limits: StreamLimits,
     inbound: InboundBudget,
+    /// Outbound peer attempts, automatic batches and manual syncs alike.
+    outbound: Arc<tokio::sync::Semaphore>,
     receipts: Mutex<ReceiptLog>,
     shutdown: tokio::sync::watch::Sender<bool>,
     tasks: Arc<TaskTracker>,
@@ -957,6 +959,7 @@ impl<S: Storage> IrohNet<S> {
                 resync_scheduler: ResyncScheduler::default(),
                 limits: StreamLimits::default(),
                 inbound: InboundBudget::new(StreamLimits::default()),
+                outbound: Arc::new(tokio::sync::Semaphore::new(MAX_RESYNC_PEER_CONCURRENCY)),
                 receipts: Mutex::default(),
                 shutdown,
                 tasks: Arc::default(),
@@ -1383,7 +1386,12 @@ impl<S: Storage> IrohNet<S> {
                 }
                 let next_due = net
                     .upgrade()
-                    .map(|current| next_resync_wake(&current.resync_scheduler, syncs.len()))
+                    .map(|current| {
+                        let busy = MAX_RESYNC_PEER_CONCURRENCY
+                            .saturating_sub(current.outbound.available_permits())
+                            .max(syncs.len());
+                        next_resync_wake(&current.resync_scheduler, busy)
+                    })
                     .unwrap_or_else(|| tokio::time::Instant::now() + EMPTY_RESYNC_SLEEP);
                 let due_sleep = tokio::time::sleep_until(next_due);
                 tokio::pin!(due_sleep);
@@ -1828,6 +1836,21 @@ impl<S: Storage> IrohNet<S> {
         let _task = match self.tasks.enter() {
             Ok(task) => task,
             Err(error) => {
+                return topic_ids
+                    .iter()
+                    .map(|topic_id| (*topic_id, Err(clone_error(&error))))
+                    .collect();
+            }
+        };
+        // A manual sync takes one of the outbound peer slots the resync loop
+        // uses, and wakes the loop when it gives the slot back.
+        let _slot = match Arc::clone(&self.outbound).acquire_owned().await {
+            Ok(permit) => OutboundSlot {
+                _permit: permit,
+                wake: self.resync_scheduler.notifier(),
+            },
+            Err(_) => {
+                let error = io::Error::other("outbound sync slots closed");
                 return topic_ids
                     .iter()
                     .map(|topic_id| (*topic_id, Err(clone_error(&error))))
@@ -4001,6 +4024,19 @@ impl SyncReadLimits {
     }
 }
 
+/// One outbound peer slot held by a manual sync. Releasing it wakes the resync
+/// loop, which may have parked with every slot taken.
+struct OutboundSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for OutboundSlot {
+    fn drop(&mut self) {
+        self.wake.notify_one();
+    }
+}
+
 /// Clears a loop's start latch when the loop task actually ends, including on
 /// abort, so a replacement loop can be started.
 struct LoopGuard<S: Storage> {
@@ -4040,14 +4076,22 @@ fn dispatch_due_resyncs<S: Storage>(
     if current.is_shutdown() || current.endpoint().is_closed() {
         return false;
     }
-    let free = MAX_RESYNC_PEER_CONCURRENCY.saturating_sub(syncs.len());
-    if free == 0 {
+    // Slots are taken before targets are claimed, so manual syncs holding
+    // slots leave nothing claimed that cannot run.
+    let mut slots = Vec::new();
+    while slots.len() < MAX_RESYNC_PEER_CONCURRENCY.saturating_sub(syncs.len()) {
+        match Arc::clone(&current.outbound).try_acquire_owned() {
+            Ok(slot) => slots.push(slot),
+            Err(_) => break,
+        }
+    }
+    if slots.is_empty() {
         return true;
     }
     let due = current
         .resync_scheduler
-        .due_targets_by_peer(free, MAX_TOPICS_PER_RESYNC_BATCH);
-    for (peer_id, targets) in due {
+        .due_targets_by_peer(slots.len(), MAX_TOPICS_PER_RESYNC_BATCH);
+    for ((peer_id, targets), slot) in due.into_iter().zip(slots) {
         // The lease owns the claims before the task is spawned, so an abort
         // releases them instead of wedging the targets in flight.
         let lease = current
@@ -4057,6 +4101,7 @@ fn dispatch_due_resyncs<S: Storage>(
         let task = current.tasks.track();
         syncs.spawn(async move {
             let _task = task;
+            let _slot = slot;
             peer_net
                 .sync_peer_batch_with_runtime(peer_id, lease, runtime)
                 .await;
@@ -5188,6 +5233,63 @@ mod tests {
         );
 
         drop(release);
+        net.shutdown().await;
+    }
+
+    /// Manual syncs and resync batches share the outbound peer slots: with
+    /// every slot held the loop claims nothing, and a running manual sync holds
+    /// a slot the loop cannot use.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_shares_slots() {
+        use crate::tests::support::{Note, node};
+
+        let (net, _storage) = stale_net().await;
+        let remote = node(74).peer_id();
+        let topic_id = net
+            .node
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [remote].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+        let runtime = net.runtime_config();
+        let weak = Arc::downgrade(&net);
+        let mut syncs = tokio::task::JoinSet::new();
+
+        let held = Arc::clone(&net.outbound)
+            .acquire_many_owned(MAX_RESYNC_PEER_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        let manual = tokio::spawn({
+            let net = Arc::clone(&net);
+            async move { net.sync_peer_now(remote, topic_id).await }
+        });
+        net.schedule_resync(remote, topic_id);
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, runtime));
+        assert!(syncs.is_empty(), "the loop dispatched without a free slot");
+        assert!(
+            !manual.is_finished(),
+            "a manual sync ran without a free slot"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while net.outbound.available_permits() == MAX_RESYNC_PEER_CONCURRENCY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the manual sync never took a slot");
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, runtime));
+        assert!(syncs.len() < MAX_RESYNC_PEER_CONCURRENCY);
+        let _ = manual.await.unwrap();
+        syncs.abort_all();
+        while syncs.join_next().await.is_some() {}
+        assert_eq!(
+            net.outbound.available_permits(),
+            MAX_RESYNC_PEER_CONCURRENCY
+        );
         net.shutdown().await;
     }
 
