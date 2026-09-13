@@ -10,15 +10,15 @@ use crate::{
     TopicInfo,
 };
 
-use super::fjall_provisional::ADMITTED_BYTES;
+use super::fjall_provisional::{ACTIVATING, ADMITTED_BYTES};
 use super::{
-    AckCommit, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS, ObligationTarget, OpMeta,
-    PeerAck, ProvisionalTopic, SnapshotRead, StagedTopic, StagingLimits, Storage, StorageCounters,
-    SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit,
-    ack_covers, ack_reached_op, apply_status_update, branch_matches, check_namespace,
-    ensure_deps_resolvable, journalled_eviction, merged_obligation, merged_peer_ack,
-    new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
-    topic_fingerprint_for, validate_batch, validate_heads,
+    AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
+    ObligationTarget, OpMeta, PeerAck, ProvisionalTopic, SnapshotRead, StagedTopic, StagingLimits,
+    Storage, StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState,
+    TopicView, ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches,
+    check_namespace, ensure_deps_resolvable, journalled_eviction, merged_obligation,
+    merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes, settled_obligation,
+    stored_ack_dominates, topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[cfg(feature = "fjall")]
@@ -696,6 +696,17 @@ impl FjallStorage {
             if current_topic_state.as_ref() != expected_topic_state.as_ref() {
                 return Err(Error::AdmissionConflict);
             }
+            // A fresh topic whose activation began holds copies of that history.
+            if expected_topic_state.is_none()
+                && fjall::Readable::contains_key(
+                    tx,
+                    &self.records,
+                    Self::key_id(ACTIVATING, &topic_id),
+                )?
+            {
+                return Err(Error::AdmissionConflict);
+            }
+
             let mut actor_tips = BTreeMap::new();
             let mut new_entries = Vec::new();
             let mut accounted_entries = BTreeSet::new();
@@ -1785,6 +1796,15 @@ impl Storage for FjallStorage {
 
     fn touch_provisional(&self, provisional: &ProvisionalTopic, now_ms: u64) -> Result<()> {
         self.touch_namespace(provisional, now_ms)
+    }
+
+    fn activate_provisional(
+        &self,
+        provisional: &ProvisionalTopic,
+        expected: &TopicState,
+        effects: AdmissionEffects,
+    ) -> Result<()> {
+        self.activate_namespace(provisional, expected, &effects)
     }
 
     fn discard_provisional(&self, provisional: &ProvisionalTopic) -> Result<bool> {

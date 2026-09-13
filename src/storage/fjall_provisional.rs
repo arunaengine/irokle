@@ -6,10 +6,12 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, OpId, PeerId, Result, TopicId};
+use crate::{ActorClock, Error, OpId, PeerId, Result, TopicId};
 
 use super::fjall::FjallStorage;
-use super::{ProvisionalTopic, check_namespaces};
+use super::{
+    AdmissionEffects, PeerAck, ProvisionalTopic, TopicState, ack_covers, check_namespaces,
+};
 
 type Tx = fjall::OptimisticWriteTx;
 type Records = fjall::OptimisticTxKeyspace;
@@ -20,6 +22,8 @@ const NAMESPACE: &[u8] = b"bn";
 const SLOT: &[u8] = b"bs";
 /// The durable session counter.
 const SESSIONS: &[u8] = b"bc";
+/// Activation in progress, `ba<topic>`: copies may sit in the active records.
+pub(super) const ACTIVATING: &[u8] = b"ba";
 /// Serialized bytes of ops admitted into a namespace keyspace.
 pub(super) const ADMITTED_BYTES: &[u8] = b"nb";
 /// Records one copy or clearing transaction moves.
@@ -46,6 +50,15 @@ fn namespace_key(source: &PeerId, topic_id: &TopicId) -> Vec<u8> {
 
 fn slot_key(slot: u32) -> Vec<u8> {
     [SLOT, &slot.to_be_bytes()].concat()
+}
+
+/// Whether a namespace key holds a record an active topic keeps: an op, its
+/// metadata, a child edge, an actor index or tip, or the topic's op index.
+fn copied_record(key: &[u8]) -> bool {
+    matches!(
+        (key.get(..1), key.get(..2), key.len()),
+        (Some(b"o" | b"m"), _, 33) | (_, Some(b"ch" | b"at" | b"to"), 66) | (_, Some(b"as"), 74)
+    )
 }
 
 impl FjallStorage {
@@ -224,6 +237,24 @@ impl FjallStorage {
         })
     }
 
+    /// The topic state a namespace keyspace holds, with its heads.
+    fn tx_namespace_state(
+        tx: &impl fjall::Readable,
+        records: &Records,
+        topic_id: &TopicId,
+    ) -> Result<Option<TopicState>> {
+        let heads: BTreeSet<OpId> =
+            Self::tx_get(tx, records, Self::key_id(b"h", topic_id))?.unwrap_or_default();
+        Ok(
+            Self::tx_get::<TopicState>(tx, records, Self::key_id(b"ts", topic_id))?.map(
+                |mut state| {
+                    state.heads = heads;
+                    state
+                },
+            ),
+        )
+    }
+
     /// End a namespace's session in `tx`: its record goes and its slot clears.
     fn tx_end_namespace(tx: &mut Tx, records: &Records, record: &NamespaceRecord) -> Result<()> {
         let provisional = &record.provisional;
@@ -261,5 +292,158 @@ impl FjallStorage {
             self.reclaim_slots()?;
         }
         Ok(ended)
+    }
+
+    pub(super) fn activate_namespace(
+        &self,
+        provisional: &ProvisionalTopic,
+        expected: &TopicState,
+        effects: &AdmissionEffects,
+    ) -> Result<()> {
+        if effects
+            .sync_obligations
+            .iter()
+            .any(|obligation| obligation.topic_id != provisional.topic_id)
+        {
+            return Err(Error::TopicMismatch);
+        }
+        let store = self.copy_namespace(provisional, expected)?;
+        self.finish_activation(provisional, &store, expected, effects)?;
+        self.reclaim_slots()
+    }
+
+    /// Mark the namespace activating and copy its records into the active
+    /// records in bounded transactions. Returns the namespace store.
+    fn copy_namespace(
+        &self,
+        provisional: &ProvisionalTopic,
+        expected: &TopicState,
+    ) -> Result<Self> {
+        let topic_id = provisional.topic_id;
+        let key = namespace_key(&provisional.source, &topic_id);
+        let record = self.transaction(|tx| {
+            let record = Self::tx_get::<NamespaceRecord>(tx, &self.records, key.as_slice())?
+                .filter(|record| record.provisional.session == provisional.session)
+                .ok_or(Error::StaleIncarnation)?;
+            if fjall::Readable::contains_key(tx, &self.records, Self::key_id(b"ts", &topic_id))? {
+                return Err(Error::AdmissionConflict);
+            }
+            // Checked before any copy, so a stale expectation leaves nothing behind.
+            let store = self.slot_store(record.slot)?;
+            if Self::tx_namespace_state(tx, &store.records, &topic_id)?.as_ref() != Some(expected) {
+                return Err(Error::AdmissionConflict);
+            }
+            if !record.provisional.activating {
+                let mut marked = record.clone();
+                marked.provisional.activating = true;
+                Self::tx_put(tx, &self.records, key.as_slice(), &marked)?;
+                Self::tx_put(
+                    tx,
+                    &self.records,
+                    Self::key_id(ACTIVATING, &topic_id),
+                    &provisional.session,
+                )?;
+            }
+            Ok(record)
+        })?;
+        let store = self.slot_store(record.slot)?;
+        // Copies stay invisible until the state record below names the topic.
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let (copied, last) = self.transaction(|tx| {
+                let mut copied = 0;
+                let mut last = None;
+                let start = after
+                    .clone()
+                    .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+                for item in fjall::Readable::range::<Vec<u8>, _>(
+                    tx,
+                    &store.records,
+                    (start, std::ops::Bound::Unbounded),
+                )
+                .take(CHUNK)
+                {
+                    let (key, value) = item.into_inner()?;
+                    copied += 1;
+                    if copied_record(&key) {
+                        tx.insert(&self.records, key.to_vec(), value);
+                    }
+                    last = Some(key.to_vec());
+                }
+                Ok((copied, last))
+            })?;
+            after = last.or(after);
+            if copied < CHUNK {
+                return Ok(store);
+            }
+        }
+    }
+
+    /// The one transaction that makes the copied history the active topic.
+    fn finish_activation(
+        &self,
+        provisional: &ProvisionalTopic,
+        store: &Self,
+        expected: &TopicState,
+        effects: &AdmissionEffects,
+    ) -> Result<()> {
+        let topic_id = provisional.topic_id;
+        let key = namespace_key(&provisional.source, &topic_id);
+        self.transaction(|tx| {
+            let current = Self::tx_get::<NamespaceRecord>(tx, &self.records, key.as_slice())?
+                .filter(|current| current.provisional.session == provisional.session)
+                .ok_or(Error::StaleIncarnation)?;
+            if fjall::Readable::contains_key(tx, &self.records, Self::key_id(b"ts", &topic_id))? {
+                return Err(Error::AdmissionConflict);
+            }
+            if Self::tx_namespace_state(tx, &store.records, &topic_id)?.as_ref() != Some(expected) {
+                return Err(Error::AdmissionConflict);
+            }
+            let heads: BTreeSet<OpId> =
+                Self::tx_get(tx, &store.records, Self::key_id(b"h", &topic_id))?
+                    .unwrap_or_default();
+            let clock: ActorClock =
+                Self::tx_get(tx, &store.records, Self::key_id(b"ac", &topic_id))?
+                    .unwrap_or_default();
+            let fingerprint: Option<[u8; 32]> =
+                Self::tx_get(tx, &store.records, Self::key_id(b"fp", &topic_id))?;
+            let generation: u64 = Self::tx_get(tx, &store.records, Self::key_id(b"mg", &topic_id))?
+                .unwrap_or_default();
+            tx.remove(&self.records, Self::key_id(ACTIVATING, &topic_id));
+            Self::tx_put(tx, &self.records, Self::key_id(b"ts", &topic_id), expected)?;
+            Self::tx_put(tx, &self.records, Self::key_id(b"h", &topic_id), &heads)?;
+            Self::tx_put(tx, &self.records, Self::key_id(b"ac", &topic_id), &clock)?;
+            if let Some(fingerprint) = fingerprint {
+                Self::tx_put(
+                    tx,
+                    &self.records,
+                    Self::key_id(b"fp", &topic_id),
+                    &fingerprint,
+                )?;
+            }
+            Self::tx_put(
+                tx,
+                &self.records,
+                Self::key_id(b"mg", &topic_id),
+                &generation,
+            )?;
+            for obligation in &effects.sync_obligations {
+                let ack: Option<PeerAck> = Self::tx_get(
+                    tx,
+                    &self.records,
+                    Self::ack_key(&topic_id, &obligation.peer_id),
+                )?;
+                if !ack_covers(ack.as_ref(), Some(expected.genesis), obligation) {
+                    Self::tx_put_obligation(tx, &self.records, obligation)?;
+                }
+            }
+            for other in Self::tx_namespaces(tx, &self.records)? {
+                if other.provisional.topic_id == topic_id {
+                    Self::tx_end_namespace(tx, &self.records, &other)?;
+                }
+            }
+            debug_assert!(current.provisional.activating);
+            Ok(())
+        })
     }
 }
