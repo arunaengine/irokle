@@ -42,7 +42,7 @@ const MAX_SYNC_MESSAGES_PER_STREAM: usize = 4096;
 // reply (which can echo up to two messages per topic) stays under its own cap.
 const MAX_BATCH_STREAM_MESSAGES: usize = MAX_SYNC_MESSAGES_PER_STREAM / 2;
 const MAX_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
-/// Bytes of the data pool of a net.
+/// Bytes of the data pool, and of the result pool, of a net.
 const MAX_INBOUND_FRAME_BYTES: usize = 256 * 1024 * 1024;
 /// Streams all served connections and embedders may handle at once.
 const MAX_SERVED_STREAMS: usize = 1024;
@@ -70,7 +70,7 @@ pub(crate) struct StreamLimits {
     pub(crate) messages: usize,
     /// Messages one batched request stream may carry.
     pub(crate) batch_messages: usize,
-    /// Bytes of the net's data pool.
+    /// Bytes of the net's data pool and of its result pool.
     pub(crate) inbound_bytes: usize,
     /// Bytes all served streams may retain until they reply.
     pub(crate) session_bytes: usize,
@@ -1785,11 +1785,37 @@ impl<S: Storage> IrohNet<S> {
         });
     }
 
+    /// Exchanges `messages` with `peer` over one stream. The call takes one of
+    /// the outbound peer slots manual and automatic syncs share, and the
+    /// responses stay charged to the result budget until they are dropped.
     pub async fn sync_with(
         &self,
         peer: iroh::EndpointAddr,
         messages: &[SyncMessage],
-    ) -> io::Result<Vec<SyncMessage>> {
+    ) -> io::Result<SyncResponses> {
+        let _task = self.tasks.enter()?;
+        let _slot = self.outbound_slot().await?;
+        self.exchange(peer, messages).await
+    }
+
+    /// One outbound peer slot. Giving it back wakes the resync loop.
+    async fn outbound_slot(&self) -> io::Result<OutboundSlot> {
+        let permit = Arc::clone(&self.outbound)
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("outbound sync slots closed"))?;
+        Ok(OutboundSlot {
+            _permit: permit,
+            wake: self.resync_scheduler.notifier(),
+        })
+    }
+
+    /// [`Self::sync_with`] for a caller that already holds an outbound slot.
+    async fn exchange(
+        &self,
+        peer: iroh::EndpointAddr,
+        messages: &[SyncMessage],
+    ) -> io::Result<SyncResponses> {
         let _task = self.tasks.enter()?;
         let mut last_error = None;
         for _ in 0..2 {
@@ -1825,13 +1851,14 @@ impl<S: Storage> IrohNet<S> {
         &self,
         connection: iroh::endpoint::Connection,
         messages: &[SyncMessage],
-    ) -> io::Result<Vec<SyncMessage>> {
+    ) -> io::Result<SyncResponses> {
         tokio::time::timeout(self.runtime.sync_io_timeout, async {
             let (mut send, mut recv) = connection.open_bi().await.map_err(other)?;
             self.outbound_streams.fetch_add(1, Ordering::Relaxed);
             let timeout = self.runtime.sync_io_timeout;
-            write_sync_messages(&mut send, messages, timeout, self.limits, None).await?;
-            read_sync_messages(&mut recv, timeout, self.limits).await
+            let budget = Some(&self.budget);
+            write_sync_messages(&mut send, messages, timeout, self.limits, budget).await?;
+            read_responses(&mut recv, timeout, self.limits, &self.budget).await
         })
         .await
         .map_err(|_| timed_out("sync exchange timed out"))?
@@ -1869,13 +1896,9 @@ impl<S: Storage> IrohNet<S> {
         };
         // A manual sync takes one of the outbound peer slots the resync loop
         // uses, and wakes the loop when it gives the slot back.
-        let _slot = match Arc::clone(&self.outbound).acquire_owned().await {
-            Ok(permit) => OutboundSlot {
-                _permit: permit,
-                wake: self.resync_scheduler.notifier(),
-            },
-            Err(_) => {
-                let error = io::Error::other("outbound sync slots closed");
+        let _slot = match self.outbound_slot().await {
+            Ok(slot) => slot,
+            Err(error) => {
                 return topic_ids
                     .iter()
                     .map(|topic_id| (*topic_id, Err(clone_error(&error))))
@@ -2285,7 +2308,7 @@ impl<S: Storage> IrohNet<S> {
         if fingerprints.is_empty() {
             return BatchOutcomes::new(outcomes, advanced, settled);
         }
-        let responses = match self.sync_with(peer.clone(), &request).await {
+        let responses = match self.exchange(peer.clone(), &request).await {
             Ok(responses) => responses,
             Err(error) => {
                 for topic_id in fingerprints.keys() {
@@ -2900,8 +2923,8 @@ impl<S: Storage> IrohNet<S> {
             }
             messages.extend(planned.messages);
         }
-        let responses = match self.sync_with(peer.clone(), &messages).await {
-            Ok(responses) => responses,
+        let (responses, charge) = match self.exchange(peer.clone(), &messages).await {
+            Ok(responses) => responses.into_parts(),
             Err(error) => {
                 fail_group(outcomes, &error);
                 return;
@@ -2915,6 +2938,7 @@ impl<S: Storage> IrohNet<S> {
             .collect::<BTreeMap<_, _>>();
         let replies = self
             .run_job(Lane::Bulk, move |shared| {
+                let _charge = charge;
                 shared.batch_replies(
                     remote_peer_id,
                     &topics,
@@ -3085,7 +3109,7 @@ impl<S: Storage> IrohNet<S> {
                 })
                 .collect::<BTreeSet<_>>();
             let mut acks = Vec::new();
-            match self.sync_with(peer.clone(), &messages).await {
+            match self.exchange(peer.clone(), &messages).await {
                 Ok(responses) => {
                     for response in responses {
                         match response {
@@ -4492,8 +4516,8 @@ impl<S: Storage> Drop for IrohNet<S> {
     }
 }
 
-/// Replies of one embedded stream, charged to the net's byte budget until
-/// this value, or the iterator it turns into, is dropped.
+/// Messages of one exchange or embedded stream, charged to the net's byte
+/// budget until this value, or the iterator it turns into, is dropped.
 pub struct SyncResponses {
     messages: Vec<SyncMessage>,
     charges: Vec<Charge>,
@@ -4514,6 +4538,10 @@ impl SyncResponses {
 
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty()
+    }
+
+    fn into_parts(self) -> (Vec<SyncMessage>, Vec<Charge>) {
+        (self.messages, self.charges)
     }
 }
 
@@ -4548,18 +4576,47 @@ impl Iterator for SyncResponsesIter {
     }
 }
 
-async fn read_sync_messages(
+/// Reads the responses of an exchange, charging each frame to the result pool
+/// before it is allocated. Only the first frame may wait: waiting while this
+/// exchange holds result bytes could wait on itself, so a later frame that
+/// finds the pool full fails the exchange.
+async fn read_responses(
     recv: &mut iroh::endpoint::RecvStream,
     sync_io_timeout: Duration,
     stream_limits: StreamLimits,
-) -> io::Result<Vec<SyncMessage>> {
+    budget: &Arc<ByteBudget>,
+) -> io::Result<SyncResponses> {
     let mut messages = Vec::new();
+    let mut held: Option<Charge> = None;
     let mut limits = SyncReadLimits::new(stream_limits);
     while let Some((len, tag)) = read_frame_head(recv, sync_io_timeout).await? {
         let frame_index = limits.observe_frame(len)?;
-        messages.push(read_frame_body(recv, len, tag, sync_io_timeout, frame_index).await?);
+        let data = tag == DATA_TAG;
+        let bytes = ByteBudget::frame_charge(len, data);
+        let mut charge = match held {
+            None => {
+                budget
+                    .wait(Pool::Results, bytes, OwnedClass::Results)
+                    .await?
+            }
+            Some(_) => budget.try_take(Pool::Results, bytes, OwnedClass::Results)?,
+        };
+        let message = read_frame_body(recv, len, tag, sync_io_timeout, frame_index).await?;
+        let ops = match &message {
+            SyncMessage::Data(data) => data.ops.len(),
+            _ => 0,
+        };
+        charge.shrink(ByteBudget::decoded_bound(len, ops));
+        match &mut held {
+            Some(held) => held.merge(charge),
+            None => held = Some(charge),
+        }
+        messages.push(message);
     }
-    Ok(messages)
+    Ok(SyncResponses {
+        messages,
+        charges: held.into_iter().collect(),
+    })
 }
 
 /// Writes `messages` as frames. With a `budget`, each encoding buffer is

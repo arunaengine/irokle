@@ -42,6 +42,8 @@ pub enum OwnedClass {
     Session,
     /// Planned reply pages and encoding buffers, until written.
     Output,
+    /// Responses of requester exchanges, until the caller drops them.
+    Results,
 }
 
 /// Owned bytes by class, now and at their highest, and running storage jobs.
@@ -60,6 +62,7 @@ pub(super) enum Pool {
     Data,
     Control,
     Session,
+    Results,
 }
 
 /// Node-wide byte pools and their counters.
@@ -67,6 +70,7 @@ pub(super) struct ByteBudget {
     data: Arc<Semaphore>,
     control: Arc<Semaphore>,
     session: Arc<Semaphore>,
+    results: Arc<Semaphore>,
     capacity: usize,
     session_capacity: usize,
     counters: Mutex<OwnedBytes>,
@@ -83,7 +87,7 @@ pub(super) struct Charge {
 pub(super) struct JobCount(Arc<ByteBudget>);
 
 impl ByteBudget {
-    /// Pools of `data_bytes` for data and `session_bytes` for
+    /// Pools of `data_bytes` for data and results and `session_bytes` for
     /// sessions. The data pool always fits a largest frame and half of it a
     /// largest page, so no single charge can wait forever.
     pub(super) fn new(data_bytes: usize, session_bytes: usize) -> Arc<Self> {
@@ -96,6 +100,7 @@ impl ByteBudget {
             data: Arc::new(Semaphore::new(capacity)),
             control: Arc::new(Semaphore::new(CONTROL_POOL_BYTES)),
             session: Arc::new(Semaphore::new(session_capacity)),
+            results: Arc::new(Semaphore::new(capacity)),
             capacity,
             session_capacity,
             counters: Mutex::default(),
@@ -149,6 +154,7 @@ impl ByteBudget {
             Pool::Data => (&self.data, self.capacity),
             Pool::Control => (&self.control, CONTROL_POOL_BYTES),
             Pool::Session => (&self.session, self.session_capacity),
+            Pool::Results => (&self.results, self.capacity),
         }
     }
 
@@ -233,7 +239,7 @@ impl ByteBudget {
 
     /// Refuse every waiting and later charge. Held charges stay until dropped.
     pub(super) fn close(&self) {
-        for semaphore in [&self.data, &self.control, &self.session] {
+        for semaphore in [&self.data, &self.control, &self.session, &self.results] {
             semaphore.close();
         }
     }
@@ -306,6 +312,7 @@ fn closed() -> io::Error {
 fn full(pool: Pool) -> io::Error {
     let message = match pool {
         Pool::Session => "sync stream retains more than the free session budget",
+        Pool::Results => "sync response exceeds the free result budget",
         Pool::Data | Pool::Control => "sync message exceeds the free byte budget",
     };
     io::Error::new(io::ErrorKind::OutOfMemory, message)

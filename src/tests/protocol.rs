@@ -190,11 +190,12 @@ async fn small_windows_complete() {
     messages.extend(push(topic_id, pushed.clone()));
     let started = Instant::now();
     let replies = bob.net.sync_with(alice_addr, &messages).await.unwrap();
+    let replies = replies.messages();
     assert!(started.elapsed() < timeout / 4, "{:?}", started.elapsed());
 
-    assert!(acked(&replies, topic_id));
-    assert_eq!(page_more(&replies, topic_id), Some(false));
-    let served = data_ids(&replies, topic_id);
+    assert!(acked(replies, topic_id));
+    assert_eq!(page_more(replies, topic_id), Some(false));
+    let served = data_ids(replies, topic_id);
     let expected = owned[1..].iter().map(|op| op.id).collect::<Vec<_>>();
     assert_eq!(served, expected);
     let stored = alice.node.storage().list_op_ids(&topic_id).unwrap();
@@ -235,14 +236,15 @@ async fn aggregate_budget_continues() {
         .sync_with(alice_addr.clone(), &messages)
         .await
         .unwrap();
+    let replies = replies.messages();
     let mut continued = 0;
     for topic_id in &topics {
         assert!(
-            acked(&replies, *topic_id),
+            acked(replies, *topic_id),
             "every pushed topic keeps its ack"
         );
-        let more = page_more(&replies, *topic_id).expect("page result");
-        assert!(more || !data_ids(&replies, *topic_id).is_empty());
+        let more = page_more(replies, *topic_id).expect("page result");
+        assert!(more || !data_ids(replies, *topic_id).is_empty());
         continued += usize::from(more);
     }
     assert!(continued > 0, "the replies must exceed the stream budget");
