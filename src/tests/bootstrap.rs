@@ -555,3 +555,37 @@ fn fjall_replaced_branch() {
     let dir = tempfile::tempdir().unwrap();
     replaced_branch(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
+
+/// The tested bootstrap bound: one staging session holds at most
+/// `MAX_STAGED_OPS_PER_SESSION` ops. A call past it stores nothing, and the
+/// topic stays invisible until a promotion.
+fn staging_op_bound<S: Storage>(storage: S) {
+    use crate::storage::MAX_STAGED_OPS_PER_SESSION;
+    let topic_id = TopicId::hash(b"staging-op-bound");
+    let source = PeerId::hash(b"staging-op-bound-source");
+    let ops = (1..=MAX_STAGED_OPS_PER_SESSION + 1)
+        .map(|seq| stub_op(topic_id, seq, 1))
+        .collect::<Vec<_>>();
+    for chunk in ops[..MAX_STAGED_OPS_PER_SESSION as usize].chunks(8192) {
+        storage
+            .stage_bootstrap_ops(source, topic_id, chunk.to_vec(), 10)
+            .unwrap();
+    }
+    let over = storage.stage_bootstrap_ops(source, topic_id, ops[ops.len() - 1..].to_vec(), 10);
+    assert!(matches!(over, Err(Error::Storage(_))), "{over:?}");
+    let staged = storage.staged_topic(&source, &topic_id).unwrap();
+    assert_eq!(staged.ops, MAX_STAGED_OPS_PER_SESSION);
+    assert!(storage.topic_state(&topic_id).unwrap().is_none());
+}
+
+#[test]
+fn memory_staging_op_bound() {
+    staging_op_bound(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_staging_op_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    staging_op_bound(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
