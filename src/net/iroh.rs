@@ -11,13 +11,12 @@ use crate::{Irokle, MemoryStorage, PeerId, ReceiveOutcome, Storage, TopicEvictio
 
 use super::frame::{MAX_FRAME_LEN, MAX_SYNC_DATA_OPS_PER_MESSAGE};
 use super::{
-    _message_type_name, IROKLE_SYNC_ALPN, decode_sync_message, encode_frame, encode_sync_message,
-    invalid_data,
+    _message_type_name, IROKLE_SYNC_ALPN, decode_sync_message, encode_sync_message, invalid_data,
 };
 
 mod budget;
 
-use budget::{ByteBudget, DATA_TAG};
+use budget::{ByteBudget, Charge, DATA_TAG, Pool};
 pub use budget::{OwnedBytes, OwnedClass};
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,6 +44,8 @@ const MAX_BATCH_STREAM_MESSAGES: usize = MAX_SYNC_MESSAGES_PER_STREAM / 2;
 const MAX_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
 /// Bytes of the data pool of a net.
 const MAX_INBOUND_FRAME_BYTES: usize = 256 * 1024 * 1024;
+/// Streams all served connections and embedders may handle at once.
+const MAX_SERVED_STREAMS: usize = 1024;
 /// Delay before a topic that advanced but still owes work is served again. It
 /// is due at once but behind every target that became due earlier, so other
 /// work takes its turn first and an idle queue continues immediately.
@@ -71,6 +72,8 @@ pub(crate) struct StreamLimits {
     pub(crate) batch_messages: usize,
     /// Bytes of the net's data pool.
     pub(crate) inbound_bytes: usize,
+    /// Bytes all served streams may retain until they reply.
+    pub(crate) session_bytes: usize,
 }
 
 impl Default for StreamLimits {
@@ -80,6 +83,7 @@ impl Default for StreamLimits {
             messages: MAX_SYNC_MESSAGES_PER_STREAM,
             batch_messages: MAX_BATCH_STREAM_MESSAGES,
             inbound_bytes: MAX_INBOUND_FRAME_BYTES,
+            session_bytes: budget::SESSION_POOL_BYTES,
         }
     }
 }
@@ -866,6 +870,7 @@ pub struct SharedNet<S: Storage> {
     budget: Arc<ByteBudget>,
     /// Outbound peer attempts, automatic batches and manual syncs alike.
     outbound: Arc<tokio::sync::Semaphore>,
+    served: Arc<tokio::sync::Semaphore>,
     receipts: Mutex<ReceiptLog>,
     shutdown: tokio::sync::watch::Sender<bool>,
     tasks: Arc<TaskTracker>,
@@ -965,8 +970,9 @@ impl<S: Storage> IrohNet<S> {
                 runtime,
                 resync_scheduler: ResyncScheduler::default(),
                 limits: StreamLimits::default(),
-                budget: ByteBudget::new(MAX_INBOUND_FRAME_BYTES),
+                budget: ByteBudget::new(MAX_INBOUND_FRAME_BYTES, budget::SESSION_POOL_BYTES),
                 outbound: Arc::new(tokio::sync::Semaphore::new(MAX_RESYNC_PEER_CONCURRENCY)),
+                served: Arc::new(tokio::sync::Semaphore::new(MAX_SERVED_STREAMS)),
                 receipts: Mutex::default(),
                 shutdown,
                 tasks: Arc::default(),
@@ -985,7 +991,7 @@ impl<S: Storage> IrohNet<S> {
         let shared =
             Arc::get_mut(&mut self.shared).expect("limits are set before the net is shared");
         shared.limits = limits;
-        shared.budget = ByteBudget::new(limits.inbound_bytes);
+        shared.budget = ByteBudget::new(limits.inbound_bytes, limits.session_bytes);
         self
     }
 
@@ -1824,7 +1830,7 @@ impl<S: Storage> IrohNet<S> {
             let (mut send, mut recv) = connection.open_bi().await.map_err(other)?;
             self.outbound_streams.fetch_add(1, Ordering::Relaxed);
             let timeout = self.runtime.sync_io_timeout;
-            write_sync_messages(&mut send, messages, timeout, self.limits).await?;
+            write_sync_messages(&mut send, messages, timeout, self.limits, None).await?;
             read_sync_messages(&mut recv, timeout, self.limits).await
         })
         .await
@@ -3454,10 +3460,14 @@ impl<S: Storage> IrohNet<S> {
         mut send: iroh::endpoint::SendStream,
     ) -> io::Result<()> {
         let _task = self.tasks.enter()?;
-        tokio::time::timeout(self.runtime.sync_io_timeout, async {
+        let timeout = self.runtime.sync_io_timeout;
+        tokio::time::timeout(timeout, async {
+            let _served = Arc::clone(&self.served)
+                .acquire_owned()
+                .await
+                .map_err(|_| io::Error::other("served sync streams closed"))?;
             let mut session = SyncSession::new(peer);
             let mut limits = SyncReadLimits::new(self.limits);
-            let timeout = self.runtime.sync_io_timeout;
             while let Some((len, tag)) = read_frame_head(&mut recv, timeout).await? {
                 let frame_index = limits.observe_frame(len)?;
                 let data = tag == DATA_TAG;
@@ -3475,7 +3485,9 @@ impl<S: Storage> IrohNet<S> {
                 (session, handled) = self
                     .run_job(lane, move |shared| {
                         let _charge = charge;
-                        let handled = session.handle(shared, message);
+                        let handled = session
+                            .handle(shared, message)
+                            .and_then(|()| session.hold(&shared.budget));
                         (session, handled)
                     })
                     .await?;
@@ -3486,11 +3498,34 @@ impl<S: Storage> IrohNet<S> {
             } else {
                 Lane::Bulk
             };
-            let responses = self
-                .run_job(lane, move |shared| session.finish(shared))
-                .await??;
-            let timeout = self.runtime.sync_io_timeout;
-            write_sync_messages(&mut send, &responses, timeout, self.limits).await?;
+            // Pages are granted before planning; this stream holds no data bytes now.
+            let grant = match session.pages_bound(self.limits) {
+                0 => None,
+                pages => {
+                    let bytes = self.budget.output_bound(pages);
+                    Some(
+                        self.budget
+                            .wait(Pool::Data, bytes, OwnedClass::Output)
+                            .await?,
+                    )
+                }
+            };
+            let (responses, held, grant) = self
+                .run_job(lane, move |shared| {
+                    let mut grant = grant;
+                    let granted = grant.as_ref().map_or(0, Charge::bytes);
+                    let responses = session.finish(shared, ByteBudget::page_bytes(granted));
+                    if let (Ok((_, used)), Some(grant)) = (&responses, &mut grant) {
+                        grant.shrink(granted - ByteBudget::page_bytes(granted) + used);
+                    }
+                    (responses, session.charge.take(), grant)
+                })
+                .await?;
+            let (responses, _) = responses?;
+            // Retained messages stay charged until the reply carrying them is out.
+            let budget = grant.is_none().then_some(&self.budget);
+            write_sync_messages(&mut send, &responses, timeout, self.limits, budget).await?;
+            drop((held, grant));
             Ok(())
         })
         .await
@@ -3499,17 +3534,41 @@ impl<S: Storage> IrohNet<S> {
 }
 
 impl<S: Storage> SharedNet<S> {
+    /// Serve the messages of one stream an embedder read. It is admitted and
+    /// charged like a served stream, but never waits: a full slot or pool fails
+    /// the call. The reply stays charged until it is dropped.
     pub fn handle_messages(
         &self,
         peer: iroh::EndpointId,
         messages: Vec<SyncMessage>,
-    ) -> io::Result<Vec<SyncMessage>> {
+    ) -> io::Result<SyncResponses> {
         let _task = self.tasks.enter()?;
+        let _served = Arc::clone(&self.served).try_acquire_owned().map_err(|_| {
+            io::Error::new(io::ErrorKind::WouldBlock, "served sync streams are full")
+        })?;
         let mut session = SyncSession::new(peer);
         for message in messages {
             session.handle(self, message)?;
+            session.hold(&self.budget)?;
         }
-        session.finish(self)
+        let mut charges = Vec::new();
+        let pages = session.pages_bound(self.limits);
+        let granted = if pages == 0 {
+            0
+        } else {
+            let bytes = self.budget.output_bound(pages);
+            charges.push(
+                self.budget
+                    .try_take(Pool::Data, bytes, OwnedClass::Output)?,
+            );
+            bytes
+        };
+        let (messages, used) = session.finish(self, ByteBudget::page_bytes(granted))?;
+        if let Some(grant) = charges.first_mut() {
+            grant.shrink(used);
+        }
+        charges.extend(session.charge.take());
+        Ok(SyncResponses { messages, charges })
     }
 
     fn full_sweep_resync_targets(&self) -> io::Result<BTreeSet<(PeerId, crate::TopicId)>> {
@@ -3874,6 +3933,9 @@ struct SyncSession {
     receipts: BTreeMap<crate::TopicId, crate::sync::SyncReceipt>,
     /// Requests to serve once the whole stream is read, latest per topic.
     requests: BTreeMap<crate::TopicId, crate::sync::SyncRequest>,
+    /// Bytes every message kept above may hold, never decreased.
+    retained: usize,
+    charge: Option<Charge>,
 }
 
 impl SyncSession {
@@ -3888,7 +3950,39 @@ impl SyncSession {
             replies: BTreeMap::new(),
             receipts: BTreeMap::new(),
             requests: BTreeMap::new(),
+            retained: 0,
+            charge: None,
         }
+    }
+
+    fn retain(&mut self, message: &SyncMessage) -> io::Result<()> {
+        let held = ByteBudget::held_bound(super::framed_message_len(message)?);
+        self.retained = self.retained.saturating_add(held);
+        Ok(())
+    }
+
+    /// Charge what the session retains. Growth never waits, since the stream
+    /// already holds session bytes; a full pool fails the stream instead.
+    fn hold(&mut self, budget: &Arc<ByteBudget>) -> io::Result<()> {
+        let held = self.charge.as_ref().map_or(0, Charge::bytes);
+        if self.retained <= held {
+            return Ok(());
+        }
+        let added = budget.try_take(Pool::Session, self.retained - held, OwnedClass::Session)?;
+        match &mut self.charge {
+            Some(charge) => charge.merge(added),
+            None => self.charge = Some(added),
+        }
+        Ok(())
+    }
+
+    /// Bytes the pages of every request may hold, at most their credits.
+    fn pages_bound(&self, limits: StreamLimits) -> usize {
+        self.requests.values().fold(0, |bytes: usize, request| {
+            let budget = crate::sync::PageBudget::from_credit(request.credit);
+            let page = ByteBudget::page_bound(budget.bytes.min(limits.bytes), budget.ops);
+            bytes.saturating_add(page)
+        })
     }
 
     fn handle<S: Storage>(&mut self, net: &SharedNet<S>, message: SyncMessage) -> io::Result<()> {
@@ -3933,13 +4027,17 @@ impl SyncSession {
         }
 
         if !self.open_allowed {
-            self.controls
-                .push(SyncMessage::Failure(crate::sync::SyncFailure {
-                    topic_id: message_topic_id(&message)
-                        .ok_or_else(|| invalid_data("sync message requires a topic"))?,
-                    code: crate::sync::SyncFailureCode::Open,
-                }));
+            let failure = SyncMessage::Failure(crate::sync::SyncFailure {
+                topic_id: message_topic_id(&message)
+                    .ok_or_else(|| invalid_data("sync message requires a topic"))?,
+                code: crate::sync::SyncFailureCode::Open,
+            });
+            self.retain(&failure)?;
+            self.controls.push(failure);
             return Ok(());
+        }
+        if matches!(message, SyncMessage::Ack(_) | SyncMessage::Request(_)) {
+            self.retain(&message)?;
         }
 
         match message {
@@ -3972,7 +4070,9 @@ impl SyncSession {
                     Err(error) => {
                         let failure = failure.ok_or(error)?;
                         tracing::warn!(topic_id = %failure.topic_id, "failing one sync topic");
-                        self.controls.push(SyncMessage::Failure(failure));
+                        let failure = SyncMessage::Failure(failure);
+                        self.retain(&failure)?;
+                        self.controls.push(failure);
                         Ok(())
                     }
                 }
@@ -3982,6 +4082,7 @@ impl SyncSession {
 
     /// Queue one reply, folding acks and receipts of a topic into the newest.
     fn keep_reply<S: Storage>(&mut self, net: &SharedNet<S>, reply: SyncMessage) -> io::Result<()> {
+        self.retain(&reply)?;
         let mut ack = match reply {
             SyncMessage::Ack(ack) => ack,
             SyncMessage::Receipt(receipt) => {
@@ -4005,8 +4106,13 @@ impl SyncSession {
 
     /// Apply the stream's acks independently, then reply: every control first,
     /// then one bounded page per request, sharing what is left of the stream
-    /// budget among the requests still to serve.
-    fn finish<S: Storage>(&mut self, net: &SharedNet<S>) -> io::Result<Vec<SyncMessage>> {
+    /// budget among the requests still to serve. Pages hold at most `granted`
+    /// bytes; the bytes they hold are returned with the reply.
+    fn finish<S: Storage>(
+        &mut self,
+        net: &SharedNet<S>,
+        granted: usize,
+    ) -> io::Result<(Vec<SyncMessage>, usize)> {
         let mut responses = std::mem::take(&mut self.controls);
         responses.extend(self.apply_acks(net)?);
         responses.extend(
@@ -4021,7 +4127,7 @@ impl SyncSession {
         );
         let requests = std::mem::take(&mut self.requests);
         let Some(peer_id) = self.remote_peer_id else {
-            return Ok(responses);
+            return Ok((responses, 0));
         };
         let page_len = super::framed_message_len(&SyncMessage::Page(crate::sync::SyncPage {
             topic_id: crate::TopicId::default(),
@@ -4041,6 +4147,7 @@ impl SyncSession {
         // page result per request left. A request whose next op does not fit
         // its share is served again from what every other request left over.
         let mut left = requests.len();
+        let mut held = 0_usize;
         let mut queue = requests.into_iter().collect::<Vec<_>>();
         let mut deferred = Vec::new();
         for pass in [false, true] {
@@ -4057,6 +4164,13 @@ impl SyncSession {
                 budget.ops = budget
                     .ops
                     .min(share_messages.saturating_mul(MAX_SYNC_DATA_OPS_PER_MESSAGE));
+                // What is left of the output grant bounds decoded pages too.
+                let grant_left = granted.saturating_sub(held);
+                budget.ops = budget.ops.min(grant_left / (2 * size_of::<crate::Op>()));
+                let ops_bytes = ByteBudget::page_bound(0, budget.ops);
+                budget.bytes = budget
+                    .bytes
+                    .min(grant_left.saturating_sub(ops_bytes) / budget::DECODED_FACTOR);
                 let page = match net.node.response_page(peer_id, &request, budget) {
                     Ok(page) => page,
                     Err(error) => {
@@ -4076,6 +4190,11 @@ impl SyncSession {
                 }
                 bytes += data.bytes;
                 messages += data.messages.len();
+                let ops = data.messages.iter().fold(0, |ops, message| match message {
+                    SyncMessage::Data(data) => ops + data.ops.len(),
+                    _ => ops,
+                });
+                held = held.saturating_add(ByteBudget::page_bound(data.bytes, ops));
                 responses.extend(data.messages);
                 // Missing ids are advisory: they take only bytes no share needs.
                 let mut result = crate::sync::SyncPage {
@@ -4091,11 +4210,12 @@ impl SyncSession {
                         super::framed_message_len(&SyncMessage::Page(result.clone()))? - page_len;
                 }
                 bytes += extra;
+                held = held.saturating_add(ByteBudget::page_bound(page_len + extra, 0));
                 responses.push(SyncMessage::Page(result));
             }
         }
         reply_fits(&responses, limits)?;
-        Ok(responses)
+        Ok((responses, held))
     }
 
     /// One rejected ack, a stale clock after a reset or one bound to another
@@ -4372,6 +4492,62 @@ impl<S: Storage> Drop for IrohNet<S> {
     }
 }
 
+/// Replies of one embedded stream, charged to the net's byte budget until
+/// this value, or the iterator it turns into, is dropped.
+pub struct SyncResponses {
+    messages: Vec<SyncMessage>,
+    charges: Vec<Charge>,
+}
+
+impl SyncResponses {
+    pub fn messages(&self) -> &[SyncMessage] {
+        &self.messages
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, SyncMessage> {
+        self.messages.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+}
+
+impl IntoIterator for SyncResponses {
+    type Item = SyncMessage;
+    type IntoIter = SyncResponsesIter;
+
+    fn into_iter(self) -> SyncResponsesIter {
+        SyncResponsesIter {
+            messages: self.messages.into_iter(),
+            _charges: self.charges,
+        }
+    }
+}
+
+/// Owned messages of one exchange or embedded stream. The charge of all of
+/// them is released when the iterator is dropped.
+pub struct SyncResponsesIter {
+    messages: std::vec::IntoIter<SyncMessage>,
+    _charges: Vec<Charge>,
+}
+
+impl Iterator for SyncResponsesIter {
+    type Item = SyncMessage;
+
+    fn next(&mut self) -> Option<SyncMessage> {
+        self.messages.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.messages.size_hint()
+    }
+}
+
 async fn read_sync_messages(
     recv: &mut iroh::endpoint::RecvStream,
     sync_io_timeout: Duration,
@@ -4386,20 +4562,37 @@ async fn read_sync_messages(
     Ok(messages)
 }
 
+/// Writes `messages` as frames. With a `budget`, each encoding buffer is
+/// charged while it exists; a served reply with an output grant passes none.
 async fn write_sync_messages(
     send: &mut iroh::endpoint::SendStream,
     messages: &[SyncMessage],
     sync_io_timeout: Duration,
     stream_limits: StreamLimits,
+    budget: Option<&Arc<ByteBudget>>,
 ) -> io::Result<()> {
     reply_fits(messages, stream_limits)?;
     for message in messages {
+        let _encoding = match budget {
+            Some(budget) => {
+                let len = super::framed_message_len(message)?;
+                let pool = ByteBudget::frame_pool(len, matches!(message, SyncMessage::Data(_)));
+                Some(budget.wait(pool, len, OwnedClass::Output).await?)
+            }
+            None => None,
+        };
         let payload = encode_sync_message(message)?;
-        let frame = encode_frame(&payload)?;
-        tokio::time::timeout(sync_io_timeout, send.write_all(&frame))
-            .await
-            .map_err(|_| timed_out("sync write timed out"))?
-            .map_err(other)?;
+        if payload.len() > MAX_FRAME_LEN {
+            return Err(invalid_data("sync frame exceeds maximum length"));
+        }
+        let prefix = (payload.len() as u32).to_be_bytes();
+        tokio::time::timeout(sync_io_timeout, async {
+            send.write_all(&prefix).await?;
+            send.write_all(&payload).await
+        })
+        .await
+        .map_err(|_| timed_out("sync write timed out"))?
+        .map_err(other)?;
     }
     send.finish().map_err(other)
 }
@@ -5113,7 +5306,7 @@ mod tests {
         .expect("control work waited behind bulk work")
         .unwrap()
         .unwrap();
-        assert!(matches!(&replies[..], [SyncMessage::Summary(_)]));
+        assert!(matches!(replies.messages(), [SyncMessage::Summary(_)]));
         assert!(
             !gate.has_left(),
             "control work finished only after bulk work"

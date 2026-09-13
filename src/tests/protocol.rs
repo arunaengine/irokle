@@ -280,6 +280,8 @@ fn serve_stream(alice: &Peer, bob: &Peer, messages: Vec<SyncMessage>) -> Vec<Syn
         .net
         .handle_messages(bob.net.endpoint().id(), messages)
         .unwrap()
+        .into_iter()
+        .collect()
 }
 
 /// Controls that fill the message budget exactly leave no room for data, but
@@ -630,10 +632,10 @@ async fn serve_within(
         .unwrap();
     assert!(replies.len() <= limits.messages);
     let result = (
-        data_ids(&replies, topic_id),
+        data_ids(replies.messages(), topic_id),
         ops,
-        page_more(&replies, topic_id),
-        framed_bytes(&replies),
+        page_more(replies.messages(), topic_id),
+        framed_bytes(replies.messages()),
         limits.bytes,
     );
     alice_net.shutdown().await;

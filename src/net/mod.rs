@@ -22,7 +22,10 @@ pub use frame::{
 #[cfg(all(feature = "iroh", test))]
 pub(crate) use iroh::StreamLimits;
 #[cfg(feature = "iroh")]
-pub use iroh::{IrohNet, IrohRuntimeConfig, OwnedBytes, OwnedClass, ShutdownOutcome};
+pub use iroh::{
+    IrohNet, IrohRuntimeConfig, OwnedBytes, OwnedClass, ShutdownOutcome, SyncResponses,
+    SyncResponsesIter,
+};
 
 #[cfg(test)]
 pub(crate) fn sync_data_messages(topic_id: TopicId, ops: Vec<Op>) -> io::Result<Vec<SyncMessage>> {

@@ -1175,7 +1175,7 @@ async fn equal_fingerprint_repairs() {
         )
         .unwrap();
     assert!(matches!(
-        responses.last(),
+        responses.messages().last(),
         Some(sync::SyncMessage::Summary(_))
     ));
 
