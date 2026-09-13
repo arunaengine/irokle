@@ -375,12 +375,9 @@ impl<S: Storage> SyncEngine<S> {
         send_set: SendSet,
         more: &mut bool,
     ) -> Result<SyncPlan> {
-        // If we don't know this topic locally, the remote's heads are
-        // unauthenticated claims. We must not surface them as `need`
-        // because that would let a peer inflate our request set for a topic
-        // we can't even validate. Bootstrap for a new member happens when the
-        // inviter pushes the genesis (and reachable history) via SyncData;
-        // until then we have nothing to negotiate.
+        // An unknown topic's remote heads are unauthenticated, so they never become
+        // `need`. Bootstrap stages pages the inviter pushes or the transport pulls
+        // with range hints, which the responder clamps and serves to members only.
         let Some(state) = self.oplog.storage().topic_state(&remote.topic_id)? else {
             return Ok(SyncPlan {
                 topic_id: remote.topic_id,

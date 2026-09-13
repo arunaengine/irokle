@@ -1749,6 +1749,58 @@ async fn bootstrap_spans_pages() {
     bob.shutdown_iroh().await;
 }
 
+/// A member invited after the history pulls the topic it does not hold, page
+/// by page. A topic neither side holds leaves nothing to do.
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invited_pulls_topic() {
+    let (alice, alice_net, bob, _) = bootstrap_pair(true).await;
+    alice_net.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice_net.endpoint()).await;
+    let nowhere = TopicId::hash("pull-nowhere");
+    bob.sync_addr_now(alice_addr.clone(), nowhere)
+        .await
+        .unwrap();
+    assert!(bob.storage().topic_state(&nowhere).unwrap().is_none());
+
+    let (topic_id, _) = invite_last(&alice, bob.peer_id(), 4200);
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        assert!(attempts <= 8, "pull did not finish");
+        match bob.sync_addr_now(alice_addr.clone(), topic_id).await {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("pull failed: {error}"),
+        }
+    }
+    assert_bootstrapped(&alice, &bob, topic_id);
+    alice_net.shutdown().await;
+    bob.shutdown_iroh().await;
+}
+
+/// A source outside the whitelist is never asked for a topic this node lacks.
+#[cfg(feature = "iroh")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlisted_never_pulls() {
+    let (alice, alice_net, bob, _) = bootstrap_pair(false).await;
+    alice_net.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice_net.endpoint()).await;
+    let (topic_id, _) = invite_last(&alice, bob.peer_id(), 3);
+
+    let error = bob.sync_addr_now(alice_addr, topic_id).await.unwrap_err();
+    assert!(error.to_string().contains("whitelist"), "{error}");
+    assert!(bob.storage().topic_state(&topic_id).unwrap().is_none());
+    assert!(
+        bob.storage()
+            .staged_bootstrap_ops(&alice.peer_id(), &topic_id)
+            .unwrap()
+            .is_empty()
+    );
+    alice_net.shutdown().await;
+    bob.shutdown_iroh().await;
+}
+
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unlisted_never_stages() {

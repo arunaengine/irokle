@@ -2257,6 +2257,15 @@ impl<S: Storage> SharedNet<S> {
         topic_id: crate::TopicId,
         summary: &SyncSummary,
     ) -> io::Result<Option<PlannedTopicSync>> {
+        if self
+            .node
+            .storage()
+            .topic_state(&topic_id)
+            .map_err(invalid_data)?
+            .is_none()
+        {
+            return self.plan_pull(remote_peer_id, topic_id, summary);
+        }
         let budget = crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default());
         // A peer still staging this topic continues from its newest receipt.
         let staged = match (
@@ -2282,6 +2291,7 @@ impl<S: Storage> SharedNet<S> {
         // A peer outside the membership is owed nothing and serves nothing.
         let member = view.state.members.contains(&remote_peer_id);
         let mut goal = TopicGoal {
+            pull: false,
             genesis: Some(view.state.genesis),
             inbound: if member {
                 summary.actor_clock.clone()
@@ -2354,6 +2364,87 @@ impl<S: Storage> SharedNet<S> {
             messages,
             estimated_responses,
         }))
+    }
+
+    /// Pull a topic this node does not hold from a peer that does. Its pages are
+    /// staged until the history makes this node a member, then promoted.
+    fn plan_pull(
+        &self,
+        remote_peer_id: PeerId,
+        topic_id: crate::TopicId,
+        summary: &SyncSummary,
+    ) -> io::Result<Option<PlannedTopicSync>> {
+        let Some(genesis) = summary.genesis else {
+            return Ok(None);
+        };
+        let probe = crate::sync::SyncData {
+            topic_id,
+            ops: Vec::new(),
+        };
+        self.node
+            .ensure_iroh_peer_whitelisted(remote_peer_id, &probe)
+            .map_err(invalid_data)?;
+        let staged = self.staged_clock(remote_peer_id, topic_id)?;
+        let actor_range_hints = summary
+            .actor_clock
+            .iter()
+            .filter(|(actor_id, seq)| staged.get(actor_id) < **seq)
+            .map(|(actor_id, seq)| crate::sync::ActorRangeHint {
+                actor_id: *actor_id,
+                from_exclusive: staged.get(actor_id),
+                to_inclusive: *seq,
+            })
+            .collect::<Vec<_>>();
+        if actor_range_hints.is_empty() {
+            return Err(invalid_data(
+                "staged topic history does not make this node a member",
+            ));
+        }
+        let plan = crate::sync::SyncPlan {
+            topic_id,
+            common: BTreeSet::new(),
+            have: BTreeSet::new(),
+            send: Vec::new(),
+            need: BTreeSet::new(),
+            actor_range_hints,
+        };
+        let mut request = self.page_request(plan).map_err(invalid_data)?;
+        request.genesis = Some(genesis);
+        let credit_ops = request.credit.ops as usize;
+        Ok(Some(PlannedTopicSync {
+            topic_id,
+            goal: TopicGoal {
+                pull: true,
+                genesis: Some(genesis),
+                inbound: summary.actor_clock.clone(),
+                outbound: crate::ActorClock::new(),
+            },
+            pushes: false,
+            push_more: false,
+            messages: vec![
+                SyncMessage::Open(self.node.sync_open(topic_id)),
+                SyncMessage::Request(request),
+            ],
+            estimated_responses: 3 + credit_ops.div_ceil(MAX_SYNC_DATA_OPS_PER_MESSAGE),
+        }))
+    }
+
+    /// The highest position per actor that `peer_id` staged here for `topic_id`.
+    fn staged_clock(
+        &self,
+        peer_id: PeerId,
+        topic_id: crate::TopicId,
+    ) -> io::Result<crate::ActorClock> {
+        let mut clock = crate::ActorClock::new();
+        let staged = self
+            .node
+            .storage()
+            .staged_bootstrap_ops(&peer_id, &topic_id)
+            .map_err(invalid_data)?;
+        for op in staged {
+            clock.observe(op.signed.body.actor_id, op.signed.body.actor_seq);
+        }
+        Ok(clock)
     }
 
     /// The request for the next page of `plan`, sized to what it asks for.
@@ -2765,11 +2856,15 @@ impl<S: Storage> SharedNet<S> {
                 }
                 SyncMessage::Data(data) if group_topics.contains(&data.topic_id) => {
                     let data_topic_id = data.topic_id;
-                    match self
+                    let received = self
                         .node
-                        .receive_sync_data_from_evicting(remote_peer_id, data)
-                    {
-                        Ok((ack, evictions)) => {
+                        .ensure_iroh_peer_whitelisted(remote_peer_id, &data)
+                        .and_then(|()| self.node.receive_sync_outcome(remote_peer_id, data));
+                    match received {
+                        // A staged page of a pulled topic owes no ack; the next request continues it.
+                        Ok(ReceiveOutcome::Staged(_)) => {}
+                        Ok(ReceiveOutcome::Acked { ack, evictions }) => {
+                            let ack = *ack;
                             self.forward_evictions(evictions);
                             if let Err(error) = self.schedule_topic_recheck(data_topic_id) {
                                 tracing::warn!(%data_topic_id, %error, "failed to schedule received topic resync");
@@ -2859,12 +2954,22 @@ impl<S: Storage> SharedNet<S> {
         topic_id: crate::TopicId,
         goal: &TopicGoal,
     ) -> io::Result<GoalProgress> {
-        let view = self
+        let Some(view) = self
             .node
             .storage()
             .topic_view(&topic_id, Some(&peer_id))
             .map_err(invalid_data)?
-            .ok_or_else(|| invalid_data("topic disappeared during sync"))?;
+        else {
+            if !goal.pull {
+                return Err(invalid_data("topic disappeared during sync"));
+            }
+            // Until promotion a pull moves only by staging more of the peer's history.
+            let staged = self.staged_clock(peer_id, topic_id)?;
+            return Ok(GoalProgress {
+                staged: covered(&staged, &goal.inbound),
+                ..GoalProgress::default()
+            });
+        };
         if goal.genesis != Some(view.state.genesis) {
             return Err(invalid_data("topic branch changed during sync"));
         }
@@ -3244,6 +3349,8 @@ struct PlannedTopicSync {
 /// appends on either side are later work, not a moving target.
 #[derive(Clone, Debug)]
 struct TopicGoal {
+    /// Whether the topic was not held locally when planned.
+    pull: bool,
     genesis: Option<crate::OpId>,
     /// The peer's clock from its summary.
     inbound: crate::ActorClock,
@@ -3256,7 +3363,8 @@ struct GoalProgress {
     inbound: u64,
     outbound: u64,
     holes: usize,
-    /// Positions of the outbound goal the peer reported staged, not certified.
+    /// Staged positions: the peer's receipts for a push, or this node's own
+    /// staging for a pull.
     staged: u64,
 }
 
