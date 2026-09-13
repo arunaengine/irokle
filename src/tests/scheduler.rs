@@ -652,3 +652,99 @@ async fn planning_holds_one_group() {
     net.shutdown().await;
     bob_net.shutdown().await;
 }
+
+/// Data frames held by served streams stay within the net's inbound budget
+/// while their handling waits for storage workers, and a control exchange for
+/// another topic still completes meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_budget_holds() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let limits = StreamLimits {
+        inbound_bytes: MAX_FRAME_LEN,
+        ..StreamLimits::default()
+    };
+    let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
+    let topic_id = shared_topic(&alice, &bob);
+    let other = shared_topic(&alice, &bob);
+    let frame = 6 * 1024 * 1024;
+    let topic = alice.open_topic::<Note>(topic_id).unwrap();
+    for index in 0..6 {
+        let text = format!("{index}{}", "x".repeat(frame));
+        topic.publish(Note { text }).unwrap();
+    }
+    let ops = crate::oplog::topological(alice.storage(), &topic_id).unwrap();
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+
+    // Every storage worker of bob is taken, so each received frame waits.
+    let workers = Arc::clone(&bob_net.bulk_lane)
+        .acquire_many_owned(BULK_JOBS as u32)
+        .await
+        .unwrap();
+    let pushes = ops[1..]
+        .iter()
+        .map(|op| {
+            let net = Arc::clone(&net);
+            let addr = bob_addr.clone();
+            let messages = vec![
+                SyncMessage::Open(alice.sync_open(topic_id)),
+                SyncMessage::Data(crate::sync::SyncData {
+                    topic_id,
+                    ops: vec![op.clone()],
+                }),
+            ];
+            tokio::spawn(async move { net.sync_with(addr, &messages).await })
+        })
+        .collect::<Vec<_>>();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while bob_net.inbound.data.available_permits() >= frame {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the data budget never filled");
+
+    let control = vec![
+        SyncMessage::Open(alice.sync_open(other)),
+        SyncMessage::Fingerprint(alice.sync_fingerprint(other).unwrap()),
+    ];
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        net.sync_with(bob_addr.clone(), &control),
+    )
+    .await
+    .expect("control waited behind data frames")
+    .unwrap();
+
+    let peak = bob_net.inbound.peak.0.load(Ordering::Relaxed);
+    assert!(
+        peak <= bob_net.inbound.peak.1,
+        "{peak} frame bytes reserved for a {} byte budget",
+        bob_net.inbound.peak.1
+    );
+    drop(workers);
+    for push in pushes {
+        tokio::time::timeout(Duration::from_secs(120), push)
+            .await
+            .expect("a push never finished")
+            .unwrap()
+            .unwrap();
+    }
+    // Out of order frames may exceed the pending quota; a sync completes the rest.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        assert!(
+            attempts <= 8,
+            "the topic did not converge after the budget freed"
+        );
+        match net.sync_now(bob_addr.clone(), topic_id).await {
+            Ok(()) => break,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("sync after the budget freed failed: {error}"),
+        }
+    }
+    assert_eq!(clock(&bob, topic_id), clock(&alice, topic_id));
+    net.shutdown().await;
+    bob_net.shutdown().await;
+}

@@ -211,6 +211,7 @@ async fn aggregate_budget_continues() {
         bytes: 96 * 1024,
         messages: 48,
         batch_messages: 24,
+        ..StreamLimits::default()
     };
     let runtime = net::IrohRuntimeConfig::default();
     let alice = peer(bind(None).await, runtime, limits);
@@ -352,6 +353,7 @@ async fn hot_topic_shares() {
         bytes: 256 * 1024,
         messages: 16,
         batch_messages: 8,
+        ..StreamLimits::default()
     };
     let (alice, bob) = stream_pair(limits).await;
     // Requests are served in topic id order, so the hot topic goes first.
@@ -698,6 +700,7 @@ async fn large_topics_progress() {
         bytes: 64 * 1024,
         messages: 256,
         batch_messages: 128,
+        ..StreamLimits::default()
     };
     let (alice, bob) = stream_pair(limits).await;
     let topics = (100..140).map(topic).collect::<Vec<_>>();

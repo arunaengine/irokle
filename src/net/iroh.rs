@@ -38,6 +38,11 @@ const MAX_SYNC_MESSAGES_PER_STREAM: usize = 4096;
 // reply (which can echo up to two messages per topic) stays under its own cap.
 const MAX_BATCH_STREAM_MESSAGES: usize = MAX_SYNC_MESSAGES_PER_STREAM / 2;
 const MAX_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
+/// Inbound frame bytes all served streams of a net may hold at once.
+const MAX_INBOUND_FRAME_BYTES: usize = 256 * 1024 * 1024;
+/// Frames up to this size draw on a separate pool of `CONTROL_INBOUND_BYTES`.
+const CONTROL_FRAME_BYTES: usize = 64 * 1024;
+const CONTROL_INBOUND_BYTES: usize = 16 * 1024 * 1024;
 /// Delay before a topic that advanced but still owes work is served again. It
 /// is due at once but behind every target that became due earlier, so other
 /// work takes its turn first and an idle queue continues immediately.
@@ -62,6 +67,8 @@ pub(crate) struct StreamLimits {
     pub(crate) messages: usize,
     /// Messages one batched request stream may carry.
     pub(crate) batch_messages: usize,
+    /// Inbound data frame bytes all served streams may hold at once.
+    pub(crate) inbound_bytes: usize,
 }
 
 impl Default for StreamLimits {
@@ -70,7 +77,51 @@ impl Default for StreamLimits {
             bytes: MAX_SYNC_STREAM_BYTES,
             messages: MAX_SYNC_MESSAGES_PER_STREAM,
             batch_messages: MAX_BATCH_STREAM_MESSAGES,
+            inbound_bytes: MAX_INBOUND_FRAME_BYTES,
         }
+    }
+}
+
+/// Node-wide reservations for inbound frames, taken before a frame is
+/// allocated and held until its message was handled. Small frames use their
+/// own pool, so control messages still flow while data frames fill theirs.
+struct InboundBudget {
+    data: Arc<tokio::sync::Semaphore>,
+    control: Arc<tokio::sync::Semaphore>,
+    /// Most data frame bytes reserved at once, and the data pool size.
+    #[cfg(test)]
+    peak: (std::sync::atomic::AtomicUsize, usize),
+}
+
+impl InboundBudget {
+    fn new(limits: StreamLimits) -> Self {
+        Self {
+            data: Arc::new(tokio::sync::Semaphore::new(
+                limits.inbound_bytes.max(MAX_FRAME_LEN),
+            )),
+            control: Arc::new(tokio::sync::Semaphore::new(CONTROL_INBOUND_BYTES)),
+            #[cfg(test)]
+            peak: (Default::default(), limits.inbound_bytes.max(MAX_FRAME_LEN)),
+        }
+    }
+
+    async fn reserve(&self, len: usize) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
+        let pool = if len <= CONTROL_FRAME_BYTES {
+            &self.control
+        } else {
+            &self.data
+        };
+        let bytes = u32::try_from(len).map_err(|_| invalid_data("sync frame length overflow"))?;
+        let permit = Arc::clone(pool)
+            .acquire_many_owned(bytes)
+            .await
+            .map_err(|_| io::Error::other("inbound frame budget closed"))?;
+        #[cfg(test)]
+        if len > CONTROL_FRAME_BYTES {
+            let in_use = self.peak.1 - self.data.available_permits();
+            self.peak.0.fetch_max(in_use, Ordering::Relaxed);
+        }
+        Ok(permit)
     }
 }
 
@@ -805,6 +856,7 @@ pub struct SharedNet<S: Storage> {
     runtime: IrohRuntimeConfig,
     resync_scheduler: ResyncScheduler,
     limits: StreamLimits,
+    inbound: InboundBudget,
     receipts: Mutex<ReceiptLog>,
     shutdown: tokio::sync::watch::Sender<bool>,
     tasks: Arc<TaskTracker>,
@@ -904,6 +956,7 @@ impl<S: Storage> IrohNet<S> {
                 runtime,
                 resync_scheduler: ResyncScheduler::default(),
                 limits: StreamLimits::default(),
+                inbound: InboundBudget::new(StreamLimits::default()),
                 receipts: Mutex::default(),
                 shutdown,
                 tasks: Arc::default(),
@@ -919,9 +972,10 @@ impl<S: Storage> IrohNet<S> {
 
     #[cfg(test)]
     pub(crate) fn with_stream_limits(mut self, limits: StreamLimits) -> Self {
-        Arc::get_mut(&mut self.shared)
-            .expect("limits are set before the net is shared")
-            .limits = limits;
+        let shared =
+            Arc::get_mut(&mut self.shared).expect("limits are set before the net is shared");
+        shared.limits = limits;
+        shared.inbound = InboundBudget::new(limits);
         self
     }
 
@@ -3278,7 +3332,10 @@ impl<S: Storage> IrohNet<S> {
         tokio::time::timeout(self.runtime.sync_io_timeout, async {
             let mut session = SyncSession::new(peer);
             let mut limits = SyncReadLimits::new(self.limits);
-            while let Some(frame) = read_next_frame(&mut recv, self.runtime.sync_io_timeout).await?
+            // The frame's reservation is held until its message was handled.
+            while let Some((frame, _reserved)) =
+                read_next_frame(&mut recv, self.runtime.sync_io_timeout, Some(&self.inbound))
+                    .await?
             {
                 let frame_index = limits.observe_frame(frame.len())?;
                 let message = decode_sync_message(&frame).map_err(|err| {
@@ -4118,7 +4175,7 @@ async fn read_sync_messages(
 ) -> io::Result<Vec<SyncMessage>> {
     let mut messages = Vec::new();
     let mut limits = SyncReadLimits::new(stream_limits);
-    while let Some(frame) = read_next_frame(recv, sync_io_timeout).await? {
+    while let Some((frame, _)) = read_next_frame(recv, sync_io_timeout, None).await? {
         let frame_index = limits.observe_frame(frame.len())?;
         messages.push(decode_sync_message(&frame).map_err(|err| {
             invalid_data(format!(
@@ -4148,10 +4205,13 @@ async fn write_sync_messages(
     send.finish().map_err(other)
 }
 
+/// Reads one frame. With a `budget`, its bytes are reserved before the frame is
+/// allocated and the reservation is returned with it.
 async fn read_next_frame(
     recv: &mut iroh::endpoint::RecvStream,
     sync_io_timeout: Duration,
-) -> io::Result<Option<Vec<u8>>> {
+    budget: Option<&InboundBudget>,
+) -> io::Result<Option<(Vec<u8>, Option<tokio::sync::OwnedSemaphorePermit>)>> {
     let mut len_buf = [0_u8; 4];
     let Some(first_read) = read_some_with_timeout(recv, &mut len_buf[..1], sync_io_timeout).await?
     else {
@@ -4186,6 +4246,10 @@ async fn read_next_frame(
             "sync frame exceeds maximum length",
         ));
     }
+    let reservation = match budget {
+        Some(budget) if len > 0 => Some(budget.reserve(len).await?),
+        _ => None,
+    };
     let mut payload = vec![0_u8; len];
     if len > 0 {
         tokio::time::timeout(sync_io_timeout, recv.read_exact(&mut payload))
@@ -4193,7 +4257,7 @@ async fn read_next_frame(
             .map_err(|_| timed_out("sync read timed out"))?
             .map_err(other)?;
     }
-    Ok(Some(payload))
+    Ok(Some((payload, reservation)))
 }
 
 async fn read_some_with_timeout(
