@@ -4811,11 +4811,11 @@ fn other(error: impl std::fmt::Display) -> io::Error {
 }
 
 #[cfg(test)]
-#[path = "../tests/scheduler.rs"]
+#[path = "../../tests/scheduler.rs"]
 mod scheduler_tests;
 
 #[cfg(test)]
-#[path = "../tests/budget.rs"]
+#[path = "../../tests/budget.rs"]
 mod budget_tests;
 
 #[cfg(test)]
