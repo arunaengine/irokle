@@ -254,6 +254,10 @@ pub struct AdmittedBatch {
 /// certifies nothing about an active topic and clears no obligation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StagedTopic {
+    /// The branch the namespace holds; `None` when nothing is staged.
+    pub genesis: Option<OpId>,
+    /// The namespace session this receipt belongs to.
+    pub session: u64,
     /// Highest contiguous sequence staged per actor.
     pub clock: ActorClock,
     pub ops: u64,

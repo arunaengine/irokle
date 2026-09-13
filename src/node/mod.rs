@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod bootstrap;
 mod builder;
 mod peers;
 mod topic;
@@ -114,6 +115,7 @@ pub struct Irokle<S: Storage = MemoryStorage> {
     config: NodeConfig,
     peer_whitelist: Arc<RwLock<Option<BTreeSet<PeerId>>>>,
     peer_health: Arc<PeerHealthStore>,
+    bootstraps: Arc<bootstrap::Bootstraps>,
     #[cfg(feature = "iroh")]
     net: Option<Arc<crate::net::IrohNet<S>>>,
 }
@@ -140,15 +142,19 @@ impl<S: Storage> Irokle<S> {
         let oplog = Oplog::with_storage(storage);
         oplog.reconcile_pending_ops()?;
         let sync = SyncEngine::new(oplog.clone(), config.signer.peer_id());
-        Ok(Self {
+        let node = Self {
             oplog,
             sync,
             peer_whitelist: Arc::new(RwLock::new(config.peer_whitelist.clone())),
             peer_health: Arc::new(PeerHealthStore::default()),
+            bootstraps: Arc::default(),
             config,
             #[cfg(feature = "iroh")]
             net: None,
-        })
+        };
+        // A bootstrap proven or begun before a restart becomes the topic now.
+        node.resume_bootstraps()?;
+        Ok(node)
     }
 
     #[cfg(feature = "iroh")]

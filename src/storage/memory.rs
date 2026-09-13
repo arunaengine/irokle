@@ -808,6 +808,8 @@ impl Storage for MemoryStorage {
         staged.session = session;
         staged.ops.extend(fresh);
         Ok(StagedTopic {
+            genesis: None,
+            session: 0,
             clock: staged_clock(
                 staged
                     .ops
@@ -834,6 +836,8 @@ impl Storage for MemoryStorage {
             return Ok(StagedTopic::default());
         };
         Ok(StagedTopic {
+            genesis: None,
+            session: 0,
             clock: staged_clock(
                 staged
                     .ops

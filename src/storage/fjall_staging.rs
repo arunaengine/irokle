@@ -140,6 +140,8 @@ impl FjallStorage {
         session.updated_ms = session.updated_ms.max(now_ms);
         Self::tx_put(tx, records, session_key(&source, &topic_id), &session)?;
         Ok(StagedTopic {
+            genesis: None,
+            session: 0,
             clock: Self::tx_staged_clock(tx, records, &prefix)?,
             ops: session.ops,
             bytes: session.bytes,
@@ -168,6 +170,8 @@ impl FjallStorage {
         };
         let session: StagedSession = postcard::from_bytes(session.as_ref())?;
         Ok(StagedTopic {
+            genesis: None,
+            session: 0,
             clock: Self::tx_staged_clock(&read_tx, &self.records, &ops_prefix(source, topic_id))?,
             ops: session.ops,
             bytes: session.bytes,
