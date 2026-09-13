@@ -192,6 +192,12 @@ fn read_delta(before: [u64; 4], after: [u64; 4]) -> Vec<(&'static str, u64)> {
 }
 
 fn report(name: &str, params: &str, samples: Vec<Sample>) {
+    for (rep, sample) in samples.iter().enumerate() {
+        eprintln!(
+            "bench_sample name={name} {params} rep={rep} ms={:.3}",
+            sample.ms
+        );
+    }
     let mut ms = samples.iter().map(|sample| sample.ms).collect::<Vec<_>>();
     ms.sort_by(f64::total_cmp);
     let vary = samples.iter().any(|s| s.counters != samples[0].counters);
@@ -489,7 +495,7 @@ fn catch_up<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
 #[test]
 #[ignore = "measurement, run explicitly"]
 fn chain_catch_up() {
-    for len in [8192, 16384] {
+    for len in [8192, 16384, 65536, 65537, 100_000] {
         let params = format!("ops={len} page_ops=4096 timed=response_page");
         each_backend(
             "catch_up",

@@ -52,6 +52,12 @@ struct Run {
 
 /// One line per workload: elapsed and every value as median and max.
 fn report(name: &str, params: &str, runs: Vec<Run>) {
+    for (rep, run) in runs.iter().enumerate() {
+        eprintln!(
+            "bench_sample name={name} {params} rep={rep} ms={:.3} completed={}",
+            run.ms, run.done
+        );
+    }
     let sorted = |mut values: Vec<f64>| {
         values.sort_by(f64::total_cmp);
         (values[values.len() / 2], values[values.len() - 1])
@@ -277,19 +283,21 @@ async fn many_topics<S: Store>(topics: usize, ops: usize) -> Run {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measurement, run explicitly"]
 async fn small_topics_sync() {
-    for name in [MemoryStorage::NAME, FjallStorage::NAME] {
-        let mut runs = Vec::new();
-        for _ in 0..REPS {
-            runs.push(match name {
-                "memory" => many_topics::<MemoryStorage>(256, 8).await,
-                _ => many_topics::<FjallStorage>(256, 8).await,
-            });
+    for topics in [256, 1024] {
+        for name in [MemoryStorage::NAME, FjallStorage::NAME] {
+            let mut runs = Vec::new();
+            for _ in 0..REPS {
+                runs.push(match name {
+                    "memory" => many_topics::<MemoryStorage>(topics, 8).await,
+                    _ => many_topics::<FjallStorage>(topics, 8).await,
+                });
+            }
+            report(
+                "small_topics",
+                &format!("backend={name} topics={topics} ops=8"),
+                runs,
+            );
         }
-        report(
-            "small_topics",
-            &format!("backend={name} topics=256 ops=8"),
-            runs,
-        );
     }
 }
 
