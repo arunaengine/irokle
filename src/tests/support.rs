@@ -288,6 +288,8 @@ pub(crate) struct StaleReadStorage<S = MemoryStorage> {
     pub(crate) read_gate: Arc<std::sync::Mutex<Option<ArmedGate>>>,
     /// Matching reads the armed gate lets pass before it pauses one.
     pub(crate) read_skips: Arc<std::sync::atomic::AtomicUsize>,
+    /// Activations left to fail before one reaches the store.
+    pub(crate) failed_activations: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) conflicts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -305,6 +307,7 @@ impl<S: Storage> StaleReadStorage<S> {
             failed_heads: Arc::default(),
             read_gate: Arc::default(),
             read_skips: Arc::default(),
+            failed_activations: Arc::default(),
             conflicts: Arc::default(),
         }
     }
@@ -720,6 +723,70 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
     }
     fn expire_bootstrap(&self, older_than_ms: u64) -> Result<usize, Error> {
         self.inner.expire_bootstrap(older_than_ms)
+    }
+    fn staging_limits(&self) -> crate::storage::StagingLimits {
+        self.inner.staging_limits()
+    }
+    fn provisional_topics(&self) -> Result<Vec<crate::storage::ProvisionalTopic>, Error> {
+        self.inner.provisional_topics()
+    }
+    fn open_provisional(
+        &self,
+        source: PeerId,
+        topic_id: TopicId,
+        genesis: OpId,
+        now_ms: u64,
+    ) -> Result<crate::storage::ProvisionalTopic, Error> {
+        self.inner
+            .open_provisional(source, topic_id, genesis, now_ms)
+    }
+    fn provisional_store(
+        &self,
+        provisional: &crate::storage::ProvisionalTopic,
+    ) -> Result<Option<Self>, Error> {
+        Ok(self
+            .inner
+            .provisional_store(provisional)?
+            .map(|inner| Self {
+                inner,
+                ..self.clone()
+            }))
+    }
+    fn stored_bytes(&self) -> Result<u64, Error> {
+        self.inner.stored_bytes()
+    }
+    fn touch_provisional(
+        &self,
+        provisional: &crate::storage::ProvisionalTopic,
+        now_ms: u64,
+    ) -> Result<(), Error> {
+        self.inner.touch_provisional(provisional, now_ms)
+    }
+    fn activate_provisional(
+        &self,
+        provisional: &crate::storage::ProvisionalTopic,
+        expected: &crate::storage::TopicState,
+        effects: crate::storage::AdmissionEffects,
+    ) -> Result<(), Error> {
+        if self
+            .failed_activations
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| left.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(Error::Storage("injected activation failure".into()));
+        }
+        self.inner
+            .activate_provisional(provisional, expected, effects)
+    }
+    fn discard_provisional(
+        &self,
+        provisional: &crate::storage::ProvisionalTopic,
+    ) -> Result<bool, Error> {
+        self.inner.discard_provisional(provisional)
     }
 }
 

@@ -113,6 +113,11 @@ pub enum Error {
     #[error("bootstrap data staged until its history proves membership")]
     BootstrapPending { staged: crate::ActorClock },
 
+    /// Bootstrap staging reached a configured limit. Nothing of the refused
+    /// data was kept; a later attempt may fit once staging drains or expires.
+    #[error("bootstrap staging capacity exhausted: {0}")]
+    StagingCapacity(String),
+
     #[error("eviction journal is full")]
     EvictionJournalFull,
 

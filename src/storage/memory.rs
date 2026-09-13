@@ -9,21 +9,36 @@ use crate::{
 };
 
 use super::{
-    AckCommit, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS, MAX_PENDING_MISSING_DEPS,
-    MAX_PENDING_WAITERS_PER_DEP, MAX_REJECTED_PER_TOPIC, ObligationTarget, OpMeta, PeerAck,
-    PendingRecord, PendingUsage, SnapshotRead, StagedSession, StagedTopic, Storage,
-    StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView,
-    ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches,
+    AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
+    MAX_PENDING_MISSING_DEPS, MAX_PENDING_WAITERS_PER_DEP, MAX_REJECTED_PER_TOPIC,
+    ObligationTarget, OpMeta, PeerAck, PendingRecord, PendingUsage, ProvisionalTopic, SnapshotRead,
+    StagedSession, StagedTopic, StagingLimits, Storage, StorageCounters, SyncObligation,
+    SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers,
+    ack_reached_op, apply_status_update, branch_matches, check_namespace, check_namespaces,
     check_pending_quota, check_staged_op, check_staged_session, ensure_deps_resolvable,
     journalled_eviction, merged_obligation, merged_peer_ack, new_peer_status, peer_departed,
     pending_op_bytes, settled_obligation, staged_clock, stored_ack_dominates,
     topic_fingerprint_for, validate_batch, validate_heads,
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MemoryStorage {
     inner: Arc<Mutex<MemoryInner>>,
     counters: Arc<StorageCounters>,
+    limits: StagingLimits,
+    /// Byte limit of a provisional namespace store; `None` for the main store.
+    namespace: Option<u64>,
+}
+
+impl Default for MemoryStorage {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            counters: Arc::default(),
+            limits: StagingLimits::MEMORY,
+            namespace: None,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -59,6 +74,11 @@ struct MemoryInner {
     /// Bootstrap staging sessions, invisible to every topic query.
     staged: BTreeMap<(PeerId, TopicId), StagedOps>,
     attempt_epoch: u64,
+    /// Provisional bootstraps by source and topic, each in its own store.
+    provisional: BTreeMap<(PeerId, TopicId), (ProvisionalTopic, MemoryStorage)>,
+    staging_sessions: u64,
+    /// Serialized bytes of admitted ops, counted in a namespace store only.
+    admitted_bytes: u64,
 }
 
 #[derive(Clone, Default)]
@@ -77,6 +97,12 @@ struct RejectedIds {
 impl MemoryStorage {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The same store applying `limits` to provisional bootstraps.
+    pub fn with_staging_limits(mut self, limits: StagingLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Work this store and its clones performed so far.
@@ -163,7 +189,7 @@ impl Storage for MemoryStorage {
     }
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
         let mut inner = self.lock()?;
-        admit_batch_locked(&mut inner, batch)
+        admit_batch_locked(&mut inner, batch, self.namespace)
     }
 
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
@@ -375,6 +401,15 @@ impl Storage for MemoryStorage {
             {
                 return Err(Error::Storage("pending waiter quota exceeded".into()));
             }
+        }
+        if previous.is_none()
+            && let Some(limit) = self.namespace
+        {
+            check_namespace(
+                inner.admitted_bytes + inner.pending_usage.bytes,
+                charge,
+                limit,
+            )?;
         }
         if previous.is_none() {
             check_pending_quota(
@@ -677,6 +712,10 @@ impl Storage for MemoryStorage {
         batch: AdmittedBatch,
         eviction: Option<&TopicEviction>,
     ) -> Result<usize> {
+        // A namespace holds one candidate branch; replacing it is the node's decision.
+        if self.namespace.is_some() {
+            return Err(Error::StaleIncarnation);
+        }
         let mut inner = self.lock()?;
         if inner.sealed_topics.contains(topic_id) {
             return Err(Error::TopicSealed);
@@ -689,7 +728,7 @@ impl Storage for MemoryStorage {
         // an empty topic with nothing installed in its place.
         let mut staged = inner.clone();
         let removed = reset_topic_locked(&mut staged, topic_id)?;
-        admit_batch_locked(&mut staged, batch)?;
+        admit_batch_locked(&mut staged, batch, self.namespace)?;
         // The journal entry is part of the same swap: after it the discarded
         // payloads exist nowhere else, so no ordering here can lose them.
         if let Some((key, eviction)) = journalled_eviction(eviction) {
@@ -812,7 +851,7 @@ impl Storage for MemoryStorage {
         if inner.topics.contains_key(&topic_id) {
             return Err(Error::AdmissionConflict);
         }
-        admit_batch_locked(&mut inner, batch)?;
+        admit_batch_locked(&mut inner, batch, None)?;
         inner
             .staged
             .retain(|(_, staged_topic), _| *staged_topic != topic_id);
@@ -834,6 +873,179 @@ impl Storage for MemoryStorage {
             .staged
             .retain(|_, staged| staged.session.updated_ms >= older_than_ms);
         Ok(before - inner.staged.len())
+    }
+
+    fn staging_limits(&self) -> StagingLimits {
+        self.limits
+    }
+
+    fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>> {
+        Ok(self
+            .lock()?
+            .provisional
+            .values()
+            .map(|(provisional, _)| provisional.clone())
+            .collect())
+    }
+
+    fn open_provisional(
+        &self,
+        source: PeerId,
+        topic_id: TopicId,
+        genesis: OpId,
+        now_ms: u64,
+    ) -> Result<ProvisionalTopic> {
+        let mut inner = self.lock()?;
+        if inner.topics.contains_key(&topic_id) {
+            return Err(Error::AdmissionConflict);
+        }
+        if let Some((provisional, _)) = inner.provisional.get(&(source, topic_id)) {
+            return Ok(provisional.clone());
+        }
+        let from_source = inner.provisional.keys().filter(|(peer, _)| *peer == source);
+        check_namespaces(&self.limits, inner.provisional.len(), from_source.count())?;
+        inner.staging_sessions += 1;
+        let provisional = ProvisionalTopic {
+            source,
+            topic_id,
+            genesis,
+            session: inner.staging_sessions,
+            updated_ms: now_ms,
+            activating: false,
+        };
+        let store = MemoryStorage {
+            inner: Arc::default(),
+            counters: Arc::clone(&self.counters),
+            limits: self.limits,
+            namespace: Some(self.limits.namespace_bytes),
+        };
+        inner
+            .provisional
+            .insert((source, topic_id), (provisional.clone(), store));
+        Ok(provisional)
+    }
+
+    fn provisional_store(&self, provisional: &ProvisionalTopic) -> Result<Option<Self>> {
+        Ok(self
+            .lock()?
+            .provisional
+            .get(&(provisional.source, provisional.topic_id))
+            .filter(|(current, _)| current.session == provisional.session)
+            .map(|(_, store)| store.clone()))
+    }
+
+    fn stored_bytes(&self) -> Result<u64> {
+        let inner = self.lock()?;
+        Ok(inner.admitted_bytes + inner.pending_usage.bytes)
+    }
+
+    fn touch_provisional(&self, provisional: &ProvisionalTopic, now_ms: u64) -> Result<()> {
+        let mut inner = self.lock()?;
+        if let Some((current, _)) = inner
+            .provisional
+            .get_mut(&(provisional.source, provisional.topic_id))
+            .filter(|(current, _)| current.session == provisional.session)
+        {
+            current.updated_ms = current.updated_ms.max(now_ms);
+        }
+        Ok(())
+    }
+
+    fn activate_provisional(
+        &self,
+        provisional: &ProvisionalTopic,
+        expected: &TopicState,
+        effects: AdmissionEffects,
+    ) -> Result<()> {
+        let topic_id = provisional.topic_id;
+        let mut inner = self.lock()?;
+        if inner.topics.contains_key(&topic_id) {
+            return Err(Error::AdmissionConflict);
+        }
+        let Some((_, store)) = inner
+            .provisional
+            .get(&(provisional.source, topic_id))
+            .filter(|(current, _)| current.session == provisional.session)
+        else {
+            return Err(Error::StaleIncarnation);
+        };
+        let store = store.clone();
+        let staged = store.lock()?;
+        if memory_topic_state_locked(&staged, &topic_id).as_ref() != Some(expected) {
+            return Err(Error::AdmissionConflict);
+        }
+        if effects
+            .sync_obligations
+            .iter()
+            .any(|obligation| obligation.topic_id != topic_id)
+        {
+            return Err(Error::TopicMismatch);
+        }
+        // One guard over both stores: nothing sees part of the history.
+        copy_topic_locked(&staged, &mut inner, &topic_id);
+        inner.topics.insert(topic_id, expected.clone());
+        for obligation in effects.sync_obligations {
+            let merged = merged_obligation_locked(&inner, &obligation)?;
+            put_obligation_locked(&mut inner, merged);
+        }
+        inner
+            .provisional
+            .retain(|(_, staged_topic), _| *staged_topic != topic_id);
+        Ok(())
+    }
+
+    fn discard_provisional(&self, provisional: &ProvisionalTopic) -> Result<bool> {
+        let mut inner = self.lock()?;
+        let key = (provisional.source, provisional.topic_id);
+        let current = inner
+            .provisional
+            .get(&key)
+            .is_some_and(|(current, _)| current.session == provisional.session);
+        if current {
+            inner.provisional.remove(&key);
+        }
+        Ok(current)
+    }
+}
+
+/// Copy every record of `topic_id` from a namespace store into `inner`.
+fn copy_topic_locked(staged: &MemoryInner, inner: &mut MemoryInner, topic_id: &TopicId) {
+    let ids = staged.topic_ops.get(topic_id).cloned().unwrap_or_default();
+    for id in &ids {
+        if let (Some(op), Some(meta)) = (staged.ops.get(id), staged.meta.get(id)) {
+            for dep in &meta.deps {
+                inner.children.entry(*dep).or_default().insert(*id);
+            }
+            inner.ops.insert(*id, op.clone());
+            inner.meta.insert(*id, meta.clone());
+        }
+    }
+    inner.topic_ops.insert(*topic_id, ids);
+    let first = ActorId::from_bytes([0; 32]);
+    let last = ActorId::from_bytes([0xff; 32]);
+    for (key, id) in staged
+        .actor_by_seq
+        .range((*topic_id, first, 0)..=(*topic_id, last, u64::MAX))
+    {
+        inner.actor_by_seq.insert(*key, *id);
+    }
+    for (key, tip) in staged
+        .actor_tip
+        .range((*topic_id, first)..=(*topic_id, last))
+    {
+        inner.actor_tip.insert(*key, *tip);
+    }
+    if let Some(heads) = staged.heads.get(topic_id) {
+        inner.heads.insert(*topic_id, heads.clone());
+    }
+    if let Some(clock) = staged.actor_clock.get(topic_id) {
+        inner.actor_clock.insert(*topic_id, clock.clone());
+    }
+    if let Some(fingerprint) = staged.topic_fingerprint.get(topic_id) {
+        inner.topic_fingerprint.insert(*topic_id, *fingerprint);
+    }
+    if let Some(generation) = staged.max_generation.get(topic_id) {
+        inner.max_generation.insert(*topic_id, *generation);
     }
 }
 
@@ -947,7 +1159,11 @@ fn topic_view_locked(
     }))
 }
 
-fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<()> {
+fn admit_batch_locked(
+    inner: &mut MemoryInner,
+    batch: AdmittedBatch,
+    namespace: Option<u64>,
+) -> Result<()> {
     validate_batch(&batch)?;
     if inner
         .heads
@@ -1082,6 +1298,20 @@ fn admit_batch_locked(inner: &mut MemoryInner, batch: AdmittedBatch) -> Result<(
     }
 
     ensure_deps_resolvable(&new_entries, |dep| Ok(dep_resolvable_locked(inner, dep)))?;
+    if let Some(limit) = namespace {
+        let mut charge = 0;
+        for (op, _) in &new_entries {
+            if !inner.ops.contains_key(&op.id) {
+                charge += pending_op_bytes(op)? as u64;
+            }
+        }
+        check_namespace(
+            inner.admitted_bytes + inner.pending_usage.bytes,
+            charge,
+            limit,
+        )?;
+        inner.admitted_bytes += charge;
+    }
 
     for (op, meta) in new_entries {
         inner
@@ -1165,6 +1395,12 @@ fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> Result<usi
                     inner.children.remove(&dep);
                 }
             }
+        }
+        if inner.admitted_bytes > 0
+            && let Some(op) = inner.ops.get(op_id)
+        {
+            let refund = pending_op_bytes(op)? as u64;
+            inner.admitted_bytes = inner.admitted_bytes.saturating_sub(refund);
         }
         inner.ops.remove(op_id);
         inner.meta.remove(op_id);

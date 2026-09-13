@@ -208,6 +208,27 @@ impl<S: Storage> Storage for Counting<S> {
         promote_bootstrap(batch: AdmittedBatch) -> ();
         discard_bootstrap(source: &PeerId, topic: &TopicId) -> usize;
         expire_bootstrap(older_than_ms: u64) -> usize;
+        provisional_topics() -> Vec<crate::storage::ProvisionalTopic>;
+        open_provisional(source: PeerId, topic: TopicId, genesis: OpId, now_ms: u64) -> crate::storage::ProvisionalTopic;
+        stored_bytes() -> u64;
+        touch_provisional(provisional: &crate::storage::ProvisionalTopic, now_ms: u64) -> ();
+        activate_provisional(provisional: &crate::storage::ProvisionalTopic, expected: &TopicState, effects: AdmissionEffects) -> ();
+        discard_provisional(provisional: &crate::storage::ProvisionalTopic) -> bool;
+    }
+    fn staging_limits(&self) -> crate::storage::StagingLimits {
+        self.inner.staging_limits()
+    }
+    fn provisional_store(
+        &self,
+        provisional: &crate::storage::ProvisionalTopic,
+    ) -> Result<Option<Self>, Error> {
+        Ok(self
+            .inner
+            .provisional_store(provisional)?
+            .map(|inner| Self {
+                inner,
+                reads: Arc::clone(&self.reads),
+            }))
     }
 }
 

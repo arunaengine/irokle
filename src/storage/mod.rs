@@ -43,6 +43,55 @@ pub const MAX_STAGED_SESSIONS_PER_SOURCE: usize = 8;
 /// A session with no write for this long may be expired.
 pub const MAX_STAGED_IDLE_MS: u64 = 10 * 60 * 1000;
 
+/// Resources bootstrap staging may take before a history proves membership.
+/// Each source and topic stages into its own namespace; bytes count every
+/// serialized op a namespace holds, admitted or buffered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StagingLimits {
+    pub total_bytes: u64,
+    pub source_bytes: u64,
+    pub namespace_bytes: u64,
+    pub namespaces: usize,
+    pub source_namespaces: usize,
+}
+
+impl StagingLimits {
+    /// The envelope of a store that keeps staged history in memory.
+    pub const MEMORY: Self = Self {
+        total_bytes: MAX_STAGED_BYTES_TOTAL,
+        source_bytes: MAX_STAGED_BYTES_PER_SESSION,
+        namespace_bytes: MAX_STAGED_BYTES_PER_SESSION,
+        namespaces: MAX_STAGED_SESSIONS,
+        source_namespaces: MAX_STAGED_SESSIONS_PER_SOURCE,
+    };
+
+    /// The envelope of a store that keeps staged history on disk.
+    pub const DISK: Self = Self {
+        total_bytes: 16 * 1024 * 1024 * 1024,
+        source_bytes: 4 * 1024 * 1024 * 1024,
+        namespace_bytes: 4 * 1024 * 1024 * 1024,
+        namespaces: MAX_STAGED_SESSIONS,
+        source_namespaces: MAX_STAGED_SESSIONS_PER_SOURCE,
+    };
+}
+
+/// A provisional bootstrap: history one source served for a topic this store
+/// does not hold, kept in its own namespace and invisible to every topic query
+/// until it proves this node's membership and is activated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvisionalTopic {
+    pub source: PeerId,
+    pub topic_id: TopicId,
+    /// The candidate branch this namespace holds.
+    pub genesis: OpId,
+    /// Durable identity of the namespace; a replacement gets a new one.
+    pub session: u64,
+    /// Last write, for idle expiry.
+    pub updated_ms: u64,
+    /// Activation began, so part of the history may be in the active records.
+    pub activating: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpMeta {
     pub id: OpId,
@@ -596,6 +645,63 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// Drop sessions last written before `older_than_ms`. Returns the number
     /// of sessions removed.
     fn expire_bootstrap(&self, older_than_ms: u64) -> Result<usize>;
+
+    /// The limits this store applies to provisional bootstraps.
+    fn staging_limits(&self) -> StagingLimits {
+        StagingLimits::MEMORY
+    }
+    /// Every provisional bootstrap namespace.
+    fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>> {
+        Ok(Vec::new())
+    }
+    /// The namespace of `source` for `topic_id`, opened empty for `genesis` when
+    /// the source has none. An existing namespace is returned unchanged, whatever
+    /// genesis it holds. Refuses an active topic with
+    /// [`crate::Error::AdmissionConflict`] and a namespace past the count limits
+    /// with [`crate::Error::StagingCapacity`].
+    fn open_provisional(
+        &self,
+        _source: PeerId,
+        _topic_id: TopicId,
+        _genesis: OpId,
+        _now_ms: u64,
+    ) -> Result<ProvisionalTopic> {
+        Err(crate::Error::StagingCapacity(
+            "this store keeps no provisional bootstraps yet".into(),
+        ))
+    }
+    /// The store holding the history of `provisional`, or `None` once its
+    /// session ended. It sees only that namespace and refuses a write past the
+    /// namespace byte limit with [`crate::Error::StagingCapacity`].
+    fn provisional_store(&self, _provisional: &ProvisionalTopic) -> Result<Option<Self>> {
+        Ok(None)
+    }
+    /// Serialized op bytes this store holds, admitted and buffered.
+    fn stored_bytes(&self) -> Result<u64> {
+        Ok(0)
+    }
+    /// Record a write to the namespace while its session is current.
+    fn touch_provisional(&self, _provisional: &ProvisionalTopic, _now_ms: u64) -> Result<()> {
+        Ok(())
+    }
+    /// Make the history of `provisional` the active topic: copy it into the
+    /// active records in bounded steps, then in one transaction refuse when the
+    /// topic is active or the namespace state is not `expected`, install the
+    /// state, heads, clock and `effects`, and end every namespace of the topic.
+    /// An interrupted activation resumes when called again.
+    fn activate_provisional(
+        &self,
+        _provisional: &ProvisionalTopic,
+        _expected: &TopicState,
+        _effects: AdmissionEffects,
+    ) -> Result<()> {
+        Err(crate::Error::StaleIncarnation)
+    }
+    /// End the namespace of `provisional` while its session is current and it
+    /// is not activating. Returns whether it ended.
+    fn discard_provisional(&self, _provisional: &ProvisionalTopic) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 mod memory;
@@ -783,6 +889,35 @@ pub(super) fn check_staged_op(
     if total_bytes + charge > MAX_STAGED_BYTES_TOTAL {
         return Err(crate::Error::Storage(
             "bootstrap staging byte budget is full".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a new provisional namespace past the total or per-source count.
+pub(super) fn check_namespaces(
+    limits: &StagingLimits,
+    namespaces: usize,
+    from_source: usize,
+) -> Result<()> {
+    if namespaces >= limits.namespaces {
+        return Err(crate::Error::StagingCapacity(
+            "bootstrap namespaces are full".into(),
+        ));
+    }
+    if from_source >= limits.source_namespaces {
+        return Err(crate::Error::StagingCapacity(
+            "bootstrap namespace quota exceeded for source".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse `charge` more bytes in a namespace holding `held` of `limit`.
+pub(super) fn check_namespace(held: u64, charge: u64, limit: u64) -> Result<()> {
+    if held.saturating_add(charge) > limit {
+        return Err(crate::Error::StagingCapacity(
+            "bootstrap namespace byte quota exceeded".into(),
         ));
     }
     Ok(())

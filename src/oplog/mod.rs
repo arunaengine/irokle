@@ -1141,6 +1141,11 @@ impl<S: Storage> Oplog<S> {
                 self.stored_op_state(&op)?
             };
             if matches!(stored, StoredOp::Complete) {
+                // Records of a topic without state exist only while an
+                // activation is unfinished; that history is not this batch's.
+                if state.is_none() {
+                    return Err(Error::AdmissionConflict);
+                }
                 continue;
             }
 
