@@ -997,7 +997,8 @@ impl<S: Storage> IrohNet<S> {
 
     /// Run storage work on a blocking thread in `lane`. The permit and the
     /// task guard move into the job, so both are held until the job really
-    /// ends, even when the awaiting caller is cancelled first.
+    /// ends, even when the awaiting caller is cancelled first. The guard leaves
+    /// with the result, so a result no one awaits is dropped before it.
     async fn run_job<T, F>(&self, lane: Lane, job: F) -> io::Result<T>
     where
         T: Send + 'static,
@@ -1017,12 +1018,12 @@ impl<S: Storage> IrohNet<S> {
         // Locals drop in reverse order: the permit is back before the task
         // stops counting, so a completed shutdown never sees a held permit.
         tokio::task::spawn_blocking(move || {
-            let _task = task;
             let _permit = permit;
             let _count = count;
-            job(&shared)
+            (job(&shared), task)
         })
         .await
+        .map(|(result, _task)| result)
         .map_err(|error| io::Error::other(format!("storage job failed: {error}")))
     }
 }
