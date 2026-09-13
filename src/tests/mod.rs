@@ -26,6 +26,7 @@ mod progress;
 mod protocol;
 mod provisional;
 mod snapshot;
+mod staging;
 mod storage;
 pub(crate) mod support;
 mod sync;
