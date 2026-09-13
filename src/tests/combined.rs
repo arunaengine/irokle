@@ -149,6 +149,25 @@ async fn late_invite_faults() {
         "work owed to the unreachable replica stays outstanding"
     );
     assert!(carol.topic_unresolved(topic_id).unwrap().is_empty());
+    // Obligations keep their peer: the replica's still names the final writes,
+    // while the member that caught up owes nothing once its ack is applied.
+    let last = oplog::topological(alice.storage(), &topic_id)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .id;
+    let owed = |peer: &PeerId| {
+        let obligations = alice.storage().sync_obligations(peer, &topic_id).unwrap();
+        obligation_covers(alice.storage(), &obligations, &last)
+    };
+    assert!(owed(&down));
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while owed(&carol_peer) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the caught-up member's ack never settled what it was owed");
 
     alice.shutdown_iroh().await;
     carol.shutdown_iroh().await;
