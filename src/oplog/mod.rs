@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::{
-    AdmissionEffects, AdmittedBatch, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage,
-    TopicState, TopicView,
+    AdmissionEffects, AdmittedBatch, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, SnapshotRead,
+    Storage, TopicState, TopicView,
 };
 use crate::{
     ActorId, Error, EventEnvelope, EvictionKey, Op, OpBody, OpId, PeerId, Result, SignedOp, Signer,
@@ -34,9 +34,6 @@ pub(crate) const MAX_ADMISSION_RETRIES: usize = 64;
 const MAX_DRAIN_OPS: usize = 4096;
 const READY_SLICE: usize = 256;
 const MAX_CACHED_PROJECTIONS: usize = 4096;
-/// Views a whole-topic check reads before it gives up certifying one; each
-/// retry means a reset committed during the hole scan.
-const MAX_VIEW_ATTEMPTS: usize = 4;
 
 #[derive(Default)]
 struct MembershipCache {
@@ -231,6 +228,31 @@ fn admission_failure(mut admitted: Admitted, error: Error) -> Error {
     }
 }
 
+/// Branch and data epoch a whole verdict is recorded under.
+fn view_key(view: &TopicView) -> (OpId, u64) {
+    (view.state.genesis, view.epoch)
+}
+
+/// Ids a topic's stored records reference without resolving them.
+fn scan_holes_in(read: &dyn SnapshotRead, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
+    let mut holes = BTreeSet::new();
+    for id in read.list_op_ids(topic_id)? {
+        let Some(meta) = read.get_meta(&id)? else {
+            holes.insert(id);
+            continue;
+        };
+        if read.get_op(&id)?.is_none() {
+            holes.insert(id);
+        }
+        for dep in &meta.deps {
+            if !read.dep_resolvable(dep)? {
+                holes.insert(*dep);
+            }
+        }
+    }
+    Ok(holes)
+}
+
 #[derive(Clone)]
 pub struct Oplog<S = MemoryStorage> {
     storage: S,
@@ -271,72 +293,62 @@ impl<S: Storage> Oplog<S> {
     /// means every admitted op is locally usable, which is what lets sync
     /// certify the topic; anything else is turned into concrete repair wants.
     pub fn topic_unresolved(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
-        match self.storage.topic_view(topic_id, None)? {
-            Some(view) => Ok(self.view_unresolved(&view)?.0),
-            None => {
-                let mut unresolved = self.storage.pending_missing_deps(topic_id)?;
-                unresolved.extend(self.scan_stored_holes(topic_id)?);
-                Ok(unresolved)
-            }
-        }
+        self.storage
+            .read_snapshot(|read| match read.topic_view(topic_id, None)? {
+                Some(view) => self.unresolved_in(read, &view),
+                None => scan_holes_in(read, topic_id),
+            })
     }
 
-    /// Ids `view`'s topic cannot resolve, and whether a hole scan ran. A scan
-    /// is not part of the view, so its whole verdict is recorded only under the
-    /// view's branch and epoch, where a later reset cannot reuse it.
-    pub(crate) fn view_unresolved(&self, view: &TopicView) -> Result<(BTreeSet<OpId>, bool)> {
-        let topic_id = view.state.topic_id;
-        let key = (view.state.genesis, view.epoch);
-        let mut unresolved = view.pending_missing.clone();
-        if self.whole_topics()?.get(&topic_id) == Some(&key) {
-            return Ok((unresolved, false));
+    /// Ids `view`'s topic cannot resolve, scanned in a later snapshot when the
+    /// cache has no verdict. The verdict is recorded only when that snapshot
+    /// still holds the view's branch and epoch.
+    pub(crate) fn view_unresolved(&self, view: &TopicView) -> Result<BTreeSet<OpId>> {
+        if self.whole_topics()?.get(&view.state.topic_id) == Some(&view_key(view)) {
+            return Ok(view.pending_missing.clone());
         }
-        let holes = self.scan_stored_holes(&topic_id)?;
-        if holes.is_empty() {
-            self.whole_topics()?.insert(topic_id, key);
-        }
-        unresolved.extend(holes);
-        Ok((unresolved, true))
-    }
-
-    /// A view of the topic and whether it is whole: only a verdict recorded for
-    /// this branch and epoch with no scan in between counts, so a reset during
-    /// a scan cannot lend the verdict to the frontier being certified.
-    pub(crate) fn whole_view(&self, topic_id: &TopicId) -> Result<Option<(TopicView, bool)>> {
-        let mut last = None;
-        for _ in 0..MAX_VIEW_ATTEMPTS {
-            let Some(view) = self.storage.topic_view(topic_id, None)? else {
-                return Ok(None);
-            };
-            let (unresolved, scanned) = self.view_unresolved(&view)?;
-            if !unresolved.is_empty() {
-                return Ok(Some((view, false)));
-            }
-            if !scanned {
-                return Ok(Some((view, true)));
-            }
-            last = Some(view);
-        }
-        Ok(last.map(|view| (view, false)))
-    }
-
-    fn scan_stored_holes(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
-        let mut holes = BTreeSet::new();
-        for id in self.storage.list_op_ids(topic_id)? {
-            let Some(meta) = self.storage.get_meta(&id)? else {
-                holes.insert(id);
-                continue;
-            };
-            if self.storage.get_op(&id)?.is_none() {
-                holes.insert(id);
-            }
-            for dep in &meta.deps {
-                if !self.storage.dep_resolvable(dep)? {
-                    holes.insert(*dep);
+        self.storage.read_snapshot(|read| {
+            let current = read.topic_view(&view.state.topic_id, None)?;
+            match current.filter(|current| view_key(current) == view_key(view)) {
+                Some(current) => self.unresolved_in(read, &current),
+                None => {
+                    let mut unresolved = view.pending_missing.clone();
+                    unresolved.extend(scan_holes_in(read, &view.state.topic_id)?);
+                    Ok(unresolved)
                 }
             }
+        })
+    }
+
+    /// Ids `view`'s topic cannot resolve, where `view` was read from `read`. A
+    /// scan of that same snapshot is recorded as whole under its branch and epoch.
+    pub(crate) fn unresolved_in(
+        &self,
+        read: &dyn SnapshotRead,
+        view: &TopicView,
+    ) -> Result<BTreeSet<OpId>> {
+        let topic_id = view.state.topic_id;
+        let mut unresolved = view.pending_missing.clone();
+        if self.whole_topics()?.get(&topic_id) == Some(&view_key(view)) {
+            return Ok(unresolved);
         }
-        Ok(holes)
+        let holes = scan_holes_in(read, &topic_id)?;
+        if holes.is_empty() {
+            self.whole_topics()?.insert(topic_id, view_key(view));
+        }
+        unresolved.extend(holes);
+        Ok(unresolved)
+    }
+
+    /// A view of the topic and whether it is whole, both from one snapshot.
+    pub(crate) fn whole_view(&self, topic_id: &TopicId) -> Result<Option<(TopicView, bool)>> {
+        self.storage.read_snapshot(|read| {
+            let Some(view) = read.topic_view(topic_id, None)? else {
+                return Ok(None);
+            };
+            let whole = self.unresolved_in(read, &view)?.is_empty();
+            Ok(Some((view, whole)))
+        })
     }
 
     /// Drop the record of which topics were found whole, so the next integrity

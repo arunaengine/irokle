@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::storage::{OpMeta, Storage};
+use crate::storage::{OpMeta, SnapshotRead, Storage};
 use crate::{Error, Op, Result, TopicId};
 
 pub fn topological<S: Storage>(storage: &S, topic_id: &TopicId) -> Result<Vec<Op>> {
@@ -16,8 +16,10 @@ pub(crate) fn topological_entries<S: Storage>(
     storage: &S,
     topic_id: &TopicId,
 ) -> Result<Vec<(Op, OpMeta)>> {
-    let ids = storage.list_op_ids(topic_id)?;
-    topological_subset_entries(storage, &ids)
+    storage.read_snapshot(|read| {
+        let ids = read.list_op_ids(topic_id)?;
+        subset_entries_in(read, &ids)
+    })
 }
 
 /// Order the ops named by `ids` oldest-first.
@@ -39,10 +41,17 @@ pub(crate) fn topological_subset_entries<S: Storage>(
     storage: &S,
     ids: &BTreeSet<crate::OpId>,
 ) -> Result<Vec<(Op, OpMeta)>> {
-    topological_meta(storage, ids)?
+    storage.read_snapshot(|read| subset_entries_in(read, ids))
+}
+
+fn subset_entries_in(
+    read: &dyn SnapshotRead,
+    ids: &BTreeSet<crate::OpId>,
+) -> Result<Vec<(Op, OpMeta)>> {
+    topological_meta(read, ids)?
         .into_iter()
         .map(|meta| {
-            let op = storage
+            let op = read
                 .get_op(&meta.id)?
                 .ok_or_else(|| Error::Storage(format!("missing op {}", meta.id)))?;
             Ok((op, meta))
@@ -54,22 +63,24 @@ pub(crate) fn topological_ids<S: Storage>(
     storage: &S,
     ids: &BTreeSet<crate::OpId>,
 ) -> Result<Vec<crate::OpId>> {
-    Ok(topological_meta(storage, ids)?
-        .into_iter()
-        .map(|meta| meta.id)
-        .collect())
+    storage.read_snapshot(|read| {
+        Ok(topological_meta(read, ids)?
+            .into_iter()
+            .map(|meta| meta.id)
+            .collect())
+    })
 }
 
-fn topological_meta<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) -> Result<Vec<OpMeta>> {
+fn topological_meta(read: &dyn SnapshotRead, ids: &BTreeSet<crate::OpId>) -> Result<Vec<OpMeta>> {
     let mut present = BTreeMap::new();
     let mut children: BTreeMap<crate::OpId, BTreeSet<crate::OpId>> = BTreeMap::new();
     let mut blocked = BTreeSet::new();
     for id in ids {
-        let Some(meta) = storage.get_meta(id)? else {
+        let Some(meta) = read.get_meta(id)? else {
             blocked.insert(*id);
             continue;
         };
-        if !storage.dep_resolvable(id)? {
+        if !read.dep_resolvable(id)? {
             blocked.insert(*id);
             continue;
         }
@@ -79,7 +90,7 @@ fn topological_meta<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) -> Res
             if ids.contains(dep) {
                 deps_in_set += 1;
                 children.entry(*dep).or_default().insert(*id);
-            } else if !storage.dep_resolvable(dep)? {
+            } else if !read.dep_resolvable(dep)? {
                 dangling = true;
             }
         }

@@ -478,7 +478,7 @@ impl<S: Storage> Irokle<S> {
         &self,
         view: &crate::storage::TopicView,
     ) -> Result<BTreeSet<OpId>> {
-        Ok(self.oplog.view_unresolved(view)?.0)
+        self.oplog.view_unresolved(view)
     }
 
     /// Audit stored records again on the next integrity question instead of

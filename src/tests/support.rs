@@ -148,6 +148,8 @@ pub(crate) type ArmedGate = (GatePoint, Arc<Gate>);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GatePoint {
     View(TopicId),
+    /// The first topic state or view read of the topic, whichever comes first.
+    Topic(TopicId),
     Heads(TopicId),
     Meta(OpId),
     PeerAck(PeerId),
@@ -211,6 +213,59 @@ impl Drop for GateRelease {
     }
 }
 
+/// Whether a write can commit while a planner holds its snapshot: a store with
+/// snapshot isolation lets it, a store behind one lock makes it wait.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Isolation {
+    #[cfg_attr(not(feature = "fjall"), allow(dead_code))]
+    Commits,
+    Blocks,
+}
+
+/// Runs `plan` until it pauses at the `skip`-th later read of `point`, runs
+/// `write` beside it, then lets the plan finish. Under [`Isolation::Commits`]
+/// the write has committed before the plan resumes.
+pub(crate) fn interleave<S: Storage, T: Send + 'static>(
+    storage: &StaleReadStorage<S>,
+    (point, skip): (GatePoint, usize),
+    isolation: Isolation,
+    plan: impl FnOnce() -> T + Send + 'static,
+    write: impl FnOnce() + Send + 'static,
+) -> T {
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    storage.arm_read_after(point, skip, Arc::clone(&gate));
+    let planning = thread::spawn({
+        let gate = Arc::clone(&gate);
+        move || {
+            let planned = plan();
+            gate.skip();
+            planned
+        }
+    });
+    gate.wait_arrival();
+    assert!(!planning.is_finished(), "{point:?} was never paused");
+    let started = Arc::new(Barrier::new(2));
+    let writing = thread::spawn({
+        let started = Arc::clone(&started);
+        move || {
+            started.wait();
+            write();
+        }
+    });
+    started.wait();
+    let mut writing = Some(writing);
+    if matches!(isolation, Isolation::Commits) {
+        writing.take().unwrap().join().unwrap();
+    }
+    drop(release);
+    let planned = planning.join().unwrap();
+    if let Some(writing) = writing {
+        writing.join().unwrap();
+    }
+    planned
+}
+
 /// Storage wrapper that simulates the stale reads of a concurrent admission:
 /// `get_op`/`actor_index` report "unknown" exactly once for ops in the
 /// one-shot sets, so a duplicate slips past the batch dedup check and reaches
@@ -231,6 +286,8 @@ pub(crate) struct StaleReadStorage<S = MemoryStorage> {
     pub(crate) obligation_gate: Arc<std::sync::Mutex<Option<Arc<Rendezvous>>>>,
     pub(crate) failed_heads: Arc<std::sync::Mutex<BTreeSet<TopicId>>>,
     pub(crate) read_gate: Arc<std::sync::Mutex<Option<ArmedGate>>>,
+    /// Matching reads the armed gate lets pass before it pauses one.
+    pub(crate) read_skips: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) conflicts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -247,13 +304,22 @@ impl<S: Storage> StaleReadStorage<S> {
             obligation_gate: Arc::default(),
             failed_heads: Arc::default(),
             read_gate: Arc::default(),
+            read_skips: Arc::default(),
             conflicts: Arc::default(),
         }
     }
 
     /// Pause the next read at `point` on `gate`, once.
     pub(crate) fn arm_read(&self, point: GatePoint, gate: Arc<Gate>) {
-        *self.read_gate.lock().unwrap() = Some((point, gate));
+        self.arm_read_after(point, 0, gate);
+    }
+
+    /// Let `skip` matching reads pass, then pause the next one on `gate`.
+    pub(crate) fn arm_read_after(&self, point: GatePoint, skip: usize, gate: Arc<Gate>) {
+        let mut armed = self.read_gate.lock().unwrap();
+        self.read_skips
+            .store(skip, std::sync::atomic::Ordering::SeqCst);
+        *armed = Some((point, gate));
     }
 
     /// Make the next `count` admission writes lose to a concurrent commit.
@@ -271,8 +337,23 @@ impl<S: Storage> StaleReadStorage<S> {
     fn gate_read(&self, point: GatePoint) {
         let gate = {
             let mut armed = self.read_gate.lock().unwrap();
+            let topic = match point {
+                GatePoint::View(topic_id) | GatePoint::Topic(topic_id) => Some(topic_id),
+                _ => None,
+            };
             match armed.as_ref() {
-                Some((armed_point, _)) if *armed_point == point => armed.take(),
+                Some((armed_point, _))
+                    if *armed_point == point
+                        || topic
+                            .is_some_and(|topic_id| *armed_point == GatePoint::Topic(topic_id)) =>
+                {
+                    let skipped = self.read_skips.try_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |left| left.checked_sub(1),
+                    );
+                    if skipped.is_ok() { None } else { armed.take() }
+                }
                 _ => None,
             }
         };
@@ -452,7 +533,9 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
         self.inner.max_generation(topic_id)
     }
     fn topic_state(&self, topic_id: &TopicId) -> Result<Option<crate::storage::TopicState>, Error> {
-        self.inner.topic_state(topic_id)
+        let state = self.inner.topic_state(topic_id);
+        self.gate_read(GatePoint::Topic(*topic_id));
+        state
     }
     fn list_topics(&self) -> Result<Vec<crate::TopicInfo>, Error> {
         self.gate_read(GatePoint::Topics);

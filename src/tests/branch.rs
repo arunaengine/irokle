@@ -9,16 +9,16 @@ use crate::sync::{SyncData, SyncEngine};
 /// Two genesis candidates for one topic signed by the same author, so their
 /// events take the same actor positions. `old` has the larger genesis id and
 /// loses the tie-break against `new`.
-struct Branches {
-    topic_id: TopicId,
-    author: Ed25519Signer,
-    member: Ed25519Signer,
-    third: Ed25519Signer,
-    old: (Op, Op),
-    new: (Op, Op),
+pub(super) struct Branches {
+    pub(super) topic_id: TopicId,
+    pub(super) author: Ed25519Signer,
+    pub(super) member: Ed25519Signer,
+    pub(super) third: Ed25519Signer,
+    pub(super) old: (Op, Op),
+    pub(super) new: (Op, Op),
 }
 
-fn branches(seed: u8) -> Branches {
+pub(super) fn branches(seed: u8) -> Branches {
     let topic_id = TopicId::hash([b"branch-race".as_slice(), &[seed]].concat());
     let author = Ed25519Signer::from_bytes(&[seed; 32]);
     let member = Ed25519Signer::from_bytes(&[seed.wrapping_add(1); 32]);
@@ -57,7 +57,7 @@ fn branches(seed: u8) -> Branches {
 }
 
 /// Replace the old branch in `storage` with the new one.
-fn reset_to_new<S: Storage>(storage: &S, branches: &Branches) {
+pub(super) fn reset_to_new<S: Storage>(storage: &S, branches: &Branches) {
     let log = Oplog::with_storage(storage.clone());
     if storage.topic_state(&branches.topic_id).unwrap().is_none() {
         log.receive_ops(vec![branches.old.0.clone()]).unwrap();
@@ -74,8 +74,7 @@ fn reset_to_new<S: Storage>(storage: &S, branches: &Branches) {
 /// An ack is built while a reset replaces the branch it started reading. It
 /// must not pair the old genesis with the new branch's clock, which would prove
 /// an old-branch position the member never held.
-#[test]
-fn ack_keeps_branch() {
+fn assert_ack_keeps_branch<S: Storage>(inner: S, isolation: Isolation) {
     let branches = branches(150);
     let topic_id = branches.topic_id;
     let author = branches.author.peer_id();
@@ -91,38 +90,34 @@ fn ack_keeps_branch() {
         .unwrap();
 
     // The member holds only the old genesis, not the event it owes.
-    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let storage = StaleReadStorage::new(inner);
     let member_log = Oplog::with_storage(storage.clone());
     member_log
         .receive_ops_from_peer(Some(author), vec![branches.old.0.clone()])
         .unwrap();
     let member_sync = SyncEngine::new(member_log, member);
 
-    let gate = Arc::new(Gate::default());
-    let _release = gate.releaser();
     // Pause right after the member read its view of the old branch.
-    storage.arm_read(GatePoint::View(topic_id), Arc::clone(&gate));
-    let acking = thread::spawn({
-        let gate = Arc::clone(&gate);
+    let writer = storage.clone();
+    let signer = branches.member.clone();
+    let received = interleave(
+        &storage,
+        (GatePoint::View(topic_id), 0),
+        isolation,
         move || {
-            let received = member_sync.receive_data(
+            member_sync.receive_data(
                 author,
                 member,
                 SyncData {
                     topic_id,
                     ops: Vec::new(),
                 },
-            );
-            gate.skip();
-            received
-        }
-    });
-    gate.wait_arrival();
-    storage.disarm_read();
-    reset_to_new(&storage, &branches);
-    gate.release();
-    let (mut ack, _) = acking.join().unwrap().unwrap();
-    ack.sign(&branches.member).unwrap();
+            )
+        },
+        move || reset_to_new(&writer, &branches),
+    );
+    let (mut ack, _) = received.unwrap();
+    ack.sign(&signer).unwrap();
 
     let _ = author_sync.apply_ack(&ack);
     assert!(
@@ -131,6 +126,21 @@ fn ack_keeps_branch() {
             .has_sync_obligations(&member, &topic_id)
             .unwrap(),
         "an ack mixing two branches cleared old-branch work: {ack:?}"
+    );
+}
+
+#[test]
+fn ack_keeps_branch() {
+    assert_ack_keeps_branch(MemoryStorage::new(), Isolation::Blocks);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_ack_keeps_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_ack_keeps_branch(
+        crate::storage::FjallStorage::open(dir.path()).unwrap(),
+        Isolation::Commits,
     );
 }
 
@@ -469,7 +479,13 @@ fn paused<S: Storage, T: Send + 'static>(
 /// A reset commits while an ack, forwarding effects, a page plan and a pending
 /// drain are paused. No old-branch work proves or owes anything on the new
 /// branch, the eviction names exactly the discarded records, usage stays exact.
-fn assert_reset_pauses<S: Storage>(inner: S, usage: impl Fn(&S) -> (u64, u64)) {
+/// Under [`Isolation::Blocks`] a reset cannot commit while a snapshot read is
+/// paused, so the ack and page pauses run only on a store that isolates them.
+fn assert_reset_pauses<S: Storage>(
+    inner: S,
+    isolation: Isolation,
+    usage: impl Fn(&S) -> (u64, u64),
+) {
     let branches = branches(210);
     let topic_id = branches.topic_id;
     let author = branches.author.peer_id();
@@ -510,16 +526,19 @@ fn assert_reset_pauses<S: Storage>(inner: S, usage: impl Fn(&S) -> (u64, u64)) {
 
     let gates = [(); 4].map(|()| Arc::new(Gate::default()));
     let _releases = gates.each_ref().map(Gate::releaser);
+    let snapshots = matches!(isolation, Isolation::Commits);
     let member_sync = SyncEngine::new(Oplog::with_storage(storage.clone()), member);
-    let acking = paused(&storage, GatePoint::View(topic_id), &gates[0], move || {
-        member_sync.receive_data(
-            author,
-            member,
-            SyncData {
-                topic_id,
-                ops: Vec::new(),
-            },
-        )
+    let acking = snapshots.then(|| {
+        paused(&storage, GatePoint::View(topic_id), &gates[0], move || {
+            member_sync.receive_data(
+                author,
+                member,
+                SyncData {
+                    topic_id,
+                    ops: Vec::new(),
+                },
+            )
+        })
     });
     // Forwarding effects commit inside the admission transaction, so the
     // admission pauses at its dependency read just before building them.
@@ -550,27 +569,29 @@ fn assert_reset_pauses<S: Storage>(inner: S, usage: impl Fn(&S) -> (u64, u64)) {
         }
     });
     #[cfg(feature = "iroh")]
-    let planning = paused(&storage, GatePoint::Meta(old_event), &gates[3], {
-        let node = node.clone();
-        let request = sync::SyncRequest {
-            topic_id,
-            known: BTreeSet::new(),
-            wants: BTreeSet::new(),
-            actor_range_hints: vec![sync::ActorRangeHint {
-                actor_id: branches.old.1.signed.body.actor_id,
-                from_exclusive: 0,
-                to_inclusive: u64::MAX,
-            }],
-            genesis: Some(old_genesis),
-            credit: sync::SyncCredit::default(),
-        };
-        move || {
-            node.response_page(
-                third,
-                &request,
-                sync::PageBudget::from_credit(request.credit),
-            )
-        }
+    let planning = snapshots.then(|| {
+        paused(&storage, GatePoint::Meta(old_event), &gates[3], {
+            let node = node.clone();
+            let request = sync::SyncRequest {
+                topic_id,
+                known: BTreeSet::new(),
+                wants: BTreeSet::new(),
+                actor_range_hints: vec![sync::ActorRangeHint {
+                    actor_id: branches.old.1.signed.body.actor_id,
+                    from_exclusive: 0,
+                    to_inclusive: u64::MAX,
+                }],
+                genesis: Some(old_genesis),
+                credit: sync::SyncCredit::default(),
+            };
+            move || {
+                node.response_page(
+                    third,
+                    &request,
+                    sync::PageBudget::from_credit(request.credit),
+                )
+            }
+        })
     });
 
     storage.disarm_read();
@@ -587,7 +608,7 @@ fn assert_reset_pauses<S: Storage>(inner: S, usage: impl Fn(&S) -> (u64, u64)) {
         gate.release();
     }
 
-    if let Ok((mut ack, _)) = acking.join().unwrap() {
+    if let Some(Ok((mut ack, _))) = acking.map(|acking| acking.join().unwrap()) {
         ack.sign(&branches.member).unwrap();
         let _ = author_sync.apply_ack(&ack);
     }
@@ -601,7 +622,7 @@ fn assert_reset_pauses<S: Storage>(inner: S, usage: impl Fn(&S) -> (u64, u64)) {
     let _ = forwarding.join().unwrap();
     let _ = draining.join().unwrap();
     #[cfg(feature = "iroh")]
-    if let Ok(page) = planning.join().unwrap() {
+    if let Some(Ok(page)) = planning.map(|planning| planning.join().unwrap()) {
         assert!(
             page.ops.iter().all(|op| discarded.contains(&op.id)),
             "a page for the old branch carried new-branch ops"
@@ -666,7 +687,7 @@ fn assert_reset_pauses<S: Storage>(inner: S, usage: impl Fn(&S) -> (u64, u64)) {
 
 #[test]
 fn memory_reset_pauses() {
-    assert_reset_pauses(MemoryStorage::new(), |storage| {
+    assert_reset_pauses(MemoryStorage::new(), Isolation::Blocks, |storage| {
         let (ops, bytes, _, _) = storage.pending_usage(&PeerId::from_bytes([0; 32]));
         (ops, bytes)
     });
@@ -678,6 +699,7 @@ fn fjall_reset_pauses() {
     let dir = tempfile::tempdir().unwrap();
     assert_reset_pauses(
         crate::storage::FjallStorage::open(dir.path()).unwrap(),
+        Isolation::Commits,
         |storage| {
             let (ops, bytes, _, _) = storage.pending_usage(&PeerId::from_bytes([0; 32]));
             (ops, bytes)

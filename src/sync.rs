@@ -332,7 +332,7 @@ impl<S: Storage> SyncEngine<S> {
     /// assumes. Callers must still refuse that fast path while their own topic
     /// is incomplete, since two identically damaged stores do match.
     fn view_digest(&self, view: &TopicView) -> Result<[u8; 32]> {
-        let (unresolved, _) = self.oplog.view_unresolved(view)?;
+        let unresolved = self.oplog.view_unresolved(view)?;
         if unresolved.is_empty() {
             return Ok(view.fingerprint);
         }
@@ -452,7 +452,7 @@ impl<S: Storage> SyncEngine<S> {
         }
         // A hole moves neither heads nor the clock, so a matching fingerprint
         // does not prove we are whole; keep negotiating until it is repaired.
-        let (unresolved, _) = self.oplog.view_unresolved(&view)?;
+        let unresolved = self.oplog.view_unresolved(&view)?;
         if unresolved.is_empty() && view.fingerprint == remote.fingerprint {
             return Ok(SyncPlan {
                 topic_id: remote.topic_id,
