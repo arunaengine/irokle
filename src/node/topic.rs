@@ -104,7 +104,7 @@ impl<E: Event, S: Storage> Topic<E, S> {
         if self
             .node
             .storage()
-            .get_meta(&op_id)?
+            .get_position(&op_id)?
             .is_some_and(|meta| meta.topic_id != self.topic_id)
         {
             return Err(Error::TopicMismatch);
@@ -116,7 +116,7 @@ impl<E: Event, S: Storage> Topic<E, S> {
         if self
             .node
             .storage()
-            .get_meta(&op_id)?
+            .get_position(&op_id)?
             .is_some_and(|meta| meta.topic_id != self.topic_id)
         {
             return Err(Error::TopicMismatch);
@@ -157,7 +157,7 @@ impl<S: Storage> RawTopic<S> {
         if self
             .oplog
             .storage()
-            .get_meta(&op_id)?
+            .get_position(&op_id)?
             .is_some_and(|meta| meta.topic_id != self.topic_id)
         {
             return Err(Error::TopicMismatch);
@@ -169,7 +169,7 @@ impl<S: Storage> RawTopic<S> {
         if self
             .oplog
             .storage()
-            .get_meta(&op_id)?
+            .get_position(&op_id)?
             .is_some_and(|meta| meta.topic_id != self.topic_id)
         {
             return Err(Error::TopicMismatch);
@@ -209,7 +209,7 @@ pub(super) fn dag_ops<S: Storage>(
             }
             // A dependency still awaiting repair simply ends this branch of the
             // walk; the rest of the DAG stays queryable.
-            let Some(meta) = storage.get_meta(&id)? else {
+            let Some(meta) = storage.get_position(&id)? else {
                 continue;
             };
             if meta.topic_id != topic_id {

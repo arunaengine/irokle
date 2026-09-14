@@ -192,6 +192,10 @@ impl Storage for MemoryStorage {
         self.counters.count_meta();
         Ok(self.lock()?.meta.get(id).cloned())
     }
+    fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {
+        self.counters.count_meta();
+        Ok(self.lock()?.meta.get(id).map(OpPosition::from))
+    }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
         let inner = self.lock()?;
         Ok(dep_resolvable_locked(&inner, id))
@@ -315,17 +319,20 @@ impl Storage for MemoryStorage {
         Ok(inner
             .peer_acks
             .get(&(*peer_id, meta.topic_id))
-            .is_some_and(|ack| ack_reached_op(ack, genesis, meta)))
+            .is_some_and(|ack| ack_reached_op(ack, genesis, op_id, &meta.into())))
     }
     fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>> {
         let inner = self.lock()?;
         let Some((meta, genesis)) = stored_op_branch(&inner, op_id) else {
             return Ok(Vec::new());
         };
+        let position = meta.into();
         let mut peers = inner
             .peer_acks
             .values()
-            .filter(|ack| ack.topic_id == meta.topic_id && ack_reached_op(ack, genesis, meta))
+            .filter(|ack| {
+                ack.topic_id == meta.topic_id && ack_reached_op(ack, genesis, op_id, &position)
+            })
             .map(|ack| ack.peer_id)
             .collect::<Vec<_>>();
         peers.sort();
@@ -1230,7 +1237,9 @@ fn clear_satisfied_locked(inner: &mut MemoryInner, ack: &PeerAck) -> Result<usiz
     };
     let mut settled = BTreeMap::new();
     for (kind, obligation) in records {
-        let rest = settled_obligation(obligation, ack, |id| Ok(inner.meta.get(id).cloned()))?;
+        let rest = settled_obligation(obligation, ack, |id| {
+            Ok(inner.meta.get(id).map(OpPosition::from))
+        })?;
         settled.insert(*kind, rest);
     }
     let records = inner.obligations.entry(key).or_default();

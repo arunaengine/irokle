@@ -861,8 +861,7 @@ impl FjallStorage {
                         None => false,
                     };
                 let has_meta =
-                    Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", &op.id))?
-                        .is_some();
+                    fjall::Readable::contains_key(tx, &self.records, Self::key_id(b"m", &op.id))?;
                 if has_op && has_meta {
                     accounted_entries.insert(op.id);
                     continue;
@@ -945,8 +944,11 @@ impl FjallStorage {
             ensure_deps_resolvable(&new_entries, |dep| {
                 Ok(
                     Self::tx_get::<Op>(tx, &self.records, Self::key_id(b"o", dep))?.is_some()
-                        && Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", dep))?
-                            .is_some(),
+                        && fjall::Readable::contains_key(
+                            tx,
+                            &self.records,
+                            Self::key_id(b"m", dep),
+                        )?,
                 )
             })?;
             if let Some(fence) = &self.namespace {
@@ -1218,7 +1220,10 @@ impl FjallStorage {
         if !fjall::Readable::contains_key(tx, records, Self::key_id(b"o", id))? {
             return Ok(None);
         }
-        Ok(Self::tx_get::<OpMeta>(tx, records, Self::key_id(b"m", id))?.map(|meta| meta.topic_id))
+        Ok(
+            Self::tx_get::<MetaPrefix>(tx, records, Self::key_id(b"m", id))?
+                .map(|meta| meta.topic_id),
+        )
     }
 
     fn read_topic_ids(
@@ -1262,13 +1267,13 @@ impl FjallStorage {
         Ok(out)
     }
 
-    /// Metadata of a stored op and the genesis of the branch holding it.
+    /// The position of a stored op and the genesis of the branch holding it.
     fn read_op_branch(
         tx: &impl fjall::Readable,
         records: &fjall::OptimisticTxKeyspace,
         op_id: &OpId,
-    ) -> Result<Option<(OpMeta, OpId)>> {
-        let Some(meta) = Self::tx_get::<OpMeta>(tx, records, Self::key_id(b"m", op_id))? else {
+    ) -> Result<Option<(MetaPrefix, OpId)>> {
+        let Some(meta) = Self::tx_get::<MetaPrefix>(tx, records, Self::key_id(b"m", op_id))? else {
             return Ok(None);
         };
         let state = Self::tx_get::<TopicState>(tx, records, Self::key_id(b"ts", &meta.topic_id))?;
@@ -1299,7 +1304,7 @@ impl FjallStorage {
             // Edges pointing at this op go too, or a dependency the reset does
             // not reach keeps naming a child the topic no longer holds.
             if let Some(meta) =
-                Self::tx_get::<OpMeta>(tx, &self.records, Self::key_id(b"m", op_id))?
+                Self::tx_get::<MetaPrefix>(tx, &self.records, Self::key_id(b"m", op_id))?
             {
                 for dep in &meta.deps {
                     tx.remove(
@@ -1479,6 +1484,16 @@ impl Storage for FjallStorage {
             _ => Ok(None),
         }
     }
+    fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {
+        self.counters.count_meta();
+        let read_tx = self.snapshot()?;
+        let prefix: Option<MetaPrefix> =
+            Self::tx_get(&read_tx, &self.records, Self::key_id(b"m", id))?;
+        match prefix {
+            Some(prefix) if self.shown(&read_tx, &prefix.topic_id)? => Ok(Some(prefix.into())),
+            _ => Ok(None),
+        }
+    }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
         let read_tx = self.snapshot()?;
         match Self::read_resolvable(&read_tx, &self.records, id)? {
@@ -1527,7 +1542,7 @@ impl Storage for FjallStorage {
         // and a damaged end may have lost its own.
         let topic_of = |id: &OpId| -> Result<Option<TopicId>> {
             Ok(
-                Self::tx_get::<OpMeta>(&read_tx, &self.records, Self::key_id(b"m", id))?
+                Self::tx_get::<MetaPrefix>(&read_tx, &self.records, Self::key_id(b"m", id))?
                     .map(|meta| meta.topic_id),
             )
         };
@@ -1648,7 +1663,7 @@ impl Storage for FjallStorage {
             &self.records,
             Self::ack_key(&meta.topic_id, peer_id),
         )?;
-        Ok(ack.is_some_and(|ack| ack_reached_op(&ack, genesis, &meta)))
+        Ok(ack.is_some_and(|ack| ack_reached_op(&ack, genesis, op_id, &meta.into())))
     }
     fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>> {
         let read_tx = self.snapshot()?;
@@ -1657,10 +1672,11 @@ impl Storage for FjallStorage {
         };
         let mut peers = Vec::new();
         let prefix = [PEER_ACK_PREFIX, meta.topic_id.as_ref()].concat();
+        let position = meta.into();
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
             let value = item.value()?;
             let ack: PeerAck = postcard::from_bytes(value.as_ref())?;
-            if ack_reached_op(&ack, genesis, &meta) {
+            if ack_reached_op(&ack, genesis, op_id, &position) {
                 peers.push(ack.peer_id);
             }
         }
@@ -1973,6 +1989,20 @@ struct MetaPrefix {
 }
 
 #[cfg(feature = "fjall")]
+impl From<MetaPrefix> for OpPosition {
+    fn from(prefix: MetaPrefix) -> Self {
+        Self {
+            topic_id: prefix.topic_id,
+            actor_id: prefix.actor_id,
+            actor_seq: prefix.actor_seq,
+            actor_prev: prefix.actor_prev,
+            deps: prefix.deps,
+            generation: prefix.generation,
+        }
+    }
+}
+
+#[cfg(feature = "fjall")]
 /// One read transaction seen through [`SnapshotRead`].
 struct FjallSnapshot<'a> {
     tx: fjall::Snapshot,
@@ -2034,14 +2064,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
             FjallStorage::key_id(b"m", id),
         )?;
         match prefix {
-            Some(prefix) if self.shown(&prefix.topic_id)? => Ok(Some(OpPosition {
-                topic_id: prefix.topic_id,
-                actor_id: prefix.actor_id,
-                actor_seq: prefix.actor_seq,
-                actor_prev: prefix.actor_prev,
-                deps: prefix.deps,
-                generation: prefix.generation,
-            })),
+            Some(prefix) if self.shown(&prefix.topic_id)? => Ok(Some(prefix.into())),
             _ => Ok(None),
         }
     }
@@ -2096,7 +2119,10 @@ fn clear_satisfied_tx(
     let mut cleared = 0;
     for (key, obligation) in stored {
         let rest = settled_obligation(&obligation, ack, |id| {
-            FjallStorage::tx_get(tx, records, FjallStorage::key_id(b"m", id))
+            Ok(
+                FjallStorage::tx_get::<MetaPrefix>(tx, records, FjallStorage::key_id(b"m", id))?
+                    .map(OpPosition::from),
+            )
         })?;
         match rest {
             Some(rest) if rest == obligation => {}

@@ -523,7 +523,7 @@ impl<S: Storage> SyncEngine<S> {
             if !seen.insert(id) {
                 continue;
             }
-            let Some(meta) = read.get_meta(&id)? else {
+            let Some(meta) = read.get_position(&id)? else {
                 dangling.insert(id);
                 continue;
             };
@@ -535,7 +535,7 @@ impl<S: Storage> SyncEngine<S> {
             if read.get_op(&id)?.is_none() {
                 dangling.insert(id);
             }
-            if remote_contains(remote, &meta) {
+            if remote_contains(remote, &id, &meta) {
                 common.insert(id);
                 continue;
             }
@@ -567,10 +567,10 @@ impl<S: Storage> SyncEngine<S> {
             if missing.contains(&id) {
                 continue;
             }
-            let Some(meta) = read.get_meta(&id)? else {
+            let Some(meta) = read.get_position(&id)? else {
                 continue;
             };
-            if meta.topic_id != remote.topic_id || remote_contains(remote, &meta) {
+            if meta.topic_id != remote.topic_id || remote_contains(remote, &id, &meta) {
                 continue;
             }
             missing.insert(id);
@@ -862,7 +862,7 @@ impl<S: Storage> SyncEngine<S> {
                     && self
                         .oplog
                         .storage()
-                        .get_meta(op_id)?
+                        .get_position(op_id)?
                         .is_some_and(|meta| meta.topic_id == data.topic_id)
                 {
                     ack.accepted.insert(*op_id);
@@ -940,9 +940,9 @@ fn clamp_actor_range_hint(hint: &ActorRangeHint, local_seq: u64) -> Option<(u64,
     Some((hint.from_exclusive, to_inclusive))
 }
 
-fn remote_contains(remote: &SyncSummary, meta: &crate::storage::OpMeta) -> bool {
+fn remote_contains(remote: &SyncSummary, id: &OpId, meta: &crate::storage::OpPosition) -> bool {
     meta.topic_id == remote.topic_id
-        && (remote.heads.contains(&meta.id)
-            || remote.actor_tips.get(&meta.actor_id) == Some(&(meta.actor_seq, meta.id))
+        && (remote.heads.contains(id)
+            || remote.actor_tips.get(&meta.actor_id) == Some(&(meta.actor_seq, *id))
             || remote.actor_clock.get(&meta.actor_id) >= meta.actor_seq)
 }

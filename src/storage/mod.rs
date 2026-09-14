@@ -461,6 +461,11 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()>;
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
+    /// The position of `id`, as [`Self::get_meta`] would give it. Backends
+    /// override it to leave the observed clock unread.
+    fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {
+        Ok(self.get_meta(id)?.as_ref().map(OpPosition::from))
+    }
     /// Whether `id` is stored completely enough to stand as a dependency. The
     /// DAG is traversed through metadata and served from op records, so either
     /// half alone is a hole to refill, never a resolved edge. This is the one
@@ -993,7 +998,7 @@ pub(super) fn merged_obligation(
 pub(super) fn settled_obligation(
     obligation: &SyncObligation,
     ack: &PeerAck,
-    mut meta: impl FnMut(&OpId) -> Result<Option<OpMeta>>,
+    mut meta: impl FnMut(&OpId) -> Result<Option<OpPosition>>,
 ) -> Result<Option<SyncObligation>> {
     let target = match &obligation.target {
         ObligationTarget::Clock(target) => {
@@ -1155,9 +1160,14 @@ pub(super) fn journalled_eviction(
 /// Whether `ack` proves the peer holds the operation `meta` describes. Only
 /// evidence certified against the topic's current genesis counts: a record from
 /// a replaced branch names the same actor sequences without covering them.
-pub(super) fn ack_reached_op(ack: &PeerAck, genesis: OpId, meta: &OpMeta) -> bool {
+pub(super) fn ack_reached_op(
+    ack: &PeerAck,
+    genesis: OpId,
+    id: &OpId,
+    position: &OpPosition,
+) -> bool {
     ack.genesis == Some(genesis)
-        && (ack.heads.contains(&meta.id) || ack.clock.get(&meta.actor_id) >= meta.actor_seq)
+        && (ack.heads.contains(id) || ack.clock.get(&position.actor_id) >= position.actor_seq)
 }
 
 /// What one acknowledgement may do to stored state.

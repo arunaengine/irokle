@@ -1302,7 +1302,7 @@ impl<S: Storage> Irokle<S> {
                 continue;
             }
             let meta = storage
-                .get_meta(&op_id)?
+                .get_position(&op_id)?
                 .ok_or_else(|| Error::Storage(format!("missing op meta for {op_id}")))?;
             if meta.topic_id != topic_id {
                 return Err(Error::TopicMismatch);

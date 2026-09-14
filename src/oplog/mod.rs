@@ -239,7 +239,7 @@ fn view_key(view: &TopicView) -> (OpId, u64) {
 fn scan_holes_in(read: &dyn SnapshotRead, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
     let mut holes = BTreeSet::new();
     for id in read.list_op_ids(topic_id)? {
-        let Some(meta) = read.get_meta(&id)? else {
+        let Some(meta) = read.get_position(&id)? else {
             holes.insert(id);
             continue;
         };
@@ -394,7 +394,7 @@ impl<S: Storage> Oplog<S> {
             }
             // A head-reachable id with no metadata is an ordinary hole to
             // repair, not an orphan; it still counts as accounted for.
-            let Some(meta) = self.storage.get_meta(&id)? else {
+            let Some(meta) = self.storage.get_position(&id)? else {
                 continue;
             };
             frontier.extend(meta.deps);
@@ -484,7 +484,7 @@ impl<S: Storage> Oplog<S> {
                 tracing::warn!(%topic_id, %id, "deferred quarantine: repair the frontier first");
                 return Ok(None);
             };
-            if self.storage.get_meta(&id)?.is_none() {
+            if self.storage.get_position(&id)?.is_none() {
                 tracing::warn!(%topic_id, %id, "deferred quarantine: repair the frontier first");
                 return Ok(None);
             }
@@ -891,7 +891,7 @@ impl<S: Storage> Oplog<S> {
         if body.actor_seq < 2 || !body.deps.contains(&prev) {
             return Ok(true);
         }
-        if let Some(meta) = self.storage.get_meta(&prev)?
+        if let Some(meta) = self.storage.get_position(&prev)?
             && self.storage.dep_resolvable(&prev)?
             && (meta.topic_id != body.topic_id
                 || meta.actor_id != body.actor_id
@@ -1828,7 +1828,7 @@ impl<S: Storage> Oplog<S> {
         for id in &body.deps {
             let meta = self
                 .storage
-                .get_meta(id)?
+                .get_position(id)?
                 .ok_or(Error::MissingDependency(*id))?;
             generation = generation.max(checked_next(meta.generation)?);
         }
@@ -1929,7 +1929,9 @@ impl<S: Storage> Oplog<S> {
             if overlay_ops.contains_key(dep) {
                 continue;
             }
-            if reset || self.storage.get_op(dep)?.is_none() || self.storage.get_meta(dep)?.is_none()
+            if reset
+                || self.storage.get_op(dep)?.is_none()
+                || self.storage.get_position(dep)?.is_none()
             {
                 missing.insert(*dep);
             }
@@ -2206,7 +2208,7 @@ impl<S: Storage> Oplog<S> {
     /// already accounts for and must repair in place.
     fn stored_op_state(&self, op: &Op) -> Result<StoredOp> {
         let has_op = self.storage.get_op(&op.id)?.is_some();
-        let has_meta = self.storage.get_meta(&op.id)?.is_some();
+        let has_meta = self.storage.get_position(&op.id)?.is_some();
         if has_op && has_meta {
             return Ok(StoredOp::Complete);
         }

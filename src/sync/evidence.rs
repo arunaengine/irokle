@@ -161,7 +161,7 @@ impl<S: Storage> SyncEngine<S> {
 
         for op_id in ack.accepted.iter().chain(ack.heads.iter()) {
             // History we have not learned yet makes no locally checkable claim.
-            let Some(meta) = read.get_meta(op_id)? else {
+            let Some(meta) = read.get_position(op_id)? else {
                 continue;
             };
             if meta.topic_id != ack.topic_id {
@@ -207,7 +207,7 @@ impl<S: Storage> SyncEngine<S> {
         let mut unresolved = BTreeSet::new();
         let mut target_clock = ActorClock::new();
         for op_id in &op_ids {
-            if let Some(meta) = self.oplog.storage().get_meta(op_id)?
+            if let Some(meta) = self.oplog.storage().get_position(op_id)?
                 && meta.topic_id == topic_id
             {
                 target_clock.observe(meta.actor_id, meta.actor_seq);
