@@ -158,6 +158,13 @@ impl<S: Storage> SyncEngine<S> {
         request_ranges(local, remote, self.request_items, knowledge)
     }
 
+    /// The same engine naming at most `positions` needed positions per page.
+    #[cfg(test)]
+    pub(crate) fn with_page_positions(mut self, positions: usize) -> Self {
+        self.page_positions = positions.max(1);
+        self
+    }
+
     /// The same engine building and accepting requests of at most `items` wants and hints.
     #[cfg(test)]
     pub(crate) fn with_request_items(mut self, items: usize) -> Self {
