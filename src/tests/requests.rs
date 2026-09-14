@@ -311,6 +311,100 @@ fn fjall_beyond_windows() {
     });
 }
 
+/// A chain beyond the request and knowledge windows, planned in slices of a
+/// few reads with one place for kept plans, pulled by two readers at once. A
+/// reader refused for capacity asks again later, one reader reconnects midway
+/// and starts its knowledge over, and both still reach the frontier without an
+/// op before its dependency.
+#[test]
+fn chain_windows_saturated() {
+    let source = super::progress::reverse_chain(MemoryStorage::new(), 40);
+    let responder = source
+        .engine
+        .clone()
+        .with_request_items(3)
+        .with_page_positions(2)
+        .with_page_actors(2)
+        .with_page_visits(4, 1);
+    let state = source
+        .log
+        .storage()
+        .topic_state(&source.topic_id)
+        .unwrap()
+        .unwrap();
+    let second = *state
+        .members
+        .iter()
+        .find(|peer| **peer != source.reader)
+        .unwrap();
+    let readers = [source.reader, second].map(|peer| {
+        let log = Oplog::new();
+        log.receive_ops(vec![source.genesis.clone()]).unwrap();
+        let engine = SyncEngine::new(log.clone(), peer).with_request_items(3);
+        (peer, log, engine, RequestKnowledge::with_capacity(2), false)
+    });
+    let mut readers = readers;
+    let (mut rounds, mut refused, mut reconnected) = (0, 0, false);
+    let summary = responder.summary(source.topic_id).unwrap();
+    while readers.iter().any(|reader| !reader.4) {
+        rounds += 1;
+        assert!(rounds < 4096, "pulls did not finish");
+        for (peer, log, engine, knowledge, done) in &mut readers {
+            if *done {
+                continue;
+            }
+            let request = engine
+                .plan_request_with(*peer, &summary, knowledge)
+                .unwrap();
+            if request.actor_range_hints.is_empty() && request.wants.is_empty() {
+                *done = true;
+                continue;
+            }
+            let budget = PageBudget::from_credit(request.credit);
+            let page = match responder.response_page(*peer, &request, budget) {
+                Ok(page) => page,
+                Err(Error::Storage(message)) if message.contains("work") => {
+                    refused += 1;
+                    continue;
+                }
+                Err(error) => panic!("{error:?}"),
+            };
+            for op in &page.ops {
+                for dep in &op.signed.body.deps {
+                    let earlier = page.ops.iter().take_while(|sent| sent.id != op.id);
+                    assert!(
+                        log.storage().dep_resolvable(dep).unwrap()
+                            || earlier.clone().any(|sent| sent.id == *dep)
+                    );
+                }
+            }
+            let received = !page.ops.is_empty();
+            log.receive_ops(page.ops).unwrap();
+            knowledge.settle(
+                &request.window,
+                (&page.positions, page.continued),
+                (received, summary.actor_clock.iter().count()),
+            );
+            if *peer == second
+                && !reconnected
+                && log.storage().list_op_ids(&source.topic_id).unwrap().len() > 10
+            {
+                *knowledge = RequestKnowledge::with_capacity(2);
+                reconnected = true;
+            }
+        }
+    }
+    assert!(refused > 0, "the one place for kept plans was contended");
+    assert!(reconnected);
+    for (_, log, _, _, _) in &readers {
+        assert_eq!(
+            log.storage().heads(&source.topic_id).unwrap(),
+            source.log.storage().heads(&source.topic_id).unwrap()
+        );
+        assert!(log.storage().ready_pending_ops().unwrap().is_empty());
+    }
+}
+
 /// One op depending on three actors that stay behind until it is served
 /// needs all three described at once. Within that capacity paging completes;
 /// below it paging ends on a round without progress instead of cycling, and
