@@ -1985,6 +1985,7 @@ impl<S: Storage> SharedNet<S> {
             remote_peer_id,
             staged.as_ref().unwrap_or(summary),
             budget,
+            &Default::default(),
         )?;
         let converged = view.state.members.contains(&remote_peer_id)
             && summary.genesis == Some(view.state.genesis)

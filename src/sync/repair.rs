@@ -5,19 +5,20 @@
 use std::collections::BTreeSet;
 
 use crate::storage::{SnapshotRead, Storage};
-use crate::{ActorClock, Op, OpId, Result, TopicId};
+use crate::{ActorClock, ActorId, Op, OpId, Result, TopicId};
 
-use super::{PageBudget, SyncEngine};
+use super::{ActorScope, PageBudget, SyncEngine};
 
 impl<S: Storage> SyncEngine<S> {
     /// Requested repair ids this store holds, oldest generation first. An id
     /// whose dependency is neither held by the peer nor sent before it waits,
-    /// and so do its dependents: its ancestors come from the forward ranges.
+    /// and so do its dependents: its ancestors come from the forward ranges. A
+    /// dependency on an actor `scope` leaves unknown names that actor instead.
     pub(super) fn plan_repair(
         read: &dyn SnapshotRead,
         topic_id: &TopicId,
         wants: &BTreeSet<OpId>,
-        peer: &ActorClock,
+        (peer, scope): (&ActorClock, &ActorScope<'_>),
         budget: PageBudget,
     ) -> Result<RepairPage> {
         let mut page = RepairPage::default();
@@ -47,12 +48,17 @@ impl<S: Storage> SyncEngine<S> {
                     ready = false;
                     break;
                 }
-                let covered = read
-                    .get_meta(dep)?
-                    .is_some_and(|meta| peer.get(&meta.actor_id) >= meta.actor_seq);
-                if !covered {
-                    ready = false;
-                    break;
+                match read.get_meta(dep)? {
+                    // Every unknown actor of the want is named at once.
+                    Some(meta) if scope.unknown(&meta.actor_id) => {
+                        page.positions.insert(meta.actor_id);
+                        ready = false;
+                    }
+                    Some(meta) if peer.get(&meta.actor_id) >= meta.actor_seq => {}
+                    _ => {
+                        ready = false;
+                        break;
+                    }
                 }
             }
             if !ready {
@@ -88,4 +94,6 @@ pub(super) struct RepairPage {
     pub(super) unsent: BTreeSet<OpId>,
     pub(super) missing: BTreeSet<OpId>,
     pub(super) too_large: Option<OpId>,
+    /// Actors the request did not describe whose positions a want needed.
+    pub(super) positions: BTreeSet<ActorId>,
 }

@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use crate::storage::{SnapshotRead, Storage};
 use crate::{ActorClock, ActorId, Error, OpId, Result, TopicId};
 
-use super::{MAX_PAGE_BYTES, MAX_PAGE_MISSING, PageBudget, PlannedPage, RangeHead, SyncEngine};
+use super::{
+    ActorScope, MAX_PAGE_BYTES, MAX_PAGE_MISSING, PageBudget, PlannedPage, RangeHead, SyncEngine,
+};
 
 /// How far one actor of a page plan got.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +43,9 @@ struct Pager<'a> {
     topic_id: &'a TopicId,
     local: &'a ActorClock,
     goal: Option<&'a ActorClock>,
+    /// Which peer positions the request gave, and ids already sent before this plan.
+    scope: &'a ActorScope<'a>,
+    sent: &'a BTreeSet<OpId>,
     window: usize,
     active: BinaryHeap<Reverse<RangeHead>>,
     metas: BTreeMap<OpId, crate::storage::OpMeta>,
@@ -54,6 +59,7 @@ struct Pager<'a> {
     covered: ActorClock,
     blocked: BTreeSet<OpId>,
     missing: BTreeSet<OpId>,
+    positions: BTreeSet<ActorId>,
     more: bool,
 }
 
@@ -137,16 +143,19 @@ impl Pager<'_> {
                 .deferred
                 .iter()
                 .any(|actor_id| !self.states.contains_key(actor_id));
-        let mut missing = self.missing;
+        let (mut missing, mut positions) = (self.missing, self.positions);
         while missing.len() > MAX_PAGE_MISSING {
             missing.pop_last();
+        }
+        while positions.len() > MAX_PAGE_MISSING {
+            positions.pop_last();
         }
         Ok(PlannedPage {
             ops,
             more,
             missing,
             too_large,
-            positions: BTreeSet::new(),
+            positions,
         })
     }
 
@@ -211,11 +220,17 @@ impl Pager<'_> {
     }
 
     /// What `meta` still waits for: an unsent or blocked dependency, a missing
-    /// record, or a position of another actor the peer does not hold yet.
+    /// record, positions of actors the request did not describe, all named at
+    /// once, or a position of another actor the peer does not hold yet.
     fn wait_for(&mut self, meta: &crate::storage::OpMeta) -> Result<Wait> {
+        let mut unknown = false;
+        let mut waits = None;
         for dep in &meta.deps {
             if self.blocked.contains(dep) {
                 return Ok(Wait::Blocked);
+            }
+            if self.sent.contains(dep) {
+                continue;
             }
             let position = match self.metas.get(dep) {
                 Some(dep_meta) => Some((dep_meta.actor_id, dep_meta.actor_seq)),
@@ -228,11 +243,19 @@ impl Pager<'_> {
                 self.missing.insert(*dep);
                 return Ok(Wait::Blocked);
             };
-            if self.covered.get(&dep_actor) < dep_seq {
-                return Ok(Wait::Position(dep_actor, dep_seq));
+            // Omitted from the request is not held: the requester names it next.
+            if self.scope.unknown(&dep_actor) {
+                self.positions.insert(dep_actor);
+                unknown = true;
+            } else if waits.is_none() && self.covered.get(&dep_actor) < dep_seq {
+                waits = Some(Wait::Position(dep_actor, dep_seq));
             }
         }
-        Ok(Wait::Ready)
+        Ok(match (unknown, waits) {
+            (true, _) => Wait::Blocked,
+            (false, Some(waits)) => waits,
+            (false, None) => Wait::Ready,
+        })
     }
 
     /// Park `head` until `dep_actor` reaches `dep_seq`, activating that actor
@@ -339,14 +362,12 @@ impl<S: Storage> SyncEngine<S> {
     /// The next causal page for a peer at `peer`, merging forward actor ranges by
     /// generation, so dependencies come first. Work grows with the page and the
     /// actors behind, never with history the peer holds. See [`Pager`].
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn plan_page(
         &self,
         read: &dyn SnapshotRead,
         topic_id: &TopicId,
-        local: &ActorClock,
-        peer: &ActorClock,
-        goal: Option<&ActorClock>,
+        (local, peer, goal): (&ActorClock, &ActorClock, Option<&ActorClock>),
+        (scope, sent): (&ActorScope<'_>, &BTreeSet<OpId>),
         excluded: &BTreeSet<OpId>,
         budget: PageBudget,
     ) -> Result<PlannedPage> {
@@ -355,6 +376,8 @@ impl<S: Storage> SyncEngine<S> {
             topic_id,
             local,
             goal,
+            scope,
+            sent,
             window: self.page_actors,
             active: BinaryHeap::new(),
             metas: BTreeMap::new(),
@@ -365,6 +388,7 @@ impl<S: Storage> SyncEngine<S> {
             covered: peer.clone(),
             blocked: excluded.clone(),
             missing: BTreeSet::new(),
+            positions: BTreeSet::new(),
             more: false,
         };
         pager.plan(budget)

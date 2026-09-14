@@ -12,8 +12,11 @@ use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, canon
 mod evidence;
 mod plan;
 mod repair;
+mod request;
 mod types;
 
+pub(crate) use request::RequestKnowledge;
+use request::{ActorScope, request_ranges};
 pub use types::{
     ActorFilter, ActorRangeHint, ActorWindow, PageBudget, SyncAck, SyncCredit, SyncData,
     SyncFailure, SyncFailureCode, SyncFingerprint, SyncMessage, SyncOpen, SyncPage, SyncPlan,
@@ -34,6 +37,7 @@ pub const SYNC_PROTOCOL: &str = "irokle/sync/5";
 /// `plan_response_data` is willing to do for a peer-supplied hint, so a
 /// malicious peer cannot push us into walking unbounded sequence ranges.
 pub const MAX_ACTOR_RANGE_HINT_SPAN: u64 = 65_536;
+/// Wants and range hints one request may carry together.
 const MAX_REQUEST_ITEMS: usize = 65_536;
 /// Bytes of the filter of actors behind that a request leaves out; past it the
 /// request sends none and those actors stay unknown.
@@ -72,6 +76,8 @@ pub struct SyncEngine<S> {
     peer_id: PeerId,
     /// Active actors of one page plan; tests scale it down.
     page_actors: usize,
+    /// Wants and hints a request may carry; tests scale it down.
+    request_items: usize,
 }
 
 /// Which operation bodies a negotiation materializes into `SyncPlan::send`.
@@ -87,6 +93,7 @@ impl<S: Storage> SyncEngine<S> {
             oplog,
             peer_id,
             page_actors: MAX_PAGE_ACTORS,
+            request_items: MAX_REQUEST_ITEMS,
         }
     }
 
@@ -96,6 +103,7 @@ impl<S: Storage> SyncEngine<S> {
         self.page_actors = actors.max(1);
         self
     }
+
     pub fn open(topic_id: TopicId, peer_id: PeerId, event_type_id: Option<String>) -> SyncOpen {
         SyncOpen {
             protocol: SYNC_PROTOCOL.into(),
@@ -181,7 +189,15 @@ impl<S: Storage> SyncEngine<S> {
     /// history, not a sync step. Sync uses [`Self::negotiate_page`].
     pub fn negotiate(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
         self.oplog.storage().read_snapshot(|read| {
-            self.negotiate_inner(read, peer_id, remote, SendSet::Closure, &mut false)
+            let knowledge = RequestKnowledge::default();
+            self.negotiate_inner(
+                read,
+                peer_id,
+                remote,
+                SendSet::Closure,
+                &knowledge,
+                &mut false,
+            )
         })
     }
 
@@ -195,21 +211,25 @@ impl<S: Storage> SyncEngine<S> {
         remote: &SyncSummary,
         budget: PageBudget,
     ) -> Result<(SyncPlan, bool)> {
+        let knowledge = RequestKnowledge::default();
         self.oplog
             .storage()
-            .read_snapshot(|read| self.negotiate_in(read, peer_id, remote, budget))
+            .read_snapshot(|read| self.negotiate_in(read, peer_id, remote, budget, &knowledge))
     }
 
-    /// [`Self::negotiate_page`] over a snapshot the caller already holds.
+    /// [`Self::negotiate_page`] over a snapshot the caller already holds, with
+    /// the request continuing from `knowledge`.
     pub(crate) fn negotiate_in(
         &self,
         read: &dyn SnapshotRead,
         peer_id: PeerId,
         remote: &SyncSummary,
         budget: PageBudget,
+        knowledge: &RequestKnowledge,
     ) -> Result<(SyncPlan, bool)> {
         let mut more = false;
-        let plan = self.negotiate_inner(read, peer_id, remote, SendSet::Page(budget), &mut more)?;
+        let send_set = SendSet::Page(budget);
+        let plan = self.negotiate_inner(read, peer_id, remote, send_set, knowledge, &mut more)?;
         Ok((plan, more))
     }
 
@@ -221,6 +241,7 @@ impl<S: Storage> SyncEngine<S> {
         peer_id: PeerId,
         remote: &SyncSummary,
         send_set: SendSet,
+        knowledge: &RequestKnowledge,
         more: &mut bool,
     ) -> Result<SyncPlan> {
         // An unknown topic's remote heads are unauthenticated, so they never become
@@ -276,7 +297,8 @@ impl<S: Storage> SyncEngine<S> {
             };
             *more = false;
             if remote_genesis < view.state.genesis {
-                plan.actor_range_hints = actor_ranges(&empty, &remote.actor_clock, 0);
+                (plan.actor_range_hints, plan.window) =
+                    request_ranges(&empty, &remote.actor_clock, self.request_items, knowledge);
                 return Ok(plan);
             }
             plan.send = match send_set {
@@ -298,9 +320,8 @@ impl<S: Storage> SyncEngine<S> {
                     let page = self.plan_page(
                         read,
                         &remote.topic_id,
-                        &view.clock,
-                        &empty,
-                        None,
+                        (&view.clock, &empty, None),
+                        (&ActorScope::whole(), &BTreeSet::new()),
                         &BTreeSet::new(),
                         budget,
                     )?;
@@ -337,9 +358,8 @@ impl<S: Storage> SyncEngine<S> {
                 let page = self.plan_page(
                     read,
                     &remote.topic_id,
-                    &view.clock,
-                    &remote.actor_clock,
-                    None,
+                    (&view.clock, &remote.actor_clock, None),
+                    (&ActorScope::whole(), &BTreeSet::new()),
                     &BTreeSet::new(),
                     budget,
                 )?;
@@ -382,12 +402,20 @@ impl<S: Storage> SyncEngine<S> {
             });
         }
         // A request past the item limit is refused whole, so the wants are cut
-        // to what one request may carry and the rest follow once these resolve.
+        // to what one request may carry beside the positions a page asked for
+        // and one hint for an actor behind; the rest follow once these resolve.
+        let behind = remote
+            .actor_clock
+            .iter()
+            .any(|(actor_id, seq)| *seq > view.clock.get(actor_id));
+        let reserved = if behind { 1 + knowledge.positions() } else { 0 };
         let need = need
             .into_iter()
-            .take(MAX_REQUEST_ITEMS)
+            .take(self.request_items.saturating_sub(reserved))
             .collect::<BTreeSet<_>>();
-        let actor_range_hints = actor_ranges(&view.clock, &remote.actor_clock, need.len());
+        let items = self.request_items - need.len();
+        let (actor_range_hints, window) =
+            request_ranges(&view.clock, &remote.actor_clock, items, knowledge);
         Ok(SyncPlan {
             topic_id: remote.topic_id,
             common,
@@ -395,7 +423,7 @@ impl<S: Storage> SyncEngine<S> {
             send,
             need,
             actor_range_hints,
-            window: ActorWindow::default(),
+            window,
         })
     }
 
@@ -497,7 +525,7 @@ impl<S: Storage> SyncEngine<S> {
     pub fn plan_request(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncRequest> {
         self.oplog
             .storage()
-            .read_snapshot(|read| self.request_in(read, peer_id, remote))
+            .read_snapshot(|read| self.request_in(read, peer_id, remote, &Default::default()))
     }
 
     /// [`Self::plan_request`] over a snapshot the caller already holds; the
@@ -507,9 +535,10 @@ impl<S: Storage> SyncEngine<S> {
         read: &dyn SnapshotRead,
         peer_id: PeerId,
         remote: &SyncSummary,
+        knowledge: &RequestKnowledge,
     ) -> Result<SyncRequest> {
         let no_push = PageBudget { ops: 0, bytes: 0 };
-        let (plan, _) = self.negotiate_in(read, peer_id, remote, no_push)?;
+        let (plan, _) = self.negotiate_in(read, peer_id, remote, no_push, knowledge)?;
         let genesis = read
             .topic_view(&plan.topic_id, None)?
             .map(|view| request_genesis(view.state.genesis, remote.genesis));
@@ -563,8 +592,13 @@ impl<S: Storage> SyncEngine<S> {
         {
             return Err(Error::StaleIncarnation);
         }
-        if request.actor_range_hints.len() > MAX_REQUEST_ITEMS
-            || request.wants.len() > MAX_REQUEST_ITEMS
+        let filter = request.window.behind.as_ref();
+        if request
+            .actor_range_hints
+            .len()
+            .saturating_add(request.wants.len())
+            > self.request_items
+            || filter.is_some_and(|filter| filter.bits.len() > MAX_ACTOR_FILTER_BYTES)
         {
             return Err(Error::Storage("sync request exceeds work budget".into()));
         }
@@ -590,11 +624,19 @@ impl<S: Storage> SyncEngine<S> {
                 goal.set(hint.actor_id, to);
             }
         }
-        let repair =
-            Self::plan_repair(read, &request.topic_id, &request.wants, &peer_clock, budget)?;
+        let scope = ActorScope::new(&request.actor_range_hints, &request.window);
+        let repair = Self::plan_repair(
+            read,
+            &request.topic_id,
+            &request.wants,
+            (&peer_clock, &scope),
+            budget,
+        )?;
         let mut used = 0;
+        let mut sent = BTreeSet::new();
         for op in &repair.ops {
             used += postcard::experimental::serialized_size(op)?;
+            sent.insert(op.id);
             let body = &op.signed.body;
             if peer_clock.get(&body.actor_id) + 1 == body.actor_seq {
                 peer_clock.set(body.actor_id, body.actor_seq);
@@ -609,7 +651,7 @@ impl<S: Storage> SyncEngine<S> {
             more: !repair.unsent.is_empty(),
             missing: repair.missing,
             too_large: repair.too_large,
-            positions: BTreeSet::new(),
+            positions: repair.positions,
         };
         if rest.ops == 0 || rest.bytes == 0 || page.too_large.is_some() {
             return Ok(page);
@@ -619,9 +661,8 @@ impl<S: Storage> SyncEngine<S> {
         let planned = self.plan_page(
             read,
             &request.topic_id,
-            local,
-            &peer_clock,
-            Some(&goal),
+            (local, &peer_clock, Some(&goal)),
+            (&scope, &sent),
             &repair.unsent,
             rest,
         )?;
@@ -629,9 +670,13 @@ impl<S: Storage> SyncEngine<S> {
         page.more = planned.more || !repair.unsent.is_subset(&forwarded);
         page.ops.extend(planned.ops);
         page.missing.extend(planned.missing);
+        page.positions.extend(planned.positions);
         page.too_large = page.too_large.or(planned.too_large);
         while page.missing.len() > MAX_PAGE_MISSING {
             page.missing.pop_last();
+        }
+        while page.positions.len() > MAX_PAGE_MISSING {
+            page.positions.pop_last();
         }
         Ok(page)
     }
@@ -724,34 +769,6 @@ impl<S: Storage> SyncEngine<S> {
             }),
         }
     }
-}
-
-/// Ranges from `local` up to `remote` for every actor `remote` is ahead on,
-/// spanning at most `MAX_ACTOR_RANGE_HINT_SPAN` positions beside `wants` ids.
-/// Actors past the span still get a zero-span hint naming their position, so a
-/// responder never takes an actor this node is behind on as held.
-fn actor_ranges(local: &ActorClock, remote: &ActorClock, wants: usize) -> Vec<ActorRangeHint> {
-    let mut remaining = MAX_ACTOR_RANGE_HINT_SPAN.saturating_sub(wants as u64);
-    remote
-        .iter()
-        .filter_map(|(actor_id, remote_seq)| {
-            let local_seq = local.get(actor_id);
-            if *remote_seq <= local_seq {
-                return None;
-            }
-            let to_inclusive = remote_seq
-                .saturating_sub(local_seq)
-                .min(remaining)
-                .saturating_add(local_seq);
-            remaining -= to_inclusive - local_seq;
-            Some(ActorRangeHint {
-                actor_id: *actor_id,
-                from_exclusive: local_seq,
-                to_inclusive,
-            })
-        })
-        .take(MAX_REQUEST_ITEMS.saturating_sub(wants))
-        .collect()
 }
 
 /// The request for the ids and ranges of `plan`, on branch `genesis`, with a
