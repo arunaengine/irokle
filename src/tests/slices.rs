@@ -248,4 +248,99 @@ mod sessions {
         bob_net.shutdown().await;
         alice_net.shutdown().await;
     }
+
+    /// On a one-worker runtime a responder's page planning is stuck in a slow
+    /// durable store while an unrelated topic's exchange with the same
+    /// responder completes; once the store answers, the sliced pull finishes.
+    #[cfg(feature = "fjall")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn graph_beside_control() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            StaleReadStorage::new(crate::storage::FjallStorage::open(dir.path()).unwrap());
+        let source = reverse_chain(storage.clone(), 40);
+        let key = |seed: u8| iroh::SecretKey::from_bytes(&[seed; 32]);
+        let bind = |seed: u8| {
+            iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                .secret_key(key(seed))
+                .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+                .bind()
+        };
+        let config = |seed: u8| NodeConfig {
+            signer: Ed25519Signer::from_iroh_secret_key(&key(seed)),
+            peer_whitelist: None,
+            ..NodeConfig::default()
+        };
+        let alice = Irokle::with_storage(storage.clone(), config(230))
+            .unwrap()
+            .with_page_visits(VISITS);
+        let alice_net =
+            Arc::new(net::IrohNet::new(bind(230).await.unwrap(), alice.clone()).unwrap());
+        alice_net.start_accept_loop().unwrap();
+        let alice_addr = super::super::iroh::ready_addr(alice_net.endpoint()).await;
+        let bob_storage = MemoryStorage::new();
+        Oplog::with_storage(bob_storage.clone())
+            .receive_ops(vec![source.genesis.clone()])
+            .unwrap();
+        let bob = Irokle::with_storage(bob_storage, config(231)).unwrap();
+        let bob_net = Arc::new(net::IrohNet::new(bind(231).await.unwrap(), bob.clone()).unwrap());
+        let other = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+
+        let ops = oplog::topological(source.log.storage(), &source.topic_id).unwrap();
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Meta(ops[ops.len() - 1].id), Arc::clone(&gate));
+        let pull = tokio::spawn({
+            let (bob_net, alice_addr) = (Arc::clone(&bob_net), alice_addr.clone());
+            async move { bob_net.sync_now(alice_addr, source.topic_id).await }
+        });
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+        let control = alice_net.lane_times()[0]
+            .jobs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let probe = vec![
+            crate::sync::SyncMessage::Open(bob.sync_open(other)),
+            crate::sync::SyncMessage::Fingerprint(bob.sync_fingerprint(other).unwrap()),
+        ];
+        let replies = bob_net.sync_with(alice_addr.clone(), &probe).await.unwrap();
+        assert!(!replies.is_empty());
+        assert!(
+            !gate.has_left(),
+            "the control exchange waited for the stuck plan"
+        );
+        assert!(
+            alice_net.lane_times()[0]
+                .jobs
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > control
+        );
+
+        drop(release);
+        let mut result = pull.await.unwrap();
+        for _ in 0..8 {
+            match result {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    result = bob_net.sync_now(alice_addr.clone(), source.topic_id).await;
+                }
+                Err(error) => panic!("sync failed: {error}"),
+            }
+        }
+        assert!(result.is_ok());
+        assert_eq!(
+            bob.storage().list_op_ids(&source.topic_id).unwrap(),
+            source.log.storage().list_op_ids(&source.topic_id).unwrap()
+        );
+        bob_net.shutdown().await;
+        alice_net.shutdown().await;
+    }
 }

@@ -510,3 +510,97 @@ async fn full_budgets_shutdown() {
         "the job committed after its requester left"
     );
 }
+
+/// Every pool and lane is full while a durable node's activation of a topic
+/// pushed to it is paused before publication and the pushing requester goes
+/// away. Shutdown waits for that job alone; the activation then publishes,
+/// every pool, lane and slot is whole, and the reopened store holds the whole
+/// topic with no staging left.
+#[cfg(feature = "fjall")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saturated_activation_reopen() {
+    use crate::storage::{FjallStorage, Hook};
+
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let storage = FjallStorage::open(dir.path()).unwrap();
+    let limits = StreamLimits::default();
+    let (bob, bob_net) = server(storage.clone(), &lookup, alice.peer_id(), limits).await;
+    let topic = alice
+        .create_topic::<crate::tests::support::Note>(crate::TopicConfig::default())
+        .unwrap();
+    publish(&alice, topic.id(), 20, 64);
+    topic.add_peer(bob.peer_id()).unwrap();
+    let topic_id = topic.id();
+    let ops = crate::oplog::topological(alice.storage(), &topic_id).unwrap();
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    storage.set_hook({
+        let gate = Arc::clone(&gate);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        move |at| {
+            if at == Hook::Publish && first.swap(false, Ordering::SeqCst) {
+                gate.pass();
+            }
+            Ok(())
+        }
+    });
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    let messages = vec![
+        SyncMessage::Open(alice.sync_open(topic_id)),
+        SyncMessage::Data(SyncData { topic_id, ops }),
+    ];
+    let push = tokio::spawn({
+        let net = Arc::clone(&net);
+        async move { net.sync_with(bob_addr, &messages).await.map(drop) }
+    });
+    let arrival = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || arrival.wait_arrival())
+        .await
+        .unwrap();
+    assert!(bob.storage().topic_state(&topic_id).unwrap().is_none());
+
+    let fill = |pool| {
+        let free = bob_net.budget.available(pool);
+        bob_net
+            .budget
+            .try_take(pool, free, OwnedClass::Output)
+            .unwrap()
+    };
+    let pools = [Pool::Data, Pool::Control, Pool::Session, Pool::Results].map(fill);
+    let lanes = [&bob_net.control_lane, &bob_net.bulk_lane].map(|lane| {
+        let free = lane.available_permits() as u32;
+        Arc::clone(lane).try_acquire_many_owned(free).unwrap()
+    });
+    push.abort();
+    assert!(push.await.unwrap_err().is_cancelled());
+    let outcome = bob_net
+        .shutdown_with_timeout(Duration::from_millis(200))
+        .await;
+    assert!(
+        matches!(outcome, ShutdownOutcome::Incomplete { .. }),
+        "{outcome:?}"
+    );
+
+    drop(release);
+    assert_eq!(
+        bob_net.shutdown_with_timeout(Duration::from_secs(60)).await,
+        ShutdownOutcome::Complete
+    );
+    drop((pools, lanes));
+    assert_eq!(bob_net.control_lane.available_permits(), CONTROL_JOBS);
+    assert_eq!(bob_net.bulk_lane.available_permits(), BULK_JOBS);
+    assert_eq!(bob_net.served.available_permits(), MAX_SERVED_STREAMS);
+    assert_released(&bob_net);
+    net.shutdown().await;
+    assert_released(&net);
+    let expected = alice.storage().list_op_ids(&topic_id).unwrap();
+    assert_eq!(bob.storage().list_op_ids(&topic_id).unwrap(), expected);
+
+    drop((bob, bob_net, storage));
+    let reopened = FjallStorage::open(dir.path()).unwrap();
+    assert!(reopened.topic_state(&topic_id).unwrap().is_some());
+    assert_eq!(reopened.list_op_ids(&topic_id).unwrap(), expected);
+    assert!(reopened.provisional_topics().unwrap().is_empty());
+}

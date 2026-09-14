@@ -236,6 +236,97 @@ mod sessions {
         alice_net.shutdown().await;
     }
 
+    /// A behind-only bootstrap whose essential dependency lies beyond the item
+    /// window, served through small streams, after the staged session was
+    /// expired and restaged and the reader reconnected on a new endpoint:
+    /// staging buffers nothing and the topic activates with the whole history.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bootstrap_reconnect_reset() {
+        let invited = Ed25519Signer::from_bytes(&[245; 32]).peer_id();
+        let storage = MemoryStorage::new();
+        let source = late_dependency(storage.clone(), 6);
+        let owner = Ed25519Signer::from_bytes(&[242; 32]);
+        source
+            .log
+            .create_control_op(
+                source.topic_id,
+                actor_id_for(source.topic_id, owner.peer_id()),
+                TopicControl::AddPeer { peer: invited },
+                &owner,
+            )
+            .unwrap();
+        let ops = oplog::topological(source.log.storage(), &source.topic_id).unwrap();
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .secret_key(iroh::SecretKey::from_bytes(&[242; 32]))
+            .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let config = NodeConfig {
+            signer: owner.clone(),
+            peer_whitelist: None,
+            ..NodeConfig::default()
+        };
+        let alice = Irokle::with_storage(storage, config)
+            .unwrap()
+            .with_request_items(3);
+        // Small streams cut every page to a few ops.
+        let limits = crate::net::StreamLimits {
+            bytes: 4 * 1024,
+            messages: 8,
+            ..crate::net::StreamLimits::default()
+        };
+        let alice_net = Arc::new(
+            net::IrohNet::new(endpoint, alice)
+                .unwrap()
+                .with_stream_limits(limits),
+        );
+        alice_net.start_accept_loop().unwrap();
+        let alice_addr = super::super::iroh::ready_addr(alice_net.endpoint()).await;
+
+        let bob_storage = StaleReadStorage::new(MemoryStorage::new());
+        let (bob, bob_net, _) = capped(bob_storage.clone(), 245, 3).await;
+        let fragment = |ops: &[Op]| crate::sync::SyncData {
+            topic_id: source.topic_id,
+            ops: ops.to_vec(),
+        };
+        let first = bob
+            .receive_sync_outcome(owner.peer_id(), fragment(&ops[..2]))
+            .unwrap();
+        assert!(matches!(first, crate::node::ReceiveOutcome::Staged(_)));
+        let session = bob.storage().provisional_topics().unwrap()[0].session;
+        bob.expire_bootstraps(u64::MAX).unwrap();
+        assert!(bob.storage().provisional_topics().unwrap().is_empty());
+        let restaged = bob
+            .receive_sync_outcome(owner.peer_id(), fragment(&ops[..2]))
+            .unwrap();
+        assert!(matches!(restaged, crate::node::ReceiveOutcome::Staged(_)));
+        assert!(bob.storage().provisional_topics().unwrap()[0].session > session);
+        bob_net.shutdown().await;
+        drop(bob_net);
+
+        let (_, bob_net, _) = capped(bob_storage.clone(), 245, 3).await;
+        sync_through(&bob_net, alice_addr, source.topic_id).await;
+        assert!(
+            bob.storage()
+                .topic_state(&source.topic_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            bob.storage().list_op_ids(&source.topic_id).unwrap(),
+            source.log.storage().list_op_ids(&source.topic_id).unwrap()
+        );
+        assert_eq!(
+            bob_storage
+                .pending_puts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        bob_net.shutdown().await;
+        alice_net.shutdown().await;
+    }
+
     /// A pull of a topic the reader does not hold, invited last, through
     /// requests that cannot name every actor: staging buffers nothing and the
     /// topic activates with the whole history. Three items: before anything is

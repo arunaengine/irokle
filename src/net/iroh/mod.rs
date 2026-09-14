@@ -269,6 +269,8 @@ pub struct SharedNet<S: Storage> {
     /// Most framed bytes of planned topic messages held at once.
     #[cfg(test)]
     planned_peak: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    lane_times: [LaneTimes; 2],
 }
 
 impl<S: Storage> std::ops::Deref for IrohNet<S> {
@@ -279,12 +281,30 @@ impl<S: Storage> std::ops::Deref for IrohNet<S> {
     }
 }
 
+#[cfg(all(test, feature = "fjall"))]
+impl<S: Storage> SharedNet<S> {
+    /// Timings of the control and the bulk lane so far.
+    pub(crate) fn lane_times(&self) -> &[LaneTimes; 2] {
+        &self.lane_times
+    }
+}
+
 /// Which bounded worker lane a storage job runs in. Control work has its own
 /// permits, so acks and status never wait behind admission or page planning.
 #[derive(Clone, Copy, Debug)]
 enum Lane {
     Control,
     Bulk,
+}
+
+/// Jobs of one lane, the longest time one waited for a permit and the longest
+/// time one ran, which bounds how long it held a snapshot or storage lock.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct LaneTimes {
+    pub(crate) jobs: AtomicU64,
+    pub(crate) waited_max_micros: AtomicU64,
+    pub(crate) ran_max_micros: AtomicU64,
 }
 
 impl<S: Storage> IrohNet<S> {
@@ -366,6 +386,8 @@ impl<S: Storage> IrohNet<S> {
                 eviction_sink,
                 #[cfg(test)]
                 planned_peak: Default::default(),
+                #[cfg(test)]
+                lane_times: Default::default(),
             }),
         })
     }
@@ -392,10 +414,20 @@ impl<S: Storage> IrohNet<S> {
             Lane::Control => &self.control_lane,
             Lane::Bulk => &self.bulk_lane,
         };
+        #[cfg(test)]
+        let queued = std::time::Instant::now();
         let permit = Arc::clone(permits)
             .acquire_owned()
             .await
             .map_err(|_| io::Error::other("storage job lane closed"))?;
+        #[cfg(test)]
+        let times = {
+            let times = &self.lane_times[lane as usize];
+            times.jobs.fetch_add(1, Ordering::Relaxed);
+            let waited = queued.elapsed().as_micros() as u64;
+            times.waited_max_micros.fetch_max(waited, Ordering::Relaxed);
+            (Arc::clone(&self.shared), lane as usize)
+        };
         let task = self.tasks.track();
         let count = self.budget.job();
         let shared = Arc::clone(&self.shared);
@@ -404,7 +436,14 @@ impl<S: Storage> IrohNet<S> {
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let _count = count;
-            (job(&shared), task)
+            #[cfg(test)]
+            let started = std::time::Instant::now();
+            let result = job(&shared);
+            #[cfg(test)]
+            times.0.lane_times[times.1]
+                .ran_max_micros
+                .fetch_max(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            (result, task)
         })
         .await
         .map(|(result, _task)| result)
