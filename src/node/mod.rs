@@ -481,6 +481,13 @@ impl<S: Storage> Irokle<S> {
         &self.sync
     }
 
+    /// The same node building and accepting requests of at most `items` wants and hints.
+    #[cfg(all(test, feature = "iroh"))]
+    pub(crate) fn with_request_items(mut self, items: usize) -> Self {
+        self.sync = self.sync.with_request_items(items);
+        self
+    }
+
     /// Ids `view`'s topic cannot resolve, where `view` came from `read`.
     #[cfg(feature = "iroh")]
     pub(crate) fn unresolved_in(

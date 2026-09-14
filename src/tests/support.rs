@@ -297,6 +297,8 @@ pub(crate) struct StaleReadStorage<S = MemoryStorage> {
     /// Activations left to fail before one reaches the store.
     pub(crate) failed_activations: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) conflicts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Ops buffered as pending so far.
+    pub(crate) pending_puts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<S: Storage> StaleReadStorage<S> {
@@ -316,6 +318,7 @@ impl<S: Storage> StaleReadStorage<S> {
             read_skips: Arc::default(),
             failed_activations: Arc::default(),
             conflicts: Arc::default(),
+            pending_puts: Arc::default(),
         }
     }
 
@@ -582,6 +585,8 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
         op: Op,
         meta: crate::storage::OpMeta,
     ) -> Result<(), Error> {
+        self.pending_puts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.put_pending_op(source_peer, op, meta)
     }
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>, Error> {

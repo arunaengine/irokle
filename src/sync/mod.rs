@@ -116,6 +116,13 @@ impl<S: Storage> SyncEngine<S> {
         request_ranges(local, remote, self.request_items, knowledge)
     }
 
+    /// The same engine building and accepting requests of at most `items` wants and hints.
+    #[cfg(test)]
+    pub(crate) fn with_request_items(mut self, items: usize) -> Self {
+        // One hint names a needed position, the other an actor behind.
+        self.request_items = items.max(2);
+        self
+    }
     pub fn open(topic_id: TopicId, peer_id: PeerId, event_type_id: Option<String>) -> SyncOpen {
         SyncOpen {
             protocol: SYNC_PROTOCOL.into(),
@@ -538,6 +545,20 @@ impl<S: Storage> SyncEngine<S> {
         self.oplog
             .storage()
             .read_snapshot(|read| self.request_in(read, peer_id, remote, &Default::default()))
+    }
+
+    /// [`Self::plan_request`] continuing from what earlier page results left in
+    /// `knowledge`.
+    #[cfg(test)]
+    pub(crate) fn plan_request_with(
+        &self,
+        peer_id: PeerId,
+        remote: &SyncSummary,
+        knowledge: &RequestKnowledge,
+    ) -> Result<SyncRequest> {
+        self.oplog
+            .storage()
+            .read_snapshot(|read| self.request_in(read, peer_id, remote, knowledge))
     }
 
     /// [`Self::plan_request`] over a snapshot the caller already holds; the

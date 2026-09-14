@@ -28,6 +28,7 @@ mod progress;
 #[cfg(feature = "iroh")]
 mod protocol;
 mod provisional;
+mod requests;
 mod snapshot;
 mod staging;
 mod storage;
