@@ -11,6 +11,7 @@ place, because opening a database changes it.
 | `fjall-schema2-fb5ea2b` | fb5ea2b | schema 2 without pending byte counters |
 | `fjall-schema2-54db4f9` | 54db4f95e8f7a654da4a75eafc1eebdbcebdb4c9 | schema 2 with pending byte counters |
 | `fjall-schema4-e112523` | e112523afc69764e4bfbba61f687f4498acf0772 | schema 4 with unscoped bootstrap staging |
+| `fjall-schema5-68e4c19` | 68e4c19ed1b30847a96dca319eb90eeed81619dc | schema 5 with staging namespaces and an interrupted activation |
 
 ## Contents
 
@@ -50,3 +51,14 @@ signed content and the signing domain did not change between them.
 `manifest.json` names an active topic (`active`, with `genesis`, `e1`, `e2`)
 and a topic staged from `source` through the old unscoped staging API
 (`staged`, `staged_genesis`, `staged_event`). It has no `dep.op`.
+
+`fjall-schema5-68e4c19` was made by an uncommitted ignored test in a scratch
+worktree of its commit, because only that commit's test helper
+`FjallStorage::interrupt_activation` stops an activation after its copies, as a
+crash there would. Its `manifest.json` names an active topic (`active`, with
+`genesis`, `e1`, `e2`), a namespace staged from `staged_source` for `staged`
+holding four ops and one buffered op (`staged_waiting`, `staged_bytes`), and a
+namespace of `activating_source` for `activating` whose activation claimed the
+topic and copied its `activating_ops` ops (`activating_session`,
+`activating_bytes`, `activating_last`). The local signer is seed 1 (`reader`).
+It has no `dep.op`.

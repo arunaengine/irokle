@@ -327,6 +327,70 @@ fn upgrades_staged_schema_four() {
     assert_eq!(staging(&raw_records(&path)), 0);
 }
 
+/// Schema 5 namespaces gain a revision and the bytes their keyspace holds. An
+/// activation interrupted at schema 5 keeps its claim, stays hidden, and
+/// completes on the current code; reopening upgrades nothing twice.
+#[test]
+fn upgrades_staged_schema_five() {
+    let dir = fixture_copy("fjall-schema5-68e4c19");
+    let m = Manifest::read(dir.path());
+    let path = dir.path().join("db");
+    assert_eq!(stored_version(&path), 5);
+    let storage = FjallStorage::open(&path).unwrap();
+    let active: TopicId = m.id("active");
+    let expected = ["genesis", "e1", "e2"]
+        .into_iter()
+        .map(|key| m.id::<OpId>(key))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(storage.list_op_ids(&active).unwrap(), expected);
+    let listed = storage.provisional_topics().unwrap();
+    assert_eq!(listed.len(), 2);
+    let session = |key: &str| {
+        listed
+            .iter()
+            .find(|provisional| provisional.session == m.id::<u64>(key))
+            .unwrap()
+            .clone()
+    };
+    let staged = session("staged_session");
+    assert_eq!(
+        (staged.bytes, staged.revision, staged.activating),
+        (m.id("staged_bytes"), 0, false)
+    );
+    let store = storage.provisional_store(&staged).unwrap().unwrap();
+    assert_eq!(store.stored_bytes().unwrap(), staged.bytes);
+    let activating = session("activating_session");
+    assert!(activating.activating);
+    assert_eq!(activating.bytes, m.id::<u64>("activating_bytes"));
+    let topic: TopicId = m.id("activating");
+    assert!(storage.topic_state(&topic).unwrap().is_none());
+    assert!(storage.list_op_ids(&topic).unwrap().is_empty());
+    assert!(storage.get_op(&m.id("activating_last")).unwrap().is_none());
+    drop((store, storage));
+    assert_eq!(stored_version(&path), 6);
+    assert_eq!(
+        FjallStorage::open(&path)
+            .unwrap()
+            .provisional_topics()
+            .unwrap(),
+        listed
+    );
+
+    let config = NodeConfig {
+        signer: Ed25519Signer::from_bytes(&[1; 32]),
+        ..NodeConfig::default()
+    };
+    let reader = Irokle::with_storage(FjallStorage::open(&path).unwrap(), config).unwrap();
+    assert_eq!(reader.peer_id(), m.id("reader"));
+    let storage = reader.storage();
+    assert!(storage.topic_state(&topic).unwrap().is_some());
+    assert_eq!(
+        storage.list_op_ids(&topic).unwrap().len(),
+        m.id::<usize>("activating_ops")
+    );
+    assert_eq!(storage.provisional_topics().unwrap(), vec![staged]);
+}
+
 /// A migrated store reopened after staging part of a late invitation, after a
 /// history cursor read part of a topic, and after an admitted event is still
 /// owed to another member: each is kept exactly, the migrated eviction record

@@ -1,0 +1,18 @@
+{
+  "active": "a70ee6400a42ef8765d286cf1401fac77ef7f86da8f798eae4e2718bec091ac5",
+  "genesis": "311e5b80783c2ba958de0054d9fd5a9781c34e2c9870d07edb305f94fa71b5ea",
+  "e1": "43aa7ec886dc2248d4e0dacd12af7b4c523a8c0b33827c1558f9b638913cd0c3",
+  "e2": "3f2f8f6516ceac87c921e1597858e05d0656de25d4cf5a3ea4c21c20075e0dd7",
+  "staged": "0eebc736543d5af456e7ee1d65d518fe425f14216550820db7b3cfb88b9666e4",
+  "staged_source": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+  "staged_session": "1",
+  "staged_waiting": "e54ded3641b62fb986256222a6ce3f178df6c1784b9c105f4dcfbe6c9ff803e2",
+  "staged_bytes": "1343",
+  "activating": "67f6301e6dd23c5e70283e9da69e92faab78440174f4ba814d3e8f4c6b271ad8",
+  "activating_source": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+  "activating_session": "2",
+  "activating_ops": "6",
+  "activating_last": "b993010ea90b81f3ae58def1e028085aae74e34ae747d37c83076c58ccf413f3",
+  "activating_bytes": "1638",
+  "reader": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+}
