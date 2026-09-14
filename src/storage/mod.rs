@@ -663,11 +663,13 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn stored_bytes(&self) -> Result<u64>;
     /// Record a write to the namespace while its session is current.
     fn touch_provisional(&self, provisional: &ProvisionalTopic, now_ms: u64) -> Result<()>;
-    /// Make the history of `provisional` the active topic: copy it into the
-    /// active records in bounded steps, then in one transaction refuse when the
-    /// topic is active or the namespace state is not `expected`, install the
-    /// state, heads, clock and `effects`, and end every namespace of the topic.
-    /// An interrupted activation resumes when called again.
+    /// Make the history of `provisional` the active topic. The first step
+    /// claims the topic's one activation for this session, which refuses a
+    /// claim of another session with [`crate::Error::AdmissionConflict`], and
+    /// freezes the namespace at `expected`. Nothing of the history is visible
+    /// to a read of the store until one transaction installs the state, heads,
+    /// clock and `effects` and ends every namespace of the topic. An
+    /// interrupted activation resumes when called again.
     fn activate_provisional(
         &self,
         provisional: &ProvisionalTopic,

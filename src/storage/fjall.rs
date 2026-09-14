@@ -35,7 +35,30 @@ pub struct FjallStorage {
     /// Key a test rewrites before every single-attempt commit, forcing a conflict.
     #[cfg(test)]
     conflict_key: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    /// A test's pause or failure at the named steps, shared with every view.
+    #[cfg(test)]
+    hook: std::sync::Arc<std::sync::Mutex<Option<HookFn>>>,
 }
+
+/// Steps of namespace ownership where a test pauses or fails the operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Hook {
+    /// An activation claim committed.
+    Claimed,
+    /// Before each bounded copy of an activation.
+    CopyChunk,
+    /// Before the transaction that publishes an activation.
+    Publish,
+    /// Before each bounded delete of a clearing slot.
+    DeleteChunk,
+    /// Before a cleared slot is released.
+    ReleaseSlot,
+    /// Before a namespace view's write commits.
+    NamespaceCommit,
+}
+
+#[cfg(test)]
+type HookFn = std::sync::Arc<dyn Fn(Hook) -> Result<()> + Send + Sync>;
 
 #[cfg(feature = "fjall")]
 const FJALL_SCHEMA_VERSION: u32 = 6;
@@ -173,6 +196,8 @@ impl FjallStorage {
             namespace: None,
             #[cfg(test)]
             conflict_key: Default::default(),
+            #[cfg(test)]
+            hook: Default::default(),
         };
         storage.ensure_schema_version()?;
         Ok(storage)
@@ -199,7 +224,21 @@ impl FjallStorage {
             namespace: Some(fence),
             #[cfg(test)]
             conflict_key: Default::default(),
+            #[cfg(test)]
+            hook: std::sync::Arc::clone(&self.hook),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn hook(&self, point: Hook) -> Result<()> {
+        let hook = self.hook.lock().unwrap().clone();
+        hook.map_or(Ok(()), |hook| hook(point))
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn hook(&self, _point: Hook) -> Result<()> {
+        Ok(())
     }
 
     /// A read snapshot. A namespace view first checks in it that its session
@@ -218,6 +257,14 @@ impl FjallStorage {
             Some(_) => Err(Error::StaleIncarnation),
             None => Ok(()),
         }
+    }
+
+    /// Whether records of `topic_id` are visible. The main store shows a topic
+    /// only once its state is installed, so copies of an unfinished activation
+    /// stay hidden.
+    fn shown(&self, tx: &impl fjall::Readable, topic_id: &TopicId) -> Result<bool> {
+        Ok(self.namespace.is_some()
+            || fjall::Readable::contains_key(tx, &self.records, Self::key_id(b"ts", topic_id))?)
     }
 
     /// Work this store and its clones performed so far.
@@ -524,6 +571,7 @@ impl FjallStorage {
                     Self::tx_fence_write(&tx, fence)?;
                     let result = f(&mut tx)?;
                     Self::tx_fence_commit(&mut tx, fence, &self.records)?;
+                    self.hook(Hook::NamespaceCommit)?;
                     result
                 }
                 None => f(&mut tx)?,
@@ -549,6 +597,7 @@ impl FjallStorage {
                 Self::tx_fence_write(&tx, fence)?;
                 let result = f(&mut tx)?;
                 Self::tx_fence_commit(&mut tx, fence, &self.records)?;
+                self.hook(Hook::NamespaceCommit)?;
                 result
             }
             None => f(&mut tx)?,
@@ -1159,11 +1208,11 @@ impl FjallStorage {
         tx: &impl fjall::Readable,
         records: &fjall::OptimisticTxKeyspace,
         id: &OpId,
-    ) -> Result<bool> {
-        Ok(
-            fjall::Readable::get(tx, records, Self::key_id(b"o", id))?.is_some()
-                && fjall::Readable::get(tx, records, Self::key_id(b"m", id))?.is_some(),
-        )
+    ) -> Result<Option<TopicId>> {
+        if !fjall::Readable::contains_key(tx, records, Self::key_id(b"o", id))? {
+            return Ok(None);
+        }
+        Ok(Self::tx_get::<OpMeta>(tx, records, Self::key_id(b"m", id))?.map(|meta| meta.topic_id))
     }
 
     fn read_topic_ids(
@@ -1311,8 +1360,8 @@ impl Storage for FjallStorage {
     fn read_snapshot<R>(&self, read: impl FnOnce(&dyn SnapshotRead) -> Result<R>) -> Result<R> {
         read(&FjallSnapshot {
             tx: self.snapshot()?,
-            records: &self.records,
-            counters: &self.counters,
+            store: self,
+            shown: Default::default(),
         })
     }
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
@@ -1408,17 +1457,34 @@ impl Storage for FjallStorage {
     }
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
         self.counters.count_op();
-        self.get(Self::key_id(b"o", id))
+        let read_tx = self.snapshot()?;
+        let op: Option<Op> = Self::tx_get(&read_tx, &self.records, Self::key_id(b"o", id))?;
+        match op {
+            Some(op) if self.shown(&read_tx, &op.signed.body.topic_id)? => Ok(Some(op)),
+            _ => Ok(None),
+        }
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
         self.counters.count_meta();
-        self.get(Self::key_id(b"m", id))
+        let read_tx = self.snapshot()?;
+        let meta: Option<OpMeta> = Self::tx_get(&read_tx, &self.records, Self::key_id(b"m", id))?;
+        match meta {
+            Some(meta) if self.shown(&read_tx, &meta.topic_id)? => Ok(Some(meta)),
+            _ => Ok(None),
+        }
     }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
-        Self::read_resolvable(&self.snapshot()?, &self.records, id)
+        let read_tx = self.snapshot()?;
+        match Self::read_resolvable(&read_tx, &self.records, id)? {
+            Some(topic_id) => self.shown(&read_tx, &topic_id),
+            None => Ok(false),
+        }
     }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>> {
         let read_tx = self.snapshot()?;
+        if !self.shown(&read_tx, topic_id)? {
+            return Ok(Vec::new());
+        }
         let prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
         let mut out = Vec::new();
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
@@ -1431,22 +1497,58 @@ impl Storage for FjallStorage {
         Ok(out)
     }
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
-        Self::read_topic_ids(&self.snapshot()?, &self.records, topic_id)
+        let read_tx = self.snapshot()?;
+        if !self.shown(&read_tx, topic_id)? {
+            return Ok(BTreeSet::new());
+        }
+        Self::read_topic_ids(&read_tx, &self.records, topic_id)
     }
     fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         Ok(self.get(Self::key_id(b"h", topic_id))?.unwrap_or_default())
     }
     fn children(&self, op_id: &OpId) -> Result<BTreeSet<OpId>> {
+        let read_tx = self.snapshot()?;
         let prefix = [b"ch".as_slice(), op_id.as_ref()].concat();
         let mut out = BTreeSet::new();
-        for item in fjall::Readable::prefix(&self.snapshot()?, &self.records, prefix) {
+        for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
             let (key, _) = item.into_inner()?;
             out.insert(Self::op_id_from_key(key.as_ref(), 2 + OpId::LEN)?);
         }
-        Ok(out)
+        if self.namespace.is_some() || out.is_empty() {
+            return Ok(out);
+        }
+        // An edge and both ends share one topic; either end's metadata names it,
+        // and a damaged end may have lost its own.
+        let topic_of = |id: &OpId| -> Result<Option<TopicId>> {
+            Ok(
+                Self::tx_get::<OpMeta>(&read_tx, &self.records, Self::key_id(b"m", id))?
+                    .map(|meta| meta.topic_id),
+            )
+        };
+        if let Some(topic_id) = topic_of(op_id)? {
+            return Ok(if self.shown(&read_tx, &topic_id)? {
+                out
+            } else {
+                BTreeSet::new()
+            });
+        }
+        let mut shown = BTreeSet::new();
+        for child in out {
+            if let Some(topic_id) = topic_of(&child)?
+                && self.shown(&read_tx, &topic_id)?
+            {
+                shown.insert(child);
+            }
+        }
+        Ok(shown)
     }
     fn actor_tip(&self, topic_id: &TopicId, actor_id: &ActorId) -> Result<Option<(u64, OpId)>> {
-        self.get([b"at".as_slice(), topic_id.as_ref(), actor_id.as_ref()].concat())
+        let read_tx = self.snapshot()?;
+        if !self.shown(&read_tx, topic_id)? {
+            return Ok(None);
+        }
+        let key = [b"at".as_slice(), topic_id.as_ref(), actor_id.as_ref()].concat();
+        Self::tx_get(&read_tx, &self.records, key)
     }
     fn actor_index(
         &self,
@@ -1454,15 +1556,18 @@ impl Storage for FjallStorage {
         actor_id: &ActorId,
         seq: u64,
     ) -> Result<Option<OpId>> {
-        self.get(
-            [
-                b"as".as_slice(),
-                topic_id.as_ref(),
-                actor_id.as_ref(),
-                &seq.to_be_bytes(),
-            ]
-            .concat(),
-        )
+        let read_tx = self.snapshot()?;
+        if !self.shown(&read_tx, topic_id)? {
+            return Ok(None);
+        }
+        let key = [
+            b"as".as_slice(),
+            topic_id.as_ref(),
+            actor_id.as_ref(),
+            &seq.to_be_bytes(),
+        ]
+        .concat();
+        Self::tx_get(&read_tx, &self.records, key)
     }
     fn actor_range(
         &self,
@@ -1472,6 +1577,9 @@ impl Storage for FjallStorage {
         limit: usize,
     ) -> Result<Vec<(u64, OpId)>> {
         let read_tx = self.snapshot()?;
+        if !self.shown(&read_tx, topic_id)? {
+            return Ok(Vec::new());
+        }
         let out =
             Self::read_actor_range(&read_tx, &self.records, (topic_id, actor_id), after, limit)?;
         self.counters.count_index(out.len());
@@ -1847,8 +1955,22 @@ impl Storage for FjallStorage {
 /// One read transaction seen through [`SnapshotRead`].
 struct FjallSnapshot<'a> {
     tx: fjall::Snapshot,
-    records: &'a fjall::OptimisticTxKeyspace,
-    counters: &'a StorageCounters,
+    store: &'a FjallStorage,
+    /// The last topic whose visibility this snapshot read.
+    shown: std::cell::Cell<Option<(TopicId, bool)>>,
+}
+
+impl FjallSnapshot<'_> {
+    fn shown(&self, topic_id: &TopicId) -> Result<bool> {
+        if let Some((known, shown)) = self.shown.get()
+            && known == *topic_id
+        {
+            return Ok(shown);
+        }
+        let shown = self.store.shown(&self.tx, topic_id)?;
+        self.shown.set(Some((*topic_id, shown)));
+        Ok(shown)
+    }
 }
 
 impl SnapshotRead for FjallSnapshot<'_> {
@@ -1857,18 +1979,37 @@ impl SnapshotRead for FjallSnapshot<'_> {
         topic_id: &TopicId,
         peer_id: Option<&PeerId>,
     ) -> Result<Option<TopicView>> {
-        FjallStorage::read_topic_view(&self.tx, self.records, topic_id, peer_id)
+        FjallStorage::read_topic_view(&self.tx, &self.store.records, topic_id, peer_id)
     }
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
-        self.counters.count_op();
-        FjallStorage::tx_get(&self.tx, self.records, FjallStorage::key_id(b"o", id))
+        self.store.counters.count_op();
+        let op: Option<Op> = FjallStorage::tx_get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(b"o", id),
+        )?;
+        match op {
+            Some(op) if self.shown(&op.signed.body.topic_id)? => Ok(Some(op)),
+            _ => Ok(None),
+        }
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
-        self.counters.count_meta();
-        FjallStorage::tx_get(&self.tx, self.records, FjallStorage::key_id(b"m", id))
+        self.store.counters.count_meta();
+        let meta: Option<OpMeta> = FjallStorage::tx_get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(b"m", id),
+        )?;
+        match meta {
+            Some(meta) if self.shown(&meta.topic_id)? => Ok(Some(meta)),
+            _ => Ok(None),
+        }
     }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
-        FjallStorage::read_resolvable(&self.tx, self.records, id)
+        match FjallStorage::read_resolvable(&self.tx, &self.store.records, id)? {
+            Some(topic_id) => self.shown(&topic_id),
+            None => Ok(false),
+        }
     }
     fn actor_range(
         &self,
@@ -1877,18 +2018,24 @@ impl SnapshotRead for FjallSnapshot<'_> {
         after: u64,
         limit: usize,
     ) -> Result<Vec<(u64, OpId)>> {
+        if !self.shown(topic_id)? {
+            return Ok(Vec::new());
+        }
         let out = FjallStorage::read_actor_range(
             &self.tx,
-            self.records,
+            &self.store.records,
             (topic_id, actor_id),
             after,
             limit,
         )?;
-        self.counters.count_index(out.len());
+        self.store.counters.count_index(out.len());
         Ok(out)
     }
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
-        FjallStorage::read_topic_ids(&self.tx, self.records, topic_id)
+        if !self.shown(topic_id)? {
+            return Ok(BTreeSet::new());
+        }
+        FjallStorage::read_topic_ids(&self.tx, &self.store.records, topic_id)
     }
 }
 

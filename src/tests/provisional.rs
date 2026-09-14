@@ -260,8 +260,10 @@ fn fjall_activation_resumes() {
     let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
     assert!(storage.topic_state(&topic_id).unwrap().is_none());
     assert!(storage.list_topics().unwrap().is_empty());
-    // Copies already sit in the active records; direct admission refuses them.
-    assert!(!storage.list_op_ids(&topic_id).unwrap().is_empty());
+    // Copies already sit in the active records, hidden from every read, and
+    // direct admission refuses the topic.
+    assert!(storage.list_op_ids(&topic_id).unwrap().is_empty());
+    assert!(storage.get_op(&ops[1].id).unwrap().is_none());
     assert!(matches!(
         Oplog::with_storage(storage.clone()).receive_ops(ops.clone()),
         Err(Error::AdmissionConflict)
