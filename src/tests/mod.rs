@@ -17,6 +17,7 @@ mod fallback;
 #[cfg(feature = "iroh")]
 mod genesis;
 mod holes;
+mod integrated;
 #[cfg(feature = "iroh")]
 mod iroh;
 mod membership;

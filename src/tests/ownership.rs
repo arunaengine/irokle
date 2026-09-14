@@ -11,11 +11,11 @@ use crate::sync::SyncData;
 
 const READER_SEED: u8 = 139;
 
-fn reader() -> PeerId {
+pub(super) fn reader() -> PeerId {
     Ed25519Signer::from_bytes(&[READER_SEED; 32]).peer_id()
 }
 
-fn reader_node<S: Storage>(storage: S) -> Irokle<S> {
+pub(super) fn reader_node<S: Storage>(storage: S) -> Irokle<S> {
     Irokle::with_storage(
         storage,
         NodeConfig {
@@ -28,7 +28,7 @@ fn reader_node<S: Storage>(storage: S) -> Irokle<S> {
 
 /// A topic of `seed` with `events` notes of `text_len` characters, then an
 /// invitation for the reader, oldest first.
-fn history(seed: u8, events: usize, text_len: usize) -> (Irokle, TopicId, Vec<Op>) {
+pub(super) fn history(seed: u8, events: usize, text_len: usize) -> (Irokle, TopicId, Vec<Op>) {
     let source = node(seed);
     let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
     for index in 0..events {
@@ -40,32 +40,39 @@ fn history(seed: u8, events: usize, text_len: usize) -> (Irokle, TopicId, Vec<Op
     (source, topic.id(), ops)
 }
 
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     1_000
 }
 
-fn bytes(ops: &[Op]) -> u64 {
+pub(super) fn bytes(ops: &[Op]) -> u64 {
     ops.iter()
         .map(|op| pending_op_bytes(op).unwrap() as u64)
         .sum()
 }
 
 /// Admit `ops` into the namespace of `provisional` through a fresh view.
-fn stage<S: Storage>(storage: &S, provisional: &ProvisionalTopic, ops: &[Op]) -> Result<(), Error> {
+pub(super) fn stage<S: Storage>(
+    storage: &S,
+    provisional: &ProvisionalTopic,
+    ops: &[Op],
+) -> Result<(), Error> {
     let store = storage
         .provisional_store(provisional)?
         .ok_or(Error::StaleIncarnation)?;
     admit(&store, provisional.source, ops)
 }
 
-fn admit<S: Storage>(store: &S, source: PeerId, ops: &[Op]) -> Result<(), Error> {
+pub(super) fn admit<S: Storage>(store: &S, source: PeerId, ops: &[Op]) -> Result<(), Error> {
     Oplog::with_storage(store.clone())
         .receive_ops_from_peer(Some(source), ops.to_vec())
         .map(drop)
 }
 
 /// The registry's current record of `provisional`'s session.
-fn listed<S: Storage>(storage: &S, provisional: &ProvisionalTopic) -> Option<ProvisionalTopic> {
+pub(super) fn listed<S: Storage>(
+    storage: &S,
+    provisional: &ProvisionalTopic,
+) -> Option<ProvisionalTopic> {
     storage
         .provisional_topics()
         .unwrap()
@@ -74,7 +81,7 @@ fn listed<S: Storage>(storage: &S, provisional: &ProvisionalTopic) -> Option<Pro
 }
 
 /// What a namespace holds, as its own view and the registry report it.
-fn contents<S: Storage>(
+pub(super) fn contents<S: Storage>(
     storage: &S,
     provisional: &ProvisionalTopic,
 ) -> (BTreeSet<OpId>, ActorClock, u64, Option<ProvisionalTopic>) {
@@ -89,7 +96,7 @@ fn contents<S: Storage>(
 }
 
 /// Every registry record's bytes equal what its namespace holds.
-fn assert_bytes_exact<S: Storage>(storage: &S) {
+pub(super) fn assert_bytes_exact<S: Storage>(storage: &S) {
     for provisional in storage.provisional_topics().unwrap() {
         let store = storage.provisional_store(&provisional).unwrap().unwrap();
         assert_eq!(provisional.bytes, store.stored_bytes().unwrap());
@@ -511,14 +518,19 @@ fn fjall_raced_expiry() {
 }
 
 #[cfg(feature = "fjall")]
-mod fjall {
+pub(super) mod fjall {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::storage::{FjallStorage, Hook, TopicState};
 
     /// Pause the `nth` arrival at `point`, counting from zero, on `gate`.
-    fn pause_at(storage: &FjallStorage, point: Hook, nth: usize, gate: &Arc<Gate>) {
+    pub(in crate::tests) fn pause_at(
+        storage: &FjallStorage,
+        point: Hook,
+        nth: usize,
+        gate: &Arc<Gate>,
+    ) {
         let seen = AtomicUsize::new(0);
         let gate = Arc::clone(gate);
         storage.set_hook(move |at| {
@@ -530,7 +542,12 @@ mod fjall {
     }
 
     /// Nothing of an unpublished topic is visible to a root or snapshot read.
-    fn assert_hidden(storage: &FjallStorage, topic_id: TopicId, actor: ActorId, ops: &[Op]) {
+    pub(in crate::tests) fn assert_hidden(
+        storage: &FjallStorage,
+        topic_id: TopicId,
+        actor: ActorId,
+        ops: &[Op],
+    ) {
         assert!(storage.topic_state(&topic_id).unwrap().is_none());
         assert!(storage.topic_view(&topic_id, None).unwrap().is_none());
         assert!(
@@ -574,7 +591,7 @@ mod fjall {
     }
 
     /// Stage `ops` into a new namespace of `source` and return it with its state.
-    fn staged(
+    pub(in crate::tests) fn staged(
         storage: &FjallStorage,
         source: PeerId,
         topic_id: TopicId,
