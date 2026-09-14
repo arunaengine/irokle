@@ -1,0 +1,20 @@
+{
+  "active": "a143cb9d67cc54e394743386e5663be2ee67249b9a8c33ae14a16bcfc56aeffe",
+  "e1": "41844269541483b0c334057c73898955c3040292df4e9c11aa2917e9bc1a7453",
+  "e2": "d4980b2c3d11ce7440dc0c31c3dcd98172af95857f3fedec2141af6d6fc36ba5",
+  "chain": "dacd26175ec7a723bdabd0803c431efb13c8e1dc873ac7bcbe021cccc0401ee3",
+  "chain_ops": "41",
+  "chain_head": "3d8fa7eea243a3bd628122a48e743112dc84821831f9b27a38247a1b048fec07",
+  "staged": "1b350d3716f7f207c7a590e9136a983591f76ac343a816b8c1037a770b4a295c",
+  "staged_source": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+  "staged_session": "1",
+  "staged_last": "ea06233021d921507117c8936f4288220184662db17abf32afc2c321998f0a6c",
+  "staged_bytes": "1343",
+  "activating": "18156ff3c767599e7ee9d866b5faa40d17c0d0dba8e7672db614b2d10428b1c3",
+  "activating_session": "2",
+  "activating_ops": "6",
+  "activating_last": "849017163a38b710b73c009c490d794694813522b565f7aa6cd333eba98ca226",
+  "cleared": "1516bcfaa16dfb98ff8cac98c69fc84b2ac237d9f15e8f2a2df55d8449f4698d",
+  "cleared_session": "3",
+  "reader": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+}

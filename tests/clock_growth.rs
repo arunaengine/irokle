@@ -174,9 +174,28 @@ fn fjall_chain_bytes() {
         let admit_ms = started.elapsed().as_millis();
         let entries = clock_entries(&log, &topic_id);
         drop(log);
+        // Reopening trims the preallocated journal to its content.
+        drop(irokle::FjallStorage::open(dir.path()).unwrap());
         let stored = directory_bytes(dir.path());
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .open()
+            .unwrap();
+        let records = db
+            .keyspace("records", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let tx = db.read_tx();
+        let value_bytes = |prefix: &[u8], len: usize| -> usize {
+            fjall::Readable::prefix(&tx, &records, prefix)
+                .map(|item| item.into_inner().unwrap())
+                .filter(|(key, _)| key.len() == len)
+                .map(|(_, value)| value.len())
+                .sum()
+        };
+        let meta_bytes = value_bytes(b"m", 33);
+        let node_bytes = value_bytes(b"cn", 66);
         println!(
-            "fjall actors={actors} directory_bytes={stored} clock_entries={entries} admit_ms={admit_ms}"
+            "fjall actors={actors} directory_bytes={stored} meta_value_bytes={meta_bytes} \
+             clock_node_value_bytes={node_bytes} clock_entries={entries} admit_ms={admit_ms}"
         );
     }
 }

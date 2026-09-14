@@ -543,3 +543,115 @@ fn reopen_keeps_progress() {
         owed
     );
 }
+
+/// The legacy metadata records of the keyspace `name`, before an upgrade.
+fn legacy_metas(path: &Path, name: &str) -> BTreeMap<OpId, crate_storage::OpMeta> {
+    let db = fjall::OptimisticTxDatabase::builder(path).open().unwrap();
+    let records = db
+        .keyspace(name, fjall::KeyspaceCreateOptions::default)
+        .unwrap();
+    let tx = db.read_tx();
+    fjall::Readable::prefix(&tx, &records, b"m")
+        .map(|item| item.into_inner().unwrap())
+        .filter(|(key, _)| key.len() == 1 + OpId::LEN)
+        .map(|(_, value)| {
+            let meta: crate_storage::OpMeta = postcard::from_bytes(&value).unwrap();
+            (meta.id, meta)
+        })
+        .collect()
+}
+
+/// Schema 6 metadata held every observed clock entry. The upgrade to schema 7
+/// names each clock by its root node in the main keyspace and in the staged,
+/// activating and clearing slot keyspaces. Stopped after any step, as a crash
+/// would stop it, the next open finishes it; every record then reads exactly
+/// as before, the interrupted activation completes and the cleared slot empties.
+#[test]
+fn upgrades_clock_schema_six() {
+    let original = fixture_copy("fjall-schema6-512b158");
+    let m = Manifest::read(original.path());
+    let path = original.path().join("db");
+    assert_eq!(stored_version(&path), 6);
+    let main = legacy_metas(&path, "records");
+    let staged = legacy_metas(&path, "bootstrap-0");
+    let activating = legacy_metas(&path, "bootstrap-1");
+    // The main keyspace also holds the hidden copies of the activation.
+    assert_eq!(
+        main.len(),
+        3 + m.id::<usize>("chain_ops") + activating.len()
+    );
+    assert!(activating.keys().all(|id| main[id] == activating[id]));
+    let chain_head = &main[&m.id::<OpId>("chain_head")];
+    assert_eq!(chain_head.observed_clock.len(), 40);
+    assert_eq!((staged.len(), activating.len()), (4, 6));
+    for steps in 0.. {
+        let dir = fixture_copy("fjall-schema6-512b158");
+        let path = dir.path().join("db");
+        FjallStorage::open_interrupted(&path, steps).unwrap();
+        assert_eq!(stored_version(&path), 7);
+        let stopped = raw_records(&path).contains_key(b"sm".as_slice());
+        let storage = FjallStorage::open(&path).unwrap();
+        assert!(!storage.migrating().unwrap(), "{steps} steps");
+        for (id, meta) in &main {
+            let shown = (!activating.contains_key(id)).then_some(meta);
+            assert_eq!(
+                storage.get_meta(id).unwrap().as_ref(),
+                shown,
+                "{steps} steps"
+            );
+        }
+        let listed = storage.provisional_topics().unwrap();
+        let session = |key: &str| {
+            listed
+                .iter()
+                .find(|provisional| provisional.session == m.id::<u64>(key))
+                .unwrap()
+                .clone()
+        };
+        let store = storage
+            .provisional_store(&session("staged_session"))
+            .unwrap()
+            .unwrap();
+        for (id, meta) in &staged {
+            assert_eq!(
+                store.get_meta(id).unwrap().as_ref(),
+                Some(meta),
+                "{steps} steps"
+            );
+        }
+        let topic: TopicId = m.id("activating");
+        assert!(storage.get_op(&m.id("activating_last")).unwrap().is_none());
+        drop((store, storage));
+
+        let config = NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[1; 32]),
+            ..NodeConfig::default()
+        };
+        let reader = Irokle::with_storage(FjallStorage::open(&path).unwrap(), config).unwrap();
+        let storage = reader.storage();
+        assert!(storage.topic_state(&topic).unwrap().is_some());
+        for (id, meta) in &activating {
+            assert_eq!(
+                storage.get_meta(id).unwrap().as_ref(),
+                Some(meta),
+                "{steps} steps"
+            );
+        }
+        let cleared: TopicId = m.id("cleared");
+        assert!(storage.list_op_ids(&cleared).unwrap().is_empty());
+        drop(reader);
+        if !stopped {
+            // Every slot keyspace that still holds records is a live namespace.
+            let db = fjall::OptimisticTxDatabase::builder(&path).open().unwrap();
+            let cleared_slot = db
+                .keyspace("bootstrap-2", fjall::KeyspaceCreateOptions::default)
+                .unwrap();
+            assert_eq!(
+                fjall::Readable::iter(&db.read_tx(), &cleared_slot).count(),
+                0
+            );
+            assert!(steps >= 4, "the upgrade took {steps} steps");
+            break;
+        }
+    }
+}

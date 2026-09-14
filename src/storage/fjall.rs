@@ -692,6 +692,30 @@ impl FjallStorage {
         Ok(true)
     }
 
+    /// Open a store, stopping its schema 7 upgrade after `steps` steps.
+    #[cfg(test)]
+    pub(crate) fn open_interrupted(path: impl AsRef<Path>, steps: usize) -> Result<()> {
+        let db = fjall::OptimisticTxDatabase::builder(path.as_ref()).open()?;
+        let storage = Self {
+            records: db.keyspace("records", fjall::KeyspaceCreateOptions::default)?,
+            db,
+            persist_mode: fjall::PersistMode::SyncAll,
+            counters: Default::default(),
+            limits: StagingLimits::DISK,
+            namespace: None,
+            clocks: Default::default(),
+            conflict_key: Default::default(),
+            hook: Default::default(),
+        };
+        storage.upgrade_schema(steps)
+    }
+
+    /// Whether a schema 7 upgrade still has steps left.
+    #[cfg(test)]
+    pub(crate) fn migrating(&self) -> Result<bool> {
+        Ok(self.get::<ClockMigration>(CLOCK_MIGRATION)?.is_some())
+    }
+
     pub(super) fn transaction<R>(
         &self,
         mut f: impl FnMut(&mut fjall::OptimisticWriteTx) -> Result<R>,

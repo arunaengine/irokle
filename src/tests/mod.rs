@@ -7,6 +7,8 @@ mod bench;
 mod bench_net;
 mod bootstrap;
 mod branch;
+#[cfg(feature = "fjall")]
+mod clocks;
 #[cfg(feature = "iroh")]
 mod combined;
 mod core;
