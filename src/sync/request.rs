@@ -420,6 +420,67 @@ mod tests {
         assert_eq!(again.1, first.1, "after the last actor the window wraps");
     }
 
+    /// A held actor the filter of a request would take as behind is named with
+    /// a zero-span hint, since its dependents would otherwise wait forever.
+    #[test]
+    fn held_collision_named() {
+        let mut colliding = [5_u8; 32];
+        colliding[28..].copy_from_slice(&[9; 4]);
+        let held = ActorId::from_bytes(colliding);
+        let mut local = clock(&[]);
+        local.observe(held, 3);
+        let mut remote = clock(&[(1, 1), (2, 1), (5, 1)]);
+        remote.observe(held, 3);
+        let mut knowledge = RequestKnowledge::default();
+        let first = request_ranges(&local, &remote, 2, &knowledge);
+        assert!(first.1.behind.as_ref().unwrap().contains(&held));
+        knowledge.settle(&first.1, (&[held].into(), false), (false, 4));
+        let named = request_ranges(&local, &remote, 2, &knowledge);
+        assert_described(&local, &remote, &named);
+        let zero = named.0.iter().find(|hint| hint.actor_id == held).unwrap();
+        assert_eq!((zero.from_exclusive, zero.to_inclusive), (3, 3));
+    }
+
+    /// Positions are kept newest first up to the capacity, at the real limit
+    /// too, and results without data advance a bounded number of times in a
+    /// row until data arrives.
+    #[test]
+    fn knowledge_bounded() {
+        let id = |index: u32| {
+            let mut bytes = [0_u8; 32];
+            bytes[..4].copy_from_slice(&index.to_be_bytes());
+            ActorId::from_bytes(bytes)
+        };
+        let window = ActorWindow {
+            after: None,
+            through: Some(id(0)),
+            behind: None,
+        };
+        for count in [MAX_PAGE_MISSING - 1, MAX_PAGE_MISSING, MAX_PAGE_MISSING + 1] {
+            let mut knowledge = RequestKnowledge::default();
+            let older = (0..count as u32).map(id).collect::<BTreeSet<_>>();
+            knowledge.settle(&window, (&older, false), (false, count));
+            assert_eq!(knowledge.positions(), count.min(MAX_PAGE_MISSING));
+            let newer = BTreeSet::from([id(u32::MAX)]);
+            knowledge.settle(&window, (&newer, false), (false, count));
+            assert_eq!(knowledge.positions[0], id(u32::MAX));
+            assert_eq!(knowledge.positions(), (count + 1).min(MAX_PAGE_MISSING));
+            assert!(
+                knowledge.positions.contains(&id(0)),
+                "the oldest of a group stays"
+            );
+        }
+        let mut knowledge = RequestKnowledge::with_capacity(1);
+        let limit = 4 * 3 + 64;
+        for _ in 0..limit + 3 {
+            knowledge.settle(&window, (&BTreeSet::new(), true), (false, 3));
+        }
+        assert_eq!(knowledge.revision(), limit as u64);
+        knowledge.settle(&window, (&BTreeSet::new(), false), (true, 3));
+        knowledge.settle(&window, (&BTreeSet::new(), true), (false, 3));
+        assert_eq!(knowledge.revision(), limit as u64 + 1);
+    }
+
     /// A request at every real limit, hints and wants at their largest
     /// encoding and a full filter, fits one sync frame.
     #[test]
@@ -476,21 +537,52 @@ mod tests {
     }
 
     /// At the real item limit the builder names no more than it may, whatever
-    /// the number of actors behind.
+    /// the number of actors behind: one below and at the limit every actor is
+    /// named, one past it a window describes the rest. A page result naming
+    /// the most positions it may fits a small frame.
     #[test]
     fn ranges_real_limit() {
         let items = super::super::MAX_REQUEST_ITEMS;
-        let mut remote = ActorClock::new();
-        for index in 0..(items as u32 + 5) {
+        let id = |index: u32| {
             let mut bytes = [0_u8; 32];
             bytes[..4].copy_from_slice(&index.to_be_bytes());
-            remote.observe(ActorId::from_bytes(bytes), 2);
-        }
+            ActorId::from_bytes(bytes)
+        };
         let local = ActorClock::new();
+        for behind in [items - 1, items, items + 1] {
+            let mut remote = ActorClock::new();
+            for index in 0..behind as u32 {
+                remote.observe(id(index), 2);
+            }
+            let ranges = request_ranges(&local, &remote, items, &RequestKnowledge::default());
+            assert_eq!(ranges.0.len(), behind.min(items));
+            assert_eq!(ranges.1.through.is_some(), behind > items, "{behind}");
+            assert_described(&local, &remote, &ranges);
+        }
+        let mut remote = ActorClock::new();
+        for index in 0..(items as u32 + 5) {
+            remote.observe(id(index), 2);
+        }
         let (hints, window) =
             request_ranges(&local, &remote, items - 7, &RequestKnowledge::default());
         assert_eq!(hints.len(), items - 7);
         assert!(window.through.is_some());
         assert_described(&local, &remote, &(hints, window));
+        let needed = (0..MAX_PAGE_MISSING as u64 + 1)
+            .map(|index| (id(index as u32), u64::MAX - index))
+            .collect::<BTreeMap<_, _>>();
+        let positions = deepest(&needed, MAX_PAGE_MISSING);
+        assert_eq!(positions.len(), MAX_PAGE_MISSING);
+        assert!(!positions.contains(&id(0)), "the shallowest gives way");
+        let page = crate::sync::SyncMessage::Page(crate::sync::SyncPage {
+            topic_id: crate::TopicId::hash(b"largest"),
+            more: true,
+            missing: (0..MAX_PAGE_MISSING as u32)
+                .map(|index| crate::OpId::hash(index.to_be_bytes()))
+                .collect(),
+            positions,
+            continued: false,
+        });
+        assert!(crate::net::framed_message_len(&page).unwrap() < 32 * 1024);
     }
 }

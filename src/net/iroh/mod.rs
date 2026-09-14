@@ -3723,6 +3723,33 @@ mod tests {
         assert_eq!(log.knowledge(&key, genesis, Some(3)), Default::default());
     }
 
+    /// An entry a node keeps requesting with stays while more entries than the
+    /// log holds come and go around it.
+    #[test]
+    fn requests_stay_in_use() {
+        let genesis = crate::OpId::hash(b"branch");
+        let key = (peer(1), topic(1));
+        let page = crate::sync::SyncPage {
+            topic_id: topic(1),
+            more: true,
+            missing: BTreeSet::new(),
+            positions: BTreeSet::from([crate::ActorId::from_bytes([9; 32])]),
+            continued: false,
+        };
+        let mut log = RequestLog::default();
+        log.sent(key, (genesis, None), Default::default(), 2);
+        log.settle(&key, Some(genesis), &page, false);
+        for index in 0..2 * MAX_BOOTSTRAP_RECEIPTS as u64 {
+            let mut id = [0_u8; 32];
+            id[..8].copy_from_slice(&index.to_le_bytes());
+            let other = (PeerId::from_bytes(id), topic(2));
+            log.sent(other, (genesis, None), Default::default(), 2);
+            log.sent(key, (genesis, None), Default::default(), 2);
+        }
+        assert_eq!(log.knowledge(&key, genesis, None).positions(), 1);
+        assert!(log.entries.len() <= MAX_BOOTSTRAP_RECEIPTS);
+    }
+
     #[test]
     fn scheduler_deduplicates_targets() {
         let scheduler = ResyncScheduler::default();
