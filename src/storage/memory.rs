@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use crate::{
     ActorClock, ActorId, Error, EvictionKey, Op, OpId, PeerId, Result, TopicEviction, TopicId,
@@ -20,6 +19,10 @@ use super::{
     new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
     topic_fingerprint_for, validate_batch, validate_heads,
 };
+
+mod staging;
+
+use staging::Staging;
 
 #[derive(Clone)]
 pub struct MemoryStorage {
@@ -41,67 +44,6 @@ impl Default for MemoryStorage {
             staging: Arc::default(),
             namespace: None,
         }
-    }
-}
-
-/// Registered provisional namespaces with their records. Lock order: this
-/// registry, then the active records, then a namespace's records.
-#[derive(Default)]
-struct Staging {
-    namespaces: BTreeMap<(PeerId, TopicId), Namespace>,
-    sessions: u64,
-}
-
-type Namespace = (ProvisionalTopic, Arc<Mutex<MemoryInner>>);
-
-/// A store's records, locked after a view's registry entry was checked. A
-/// change through a view updates that entry's bytes and revision on release.
-struct Locked<'a> {
-    inner: MutexGuard<'a, MemoryInner>,
-    staging: Option<(MutexGuard<'a, Staging>, (PeerId, TopicId))>,
-    changed: bool,
-}
-
-impl Deref for Locked<'_> {
-    type Target = MemoryInner;
-
-    fn deref(&self) -> &MemoryInner {
-        &self.inner
-    }
-}
-
-impl DerefMut for Locked<'_> {
-    fn deref_mut(&mut self) -> &mut MemoryInner {
-        self.changed = true;
-        &mut self.inner
-    }
-}
-
-impl Drop for Locked<'_> {
-    fn drop(&mut self) {
-        if let (true, Some((staging, key))) = (self.changed, &mut self.staging)
-            && let Some((provisional, _)) = staging.namespaces.get_mut(key)
-        {
-            provisional.revision = provisional.revision.saturating_add(1);
-            provisional.bytes = self.inner.admitted_bytes + self.inner.pending_usage.bytes;
-        }
-    }
-}
-
-impl Locked<'_> {
-    /// What the other namespaces leave a view; `None` for the main store.
-    fn quota(&self, limits: &StagingLimits) -> Option<StagingQuota> {
-        let (staging, key) = self.staging.as_ref()?;
-        let (mut others, mut source) = (0_u64, 0_u64);
-        for (other, (provisional, _)) in &staging.namespaces {
-            if other != key {
-                others = others.saturating_add(provisional.bytes);
-                if other.0 == key.0 {
-                    source = source.saturating_add(provisional.bytes);
-                }
-            }
-        }
-        Some(StagingQuota::new(limits, others, source))
     }
 }
 
@@ -161,44 +103,6 @@ impl MemoryStorage {
     /// Work this store and its clones performed so far.
     pub fn counters(&self) -> CounterSnapshot {
         self.counters.snapshot()
-    }
-
-    /// The records of this store. A view first checks, under the registry
-    /// lock it keeps, that its session is still registered.
-    fn lock(&self) -> Result<Locked<'_>> {
-        let staging = match self.namespace {
-            Some((source, topic_id, session)) => {
-                let staging = self.staging()?;
-                let current = staging
-                    .namespaces
-                    .get(&(source, topic_id))
-                    .is_some_and(|(provisional, _)| provisional.session == session);
-                if !current {
-                    return Err(Error::StaleIncarnation);
-                }
-                Some((staging, (source, topic_id)))
-            }
-            None => None,
-        };
-        Ok(Locked {
-            inner: self.inner.lock()?,
-            staging,
-            changed: false,
-        })
-    }
-
-    fn staging(&self) -> Result<MutexGuard<'_, Staging>> {
-        self.staging
-            .lock()
-            .map_err(|_| Error::Storage("staging lock poisoned".into()))
-    }
-
-    /// Refuse a registry operation on a namespace view.
-    fn main_store(&self) -> Result<()> {
-        match self.namespace {
-            Some(_) => Err(Error::StaleIncarnation),
-            None => Ok(()),
-        }
     }
 }
 
