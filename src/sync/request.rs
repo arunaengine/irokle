@@ -27,7 +27,7 @@ impl RequestKnowledge {
     /// positions keep the window for the next request, which names them first;
     /// otherwise the next window starts after this one, so positions no
     /// request could satisfy do not hold every other actor back.
-    #[cfg(feature = "iroh")]
+    #[cfg(any(feature = "iroh", test))]
     pub(crate) fn settle(&mut self, window: &ActorWindow, positions: &BTreeSet<ActorId>) {
         let known = self.positions.len();
         self.positions.extend(positions.iter().copied());
@@ -52,7 +52,7 @@ impl RequestKnowledge {
 
     /// How often page results named new positions, so a page that only asked
     /// for them still counts as progress.
-    #[cfg(feature = "iroh")]
+    #[cfg(any(feature = "iroh", test))]
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }
@@ -182,4 +182,187 @@ pub(crate) fn request_ranges(
         .collect::<Vec<_>>();
     window.behind = ActorFilter::new(&omitted, MAX_ACTOR_FILTER_BYTES);
     (hints, window)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn actor(byte: u8) -> ActorId {
+        ActorId::from_bytes([byte; 32])
+    }
+
+    fn clock(entries: &[(u8, u64)]) -> ActorClock {
+        let mut clock = ActorClock::new();
+        for (byte, seq) in entries {
+            clock.observe(actor(*byte), *seq);
+        }
+        clock
+    }
+
+    /// Every actor behind inside the window is named, and a named actor's
+    /// hint starts at the requester's own position.
+    fn assert_described(
+        local: &ActorClock,
+        remote: &ActorClock,
+        (hints, window): &(Vec<ActorRangeHint>, ActorWindow),
+    ) {
+        let named = hints
+            .iter()
+            .map(|hint| (hint.actor_id, hint.from_exclusive))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for (actor_id, seq) in remote.iter() {
+            if *seq > local.get(actor_id) && window.contains(actor_id) {
+                assert!(named.contains_key(actor_id), "{actor_id} omitted");
+            }
+        }
+        for (actor_id, from) in named {
+            assert_eq!(from, local.get(&actor_id));
+        }
+    }
+
+    /// Up to the item limit every actor behind is named and the window holds
+    /// every actor; one past it names a run whose window leaves the rest unknown.
+    #[test]
+    fn ranges_fit_items() {
+        let local = clock(&[(1, 1), (9, 5)]);
+        let remote = clock(&[(1, 3), (2, 2), (3, 1), (9, 5)]);
+        for items in [3, 4] {
+            let ranges = request_ranges(&local, &remote, items, &RequestKnowledge::default());
+            assert_eq!(ranges.0.len(), 3);
+            assert_eq!(ranges.1, ActorWindow::default());
+            assert_described(&local, &remote, &ranges);
+        }
+        let ranges = request_ranges(&local, &remote, 2, &RequestKnowledge::default());
+        assert_eq!(ranges.0.len(), 2);
+        assert_eq!((ranges.1.after, ranges.1.through), (None, Some(actor(2))));
+        // The actor behind outside the window is filtered, held actors are not.
+        let behind = ranges.1.behind.as_ref().unwrap();
+        assert!(behind.contains(&actor(3)));
+        assert!(ranges.1.holds(&actor(9)));
+        assert!(!ranges.1.contains(&actor(3)));
+        assert_described(&local, &remote, &ranges);
+        let empty = request_ranges(&local, &remote, 0, &RequestKnowledge::default());
+        assert!(empty.0.is_empty());
+        assert!(
+            remote
+                .iter()
+                .all(|(actor_id, _)| !empty.1.contains(actor_id))
+        );
+        let (none, window) = request_ranges(&remote, &remote, 1, &RequestKnowledge::default());
+        assert!(none.is_empty());
+        assert_eq!(window, ActorWindow::default());
+    }
+
+    /// A page naming positions keeps the window and the next request names
+    /// them first, held or behind; a page naming none moves the window on and
+    /// wraps after the last actor.
+    #[test]
+    fn knowledge_moves_window() {
+        let local = clock(&[(9, 4)]);
+        let remote = clock(&[(1, 1), (2, 1), (3, 1), (4, 1), (9, 4)]);
+        let mut knowledge = RequestKnowledge::default();
+        let first = request_ranges(&local, &remote, 2, &knowledge);
+        assert_eq!(first.1.through, Some(actor(2)));
+        knowledge.settle(&first.1, &[actor(9), actor(4)].into());
+        assert_eq!(knowledge.revision(), 1);
+        let asked = request_ranges(&local, &remote, 2, &knowledge);
+        assert_described(&local, &remote, &asked);
+        assert_eq!(asked.0[0].actor_id, actor(4));
+        assert_eq!(asked.1.after, None);
+        knowledge.settle(&asked.1, &[actor(4)].into());
+        assert_eq!(
+            knowledge.revision(),
+            1,
+            "a repeated position is no progress"
+        );
+        let named = request_ranges(&local, &remote, 3, &knowledge);
+        let zero = named
+            .0
+            .iter()
+            .find(|hint| hint.actor_id == actor(9))
+            .unwrap();
+        assert_eq!((zero.from_exclusive, zero.to_inclusive), (4, 4));
+        knowledge.settle(&named.1, &BTreeSet::new());
+        let next = request_ranges(&local, &remote, 2, &knowledge);
+        assert_described(&local, &remote, &next);
+        assert_eq!(next.1.after, named.1.through);
+        knowledge.settle(&next.1, &BTreeSet::new());
+        let wrapped = request_ranges(&local, &remote, 2, &knowledge);
+        assert_eq!(wrapped.1, first.1, "after the last actor the window wraps");
+    }
+
+    /// A request at every real limit, hints and wants at their largest
+    /// encoding and a full filter, fits one sync frame.
+    #[test]
+    fn largest_request_frames() {
+        let items = super::super::MAX_REQUEST_ITEMS;
+        let hints = (0..items as u32 / 2)
+            .map(|index| {
+                let mut bytes = [0xff_u8; 32];
+                bytes[..4].copy_from_slice(&index.to_be_bytes());
+                ActorRangeHint {
+                    actor_id: ActorId::from_bytes(bytes),
+                    from_exclusive: u64::MAX - 1,
+                    to_inclusive: u64::MAX,
+                }
+            })
+            .collect();
+        let wants = (0..items as u32 / 2)
+            .map(|index| crate::OpId::hash(index.to_be_bytes()))
+            .collect();
+        let request = crate::sync::SyncMessage::Request(crate::sync::SyncRequest {
+            topic_id: crate::TopicId::hash(b"largest"),
+            known: BTreeSet::new(),
+            wants,
+            actor_range_hints: hints,
+            genesis: Some(crate::OpId::hash(b"genesis")),
+            credit: Default::default(),
+            window: ActorWindow {
+                after: Some(ActorId::from_bytes([0; 32])),
+                through: Some(ActorId::from_bytes([0xff; 32])),
+                behind: Some(ActorFilter {
+                    bits: vec![0xff; MAX_ACTOR_FILTER_BYTES],
+                }),
+            },
+        });
+        let framed = crate::net::framed_message_len(&request).unwrap();
+        assert!(framed <= 16 * 1024 * 1024 + 4, "{framed} bytes");
+    }
+
+    /// A filter never misses an actor it holds, and at ten bits an actor
+    /// seldom collides.
+    #[test]
+    fn filter_never_misses() {
+        let id =
+            |index: u32| crate::ActorId::from_bytes(*blake3::hash(&index.to_le_bytes()).as_bytes());
+        let held = (0..4096).map(id).collect::<Vec<_>>();
+        let filter = ActorFilter::new(&held, MAX_ACTOR_FILTER_BYTES).unwrap();
+        assert!(held.iter().all(|actor_id| filter.contains(actor_id)));
+        let collisions = (4096..8192)
+            .filter(|index| filter.contains(&id(*index)))
+            .count();
+        assert!(collisions < 4096 / 20, "{collisions} collisions");
+        assert!(ActorFilter::new(&held, 64).is_none());
+        assert!(!ActorFilter::default().contains(&held[0]));
+    }
+
+    /// At the real item limit the builder names no more than it may, whatever
+    /// the number of actors behind.
+    #[test]
+    fn ranges_real_limit() {
+        let items = super::super::MAX_REQUEST_ITEMS;
+        let mut remote = ActorClock::new();
+        for index in 0..(items as u32 + 5) {
+            let mut bytes = [0_u8; 32];
+            bytes[..4].copy_from_slice(&index.to_be_bytes());
+            remote.observe(ActorId::from_bytes(bytes), 2);
+        }
+        let local = ActorClock::new();
+        let (hints, window) =
+            request_ranges(&local, &remote, items - 7, &RequestKnowledge::default());
+        assert_eq!(hints.len(), items - 7);
+        assert!(window.through.is_some());
+        assert_described(&local, &remote, &(hints, window));
+    }
 }

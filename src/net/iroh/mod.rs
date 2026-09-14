@@ -3625,6 +3625,35 @@ mod tests {
         TopicId::from_bytes([byte; 32])
     }
 
+    /// A request continues its peer's knowledge only on the same branch and
+    /// staging session; the first session continues what came before it.
+    #[test]
+    fn requests_follow_branch() {
+        let key = (peer(1), topic(1));
+        let (genesis, other) = (crate::OpId::hash(b"branch"), crate::OpId::hash(b"reset"));
+        let window = crate::sync::ActorWindow {
+            after: None,
+            through: Some(crate::ActorId::from_bytes([4; 32])),
+            behind: None,
+        };
+        let mut log = RequestLog::default();
+        log.sent(key, genesis, None, window);
+        let positions = BTreeSet::from([crate::ActorId::from_bytes([9; 32])]);
+        log.settle(&key, Some(genesis), &positions);
+        let learned = log.knowledge(&key, genesis, None);
+        assert_eq!((learned.positions(), learned.revision()), (1, 1));
+        assert_eq!(log.knowledge(&key, genesis, Some(3)), learned);
+        log.sent(key, genesis, Some(3), Default::default());
+        assert_eq!(log.knowledge(&key, genesis, Some(3)), learned);
+        assert_eq!(log.knowledge(&key, genesis, Some(4)), Default::default());
+        assert_eq!(log.knowledge(&key, other, Some(3)), Default::default());
+        assert_eq!(log.revision(&key, Some(other)), 0);
+        log.settle(&key, Some(other), &positions);
+        assert_eq!(log.knowledge(&key, genesis, Some(3)), learned);
+        log.sent(key, other, None, Default::default());
+        assert_eq!(log.knowledge(&key, genesis, Some(3)), Default::default());
+    }
+
     #[test]
     fn scheduler_deduplicates_targets() {
         let scheduler = ResyncScheduler::default();
