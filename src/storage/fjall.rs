@@ -229,6 +229,12 @@ impl FjallStorage {
         }
     }
 
+    /// Pause or fail the named steps of this store and its views.
+    #[cfg(test)]
+    pub(crate) fn set_hook(&self, hook: impl Fn(Hook) -> Result<()> + Send + Sync + 'static) {
+        *self.hook.lock().unwrap() = Some(std::sync::Arc::new(hook));
+    }
+
     #[cfg(test)]
     pub(super) fn hook(&self, point: Hook) -> Result<()> {
         let hook = self.hook.lock().unwrap().clone();

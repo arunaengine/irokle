@@ -693,6 +693,8 @@ mod fjall_pending;
 mod fjall_provisional;
 #[cfg(feature = "fjall")]
 pub use fjall::FjallStorage;
+#[cfg(all(test, feature = "fjall"))]
+pub(crate) use fjall::Hook;
 
 pub(super) fn validate_batch(batch: &AdmittedBatch) -> Result<()> {
     for state in [&batch.expected_topic_state, &batch.topic_state]

@@ -509,3 +509,398 @@ fn fjall_raced_expiry() {
     let dir = tempfile::tempdir().unwrap();
     assert_raced_expiry(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
+
+#[cfg(feature = "fjall")]
+mod fjall {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::storage::{FjallStorage, Hook, TopicState};
+
+    /// Pause the `nth` arrival at `point`, counting from zero, on `gate`.
+    fn pause_at(storage: &FjallStorage, point: Hook, nth: usize, gate: &Arc<Gate>) {
+        let seen = AtomicUsize::new(0);
+        let gate = Arc::clone(gate);
+        storage.set_hook(move |at| {
+            if at == point && seen.fetch_add(1, Ordering::SeqCst) == nth {
+                gate.pass();
+            }
+            Ok(())
+        });
+    }
+
+    /// Nothing of an unpublished topic is visible to a root or snapshot read.
+    fn assert_hidden(storage: &FjallStorage, topic_id: TopicId, actor: ActorId, ops: &[Op]) {
+        assert!(storage.topic_state(&topic_id).unwrap().is_none());
+        assert!(storage.topic_view(&topic_id, None).unwrap().is_none());
+        assert!(
+            storage
+                .list_topics()
+                .unwrap()
+                .iter()
+                .all(|topic| topic.topic_id != topic_id)
+        );
+        assert!(storage.list_ops(&topic_id).unwrap().is_empty());
+        assert!(storage.list_op_ids(&topic_id).unwrap().is_empty());
+        assert!(storage.heads(&topic_id).unwrap().is_empty());
+        assert!(storage.actor_clock(&topic_id).unwrap().is_empty());
+        assert!(storage.actor_tip(&topic_id, &actor).unwrap().is_none());
+        assert!(storage.actor_index(&topic_id, &actor, 1).unwrap().is_none());
+        assert!(
+            storage
+                .actor_range(&topic_id, &actor, 0, 16)
+                .unwrap()
+                .is_empty()
+        );
+        for op in [&ops[0], &ops[ops.len() / 2], &ops[ops.len() - 2]] {
+            assert!(storage.get_op(&op.id).unwrap().is_none());
+            assert!(storage.get_meta(&op.id).unwrap().is_none());
+            assert!(!storage.dep_resolvable(&op.id).unwrap());
+            assert!(storage.children(&op.id).unwrap().is_empty());
+        }
+        storage
+            .read_snapshot(|read| {
+                assert!(read.topic_view(&topic_id, None)?.is_none());
+                assert!(read.list_op_ids(&topic_id)?.is_empty());
+                assert!(read.actor_range(&topic_id, &actor, 0, 16)?.is_empty());
+                for op in ops {
+                    assert!(read.get_op(&op.id)?.is_none());
+                    assert!(read.get_meta(&op.id)?.is_none());
+                    assert!(!read.dep_resolvable(&op.id)?);
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Stage `ops` into a new namespace of `source` and return it with its state.
+    fn staged(
+        storage: &FjallStorage,
+        source: PeerId,
+        topic_id: TopicId,
+        ops: &[Op],
+    ) -> (ProvisionalTopic, TopicState) {
+        let provisional = storage
+            .open_provisional(source, topic_id, ops[0].id, now())
+            .unwrap();
+        stage(storage, &provisional, ops).unwrap();
+        let store = storage.provisional_store(&provisional).unwrap().unwrap();
+        let state = store.topic_state(&topic_id).unwrap().unwrap();
+        (listed(storage, &provisional).unwrap(), state)
+    }
+
+    /// Two passes clear one ended slot while another session takes it: the late
+    /// pass's delete does nothing to the new session.
+    #[test]
+    fn fjall_stale_clearing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path()).unwrap();
+        let (first_source, first_topic, first_ops) = history(151, 30, 64);
+        let (second_source, second_topic, second_ops) = history(152, 30, 64);
+        let (first, _) = staged(&storage, first_source.peer_id(), first_topic, &first_ops);
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        pause_at(&storage, Hook::DeleteChunk, 0, &gate);
+        let late = thread::spawn({
+            let storage = storage.clone();
+            move || storage.discard_provisional(&first)
+        });
+        gate.wait_arrival();
+        // This open clears and releases the slot, then takes it.
+        let (second, _) = staged(&storage, second_source.peer_id(), second_topic, &second_ops);
+        let before = contents(&storage, &second);
+        drop(release);
+        assert!(late.join().unwrap().unwrap());
+        assert_eq!(contents(&storage, &second), before);
+        assert_eq!(before.2, bytes(&second_ops));
+        assert_bytes_exact(&storage);
+    }
+
+    /// A view write that read its session before the session ended and its slot
+    /// was taken fails as stale instead of committing into the new session.
+    #[test]
+    fn fjall_stale_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path()).unwrap();
+        let (first_source, first_topic, first_ops) = history(153, 20, 64);
+        let (second_source, second_topic, second_ops) = history(154, 20, 64);
+        let (first, _) = staged(
+            &storage,
+            first_source.peer_id(),
+            first_topic,
+            &first_ops[..10],
+        );
+        let retained = storage.provisional_store(&first).unwrap().unwrap();
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        pause_at(&storage, Hook::NamespaceCommit, 0, &gate);
+        let writing = thread::spawn({
+            let rest = first_ops[10..].to_vec();
+            move || admit(&retained, first_source.peer_id(), &rest)
+        });
+        gate.wait_arrival();
+        assert!(
+            storage
+                .discard_provisional(&listed(&storage, &first).unwrap())
+                .unwrap()
+        );
+        let (second, _) = staged(&storage, second_source.peer_id(), second_topic, &second_ops);
+        let before = contents(&storage, &second);
+        drop(release);
+        let late = writing.join().unwrap();
+        assert_eq!(contents(&storage, &second), before);
+        assert!(matches!(late, Err(Error::StaleIncarnation)), "{late:?}");
+        assert_bytes_exact(&storage);
+    }
+
+    /// Copies of an activation stay invisible until its publication, to root
+    /// reads and to a snapshot opened before the publication and read after it.
+    #[test]
+    fn fjall_hidden_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path()).unwrap();
+        let (source, topic_id, ops) = history(155, 800, 8);
+        let actor = actor_id_for(topic_id, source.peer_id());
+        let (provisional, state) = staged(&storage, source.peer_id(), topic_id, &ops);
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        pause_at(&storage, Hook::Publish, 0, &gate);
+        let activating = thread::spawn({
+            let storage = storage.clone();
+            let state = state.clone();
+            move || storage.activate_provisional(&provisional, &state, AdmissionEffects::default())
+        });
+        gate.wait_arrival();
+        assert_hidden(&storage, topic_id, actor, &ops);
+        let opened = Arc::new(Barrier::new(2));
+        let published = Arc::new(Barrier::new(2));
+        let reading = thread::spawn({
+            let storage = storage.clone();
+            let (opened, published) = (Arc::clone(&opened), Arc::clone(&published));
+            let ops = ops.clone();
+            move || {
+                storage
+                    .read_snapshot(|read| {
+                        opened.wait();
+                        published.wait();
+                        assert!(read.topic_view(&topic_id, None)?.is_none());
+                        assert!(read.list_op_ids(&topic_id)?.is_empty());
+                        assert!(read.get_meta(&ops[1].id)?.is_none());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        });
+        opened.wait();
+        drop(release);
+        activating.join().unwrap().unwrap();
+        published.wait();
+        reading.join().unwrap();
+        assert_eq!(storage.topic_state(&topic_id).unwrap(), Some(state));
+        assert_eq!(
+            storage.list_op_ids(&topic_id).unwrap(),
+            source.storage().list_op_ids(&topic_id).unwrap()
+        );
+    }
+
+    /// An activation paused before its copy while a second facade publishes the
+    /// same session, its slot still uncleared, and the topic advances writes
+    /// nothing when it resumes.
+    #[test]
+    fn fjall_late_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path()).unwrap();
+        let other = storage.clone();
+        let (source, topic_id, ops) = history(156, 30, 8);
+        let actor = actor_id_for(topic_id, source.peer_id());
+        let (provisional, state) = staged(&storage, source.peer_id(), topic_id, &ops);
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        let copies = AtomicUsize::new(0);
+        storage.set_hook({
+            let gate = Arc::clone(&gate);
+            move |at| match at {
+                Hook::CopyChunk if copies.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    gate.pass();
+                    Ok(())
+                }
+                Hook::DeleteChunk => Err(Error::Storage("slot kept for the late copy".into())),
+                _ => Ok(()),
+            }
+        });
+        let late = thread::spawn({
+            let (provisional, state) = (provisional.clone(), state.clone());
+            move || storage.activate_provisional(&provisional, &state, AdmissionEffects::default())
+        });
+        gate.wait_arrival();
+        let published =
+            other.activate_provisional(&provisional, &state, AdmissionEffects::default());
+        assert!(published.is_err(), "the slot was not cleared");
+        assert_eq!(other.topic_state(&topic_id).unwrap(), Some(state.clone()));
+        let appended = source
+            .open_topic::<Note>(topic_id)
+            .unwrap()
+            .publish(Note {
+                text: "after".into(),
+            })
+            .unwrap()
+            .meta
+            .op_id;
+        let appended = source.storage().get_op(&appended).unwrap().unwrap();
+        admit(&other, source.peer_id(), &[appended]).unwrap();
+        let view = |storage: &FjallStorage| {
+            (
+                storage.topic_view(&topic_id, None).unwrap(),
+                storage.list_op_ids(&topic_id).unwrap(),
+                storage.actor_tip(&topic_id, &actor).unwrap(),
+                storage.actor_range(&topic_id, &actor, 0, 64).unwrap(),
+            )
+        };
+        let before = view(&other);
+        drop(release);
+        let resumed = late.join().unwrap();
+        assert_eq!(view(&other), before);
+        assert!(
+            matches!(resumed, Err(Error::AdmissionConflict)),
+            "{resumed:?}"
+        );
+        assert_eq!(before.2.unwrap().0, ops.len() as u64 + 1);
+    }
+
+    /// While one session holds a topic's activation claim, another session of
+    /// that topic, on another branch, cannot claim or copy; the claimant
+    /// publishes its own branch and ends the other.
+    #[test]
+    fn fjall_competing_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path()).unwrap();
+        let topic_id = TopicId::hash(b"competing-claim");
+        let side = |seed: u8| {
+            let (_, _, genesis, event) =
+                forked_side(MemoryStorage::new(), topic_id, seed, [reader()], "side");
+            vec![genesis, event]
+        };
+        let (winner_ops, loser_ops) = (side(157), side(158));
+        let winner_source = PeerId::hash(b"claim-winner");
+        let loser_source = PeerId::hash(b"claim-loser");
+        let (winner, winner_state) = staged(&storage, winner_source, topic_id, &winner_ops);
+        let (loser, loser_state) = staged(&storage, loser_source, topic_id, &loser_ops);
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        pause_at(&storage, Hook::CopyChunk, 0, &gate);
+        let claiming = thread::spawn({
+            let storage = storage.clone();
+            let state = winner_state.clone();
+            move || storage.activate_provisional(&winner, &state, AdmissionEffects::default())
+        });
+        gate.wait_arrival();
+        let refused =
+            storage.activate_provisional(&loser, &loser_state, AdmissionEffects::default());
+        let loser_listed = listed(&storage, &loser);
+        drop(release);
+        let claimed = claiming.join().unwrap();
+        assert_eq!(storage.topic_state(&topic_id).unwrap(), Some(winner_state));
+        assert_eq!(
+            storage.list_op_ids(&topic_id).unwrap(),
+            winner_ops.iter().map(|op| op.id).collect()
+        );
+        assert!(storage.get_op(&loser_ops[1].id).unwrap().is_none());
+        assert!(storage.provisional_topics().unwrap().is_empty());
+        assert!(
+            matches!(refused, Err(Error::AdmissionConflict)),
+            "{refused:?}"
+        );
+        assert!(!loser_listed.unwrap().activating);
+        claimed.unwrap();
+    }
+
+    /// A failure at each step of an activation and its reclamation, then a
+    /// reopen, leaves either a hidden resumable namespace or the whole topic,
+    /// and completing through the same calls leaves an empty reusable slot.
+    #[test]
+    fn fjall_activation_crashes() {
+        let (source, topic_id, ops) = history(159, 1200, 8);
+        let actor = actor_id_for(topic_id, source.peer_id());
+        let steps = [
+            (Hook::Claimed, 0),
+            (Hook::CopyChunk, 0),
+            (Hook::CopyChunk, 1),
+            (Hook::Publish, 0),
+            (Hook::DeleteChunk, 0),
+            (Hook::ReleaseSlot, 0),
+        ];
+        for (point, nth) in steps {
+            let dir = tempfile::tempdir().unwrap();
+            let state = {
+                let storage = FjallStorage::open(dir.path()).unwrap();
+                let (provisional, state) = staged(&storage, source.peer_id(), topic_id, &ops);
+                let seen = AtomicUsize::new(0);
+                storage.set_hook(move |at| {
+                    if at == point && seen.fetch_add(1, Ordering::SeqCst) == nth {
+                        return Err(Error::Storage("injected crash".into()));
+                    }
+                    Ok(())
+                });
+                let crashed =
+                    storage.activate_provisional(&provisional, &state, AdmissionEffects::default());
+                assert!(crashed.is_err(), "{point:?} {nth}");
+                state
+            };
+            let storage = FjallStorage::open(dir.path()).unwrap();
+            if storage.topic_state(&topic_id).unwrap().is_none() {
+                assert_hidden(&storage, topic_id, actor, &ops);
+                let listed = storage.provisional_topics().unwrap();
+                assert_eq!(listed.len(), 1, "{point:?} {nth}");
+                // Every failing step comes after the claim committed.
+                assert!(listed[0].activating, "{point:?} {nth}");
+                storage
+                    .activate_provisional(&listed[0], &state, AdmissionEffects::default())
+                    .unwrap();
+            }
+            assert_eq!(storage.topic_state(&topic_id).unwrap(), Some(state));
+            assert_eq!(
+                storage.list_op_ids(&topic_id).unwrap(),
+                source.storage().list_op_ids(&topic_id).unwrap()
+            );
+            assert!(storage.provisional_topics().unwrap().is_empty());
+            let (other_source, other_topic, other_ops) = history(160, 2, 8);
+            let other = storage
+                .open_provisional(other_source.peer_id(), other_topic, other_ops[0].id, now())
+                .unwrap();
+            let fresh = storage.provisional_store(&other).unwrap().unwrap();
+            assert_eq!(fresh.stored_bytes().unwrap(), 0, "{point:?} {nth}");
+            assert!(fresh.list_op_ids(&topic_id).unwrap().is_empty());
+        }
+    }
+
+    /// Registry bytes survive a reopen, and a failed clearing pass leaves the
+    /// slot to the next pass instead of to a new session.
+    #[test]
+    fn fjall_reopen_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, topic_id, ops) = history(161, 30, 64);
+        let (other_source, other_topic, other_ops) = history(162, 30, 64);
+        let first = {
+            let storage = FjallStorage::open(dir.path()).unwrap();
+            let (first, _) = staged(&storage, source.peer_id(), topic_id, &ops[..20]);
+            let seen = AtomicUsize::new(0);
+            storage.set_hook(move |at| {
+                if at == Hook::DeleteChunk && seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(Error::Storage("injected delete failure".into()));
+                }
+                Ok(())
+            });
+            assert!(storage.discard_provisional(&first).is_err());
+            first
+        };
+        let storage = FjallStorage::open(dir.path()).unwrap();
+        assert!(listed(&storage, &first).is_none());
+        let (second, _) = staged(&storage, other_source.peer_id(), other_topic, &other_ops);
+        assert_eq!(contents(&storage, &second).2, bytes(&other_ops));
+        drop(storage);
+        let storage = FjallStorage::open(dir.path()).unwrap();
+        let reopened = listed(&storage, &second).unwrap();
+        assert_eq!(reopened.bytes, bytes(&other_ops));
+        assert_bytes_exact(&storage);
+    }
+}
