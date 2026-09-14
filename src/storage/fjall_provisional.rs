@@ -37,6 +37,9 @@ pub(super) const SLOT: &[u8] = b"bs";
 const SESSIONS: &[u8] = b"bc";
 /// Activation claim, `ba<topic>` holding the claiming session.
 pub(super) const ACTIVATING: &[u8] = b"ba";
+/// `bq<slot>`: the bytes a clearing slot still holds and the source they came
+/// from, charged against the staging limits until the slot is released.
+pub(super) const CLEARING: &[u8] = b"bq";
 /// Serialized bytes of ops admitted into a namespace keyspace.
 pub(super) const ADMITTED_BYTES: &[u8] = b"nb";
 /// Records one copy or clearing transaction moves.
@@ -60,13 +63,24 @@ struct LegacyNamespaceRecord {
     slot: u32,
 }
 
+/// The charge a clearing slot carries over from its ended session.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(super) struct ClearingCharge {
+    pub(super) source: PeerId,
+    pub(super) bytes: u64,
+}
+
+pub(super) fn clearing_key(slot: u32) -> Vec<u8> {
+    [CLEARING, &slot.to_be_bytes()].concat()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SlotRecord {
-    source: PeerId,
+pub(super) struct SlotRecord {
+    pub(super) source: PeerId,
     topic_id: TopicId,
     session: u64,
     /// The session ended; the keyspace is emptied before the slot is reused.
-    clearing: bool,
+    pub(super) clearing: bool,
 }
 
 /// The capability of a namespace view: the registry record it stages under.
@@ -170,6 +184,14 @@ impl FjallStorage {
                 source = source.saturating_add(record.provisional.bytes);
             }
         }
+        // Bytes of ended sessions stay charged until their slot is emptied.
+        for item in fjall::Readable::prefix(tx, &fence.registry, CLEARING) {
+            let charge: ClearingCharge = postcard::from_bytes(item.value()?.as_ref())?;
+            others = others.saturating_add(charge.bytes);
+            if charge.source == own.source {
+                source = source.saturating_add(charge.bytes);
+            }
+        }
         Ok(StagingQuota::new(limits, others, source))
     }
 
@@ -227,11 +249,31 @@ impl FjallStorage {
             self.transaction(|tx| {
                 if clears(tx)? && fjall::Readable::iter(tx, &store).next().is_none() {
                     tx.remove(&self.records, key.clone());
+                    tx.remove(&self.records, clearing_key(slot));
                 }
                 Ok(())
             })?;
         }
         Ok(())
+    }
+
+    /// Every slot in use: whether it clears, the bytes its keyspace counts
+    /// and the charge a clearing slot carries.
+    #[cfg(test)]
+    pub(crate) fn slot_bytes(&self) -> Result<Vec<(bool, u64, Option<u64>)>> {
+        let tx = self.db.read_tx();
+        let mut out = Vec::new();
+        for item in fjall::Readable::prefix(&tx, &self.records, SLOT) {
+            let (key, value) = item.into_inner()?;
+            let record: SlotRecord = postcard::from_bytes(value.as_ref())?;
+            let slot = u32::from_be_bytes(key[SLOT.len()..].try_into().unwrap());
+            let store = self.slot_records(slot)?;
+            let admitted: u64 = Self::tx_get(&tx, &store, ADMITTED_BYTES)?.unwrap_or_default();
+            let counted = admitted + Self::tx_pending_bytes(&tx, &store)?;
+            let charge = Self::tx_get::<ClearingCharge>(&tx, &self.records, clearing_key(slot))?;
+            out.push((record.clearing, counted, charge.map(|charge| charge.bytes)));
+        }
+        Ok(out)
     }
 
     pub(super) fn read_provisional_topics(&self) -> Result<Vec<ProvisionalTopic>> {
@@ -374,13 +416,23 @@ impl FjallStorage {
         )
     }
 
-    /// End a namespace's session in `tx`: its record goes and its slot clears.
+    /// End a namespace's session in `tx`: its record goes and its slot clears,
+    /// keeping the namespace's bytes charged until the slot is released.
     fn tx_end_namespace(tx: &mut Tx, records: &Records, record: &NamespaceRecord) -> Result<()> {
         let provisional = &record.provisional;
         tx.remove(
             records,
             namespace_key(&provisional.source, &provisional.topic_id),
         );
+        Self::tx_put(
+            tx,
+            records,
+            clearing_key(record.slot),
+            &ClearingCharge {
+                source: provisional.source,
+                bytes: provisional.bytes,
+            },
+        )?;
         Self::tx_put(
             tx,
             records,

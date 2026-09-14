@@ -541,6 +541,103 @@ pub(super) mod fjall {
         });
     }
 
+    /// Staged and clearing bytes together stay within the total, and every
+    /// clearing slot is charged exactly what its keyspace still counts.
+    fn assert_retained(storage: &FjallStorage, limits: &StagingLimits) {
+        let slots = storage.slot_bytes().unwrap();
+        let retained = slots.iter().map(|(_, counted, _)| counted).sum::<u64>();
+        assert!(retained <= limits.total_bytes, "{retained} bytes retained");
+        for (clearing, counted, charge) in slots {
+            assert_eq!(charge, clearing.then_some(counted));
+        }
+    }
+
+    /// Bytes of an ended session stay charged while its slot clears. While
+    /// deletion fails, views of two facades over one store keep admitting into
+    /// the namespaces still open, before and after a reopen, and staged plus
+    /// clearing bytes never pass the total; once deletion works the charge goes
+    /// with its slot and the refused history stages.
+    #[test]
+    fn fjall_clearing_charged() {
+        let histories = (0..3)
+            .map(|index| history(190 + index, 6, 256))
+            .collect::<Vec<_>>();
+        let one = bytes(&histories[0].2);
+        let limits = StagingLimits {
+            total_bytes: 2 * one + one / 4,
+            ..StagingLimits::MEMORY
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            FjallStorage::open(dir.path())
+                .unwrap()
+                .with_staging_limits(limits)
+        };
+        let fail_deletes = |storage: &FjallStorage| {
+            storage.set_hook(|point| match point {
+                Hook::DeleteChunk => Err(Error::Storage("deletion fails".into())),
+                _ => Ok(()),
+            });
+        };
+        let first = open();
+        let second = first.clone();
+        let namespaces = histories
+            .iter()
+            .map(|(source, topic_id, ops)| {
+                first
+                    .open_provisional(source.peer_id(), *topic_id, ops[0].id, now())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        stage(&first, &namespaces[0], &histories[0].2).unwrap();
+        assert_retained(&first, &limits);
+        fail_deletes(&first);
+        let ended = listed(&second, &namespaces[0]).unwrap();
+        assert!(second.discard_provisional(&ended).is_err());
+        assert_retained(&first, &limits);
+        let half = histories[1].2.len() / 2;
+        stage(&second, &namespaces[1], &histories[1].2[..half]).unwrap();
+        assert_retained(&first, &limits);
+        let refused = stage(&first, &namespaces[2], &histories[2].2);
+        assert!(
+            matches!(refused, Err(Error::StagingCapacity(_))),
+            "{refused:?}"
+        );
+        assert_retained(&first, &limits);
+        drop((first, second));
+
+        let reopened = open();
+        fail_deletes(&reopened);
+        assert_retained(&reopened, &limits);
+        let refused = stage(&reopened, &namespaces[2], &histories[2].2);
+        assert!(
+            matches!(refused, Err(Error::StagingCapacity(_))),
+            "{refused:?}"
+        );
+        let clearing = reopened.slot_bytes().unwrap();
+        assert_eq!(
+            clearing.iter().filter(|(clearing, _, _)| *clearing).count(),
+            1
+        );
+
+        reopened.set_hook(|_| Ok(()));
+        let (source, topic_id, ops) = &histories[0];
+        let restarted = reopened
+            .open_provisional(source.peer_id(), *topic_id, ops[0].id, now())
+            .unwrap();
+        assert!(
+            reopened
+                .slot_bytes()
+                .unwrap()
+                .iter()
+                .all(|(clearing, _, _)| !clearing)
+        );
+        stage(&reopened, &namespaces[2], &histories[2].2).unwrap();
+        assert_retained(&reopened, &limits);
+        assert_bytes_exact(&reopened);
+        assert_eq!(listed(&reopened, &restarted).unwrap().bytes, 0);
+    }
+
     /// Nothing of an unpublished topic is visible to a root or snapshot read.
     pub(in crate::tests) fn assert_hidden(
         storage: &FjallStorage,

@@ -585,6 +585,37 @@ impl FjallStorage {
         })
     }
 
+    /// Charge every slot a schema 6 store left clearing with the bytes its
+    /// keyspace still counts, which schema 6 no longer charged anywhere.
+    fn tx_charge_clearing(&self, tx: &mut fjall::OptimisticWriteTx) -> Result<()> {
+        use super::fjall_provisional::{ClearingCharge, SLOT, SlotRecord, clearing_key};
+        let mut clearing = Vec::new();
+        for item in fjall::Readable::prefix(tx, &self.records, SLOT) {
+            let (key, value) = item.into_inner()?;
+            let record: SlotRecord = postcard::from_bytes(value.as_ref())?;
+            let slot = key
+                .get(SLOT.len()..)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_be_bytes)
+                .ok_or_else(|| Error::Storage("corrupt fjall bootstrap slot key".into()))?;
+            if record.clearing {
+                clearing.push((slot, record.source));
+            }
+        }
+        for (slot, source) in clearing {
+            let store = self.slot_records(slot)?;
+            let admitted: u64 = Self::tx_get(tx, &store, ADMITTED_BYTES)?.unwrap_or_default();
+            let bytes = admitted + Self::tx_pending_bytes(tx, &store)?;
+            Self::tx_put(
+                tx,
+                &self.records,
+                clearing_key(slot),
+                &ClearingCharge { source, bytes },
+            )?;
+        }
+        Ok(())
+    }
+
     /// Upgrade a schema 6 database. Stored metadata names its observed clock
     /// by the hash of a trie node instead of holding every entry, so a clock
     /// one position ahead of another shares all but a path of nodes with it.
@@ -604,6 +635,7 @@ impl FjallStorage {
                 CLOCK_MIGRATION,
                 &ClockMigration::default(),
             )?;
+            self.tx_charge_clearing(tx)?;
             Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &7_u32)?;
             Ok(())
         })?;

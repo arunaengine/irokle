@@ -544,6 +544,17 @@ fn reopen_keeps_progress() {
     );
 }
 
+/// The bytes the one clearing slot of `slots` counts.
+fn slots_cleared(slots: &[(bool, u64, Option<u64>)]) -> u64 {
+    let clearing = slots
+        .iter()
+        .filter(|(clearing, _, _)| *clearing)
+        .collect::<Vec<_>>();
+    assert_eq!(clearing.len(), 1);
+    assert!(clearing[0].1 > 0);
+    clearing[0].1
+}
+
 /// The legacy metadata records of the keyspace `name`, before an upgrade.
 fn legacy_metas(path: &Path, name: &str) -> BTreeMap<OpId, crate_storage::OpMeta> {
     let db = fjall::OptimisticTxDatabase::builder(path).open().unwrap();
@@ -600,6 +611,9 @@ fn upgrades_clock_schema_six() {
                 "{steps} steps"
             );
         }
+        // The slot schema 6 left clearing is charged what its keyspace counts.
+        let slots = storage.slot_bytes().unwrap();
+        assert!(slots.contains(&(true, slots_cleared(&slots), Some(slots_cleared(&slots)))));
         let listed = storage.provisional_topics().unwrap();
         let session = |key: &str| {
             listed
