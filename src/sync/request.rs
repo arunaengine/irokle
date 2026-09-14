@@ -23,12 +23,22 @@ pub(crate) struct RequestKnowledge {
 }
 
 impl RequestKnowledge {
-    /// Fold the result of a page served for a request with `window`. New
-    /// positions keep the window for the next request, which names them first;
-    /// otherwise the next window starts after this one, so positions no
-    /// request could satisfy do not hold every other actor back.
+    /// Fold the result of a page served for a request with `window`. A page
+    /// the responder `continued` wants the same request again. New positions
+    /// keep the window for the next request, which names them first; otherwise
+    /// the next window starts after this one, so positions no request could
+    /// satisfy do not hold every other actor back.
     #[cfg(any(feature = "iroh", test))]
-    pub(crate) fn settle(&mut self, window: &ActorWindow, positions: &BTreeSet<ActorId>) {
+    pub(crate) fn settle(
+        &mut self,
+        window: &ActorWindow,
+        positions: &BTreeSet<ActorId>,
+        continued: bool,
+    ) {
+        if continued {
+            self.revision += 1;
+            return;
+        }
         let known = self.positions.len();
         self.positions.extend(positions.iter().copied());
         while self.positions.len() > super::MAX_PAGE_MISSING {
@@ -50,8 +60,8 @@ impl RequestKnowledge {
         self.positions.len()
     }
 
-    /// How often page results named new positions, so a page that only asked
-    /// for them still counts as progress.
+    /// How often page results named new positions or a kept plan, so a page
+    /// that carried nothing but either still counts as progress.
     #[cfg(any(feature = "iroh", test))]
     pub(crate) fn revision(&self) -> u64 {
         self.revision
@@ -264,13 +274,13 @@ mod tests {
         let mut knowledge = RequestKnowledge::default();
         let first = request_ranges(&local, &remote, 2, &knowledge);
         assert_eq!(first.1.through, Some(actor(2)));
-        knowledge.settle(&first.1, &[actor(9), actor(4)].into());
+        knowledge.settle(&first.1, &[actor(9), actor(4)].into(), false);
         assert_eq!(knowledge.revision(), 1);
         let asked = request_ranges(&local, &remote, 2, &knowledge);
         assert_described(&local, &remote, &asked);
         assert_eq!(asked.0[0].actor_id, actor(4));
         assert_eq!(asked.1.after, None);
-        knowledge.settle(&asked.1, &[actor(4)].into());
+        knowledge.settle(&asked.1, &[actor(4)].into(), false);
         assert_eq!(
             knowledge.revision(),
             1,
@@ -283,11 +293,11 @@ mod tests {
             .find(|hint| hint.actor_id == actor(9))
             .unwrap();
         assert_eq!((zero.from_exclusive, zero.to_inclusive), (4, 4));
-        knowledge.settle(&named.1, &BTreeSet::new());
+        knowledge.settle(&named.1, &BTreeSet::new(), false);
         let next = request_ranges(&local, &remote, 2, &knowledge);
         assert_described(&local, &remote, &next);
         assert_eq!(next.1.after, named.1.through);
-        knowledge.settle(&next.1, &BTreeSet::new());
+        knowledge.settle(&next.1, &BTreeSet::new(), false);
         let wrapped = request_ranges(&local, &remote, 2, &knowledge);
         assert_eq!(wrapped.1, first.1, "after the last actor the window wraps");
     }

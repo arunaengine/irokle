@@ -202,14 +202,16 @@ impl RequestLog {
         &mut self,
         key: &(PeerId, crate::TopicId),
         genesis: Option<crate::OpId>,
-        positions: &BTreeSet<crate::ActorId>,
+        page: &crate::sync::SyncPage,
     ) {
         if let Some(entry) = self
             .entries
             .get_mut(key)
             .filter(|entry| Some(entry.genesis) == genesis)
         {
-            entry.knowledge.settle(&entry.window, positions);
+            entry
+                .knowledge
+                .settle(&entry.window, &page.positions, page.continued);
         }
     }
 
@@ -2637,11 +2639,8 @@ impl<S: Storage> SharedNet<S> {
                         more.insert(page.topic_id);
                     }
                     let genesis = geneses.get(&page.topic_id).copied().flatten();
-                    self.request_log().settle(
-                        &(remote_peer_id, page.topic_id),
-                        genesis,
-                        &page.positions,
-                    );
+                    self.request_log()
+                        .settle(&(remote_peer_id, page.topic_id), genesis, &page);
                 }
                 SyncMessage::Request(request) if group_topics.contains(&request.topic_id) => {
                     let topic_id = request.topic_id;
@@ -3639,7 +3638,14 @@ mod tests {
         let mut log = RequestLog::default();
         log.sent(key, genesis, None, window);
         let positions = BTreeSet::from([crate::ActorId::from_bytes([9; 32])]);
-        log.settle(&key, Some(genesis), &positions);
+        let page = crate::sync::SyncPage {
+            topic_id: topic(1),
+            more: true,
+            missing: BTreeSet::new(),
+            positions: positions.clone(),
+            continued: false,
+        };
+        log.settle(&key, Some(genesis), &page);
         let learned = log.knowledge(&key, genesis, None);
         assert_eq!((learned.positions(), learned.revision()), (1, 1));
         assert_eq!(log.knowledge(&key, genesis, Some(3)), learned);
@@ -3648,7 +3654,7 @@ mod tests {
         assert_eq!(log.knowledge(&key, genesis, Some(4)), Default::default());
         assert_eq!(log.knowledge(&key, other, Some(3)), Default::default());
         assert_eq!(log.revision(&key, Some(other)), 0);
-        log.settle(&key, Some(other), &positions);
+        log.settle(&key, Some(other), &page);
         assert_eq!(log.knowledge(&key, genesis, Some(3)), learned);
         log.sent(key, other, None, Default::default());
         assert_eq!(log.knowledge(&key, genesis, Some(3)), Default::default());
