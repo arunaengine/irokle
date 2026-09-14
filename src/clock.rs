@@ -6,7 +6,11 @@ use serde::de::Deserializer;
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(all(feature = "fjall", test))]
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+#[cfg(all(feature = "fjall", test))]
+use std::sync::{Mutex, OnceLock, Weak};
 
 /// Positions per actor. Clones share structure: entries live in a persistent
 /// trie over the nibbles of actor ids, so a clock derived from another by a
@@ -17,11 +21,12 @@ pub struct ActorClock {
     root: Option<Arc<Node>>,
 }
 
-#[derive(Clone)]
 enum Node {
     Leaf {
         actor: ActorId,
         seq: u64,
+        #[cfg(all(feature = "fjall", test))]
+        hash: OnceLock<[u8; 32]>,
     },
     /// Entries sharing the nibbles of `key` before `level`, one child per
     /// distinct nibble at `level`, in nibble order. At least two children.
@@ -31,7 +36,104 @@ enum Node {
         len: usize,
         key: ActorId,
         children: Vec<Arc<Node>>,
+        #[cfg(all(feature = "fjall", test))]
+        hash: OnceLock<[u8; 32]>,
     },
+}
+
+/// A clone is about to change, so it does not keep the hash of its source.
+impl Clone for Node {
+    fn clone(&self) -> Self {
+        match self {
+            Node::Leaf { actor, seq, .. } => Node::Leaf {
+                actor: *actor,
+                seq: *seq,
+                #[cfg(all(feature = "fjall", test))]
+                hash: OnceLock::new(),
+            },
+            Node::Branch {
+                level,
+                bitmap,
+                len,
+                key,
+                children,
+                ..
+            } => Node::Branch {
+                level: *level,
+                bitmap: *bitmap,
+                len: *len,
+                key: *key,
+                children: children.clone(),
+                #[cfg(all(feature = "fjall", test))]
+                hash: OnceLock::new(),
+            },
+        }
+    }
+}
+
+#[cfg(all(feature = "fjall", test))]
+/// The stored form of one trie node, its children named by their hashes.
+#[derive(Serialize, Deserialize)]
+enum Encoded {
+    Leaf {
+        actor: ActorId,
+        seq: u64,
+    },
+    Branch {
+        level: u8,
+        bitmap: u16,
+        len: u64,
+        key: ActorId,
+        children: Vec<[u8; 32]>,
+    },
+}
+
+#[cfg(all(feature = "fjall", test))]
+/// Separates node hashes from every other blake3 hash of this crate.
+const NODE_DOMAIN: &[u8] = b"irokle/clock-node/1";
+
+#[cfg(all(feature = "fjall", test))]
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(NODE_DOMAIN);
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+#[cfg(all(feature = "fjall", test))]
+impl Node {
+    fn encoded(&self) -> Encoded {
+        match self {
+            Node::Leaf { actor, seq, .. } => Encoded::Leaf {
+                actor: *actor,
+                seq: *seq,
+            },
+            Node::Branch {
+                level,
+                bitmap,
+                len,
+                key,
+                children,
+                ..
+            } => Encoded::Branch {
+                level: *level,
+                bitmap: *bitmap,
+                len: *len as u64,
+                key: *key,
+                children: children.iter().map(|child| child.hash()).collect(),
+            },
+        }
+    }
+
+    /// The hash of this node's stored form, computed once.
+    fn hash(&self) -> [u8; 32] {
+        let cell = match self {
+            Node::Leaf { hash, .. } | Node::Branch { hash, .. } => hash,
+        };
+        *cell.get_or_init(|| {
+            digest(&postcard::to_allocvec(&self.encoded()).expect("a clock node encodes"))
+        })
+    }
 }
 
 impl Node {
@@ -69,7 +171,12 @@ fn first_difference(a: &ActorId, b: &ActorId) -> Option<u8> {
 }
 
 fn leaf(actor: ActorId, seq: u64) -> Arc<Node> {
-    Arc::new(Node::Leaf { actor, seq })
+    Arc::new(Node::Leaf {
+        actor,
+        seq,
+        #[cfg(all(feature = "fjall", test))]
+        hash: OnceLock::new(),
+    })
 }
 
 /// A branch at `level` over two subtrees whose keys first differ there.
@@ -84,6 +191,8 @@ fn pair(level: u8, a: Arc<Node>, b: Arc<Node>) -> Arc<Node> {
         len,
         key,
         children,
+        #[cfg(all(feature = "fjall", test))]
+        hash: OnceLock::new(),
     })
 }
 
@@ -127,8 +236,13 @@ fn set_node(node: &mut Arc<Node>, actor: &ActorId, seq: Option<u64>) -> bool {
         len,
         key,
         children,
+        #[cfg(all(feature = "fjall", test))]
+        hash,
     } = Arc::make_mut(node)
     {
+        // A node held only here changes in place and loses its hash.
+        #[cfg(all(feature = "fjall", test))]
+        hash.take();
         let digit = nibble(actor, *level);
         let index = slot(*bitmap, digit);
         if *bitmap & (1 << digit) == 0 {
@@ -161,8 +275,8 @@ fn union(a: &Arc<Node>, b: &Arc<Node>) -> Arc<Node> {
         return Arc::clone(a);
     }
     let (upper, lower) = match (&**a, &**b) {
-        (_, Node::Leaf { actor, seq }) => return observed(a, actor, *seq),
-        (Node::Leaf { actor, seq }, _) => return observed(b, actor, *seq),
+        (_, Node::Leaf { actor, seq, .. }) => return observed(a, actor, *seq),
+        (Node::Leaf { actor, seq, .. }, _) => return observed(b, actor, *seq),
         (
             Node::Branch {
                 level: la, key: ka, ..
@@ -262,6 +376,8 @@ fn union_children(a: &Arc<Node>, b: &Arc<Node>) -> Arc<Node> {
         len: children.iter().map(|child| child.len()).sum(),
         key: *key,
         children,
+        #[cfg(all(feature = "fjall", test))]
+        hash: OnceLock::new(),
     })
 }
 
@@ -278,7 +394,9 @@ fn observed(node: &Arc<Node>, actor: &ActorId, seq: u64) -> Arc<Node> {
 fn lookup(mut node: &Node, actor: &ActorId) -> Option<u64> {
     loop {
         match node {
-            Node::Leaf { actor: held, seq } => return (held == actor).then_some(*seq),
+            Node::Leaf {
+                actor: held, seq, ..
+            } => return (held == actor).then_some(*seq),
             Node::Branch {
                 level,
                 bitmap,
@@ -384,13 +502,235 @@ impl ActorClock {
         std::iter::from_fn(move || {
             loop {
                 match stack.pop()? {
-                    Node::Leaf { actor, seq } => return Some((actor, seq)),
+                    Node::Leaf { actor, seq, .. } => return Some((actor, seq)),
                     Node::Branch { children, .. } => {
                         stack.extend(children.iter().rev().map(|child| &**child));
                     }
                 }
             }
         })
+    }
+}
+
+#[cfg(all(feature = "fjall", test))]
+impl ActorClock {
+    /// The hash naming this clock's stored root node; `None` when empty.
+    pub(crate) fn root_hash(&self) -> Option<[u8; 32]> {
+        self.root.as_deref().map(Node::hash)
+    }
+
+    /// The stored form of every node of this clock that `stored` does not
+    /// report as held, by hash and parents first. The subtree of a held node
+    /// is held too, so it is not visited.
+    pub(crate) fn unstored_nodes(
+        &self,
+        mut stored: impl FnMut(&[u8; 32]) -> crate::Result<bool>,
+    ) -> crate::Result<Vec<([u8; 32], Vec<u8>)>> {
+        let mut out = Vec::new();
+        let mut stack = Vec::new();
+        stack.extend(self.root.as_deref());
+        while let Some(node) = stack.pop() {
+            let hash = node.hash();
+            if stored(&hash)? {
+                continue;
+            }
+            out.push((hash, postcard::to_allocvec(&node.encoded())?));
+            if let Node::Branch { children, .. } = node {
+                stack.extend(children.iter().map(|child| &**child));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The clock whose stored root node is `root`, reading nodes through
+    /// `fetch` and sharing every node `cache` still holds. A node whose bytes
+    /// do not hash to its name, or that breaks the trie's shape, is refused.
+    pub(crate) fn load(
+        root: &[u8; 32],
+        cache: &ClockCache,
+        mut fetch: impl FnMut(&[u8; 32]) -> crate::Result<Option<Vec<u8>>>,
+    ) -> crate::Result<Self> {
+        let root = cache.node(root, &mut fetch, None)?;
+        Ok(Self { root: Some(root) })
+    }
+}
+
+/// Reads the stored bytes of the node a hash names.
+#[cfg(all(feature = "fjall", test))]
+type NodeFetch<'a> = dyn FnMut(&[u8; 32]) -> crate::Result<Option<Vec<u8>>> + 'a;
+
+#[cfg(all(feature = "fjall", test))]
+fn corrupt() -> crate::Error {
+    crate::Error::Storage("corrupt stored clock node".into())
+}
+
+#[cfg(all(feature = "fjall", test))]
+/// Clock nodes loaded or stored recently, so loading a clock that shares most
+/// of its nodes with another reads only the rest. Nodes are held only while
+/// something else holds them, except those of the latest clocks, which are
+/// held within an estimate of their bytes.
+#[derive(Default)]
+pub(crate) struct ClockCache {
+    inner: Mutex<CacheInner>,
+}
+
+#[cfg(all(feature = "fjall", test))]
+#[derive(Default)]
+struct CacheInner {
+    nodes: HashMap<[u8; 32], Weak<Node>>,
+    latest: VecDeque<(Arc<Node>, usize)>,
+    bytes: usize,
+}
+
+#[cfg(all(feature = "fjall", test))]
+/// Estimated bytes the latest clocks may hold, counting every entry.
+const CACHE_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(all(feature = "fjall", test))]
+/// Estimated bytes one clock entry holds in its nodes.
+const ENTRY_BYTES: usize = 160;
+#[cfg(all(feature = "fjall", test))]
+/// Node names the cache tracks before it drops those nothing holds.
+const CACHE_NODES: usize = 1 << 18;
+
+#[cfg(all(feature = "fjall", test))]
+impl ClockCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheInner> {
+        // Only a shortcut: a poisoned cache still names valid nodes.
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hold `clock` among the latest clocks and name its nodes, so a clock
+    /// loaded or derived from it next shares them.
+    pub(crate) fn keep(&self, clock: &ActorClock) {
+        let Some(root) = &clock.root else {
+            return;
+        };
+        let bytes = root.len().saturating_mul(ENTRY_BYTES);
+        if bytes > CACHE_BYTES {
+            return;
+        }
+        let mut inner = self.lock();
+        inner.remember(root);
+        inner.bytes += bytes;
+        inner.latest.push_back((Arc::clone(root), bytes));
+        while inner.bytes > CACHE_BYTES {
+            let Some((_, bytes)) = inner.latest.pop_front() else {
+                break;
+            };
+            inner.bytes -= bytes;
+        }
+    }
+
+    /// The node named `hash`: shared when something still holds it, otherwise
+    /// read, checked against its name and, below `parent`, against its place.
+    fn node(
+        &self,
+        hash: &[u8; 32],
+        fetch: &mut NodeFetch<'_>,
+        parent: Option<(u8, &ActorId)>,
+    ) -> crate::Result<Arc<Node>> {
+        let held = self.lock().nodes.get(hash).and_then(Weak::upgrade);
+        let node = match held {
+            Some(node) => node,
+            None => {
+                let bytes = fetch(hash)?.ok_or_else(corrupt)?;
+                if digest(&bytes) != *hash {
+                    return Err(corrupt());
+                }
+                let node = match postcard::from_bytes::<Encoded>(&bytes)? {
+                    Encoded::Leaf { actor, seq } => Node::Leaf {
+                        actor,
+                        seq,
+                        #[cfg(all(feature = "fjall", test))]
+                        hash: OnceLock::from(*hash),
+                    },
+                    Encoded::Branch {
+                        level,
+                        bitmap,
+                        len,
+                        key,
+                        children,
+                    } => {
+                        if level >= 64
+                            || children.len() < 2
+                            || bitmap.count_ones() as usize != children.len()
+                        {
+                            return Err(corrupt());
+                        }
+                        let children = children
+                            .iter()
+                            .map(|child| self.node(child, fetch, Some((level, &key))))
+                            .collect::<crate::Result<Vec<_>>>()?;
+                        let digits = children
+                            .iter()
+                            .map(|child| 1_u16 << nibble(child.key(), level))
+                            .fold(0, |bits, bit| bits | bit);
+                        let total = children.iter().map(|child| child.len()).sum::<usize>();
+                        if digits != bitmap || total as u64 != len {
+                            return Err(corrupt());
+                        }
+                        Node::Branch {
+                            level,
+                            bitmap,
+                            len: total,
+                            key,
+                            children,
+                            #[cfg(all(feature = "fjall", test))]
+                            hash: OnceLock::from(*hash),
+                        }
+                    }
+                };
+                let node = Arc::new(node);
+                self.lock().name(hash, &node);
+                node
+            }
+        };
+        // A child shares its parent's nibbles before the parent's level and
+        // branches, if at all, below it.
+        if let Some((level, key)) = parent {
+            let below = match &*node {
+                Node::Leaf { .. } => true,
+                Node::Branch { level: child, .. } => *child > level,
+            };
+            if !below || first_difference(node.key(), key).is_some_and(|at| at < level) {
+                return Err(corrupt());
+            }
+        }
+        Ok(node)
+    }
+}
+
+#[cfg(all(feature = "fjall", test))]
+impl CacheInner {
+    fn name(&mut self, hash: &[u8; 32], node: &Arc<Node>) {
+        if self.nodes.len() >= CACHE_NODES {
+            self.nodes.retain(|_, node| node.strong_count() > 0);
+            if self.nodes.len() >= CACHE_NODES / 2 {
+                self.nodes.clear();
+            }
+        }
+        self.nodes.insert(*hash, Arc::downgrade(node));
+    }
+
+    /// Name `node` and the nodes below it not named yet.
+    fn remember(&mut self, node: &Arc<Node>) {
+        let mut stack = vec![Arc::clone(node)];
+        while let Some(node) = stack.pop() {
+            let hash = node.hash();
+            if self
+                .nodes
+                .get(&hash)
+                .is_some_and(|held| held.strong_count() > 0)
+            {
+                continue;
+            }
+            self.name(&hash, &node);
+            if let Node::Branch { children, .. } = &*node {
+                stack.extend(children.iter().cloned());
+            }
+        }
     }
 }
 
@@ -618,6 +958,94 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A clock stored as nodes loads back equal; a clock one position ahead
+    /// stores only the path to that position; a node whose bytes do not match
+    /// its name, or that sits below a parent it does not belong to, is refused.
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn stored_nodes_round_trip() {
+        let actor =
+            |index: u32| ActorId::from_bytes(*blake3::hash(&index.to_le_bytes()).as_bytes());
+        let mut store = std::collections::HashMap::new();
+        let put = |clock: &ActorClock, store: &mut std::collections::HashMap<[u8; 32], Vec<u8>>| {
+            let nodes = clock
+                .unstored_nodes(|hash| Ok(store.contains_key(hash)))
+                .unwrap();
+            let written = nodes.len();
+            store.extend(nodes);
+            written
+        };
+        let mut clock = ActorClock::new();
+        for index in 0..2048 {
+            clock.observe(actor(index), u64::from(index % 7));
+        }
+        assert!(put(&clock, &mut store) > 2048);
+        let mut ahead = clock.clone();
+        ahead.observe(actor(5000), 1);
+        let path = put(&ahead, &mut store);
+        assert!((2..=6).contains(&path), "{path} nodes for one position");
+        for (stored, cache) in [
+            (&clock, ClockCache::default()),
+            (&ahead, ClockCache::default()),
+        ] {
+            let fetch = |hash: &[u8; 32]| Ok(store.get(hash).cloned());
+            let loaded = ActorClock::load(&stored.root_hash().unwrap(), &cache, fetch).unwrap();
+            assert_eq!(&loaded, stored);
+            assert_eq!(loaded.root_hash(), stored.root_hash());
+        }
+        // A cache shares the nodes of a clock it keeps with the next load.
+        let cache = ClockCache::default();
+        cache.keep(&clock);
+        let mut reads = 0;
+        let loaded = ActorClock::load(&ahead.root_hash().unwrap(), &cache, |hash| {
+            reads += 1;
+            Ok(store.get(hash).cloned())
+        })
+        .unwrap();
+        assert_eq!(loaded, ahead);
+        assert!(reads <= path, "{reads} reads");
+
+        let root = clock.root_hash().unwrap();
+        let mut damaged = store.clone();
+        damaged.get_mut(&root).unwrap()[3] ^= 1;
+        let refused = ActorClock::load(&root, &ClockCache::default(), |hash| {
+            Ok(damaged.get(hash).cloned())
+        });
+        assert!(matches!(refused, Err(crate::Error::Storage(_))));
+        // A well-named node that claims a child of another subtree is refused.
+        let Some(Node::Branch { children, .. }) = clock.root.as_deref() else {
+            panic!("a root of many entries is a branch");
+        };
+        let (first, second) = (children[0].hash(), children[1].hash());
+        let Ok(Encoded::Branch {
+            level,
+            bitmap,
+            len,
+            key,
+            children: named,
+        }) = postcard::from_bytes::<Encoded>(&store[&first])
+        else {
+            panic!("a child of many entries is a branch");
+        };
+        let mut moved = named.clone();
+        moved[0] = second;
+        let forged = postcard::to_allocvec(&Encoded::Branch {
+            level,
+            bitmap,
+            len,
+            key,
+            children: moved,
+        })
+        .unwrap();
+        let forged_name = digest(&forged);
+        let mut forged_store = store.clone();
+        forged_store.insert(forged_name, forged);
+        let refused = ActorClock::load(&forged_name, &ClockCache::default(), |hash| {
+            Ok(forged_store.get(hash).cloned())
+        });
+        assert!(matches!(refused, Err(crate::Error::Storage(_))));
     }
 
     /// A clock derived by one more position shares all but the path to it, and
