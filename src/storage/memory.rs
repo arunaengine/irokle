@@ -12,10 +12,10 @@ use crate::{
 use super::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
     MAX_PENDING_MISSING_DEPS, MAX_PENDING_WAITERS_PER_DEP, MAX_REJECTED_PER_TOPIC,
-    ObligationTarget, OpMeta, PeerAck, PendingRecord, PendingUsage, ProvisionalTopic, SnapshotRead,
-    StagingLimits, StagingQuota, Storage, StorageCounters, SyncObligation, SyncPeerStatus,
-    SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers, ack_reached_op,
-    apply_status_update, branch_matches, check_namespaces, check_pending_quota,
+    ObligationTarget, OpMeta, OpPosition, PeerAck, PendingRecord, PendingUsage, ProvisionalTopic,
+    SnapshotRead, StagingLimits, StagingQuota, Storage, StorageCounters, SyncObligation,
+    SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers,
+    ack_reached_op, apply_status_update, branch_matches, check_namespaces, check_pending_quota,
     ensure_deps_resolvable, journalled_eviction, merged_obligation, merged_peer_ack,
     new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
     topic_fingerprint_for, validate_batch, validate_heads,
@@ -1050,6 +1050,10 @@ impl SnapshotRead for MemorySnapshot<'_> {
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
         self.counters.count_meta();
         Ok(self.inner.meta.get(id).cloned())
+    }
+    fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {
+        self.counters.count_meta();
+        Ok(self.inner.meta.get(id).map(OpPosition::from))
     }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
         Ok(dep_resolvable_locked(self.inner, id))

@@ -13,9 +13,9 @@ use crate::{
 use super::fjall_provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
 use super::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
-    ObligationTarget, OpMeta, PeerAck, ProvisionalTopic, SnapshotRead, StagingLimits, Storage,
-    StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView,
-    ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches,
+    ObligationTarget, OpMeta, OpPosition, PeerAck, ProvisionalTopic, SnapshotRead, StagingLimits,
+    Storage, StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState,
+    TopicView, ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches,
     ensure_deps_resolvable, journalled_eviction, merged_obligation, merged_peer_ack,
     new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
     topic_fingerprint_for, validate_batch, validate_heads,
@@ -1957,6 +1957,21 @@ impl Storage for FjallStorage {
     }
 }
 
+/// The leading fields of a stored [`OpMeta`], in its field order. Postcard
+/// decodes them and leaves the observed clock after them unread.
+#[cfg(feature = "fjall")]
+#[derive(Deserialize)]
+struct MetaPrefix {
+    _id: OpId,
+    topic_id: TopicId,
+    _author: PeerId,
+    actor_id: ActorId,
+    actor_seq: u64,
+    actor_prev: Option<OpId>,
+    deps: BTreeSet<OpId>,
+    generation: u64,
+}
+
 #[cfg(feature = "fjall")]
 /// One read transaction seen through [`SnapshotRead`].
 struct FjallSnapshot<'a> {
@@ -2008,6 +2023,25 @@ impl SnapshotRead for FjallSnapshot<'_> {
         )?;
         match meta {
             Some(meta) if self.shown(&meta.topic_id)? => Ok(Some(meta)),
+            _ => Ok(None),
+        }
+    }
+    fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {
+        self.store.counters.count_meta();
+        let prefix: Option<MetaPrefix> = FjallStorage::tx_get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(b"m", id),
+        )?;
+        match prefix {
+            Some(prefix) if self.shown(&prefix.topic_id)? => Ok(Some(OpPosition {
+                topic_id: prefix.topic_id,
+                actor_id: prefix.actor_id,
+                actor_seq: prefix.actor_seq,
+                actor_prev: prefix.actor_prev,
+                deps: prefix.deps,
+                generation: prefix.generation,
+            })),
             _ => Ok(None),
         }
     }

@@ -5,7 +5,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
-use crate::storage::{SnapshotRead, Storage};
+use crate::storage::{OpPosition, SnapshotRead, Storage};
 use crate::{ActorClock, ActorId, Error, OpId, Result, TopicId};
 
 use super::{
@@ -48,7 +48,7 @@ struct Pager<'a> {
     sent: &'a BTreeSet<OpId>,
     window: usize,
     active: BinaryHeap<Reverse<RangeHead>>,
-    metas: BTreeMap<OpId, crate::storage::OpMeta>,
+    metas: BTreeMap<OpId, OpPosition>,
     /// Actors behind the goal not activated yet, in clock order.
     deferred: VecDeque<ActorId>,
     /// Suspended heads by the actor they wait for, with the position needed.
@@ -164,7 +164,7 @@ impl Pager<'_> {
         while self.active.len() < self.window {
             if let Some(head) = self.resumable.pop_front() {
                 let (_, actor_id, _, id, _) = head;
-                let Some(meta) = self.read.get_meta(&id)? else {
+                let Some(meta) = self.read.get_position(&id)? else {
                     self.missing.insert(id);
                     self.block(actor_id, id);
                     continue;
@@ -199,7 +199,7 @@ impl Pager<'_> {
             self.stop(actor_id);
             return Ok(());
         };
-        let meta = self.read.get_meta(&id)?;
+        let meta = self.read.get_position(&id)?;
         if seq != after + 1 || meta.is_none() {
             match meta.filter(|_| seq != after + 1) {
                 Some(meta) => self.missing.extend(meta.actor_prev),
@@ -222,7 +222,7 @@ impl Pager<'_> {
     /// What `meta` still waits for: an unsent or blocked dependency, a missing
     /// record, positions of actors the request did not describe, all named at
     /// once, or a position of another actor the peer does not hold yet.
-    fn wait_for(&mut self, meta: &crate::storage::OpMeta) -> Result<Wait> {
+    fn wait_for(&mut self, meta: &OpPosition) -> Result<Wait> {
         let mut unknown = false;
         let mut waits = None;
         for dep in &meta.deps {
@@ -236,7 +236,7 @@ impl Pager<'_> {
                 Some(dep_meta) => Some((dep_meta.actor_id, dep_meta.actor_seq)),
                 None => self
                     .read
-                    .get_meta(dep)?
+                    .get_position(dep)?
                     .map(|dep_meta| (dep_meta.actor_id, dep_meta.actor_seq)),
             };
             let Some((dep_actor, dep_seq)) = position else {

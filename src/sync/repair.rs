@@ -24,7 +24,7 @@ impl<S: Storage> SyncEngine<S> {
         let mut page = RepairPage::default();
         let mut ordered = Vec::with_capacity(wants.len());
         for id in wants {
-            match read.get_meta(id)? {
+            match read.get_position(id)? {
                 Some(meta) if meta.topic_id == *topic_id => {
                     ordered.push((meta.generation, *id, meta.deps))
                 }
@@ -48,7 +48,7 @@ impl<S: Storage> SyncEngine<S> {
                     ready = false;
                     break;
                 }
-                match read.get_meta(dep)? {
+                match read.get_position(dep)? {
                     // Every unknown actor of the want is named at once.
                     Some(meta) if scope.unknown(&meta.actor_id) => {
                         page.positions.insert(meta.actor_id);

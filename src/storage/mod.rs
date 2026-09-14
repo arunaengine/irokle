@@ -115,6 +115,32 @@ pub struct OpMeta {
     pub missing_deps: BTreeSet<OpId>,
 }
 
+/// Where an admitted op sits in its topic's graph: the part of [`OpMeta`] that
+/// page planning reads, without the op's observed clock, whose size grows with
+/// the actors behind the op.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpPosition {
+    pub topic_id: TopicId,
+    pub actor_id: ActorId,
+    pub actor_seq: u64,
+    pub actor_prev: Option<OpId>,
+    pub deps: BTreeSet<OpId>,
+    pub generation: u64,
+}
+
+impl From<&OpMeta> for OpPosition {
+    fn from(meta: &OpMeta) -> Self {
+        Self {
+            topic_id: meta.topic_id,
+            actor_id: meta.actor_id,
+            actor_seq: meta.actor_seq,
+            actor_prev: meta.actor_prev,
+            deps: meta.deps.clone(),
+            generation: meta.generation,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ControlKey {
     pub generation: u64,
@@ -406,6 +432,11 @@ pub trait SnapshotRead {
     -> Result<Option<TopicView>>;
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
+    /// The position of `id`, as [`Self::get_meta`] would give it. Backends
+    /// override it to leave the observed clock unread.
+    fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {
+        Ok(self.get_meta(id)?.as_ref().map(OpPosition::from))
+    }
     /// See [`Storage::dep_resolvable`].
     fn dep_resolvable(&self, id: &OpId) -> Result<bool>;
     /// See [`Storage::actor_range`].
