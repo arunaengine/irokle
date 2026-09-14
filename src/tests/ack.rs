@@ -978,7 +978,7 @@ fn fjall_migrates_legacy() {
     let ack_signer = Ed25519Signer::from_bytes(&[127; 32]);
     let peer = ack_signer.peer_id();
 
-    let (topic_id, op_id, actor_id, actor_seq) = {
+    let (topic_id, op_id, actor_id, actor_seq, metas) = {
         let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
         let irokle = Irokle::with_storage(storage, NodeConfig::default()).unwrap();
         let topic = irokle
@@ -1005,11 +1005,19 @@ fn fjall_migrates_legacy() {
         };
         ack.sign(&ack_signer).unwrap();
         irokle.apply_sync_ack(&ack).unwrap();
+        let storage = irokle.storage();
+        let metas = storage
+            .list_op_ids(&topic.id())
+            .unwrap()
+            .iter()
+            .map(|id| storage.get_meta(id).unwrap().unwrap())
+            .collect::<Vec<_>>();
         (
             topic.id(),
             record.meta.op_id,
             record.meta.actor_id,
             record.meta.actor_seq,
+            metas,
         )
     };
 
@@ -1037,6 +1045,21 @@ fn fjall_migrates_legacy() {
             [b"ak".as_slice(), peer.as_ref(), topic_id.as_ref()].concat(),
             legacy,
         );
+        // Metadata held every clock entry and there were no clock nodes.
+        for meta in &metas {
+            tx.insert(
+                &records,
+                [b"m".as_slice(), meta.id.as_ref()].concat(),
+                postcard::to_allocvec(meta).unwrap(),
+            );
+        }
+        let nodes = [b"cn".as_slice(), topic_id.as_ref()].concat();
+        let node_keys = fjall::Readable::prefix(&tx, &records, nodes)
+            .map(|item| item.key().unwrap().to_vec())
+            .collect::<Vec<_>>();
+        for key in node_keys {
+            tx.remove(&records, key);
+        }
         tx.insert(
             &records,
             b"sv".to_vec(),

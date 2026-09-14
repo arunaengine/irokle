@@ -32,7 +32,7 @@ type Records = fjall::OptimisticTxKeyspace;
 /// Namespace record, `bn<source><topic>`. No other key begins with `b`.
 const NAMESPACE: &[u8] = b"bn";
 /// Slot owner, `bs<slot>` with a big-endian slot number.
-const SLOT: &[u8] = b"bs";
+pub(super) const SLOT: &[u8] = b"bs";
 /// The durable session counter.
 const SESSIONS: &[u8] = b"bc";
 /// Activation claim, `ba<topic>` holding the claiming session.
@@ -86,11 +86,14 @@ fn slot_key(slot: u32) -> Vec<u8> {
 }
 
 /// Whether a namespace key holds a record an active topic keeps: an op, its
-/// metadata, a child edge, an actor index or tip, or the topic's op index.
+/// metadata, a clock node, a child edge, an actor index or tip, or the topic's
+/// op index.
 fn copied_record(key: &[u8]) -> bool {
     matches!(
         (key.get(..1), key.get(..2), key.len()),
-        (Some(b"o" | b"m"), _, 33) | (_, Some(b"ch" | b"at" | b"to"), 66) | (_, Some(b"as"), 74)
+        (Some(b"o" | b"m"), _, 33)
+            | (_, Some(b"ch" | b"at" | b"to" | b"cn"), 66)
+            | (_, Some(b"as"), 74)
     )
 }
 
@@ -104,7 +107,7 @@ impl FjallStorage {
     }
 
     /// The keyspace of `slot`.
-    fn slot_records(&self, slot: u32) -> Result<Records> {
+    pub(super) fn slot_records(&self, slot: u32) -> Result<Records> {
         Ok(self.db.keyspace(
             &format!("bootstrap-{slot}"),
             fjall::KeyspaceCreateOptions::default,

@@ -6,10 +6,10 @@ use serde::de::Deserializer;
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 use std::sync::{Mutex, OnceLock, Weak};
 
 /// Positions per actor. Clones share structure: entries live in a persistent
@@ -25,7 +25,7 @@ enum Node {
     Leaf {
         actor: ActorId,
         seq: u64,
-        #[cfg(all(feature = "fjall", test))]
+        #[cfg(feature = "fjall")]
         hash: OnceLock<[u8; 32]>,
     },
     /// Entries sharing the nibbles of `key` before `level`, one child per
@@ -36,7 +36,7 @@ enum Node {
         len: usize,
         key: ActorId,
         children: Vec<Arc<Node>>,
-        #[cfg(all(feature = "fjall", test))]
+        #[cfg(feature = "fjall")]
         hash: OnceLock<[u8; 32]>,
     },
 }
@@ -48,7 +48,7 @@ impl Clone for Node {
             Node::Leaf { actor, seq, .. } => Node::Leaf {
                 actor: *actor,
                 seq: *seq,
-                #[cfg(all(feature = "fjall", test))]
+                #[cfg(feature = "fjall")]
                 hash: OnceLock::new(),
             },
             Node::Branch {
@@ -64,14 +64,14 @@ impl Clone for Node {
                 len: *len,
                 key: *key,
                 children: children.clone(),
-                #[cfg(all(feature = "fjall", test))]
+                #[cfg(feature = "fjall")]
                 hash: OnceLock::new(),
             },
         }
     }
 }
 
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 /// The stored form of one trie node, its children named by their hashes.
 #[derive(Serialize, Deserialize)]
 enum Encoded {
@@ -88,11 +88,11 @@ enum Encoded {
     },
 }
 
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 /// Separates node hashes from every other blake3 hash of this crate.
 const NODE_DOMAIN: &[u8] = b"irokle/clock-node/1";
 
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(NODE_DOMAIN);
@@ -100,7 +100,7 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 impl Node {
     fn encoded(&self) -> Encoded {
         match self {
@@ -174,7 +174,7 @@ fn leaf(actor: ActorId, seq: u64) -> Arc<Node> {
     Arc::new(Node::Leaf {
         actor,
         seq,
-        #[cfg(all(feature = "fjall", test))]
+        #[cfg(feature = "fjall")]
         hash: OnceLock::new(),
     })
 }
@@ -191,7 +191,7 @@ fn pair(level: u8, a: Arc<Node>, b: Arc<Node>) -> Arc<Node> {
         len,
         key,
         children,
-        #[cfg(all(feature = "fjall", test))]
+        #[cfg(feature = "fjall")]
         hash: OnceLock::new(),
     })
 }
@@ -236,12 +236,12 @@ fn set_node(node: &mut Arc<Node>, actor: &ActorId, seq: Option<u64>) -> bool {
         len,
         key,
         children,
-        #[cfg(all(feature = "fjall", test))]
+        #[cfg(feature = "fjall")]
         hash,
     } = Arc::make_mut(node)
     {
         // A node held only here changes in place and loses its hash.
-        #[cfg(all(feature = "fjall", test))]
+        #[cfg(feature = "fjall")]
         hash.take();
         let digit = nibble(actor, *level);
         let index = slot(*bitmap, digit);
@@ -376,7 +376,7 @@ fn union_children(a: &Arc<Node>, b: &Arc<Node>) -> Arc<Node> {
         len: children.iter().map(|child| child.len()).sum(),
         key: *key,
         children,
-        #[cfg(all(feature = "fjall", test))]
+        #[cfg(feature = "fjall")]
         hash: OnceLock::new(),
     })
 }
@@ -512,7 +512,7 @@ impl ActorClock {
     }
 }
 
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 impl ActorClock {
     /// The hash naming this clock's stored root node; `None` when empty.
     pub(crate) fn root_hash(&self) -> Option<[u8; 32]> {
@@ -556,15 +556,15 @@ impl ActorClock {
 }
 
 /// Reads the stored bytes of the node a hash names.
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 type NodeFetch<'a> = dyn FnMut(&[u8; 32]) -> crate::Result<Option<Vec<u8>>> + 'a;
 
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 fn corrupt() -> crate::Error {
     crate::Error::Storage("corrupt stored clock node".into())
 }
 
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 /// Clock nodes loaded or stored recently, so loading a clock that shares most
 /// of its nodes with another reads only the rest. Nodes are held only while
 /// something else holds them, except those of the latest clocks, which are
@@ -574,7 +574,7 @@ pub(crate) struct ClockCache {
     inner: Mutex<CacheInner>,
 }
 
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 #[derive(Default)]
 struct CacheInner {
     nodes: HashMap<[u8; 32], Weak<Node>>,
@@ -582,17 +582,17 @@ struct CacheInner {
     bytes: usize,
 }
 
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 /// Estimated bytes the latest clocks may hold, counting every entry.
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 /// Estimated bytes one clock entry holds in its nodes.
 const ENTRY_BYTES: usize = 160;
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 /// Node names the cache tracks before it drops those nothing holds.
 const CACHE_NODES: usize = 1 << 18;
 
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 impl ClockCache {
     fn lock(&self) -> std::sync::MutexGuard<'_, CacheInner> {
         // Only a shortcut: a poisoned cache still names valid nodes.
@@ -643,7 +643,7 @@ impl ClockCache {
                     Encoded::Leaf { actor, seq } => Node::Leaf {
                         actor,
                         seq,
-                        #[cfg(all(feature = "fjall", test))]
+                        #[cfg(feature = "fjall")]
                         hash: OnceLock::from(*hash),
                     },
                     Encoded::Branch {
@@ -677,7 +677,7 @@ impl ClockCache {
                             len: total,
                             key,
                             children,
-                            #[cfg(all(feature = "fjall", test))]
+                            #[cfg(feature = "fjall")]
                             hash: OnceLock::from(*hash),
                         }
                     }
@@ -702,7 +702,7 @@ impl ClockCache {
     }
 }
 
-#[cfg(all(feature = "fjall", test))]
+#[cfg(feature = "fjall")]
 impl CacheInner {
     fn name(&mut self, hash: &[u8; 32], node: &Arc<Node>) {
         if self.nodes.len() >= CACHE_NODES {

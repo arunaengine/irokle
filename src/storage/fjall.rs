@@ -32,6 +32,8 @@ pub struct FjallStorage {
     /// The registry record a provisional namespace view stages under; `None`
     /// for the main store.
     pub(super) namespace: Option<Fence>,
+    /// Clock nodes loaded or stored recently, shared with every view.
+    clocks: std::sync::Arc<crate::clock::ClockCache>,
     /// Key a test rewrites before every single-attempt commit, forcing a conflict.
     #[cfg(test)]
     conflict_key: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
@@ -61,7 +63,7 @@ pub(crate) enum Hook {
 type HookFn = std::sync::Arc<dyn Fn(Hook) -> Result<()> + Send + Sync>;
 
 #[cfg(feature = "fjall")]
-const FJALL_SCHEMA_VERSION: u32 = 6;
+const FJALL_SCHEMA_VERSION: u32 = 7;
 /// Eviction journal records. No other keyspace begins with `e`, so this is the
 /// whole prefix: unlike `ob`, it cannot be shadowed by a single-letter prefix.
 #[cfg(feature = "fjall")]
@@ -70,6 +72,13 @@ const EVICTION_PREFIX: &[u8] = b"ev";
 const SEALED_TOPIC_PREFIX: &[u8] = b"se";
 #[cfg(feature = "fjall")]
 const FJALL_SCHEMA_VERSION_KEY: &[u8] = b"sv";
+/// Where an unfinished schema 7 upgrade continues, see [`ClockMigration`].
+const CLOCK_MIGRATION: &[u8] = b"sm";
+/// Metadata records one step of the schema 7 upgrade rewrites at most.
+const MIGRATION_RECORDS: usize = 1024;
+/// Observed clock entries one step of the schema 7 upgrade reads at most,
+/// beyond the first record.
+const MIGRATION_ENTRIES: usize = 1 << 20;
 /// Stored acknowledgements, keyed on `ak<topic><peer>` since schema 3. No
 /// other key starts with `ak`, so this is the whole prefix.
 #[cfg(feature = "fjall")]
@@ -194,6 +203,7 @@ impl FjallStorage {
             counters: Default::default(),
             limits: StagingLimits::DISK,
             namespace: None,
+            clocks: Default::default(),
             #[cfg(test)]
             conflict_key: Default::default(),
             #[cfg(test)]
@@ -222,6 +232,7 @@ impl FjallStorage {
             counters: std::sync::Arc::clone(&self.counters),
             limits: self.limits,
             namespace: Some(fence),
+            clocks: std::sync::Arc::clone(&self.clocks),
             #[cfg(test)]
             conflict_key: Default::default(),
             #[cfg(test)]
@@ -285,31 +296,45 @@ impl FjallStorage {
     }
 
     fn ensure_schema_version(&self) -> Result<()> {
+        self.upgrade_schema(usize::MAX)
+    }
+
+    /// Upgrade to the current schema, stopping after `steps` steps of the
+    /// schema 7 rewrite, as a crash between two of them would.
+    fn upgrade_schema(&self, steps: usize) -> Result<()> {
         match self.get::<u32>(FJALL_SCHEMA_VERSION_KEY)? {
-            Some(FJALL_SCHEMA_VERSION) => Ok(()),
+            Some(FJALL_SCHEMA_VERSION) => self.finish_clock_migration(steps),
             Some(1) => {
                 self.migrate_to_schema_two()?;
                 self.migrate_to_schema_three()?;
                 self.migrate_to_schema_four()?;
                 self.migrate_to_schema_five()?;
-                self.migrate_to_schema_six()
+                self.migrate_to_schema_six()?;
+                self.migrate_to_schema_seven(steps)
             }
             Some(2) => {
                 self.migrate_to_schema_three()?;
                 self.migrate_to_schema_four()?;
                 self.migrate_to_schema_five()?;
-                self.migrate_to_schema_six()
+                self.migrate_to_schema_six()?;
+                self.migrate_to_schema_seven(steps)
             }
             Some(3) => {
                 self.migrate_to_schema_four()?;
                 self.migrate_to_schema_five()?;
-                self.migrate_to_schema_six()
+                self.migrate_to_schema_six()?;
+                self.migrate_to_schema_seven(steps)
             }
             Some(4) => {
                 self.migrate_to_schema_five()?;
-                self.migrate_to_schema_six()
+                self.migrate_to_schema_six()?;
+                self.migrate_to_schema_seven(steps)
             }
-            Some(5) => self.migrate_to_schema_six(),
+            Some(5) => {
+                self.migrate_to_schema_six()?;
+                self.migrate_to_schema_seven(steps)
+            }
+            Some(6) => self.migrate_to_schema_seven(steps),
             Some(version) => Err(Error::Storage(format!(
                 "unsupported fjall schema version {version}"
             ))),
@@ -555,14 +580,116 @@ impl FjallStorage {
                 return Ok(());
             }
             self.tx_migrate_namespaces(tx)?;
+            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &6_u32)?;
+            Ok(())
+        })
+    }
+
+    /// Upgrade a schema 6 database. Stored metadata names its observed clock
+    /// by the hash of a trie node instead of holding every entry, so a clock
+    /// one position ahead of another shares all but a path of nodes with it.
+    /// The version moves to 7 with a cursor first, which an older binary
+    /// refuses; bounded steps then rewrite the records of the main keyspace
+    /// and of every slot keyspace, and the step that removes the cursor
+    /// completes the layout. Opening a store continues a step sequence an
+    /// interruption left.
+    fn migrate_to_schema_seven(&self, steps: usize) -> Result<()> {
+        self.transaction(|tx| {
+            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(6) {
+                return Ok(());
+            }
             Self::tx_put(
                 tx,
                 &self.records,
-                FJALL_SCHEMA_VERSION_KEY,
-                &FJALL_SCHEMA_VERSION,
+                CLOCK_MIGRATION,
+                &ClockMigration::default(),
             )?;
+            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &7_u32)?;
             Ok(())
-        })
+        })?;
+        self.finish_clock_migration(steps)
+    }
+
+    /// Run up to `steps` of the steps a schema 7 upgrade has left.
+    fn finish_clock_migration(&self, steps: usize) -> Result<()> {
+        for _ in 0..steps {
+            if !self.transaction(|tx| self.tx_clock_migration_step(tx))? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Rewrite the next bounded run of legacy metadata records, or move the
+    /// cursor to the next keyspace, or remove it. False once none is left.
+    fn tx_clock_migration_step(&self, tx: &mut fjall::OptimisticWriteTx) -> Result<bool> {
+        let Some(cursor) = Self::tx_get::<ClockMigration>(tx, &self.records, CLOCK_MIGRATION)?
+        else {
+            return Ok(false);
+        };
+        let records = match cursor.slot {
+            Some(slot) => self.slot_records(slot)?,
+            None => self.records.clone(),
+        };
+        let start = cursor.after.clone().map_or(
+            std::ops::Bound::Included(b"m".to_vec()),
+            std::ops::Bound::Excluded,
+        );
+        let mut legacy = Vec::new();
+        let mut entries = 0;
+        let mut last = None;
+        let mut ended = true;
+        for item in fjall::Readable::range::<Vec<u8>, _>(
+            tx,
+            &records,
+            (start, std::ops::Bound::Excluded(b"n".to_vec())),
+        ) {
+            if legacy.len() == MIGRATION_RECORDS || entries > MIGRATION_ENTRIES {
+                ended = false;
+                break;
+            }
+            let (key, value) = item.into_inner()?;
+            last = Some(key.to_vec());
+            // Other `m` keys, such as a topic's highest generation, are longer.
+            if key.len() != 1 + OpId::LEN {
+                continue;
+            }
+            let meta: OpMeta = postcard::from_bytes(value.as_ref())?;
+            entries += meta.observed_clock.len();
+            legacy.push(meta);
+        }
+        for meta in &legacy {
+            self.tx_put_meta(tx, &records, meta)?;
+        }
+        let next = if !ended {
+            Some(ClockMigration {
+                slot: cursor.slot,
+                after: last.or(cursor.after),
+            })
+        } else {
+            let mut slots = Vec::new();
+            for item in fjall::Readable::prefix(tx, &self.records, super::fjall_provisional::SLOT) {
+                let key = item.key()?;
+                let slot = key
+                    .get(super::fjall_provisional::SLOT.len()..)
+                    .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                    .map(u32::from_be_bytes)
+                    .ok_or_else(|| Error::Storage("corrupt fjall bootstrap slot key".into()))?;
+                slots.push(slot);
+            }
+            slots
+                .into_iter()
+                .find(|slot| cursor.slot.is_none_or(|current| *slot > current))
+                .map(|slot| ClockMigration {
+                    slot: Some(slot),
+                    after: None,
+                })
+        };
+        match next {
+            Some(next) => Self::tx_put(tx, &self.records, CLOCK_MIGRATION, &next)?,
+            None => tx.remove(&self.records, CLOCK_MIGRATION),
+        }
+        Ok(true)
     }
 
     pub(super) fn transaction<R>(
@@ -979,7 +1106,7 @@ impl FjallStorage {
                     .unwrap_or_default();
             for (op, meta) in new_entries {
                 Self::tx_put(tx, &self.records, Self::key_id(b"o", &op.id), &op)?;
-                Self::tx_put(tx, &self.records, Self::key_id(b"m", &meta.id), &meta)?;
+                self.tx_put_meta(tx, &self.records, &meta)?;
                 Self::tx_put(
                     tx,
                     &self.records,
@@ -1115,7 +1242,7 @@ impl FjallStorage {
     pub(crate) fn orphan_op(&self, op: &Op, meta: &OpMeta) {
         self.transaction(|tx| {
             Self::tx_put(tx, &self.records, Self::key_id(b"o", &op.id), op)?;
-            Self::tx_put(tx, &self.records, Self::key_id(b"m", &op.id), meta)?;
+            self.tx_put_meta(tx, &self.records, meta)?;
             Self::tx_put(
                 tx,
                 &self.records,
@@ -1338,8 +1465,13 @@ impl FjallStorage {
         ] {
             tx.remove(&self.records, Self::key_id(prefix, topic_id));
         }
-        // Actor index/tip and sync status share a `<prefix><topic>` layout.
-        for prefix in [b"as".as_slice(), b"at".as_slice(), b"ss".as_slice()] {
+        // Actor index/tip, sync status and clock nodes share a `<prefix><topic>` layout.
+        for prefix in [
+            b"as".as_slice(),
+            b"at".as_slice(),
+            b"ss".as_slice(),
+            CLOCK_NODE,
+        ] {
             let scan = [prefix, topic_id.as_ref()].concat();
             let mut keys = Vec::new();
             for item in fjall::Readable::prefix(tx, &self.records, scan) {
@@ -1478,9 +1610,12 @@ impl Storage for FjallStorage {
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
         self.counters.count_meta();
         let read_tx = self.snapshot()?;
-        let meta: Option<OpMeta> = Self::tx_get(&read_tx, &self.records, Self::key_id(b"m", id))?;
-        match meta {
-            Some(meta) if self.shown(&read_tx, &meta.topic_id)? => Ok(Some(meta)),
+        let stored: Option<StoredMeta> =
+            Self::tx_get(&read_tx, &self.records, Self::key_id(b"m", id))?;
+        match stored {
+            Some(stored) if self.shown(&read_tx, &stored.topic_id)? => {
+                self.loaded_meta(&read_tx, &self.records, stored).map(Some)
+            }
             _ => Ok(None),
         }
     }
@@ -1973,7 +2108,118 @@ impl Storage for FjallStorage {
     }
 }
 
-/// The leading fields of a stored [`OpMeta`], in its field order. Postcard
+/// A stored [`OpMeta`]: its observed clock named by the hash of the clock's
+/// root node, whose nodes the op's topic keeps under [`CLOCK_NODE`].
+#[cfg(feature = "fjall")]
+#[derive(Serialize, Deserialize)]
+struct StoredMeta {
+    id: OpId,
+    topic_id: TopicId,
+    author: PeerId,
+    actor_id: ActorId,
+    actor_seq: u64,
+    actor_prev: Option<OpId>,
+    deps: BTreeSet<OpId>,
+    generation: u64,
+    observed_clock: Option<[u8; 32]>,
+    ready: bool,
+    missing_deps: BTreeSet<OpId>,
+}
+
+/// The next records the schema 7 upgrade rewrites: those after `after` in
+/// the keyspace of `slot`, the main keyspace for `None`.
+#[cfg(feature = "fjall")]
+#[derive(Default, Serialize, Deserialize)]
+struct ClockMigration {
+    slot: Option<u32>,
+    after: Option<Vec<u8>>,
+}
+
+/// Clock nodes, by topic and node hash. Nodes are immutable and shared by
+/// every clock of the topic that holds them; a topic reset removes them.
+#[cfg(feature = "fjall")]
+pub(super) const CLOCK_NODE: &[u8] = b"cn";
+
+#[cfg(feature = "fjall")]
+fn clock_node_key(topic_id: &TopicId, hash: &[u8; 32]) -> Vec<u8> {
+    [CLOCK_NODE, topic_id.as_ref(), hash].concat()
+}
+
+#[cfg(feature = "fjall")]
+impl FjallStorage {
+    /// Store `meta` in `records` with the nodes of its observed clock that
+    /// `records` does not hold yet, in the same transaction.
+    pub(super) fn tx_put_meta(
+        &self,
+        tx: &mut fjall::OptimisticWriteTx,
+        records: &fjall::OptimisticTxKeyspace,
+        meta: &OpMeta,
+    ) -> Result<()> {
+        let nodes = meta.observed_clock.unstored_nodes(|hash| {
+            Ok(fjall::Readable::contains_key(
+                tx,
+                records,
+                clock_node_key(&meta.topic_id, hash),
+            )?)
+        })?;
+        for (hash, bytes) in nodes {
+            tx.insert(records, clock_node_key(&meta.topic_id, &hash), bytes);
+        }
+        let stored = StoredMeta {
+            id: meta.id,
+            topic_id: meta.topic_id,
+            author: meta.author,
+            actor_id: meta.actor_id,
+            actor_seq: meta.actor_seq,
+            actor_prev: meta.actor_prev,
+            deps: meta.deps.clone(),
+            generation: meta.generation,
+            observed_clock: meta.observed_clock.root_hash(),
+            ready: meta.ready,
+            missing_deps: meta.missing_deps.clone(),
+        };
+        Self::tx_put(tx, records, Self::key_id(b"m", &meta.id), &stored)?;
+        self.clocks.keep(&meta.observed_clock);
+        Ok(())
+    }
+
+    /// `stored` with its observed clock loaded from the nodes `records` holds.
+    fn loaded_meta(
+        &self,
+        tx: &impl fjall::Readable,
+        records: &fjall::OptimisticTxKeyspace,
+        stored: StoredMeta,
+    ) -> Result<OpMeta> {
+        let observed_clock = match &stored.observed_clock {
+            Some(root) => {
+                let clock = ActorClock::load(root, &self.clocks, |hash| {
+                    Ok(
+                        fjall::Readable::get(tx, records, clock_node_key(&stored.topic_id, hash))?
+                            .map(|bytes| bytes.to_vec()),
+                    )
+                })?;
+                self.clocks.keep(&clock);
+                clock
+            }
+            None => ActorClock::new(),
+        };
+        Ok(OpMeta {
+            id: stored.id,
+            topic_id: stored.topic_id,
+            author: stored.author,
+            actor_id: stored.actor_id,
+            actor_seq: stored.actor_seq,
+            actor_prev: stored.actor_prev,
+            deps: stored.deps,
+            generation: stored.generation,
+            observed_clock,
+            ready: stored.ready,
+            missing_deps: stored.missing_deps,
+        })
+    }
+}
+
+/// The leading fields of a [`StoredMeta`], in its field order. Postcard
 /// decodes them and leaves the observed clock after them unread.
 #[cfg(feature = "fjall")]
 #[derive(Deserialize)]
@@ -2046,13 +2292,16 @@ impl SnapshotRead for FjallSnapshot<'_> {
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>> {
         self.store.counters.count_meta();
-        let meta: Option<OpMeta> = FjallStorage::tx_get(
+        let stored: Option<StoredMeta> = FjallStorage::tx_get(
             &self.tx,
             &self.store.records,
             FjallStorage::key_id(b"m", id),
         )?;
-        match meta {
-            Some(meta) if self.shown(&meta.topic_id)? => Ok(Some(meta)),
+        match stored {
+            Some(stored) if self.shown(&stored.topic_id)? => self
+                .store
+                .loaded_meta(&self.tx, &self.store.records, stored)
+                .map(Some),
             _ => Ok(None),
         }
     }
