@@ -20,6 +20,7 @@ mod holes;
 #[cfg(feature = "iroh")]
 mod iroh;
 mod membership;
+mod ownership;
 mod pages;
 mod pending;
 mod planning;
