@@ -1871,10 +1871,10 @@ async fn pull_fills_hole(bob_fjall: bool) {
     let bob_peer = PeerId::from_bytes(*bob_endpoint.id().as_bytes());
     let (topic_id, ops) = invite_last(&alice, bob_peer, 20);
     let builder = Irokle::builder().with_peer_whitelist(vec![alice.peer_id()]);
-    let dir = tempfile::tempdir().unwrap();
     if bob_fjall {
         #[cfg(feature = "fjall")]
         {
+            let dir = tempfile::tempdir().unwrap();
             let bob = builder
                 .with_fjall_path(dir.path())
                 .unwrap()
