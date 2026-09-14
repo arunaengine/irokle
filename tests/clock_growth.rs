@@ -118,6 +118,17 @@ fn clock_entries<S: Storage>(log: &Oplog<S>, topic_id: &TopicId) -> usize {
         .sum()
 }
 
+/// The chain sizes to measure: `CLOCK_GROWTH_ACTORS` as a comma separated
+/// list, or three doublings.
+fn sizes() -> Vec<usize> {
+    std::env::var("CLOCK_GROWTH_ACTORS").map_or(vec![1024, 2048, 4096], |sizes| {
+        sizes
+            .split(',')
+            .map(|size| size.trim().parse().unwrap())
+            .collect()
+    })
+}
+
 fn live() -> usize {
     LIVE.load(Ordering::Relaxed)
 }
@@ -127,7 +138,7 @@ fn live() -> usize {
 #[test]
 #[ignore = "measures retained bytes of large chains, run explicitly"]
 fn memory_chain_bytes() {
-    for actors in [1024, 2048, 4096] {
+    for actors in sizes() {
         let start = live();
         let (topic_id, ops) = reverse_chain(actors);
         let fixture = live() - start;
@@ -166,7 +177,7 @@ fn fjall_chain_bytes() {
             })
             .sum()
     }
-    for actors in [1024, 2048, 4096] {
+    for actors in sizes() {
         let (topic_id, ops) = reverse_chain(actors);
         let dir = tempfile::tempdir().unwrap();
         let started = std::time::Instant::now();
