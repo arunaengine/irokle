@@ -4,6 +4,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::storage::{OpPosition, SnapshotRead, Storage};
 use crate::{ActorClock, ActorId, Error, OpId, Result, TopicId};
@@ -11,6 +12,25 @@ use crate::{ActorClock, ActorId, Error, OpId, Result, TopicId};
 use super::{
     ActorScope, MAX_PAGE_BYTES, MAX_PAGE_MISSING, PageBudget, PlannedPage, RangeHead, SyncEngine,
 };
+
+/// Storage reads one page plan makes before it ends its work slice.
+pub(super) const MAX_PAGE_VISITS: usize = 65_536;
+
+/// Work page plans performed: storage reads, dependency edges examined, slices
+/// that ended on their read budget, and plans resumed from a kept frontier.
+#[derive(Debug, Default)]
+pub(crate) struct PageWork {
+    visits: AtomicU64,
+    edges: AtomicU64,
+    ended: AtomicU64,
+    resumed: AtomicU64,
+}
+
+impl PageWork {
+    pub(super) fn resumed(&self) {
+        self.resumed.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// How far one actor of a page plan got.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,6 +43,52 @@ enum ActorState {
     Reached(u64),
     /// A missing record or an unsent want stopped it.
     Blocked,
+}
+
+/// Everything a page plan learned, kept when its slice ended before it could
+/// send anything, to go on from for the same request.
+pub(super) struct Frontier {
+    active: BinaryHeap<Reverse<RangeHead>>,
+    metas: BTreeMap<OpId, OpPosition>,
+    deferred: VecDeque<ActorId>,
+    suspended: BTreeMap<ActorId, Vec<(u64, RangeHead)>>,
+    resumable: VecDeque<RangeHead>,
+    states: BTreeMap<ActorId, ActorState>,
+    covered: ActorClock,
+    blocked: BTreeSet<OpId>,
+    missing: BTreeSet<OpId>,
+    positions: BTreeSet<ActorId>,
+}
+
+impl Frontier {
+    /// The position the plan takes the peer to hold of `actor_id`.
+    pub(super) fn covered(&self, actor_id: &ActorId) -> u64 {
+        self.covered.get(actor_id)
+    }
+
+    /// A conservative estimate of the bytes the frontier holds.
+    pub(super) fn bytes(&self) -> usize {
+        const ID: usize = 64;
+        let head = size_of::<RangeHead>() + ID;
+        let metas = self
+            .metas
+            .values()
+            .map(|meta| size_of::<OpPosition>() + ID + meta.deps.len() * ID)
+            .sum::<usize>();
+        let suspended = self
+            .suspended
+            .values()
+            .map(|waiting| ID + waiting.len() * (head + 8))
+            .sum::<usize>();
+        self.active.len() * head
+            + metas
+            + suspended
+            + (self.deferred.len() + self.blocked.len() + self.missing.len()) * ID
+            + self.positions.len() * ID
+            + self.resumable.len() * head
+            + self.states.len() * (ID + size_of::<ActorState>())
+            + self.covered.iter().count() * ID
+    }
 }
 
 /// What an op still needs before it can be sent.
@@ -47,6 +113,11 @@ struct Pager<'a> {
     scope: &'a ActorScope<'a>,
     sent: &'a BTreeSet<OpId>,
     window: usize,
+    work: &'a PageWork,
+    /// Storage reads this slice made, and the most it may make.
+    visits: usize,
+    visit_limit: usize,
+    ended: bool,
     active: BinaryHeap<Reverse<RangeHead>>,
     metas: BTreeMap<OpId, OpPosition>,
     /// Actors behind the goal not activated yet, in clock order.
@@ -71,26 +142,48 @@ impl Pager<'_> {
             .map_or(local_seq, |goal| goal.get(actor_id).min(local_seq))
     }
 
-    fn plan(mut self, budget: PageBudget) -> Result<PlannedPage> {
-        let behind = self
-            .local
-            .iter()
-            .filter(|(actor_id, _)| self.limit(actor_id) > self.covered.get(actor_id))
-            .map(|(actor_id, _)| *actor_id)
-            .collect::<VecDeque<_>>();
-        // A zero allowance reads nothing; whether the goal holds more is known
-        // from the clocks alone.
-        if budget.ops == 0 || budget.bytes == 0 {
-            return Ok(PlannedPage {
-                more: !behind.is_empty(),
-                ..PlannedPage::default()
-            });
+    /// Count one storage read of this slice.
+    fn visit(&mut self) {
+        self.visits += 1;
+        self.work.visits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn exhausted(&self) -> bool {
+        self.visits >= self.visit_limit
+    }
+
+    /// Plan one slice. A fresh plan starts from the actors behind; a resumed one
+    /// goes on from its frontier. Returns the frontier when the slice ended on
+    /// its read budget before sending anything.
+    fn plan(mut self, budget: PageBudget, fresh: bool) -> Result<(PlannedPage, Option<Frontier>)> {
+        if fresh {
+            let behind = self
+                .local
+                .iter()
+                .filter(|(actor_id, _)| self.limit(actor_id) > self.covered.get(actor_id))
+                .map(|(actor_id, _)| *actor_id)
+                .collect::<VecDeque<_>>();
+            // A zero allowance reads nothing; whether the goal holds more is
+            // known from the clocks alone.
+            if budget.ops == 0 || budget.bytes == 0 {
+                let page = PlannedPage {
+                    more: !behind.is_empty(),
+                    ..PlannedPage::default()
+                };
+                return Ok((page, None));
+            }
+            self.deferred = behind;
         }
-        self.deferred = behind;
         let mut ops = Vec::new();
         let mut too_large = None;
         let mut bytes = 0_usize;
         loop {
+            // A slice out of reads, or a resumed plan given no allowance, ends
+            // here and keeps what it holds.
+            if budget.ops == 0 || budget.bytes == 0 || self.exhausted() {
+                self.ended = true;
+                break;
+            }
             self.fill()?;
             let Some(Reverse(head)) = self.active.pop() else {
                 break;
@@ -108,6 +201,7 @@ impl Pager<'_> {
                     continue;
                 }
             }
+            self.visit();
             let Some(op) = self.read.get_op(&id)? else {
                 self.missing.insert(id);
                 self.block(actor_id, id);
@@ -136,6 +230,7 @@ impl Pager<'_> {
             }
         }
         let more = self.more
+            || self.ended
             || !self.active.is_empty()
             || !self.resumable.is_empty()
             || self.suspended.values().any(|waiting| !waiting.is_empty())
@@ -143,27 +238,45 @@ impl Pager<'_> {
                 .deferred
                 .iter()
                 .any(|actor_id| !self.states.contains_key(actor_id));
-        let (mut missing, mut positions) = (self.missing, self.positions);
+        let (mut missing, mut positions) = (self.missing.clone(), self.positions.clone());
         while missing.len() > MAX_PAGE_MISSING {
             missing.pop_last();
         }
         while positions.len() > MAX_PAGE_MISSING {
             positions.pop_last();
         }
-        Ok(PlannedPage {
+        let frontier = (self.ended && ops.is_empty() && too_large.is_none()).then(|| {
+            self.work.ended.fetch_add(1, Ordering::Relaxed);
+            Frontier {
+                active: self.active,
+                metas: self.metas,
+                deferred: self.deferred,
+                suspended: self.suspended,
+                resumable: self.resumable,
+                states: self.states,
+                covered: self.covered,
+                blocked: self.blocked,
+                missing: self.missing,
+                positions: self.positions,
+            }
+        });
+        let page = PlannedPage {
             ops,
             more,
             missing,
             too_large,
             positions,
-        })
+            continued: false,
+        };
+        Ok((page, frontier))
     }
 
     /// Fill free slots: resumed heads first, then deferred actors in order.
     fn fill(&mut self) -> Result<()> {
-        while self.active.len() < self.window {
+        while self.active.len() < self.window && !self.exhausted() {
             if let Some(head) = self.resumable.pop_front() {
                 let (_, actor_id, _, id, _) = head;
+                self.visit();
                 let Some(meta) = self.read.get_position(&id)? else {
                     self.missing.insert(id);
                     self.block(actor_id, id);
@@ -190,6 +303,7 @@ impl Pager<'_> {
     /// `after < limit`. A gap in the index stops the actor and names the
     /// record the next indexed op follows.
     fn activate(&mut self, actor_id: ActorId, after: u64, limit: u64) -> Result<()> {
+        self.visit();
         let next = self
             .read
             .actor_range(self.topic_id, &actor_id, after, 1)?
@@ -199,6 +313,7 @@ impl Pager<'_> {
             self.stop(actor_id);
             return Ok(());
         };
+        self.visit();
         let meta = self.read.get_position(&id)?;
         if seq != after + 1 || meta.is_none() {
             match meta.filter(|_| seq != after + 1) {
@@ -226,6 +341,7 @@ impl Pager<'_> {
         let mut unknown = false;
         let mut waits = None;
         for dep in &meta.deps {
+            self.work.edges.fetch_add(1, Ordering::Relaxed);
             if self.blocked.contains(dep) {
                 return Ok(Wait::Blocked);
             }
@@ -234,10 +350,12 @@ impl Pager<'_> {
             }
             let position = match self.metas.get(dep) {
                 Some(dep_meta) => Some((dep_meta.actor_id, dep_meta.actor_seq)),
-                None => self
-                    .read
-                    .get_position(dep)?
-                    .map(|dep_meta| (dep_meta.actor_id, dep_meta.actor_seq)),
+                None => {
+                    self.visit();
+                    self.read
+                        .get_position(dep)?
+                        .map(|dep_meta| (dep_meta.actor_id, dep_meta.actor_seq))
+                }
             };
             let Some((dep_actor, dep_seq)) = position else {
                 self.missing.insert(*dep);
@@ -361,8 +479,9 @@ impl Pager<'_> {
 impl<S: Storage> SyncEngine<S> {
     /// The next causal page for a peer at `peer`, merging forward actor ranges by
     /// generation, so dependencies come first. Work grows with the page and the
-    /// actors behind, never with history the peer holds. See [`Pager`].
-    pub(crate) fn plan_page(
+    /// actors behind, never with history the peer holds, and one slice reads at
+    /// most the engine's visit budget. See [`Pager`].
+    pub(super) fn plan_page(
         &self,
         read: &dyn SnapshotRead,
         topic_id: &TopicId,
@@ -370,7 +489,7 @@ impl<S: Storage> SyncEngine<S> {
         (scope, sent): (&ActorScope<'_>, &BTreeSet<OpId>),
         excluded: &BTreeSet<OpId>,
         budget: PageBudget,
-    ) -> Result<PlannedPage> {
+    ) -> Result<(PlannedPage, Option<Frontier>)> {
         let pager = Pager {
             read,
             topic_id,
@@ -379,6 +498,10 @@ impl<S: Storage> SyncEngine<S> {
             scope,
             sent,
             window: self.page_actors,
+            work: &self.work,
+            visits: 0,
+            visit_limit: self.page_visits,
+            ended: false,
             active: BinaryHeap::new(),
             metas: BTreeMap::new(),
             deferred: VecDeque::new(),
@@ -391,6 +514,44 @@ impl<S: Storage> SyncEngine<S> {
             positions: BTreeSet::new(),
             more: false,
         };
-        pager.plan(budget)
+        pager.plan(budget, true)
+    }
+
+    /// One more slice of the kept plan `frontier`, against the clocks it
+    /// planned on and a request with the same scope.
+    pub(super) fn resume_page(
+        &self,
+        read: &dyn SnapshotRead,
+        topic_id: &TopicId,
+        (local, goal, frontier): (&ActorClock, &ActorClock, Frontier),
+        scope: &ActorScope<'_>,
+        budget: PageBudget,
+    ) -> Result<(PlannedPage, Option<Frontier>)> {
+        const SENT: BTreeSet<OpId> = BTreeSet::new();
+        let pager = Pager {
+            read,
+            topic_id,
+            local,
+            goal: Some(goal),
+            scope,
+            sent: &SENT,
+            window: self.page_actors,
+            work: &self.work,
+            visits: 0,
+            visit_limit: self.page_visits,
+            ended: false,
+            active: frontier.active,
+            metas: frontier.metas,
+            deferred: frontier.deferred,
+            suspended: frontier.suspended,
+            resumable: frontier.resumable,
+            states: frontier.states,
+            covered: frontier.covered,
+            blocked: frontier.blocked,
+            missing: frontier.missing,
+            positions: frontier.positions,
+            more: false,
+        };
+        pager.plan(budget, false)
     }
 }

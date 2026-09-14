@@ -618,6 +618,7 @@ async fn serve_within(
             more: false,
             missing: BTreeSet::new(),
             positions: BTreeSet::new(),
+            continued: false,
         }),
     ]);
     let limits = StreamLimits {

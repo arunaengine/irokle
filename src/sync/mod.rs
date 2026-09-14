@@ -2,6 +2,7 @@
 //! Transport-neutral sync messages, planning, acknowledgements, and reports.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use smallvec::SmallVec;
 
@@ -9,12 +10,15 @@ use crate::oplog::{Oplog, ReceiveEffects, TopicEviction, subset_in};
 use crate::storage::{SnapshotRead, Storage, TopicView, topic_fingerprint_for};
 use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, canonical_bytes};
 
+mod continuation;
 mod evidence;
 mod plan;
 mod repair;
 mod request;
 mod types;
 
+use continuation::{Continuation, Continuations, MAX_CONTINUATIONS};
+use plan::{MAX_PAGE_VISITS, PageWork};
 pub(crate) use request::RequestKnowledge;
 use request::{ActorScope, request_ranges};
 pub use types::{
@@ -68,6 +72,9 @@ pub struct PlannedPage {
     /// Actors the request did not describe whose positions the page needed,
     /// at most [`MAX_PAGE_MISSING`]. Their dependents wait for a request naming them.
     pub positions: BTreeSet<ActorId>,
+    /// The page ended its work slice before it could send anything and this
+    /// store kept its plan: the same request goes on from it.
+    pub continued: bool,
 }
 
 #[derive(Clone)]
@@ -78,6 +85,11 @@ pub struct SyncEngine<S> {
     page_actors: usize,
     /// Wants and hints a request may carry; tests scale it down.
     request_items: usize,
+    /// Storage reads of one page slice; tests scale it down.
+    page_visits: usize,
+    /// Plans kept across slices, shared by the engine's clones.
+    continuations: Arc<Mutex<Continuations>>,
+    work: Arc<PageWork>,
 }
 
 /// Which operation bodies a negotiation materializes into `SyncPlan::send`.
@@ -94,7 +106,17 @@ impl<S: Storage> SyncEngine<S> {
             peer_id,
             page_actors: MAX_PAGE_ACTORS,
             request_items: MAX_REQUEST_ITEMS,
+            page_visits: MAX_PAGE_VISITS,
+            continuations: Arc::new(Mutex::new(Continuations::new(MAX_CONTINUATIONS))),
+            work: Arc::default(),
         }
+    }
+
+    fn continuations(&self) -> MutexGuard<'_, Continuations> {
+        // Kept plans are only a shortcut; a poisoned store still holds valid ones.
+        self.continuations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The same engine planning pages with at most `actors` active actors.
@@ -336,7 +358,7 @@ impl<S: Storage> SyncEngine<S> {
                     &view.state.heads,
                 )?,
                 SendSet::Page(budget) => {
-                    let page = self.plan_page(
+                    let (page, _) = self.plan_page(
                         read,
                         &remote.topic_id,
                         (&view.clock, &empty, None),
@@ -374,7 +396,7 @@ impl<S: Storage> SyncEngine<S> {
         let send = match send_set {
             SendSet::Closure => self.missing_closure_in(read, remote, &view.state.heads)?,
             SendSet::Page(budget) => {
-                let page = self.plan_page(
+                let (page, _) = self.plan_page(
                     read,
                     &remote.topic_id,
                     (&view.clock, &remote.actor_clock, None),
@@ -685,20 +707,54 @@ impl<S: Storage> SyncEngine<S> {
             missing: repair.missing,
             too_large: repair.too_large,
             positions: repair.positions,
+            continued: false,
         };
         if rest.ops == 0 || rest.bytes == 0 || page.too_large.is_some() {
             return Ok(page);
         }
+        // Only a request without wants is repeated after an empty slice, so
+        // only its plans are kept.
+        let key = (peer_id, request.topic_id);
+        let continues = request.wants.is_empty();
+        let kept = continues
+            .then(|| self.continuations().take(key, &view, request))
+            .flatten();
         // Wants this page could not carry keep their dependents out of the
         // forward ranges, which still serve every independent actor.
-        let planned = self.plan_page(
-            read,
-            &request.topic_id,
-            (local, &peer_clock, Some(&goal)),
-            (&scope, &sent),
-            &repair.unsent,
-            rest,
-        )?;
+        let (planned, frontier) = match kept {
+            Some(kept) => {
+                self.work.resumed();
+                let clocks = (&kept.local, &kept.goal, kept.frontier);
+                let planned = self.resume_page(read, &request.topic_id, clocks, &scope, rest)?;
+                (
+                    planned.0,
+                    planned.1.map(|frontier| (frontier, kept.local, kept.goal)),
+                )
+            }
+            None => {
+                let planned = self.plan_page(
+                    read,
+                    &request.topic_id,
+                    (local, &peer_clock, Some(&goal)),
+                    (&scope, &sent),
+                    &repair.unsent,
+                    rest,
+                )?;
+                let clocks = |frontier| (frontier, local.clone(), goal.clone());
+                (planned.0, planned.1.map(clocks))
+            }
+        };
+        if let Some((frontier, local, goal)) = frontier
+            && page.ops.is_empty()
+        {
+            // An empty slice that cannot be kept would repeat forever.
+            if !continues {
+                return Err(Error::Storage("sync page work exceeds its budget".into()));
+            }
+            let continuation = Continuation::new((&view, request), local, goal, frontier);
+            self.continuations().keep(key, continuation)?;
+            page.continued = true;
+        }
         let forwarded = planned.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
         page.more = planned.more || !repair.unsent.is_subset(&forwarded);
         page.ops.extend(planned.ops);

@@ -257,6 +257,7 @@ impl SyncSession {
             more: false,
             missing: BTreeSet::new(),
             positions: BTreeSet::new(),
+            continued: false,
         }))?;
         let mut bytes = requests.len() * page_len;
         for response in &responses {
@@ -314,6 +315,7 @@ impl SyncSession {
                     && more
                     && page.missing.is_empty()
                     && page.positions.is_empty()
+                    && !page.continued
                 {
                     deferred.push((topic_id, request));
                     continue;
@@ -333,6 +335,7 @@ impl SyncSession {
                     more,
                     missing: page.missing,
                     positions: page.positions,
+                    continued: page.continued,
                 };
                 let mut extra =
                     crate::net::framed_message_len(&SyncMessage::Page(result.clone()))? - page_len;

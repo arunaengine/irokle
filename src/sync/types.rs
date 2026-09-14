@@ -183,6 +183,9 @@ pub struct SyncPage {
     /// Actors outside the request's window whose positions the page needed:
     /// the requester names them in its next request.
     pub positions: BTreeSet<ActorId>,
+    /// The responder ended its work slice before it could send anything and
+    /// kept its plan: the same request goes on from it.
+    pub continued: bool,
 }
 
 /// Staged progress of data for a topic the receiver does not hold yet. It is
