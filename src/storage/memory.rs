@@ -13,12 +13,12 @@ use super::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
     MAX_PENDING_MISSING_DEPS, MAX_PENDING_WAITERS_PER_DEP, MAX_REJECTED_PER_TOPIC,
     ObligationTarget, OpMeta, PeerAck, PendingRecord, PendingUsage, ProvisionalTopic, SnapshotRead,
-    StagingLimits, Storage, StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate,
-    TopicState, TopicView, ack_commit, ack_covers, ack_reached_op, apply_status_update,
-    branch_matches, check_namespace, check_namespaces, check_pending_quota, ensure_deps_resolvable,
-    journalled_eviction, merged_obligation, merged_peer_ack, new_peer_status, peer_departed,
-    pending_op_bytes, settled_obligation, stored_ack_dominates, topic_fingerprint_for,
-    validate_batch, validate_heads,
+    StagingLimits, StagingQuota, Storage, StorageCounters, SyncObligation, SyncPeerStatus,
+    SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers, ack_reached_op,
+    apply_status_update, branch_matches, check_namespaces, check_pending_quota,
+    ensure_deps_resolvable, journalled_eviction, merged_obligation, merged_peer_ack,
+    new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
+    topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[derive(Clone)]
@@ -85,6 +85,23 @@ impl Drop for Locked<'_> {
             provisional.revision = provisional.revision.saturating_add(1);
             provisional.bytes = self.inner.admitted_bytes + self.inner.pending_usage.bytes;
         }
+    }
+}
+
+impl Locked<'_> {
+    /// What the other namespaces leave a view; `None` for the main store.
+    fn quota(&self, limits: &StagingLimits) -> Option<StagingQuota> {
+        let (staging, key) = self.staging.as_ref()?;
+        let (mut others, mut source) = (0_u64, 0_u64);
+        for (other, (provisional, _)) in &staging.namespaces {
+            if other != key {
+                others = others.saturating_add(provisional.bytes);
+                if other.0 == key.0 {
+                    source = source.saturating_add(provisional.bytes);
+                }
+            }
+        }
+        Some(StagingQuota::new(limits, others, source))
     }
 }
 
@@ -259,8 +276,8 @@ impl Storage for MemoryStorage {
     }
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
         let mut inner = self.lock()?;
-        let limit = self.namespace.map(|_| self.limits.namespace_bytes);
-        admit_batch_locked(&mut inner, batch, limit)
+        let quota = inner.quota(&self.limits);
+        admit_batch_locked(&mut inner, batch, quota)
     }
 
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
@@ -462,12 +479,10 @@ impl Storage for MemoryStorage {
                 return Err(Error::Storage("pending waiter quota exceeded".into()));
             }
         }
-        if previous.is_none() && self.namespace.is_some() {
-            check_namespace(
-                inner.admitted_bytes + inner.pending_usage.bytes,
-                charge,
-                self.limits.namespace_bytes,
-            )?;
+        if previous.is_none()
+            && let Some(quota) = inner.quota(&self.limits)
+        {
+            quota.check(inner.admitted_bytes + inner.pending_usage.bytes, charge)?;
         }
         if previous.is_none() {
             check_pending_quota(
@@ -1127,7 +1142,7 @@ fn topic_view_locked(
 fn admit_batch_locked(
     inner: &mut MemoryInner,
     batch: AdmittedBatch,
-    namespace: Option<u64>,
+    quota: Option<StagingQuota>,
 ) -> Result<()> {
     validate_batch(&batch)?;
     if inner
@@ -1263,18 +1278,14 @@ fn admit_batch_locked(
     }
 
     ensure_deps_resolvable(&new_entries, |dep| Ok(dep_resolvable_locked(inner, dep)))?;
-    if let Some(limit) = namespace {
+    if let Some(quota) = quota {
         let mut charge = 0;
         for (op, _) in &new_entries {
             if !inner.ops.contains_key(&op.id) {
                 charge += pending_op_bytes(op)? as u64;
             }
         }
-        check_namespace(
-            inner.admitted_bytes + inner.pending_usage.bytes,
-            charge,
-            limit,
-        )?;
+        quota.check(inner.admitted_bytes + inner.pending_usage.bytes, charge)?;
         inner.admitted_bytes += charge;
     }
 

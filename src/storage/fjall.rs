@@ -15,7 +15,7 @@ use super::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
     ObligationTarget, OpMeta, PeerAck, ProvisionalTopic, SnapshotRead, StagingLimits, Storage,
     StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView,
-    ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches, check_namespace,
+    ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches,
     ensure_deps_resolvable, journalled_eviction, merged_obligation, merged_peer_ack,
     new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
     topic_fingerprint_for, validate_batch, validate_heads,
@@ -894,7 +894,7 @@ impl FjallStorage {
                             .is_some(),
                 )
             })?;
-            if self.namespace.is_some() {
+            if let Some(fence) = &self.namespace {
                 let mut charge = 0;
                 for (op, _) in &new_entries {
                     if !fjall::Readable::contains_key(
@@ -907,10 +907,9 @@ impl FjallStorage {
                 }
                 let admitted: u64 =
                     Self::tx_get(tx, &self.records, ADMITTED_BYTES)?.unwrap_or_default();
-                check_namespace(
+                Self::tx_staging_quota(tx, fence, &self.limits)?.check(
                     admitted + Self::tx_pending_bytes(tx, &self.records)?,
                     charge,
-                    self.limits.namespace_bytes,
                 )?;
                 Self::tx_put(tx, &self.records, ADMITTED_BYTES, &(admitted + charge))?;
             }
@@ -1557,15 +1556,14 @@ impl Storage for FjallStorage {
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         let charge = Self::pending_charge(&op, &meta)?;
         self.transaction(|tx| {
-            if self.namespace.is_some()
+            if let Some(fence) = &self.namespace
                 && Self::tx_pending_record(tx, &self.records, &op.id)?.is_none()
             {
                 let admitted: u64 =
                     Self::tx_get(tx, &self.records, ADMITTED_BYTES)?.unwrap_or_default();
-                check_namespace(
+                Self::tx_staging_quota(tx, fence, &self.limits)?.check(
                     admitted + Self::tx_pending_bytes(tx, &self.records)?,
                     charge,
-                    self.limits.namespace_bytes,
                 )?;
             }
             Self::tx_put_pending(tx, &self.records, source_peer, &op, &meta, charge)

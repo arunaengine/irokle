@@ -17,7 +17,8 @@ use crate::{ActorClock, Error, OpId, PeerId, Result, TopicId};
 
 use super::fjall::FjallStorage;
 use super::{
-    AdmissionEffects, PeerAck, ProvisionalTopic, TopicState, ack_covers, check_namespaces,
+    AdmissionEffects, PeerAck, ProvisionalTopic, StagingLimits, StagingQuota, TopicState,
+    ack_covers, check_namespaces,
 };
 
 type Tx = fjall::OptimisticWriteTx;
@@ -141,6 +142,27 @@ impl FjallStorage {
         record.provisional.bytes = admitted + Self::tx_pending_bytes(tx, records)?;
         record.provisional.revision = record.provisional.revision.saturating_add(1);
         Self::tx_put(tx, &fence.registry, fence.key.as_slice(), &record)
+    }
+
+    /// What every other namespace leaves the view of `fence`, read in its
+    /// writing transaction so a concurrent charge makes one of them conflict.
+    pub(super) fn tx_staging_quota(
+        tx: &Tx,
+        fence: &Fence,
+        limits: &StagingLimits,
+    ) -> Result<StagingQuota> {
+        let own = Self::fenced(tx, fence)?.provisional;
+        let (mut others, mut source) = (0_u64, 0_u64);
+        for record in Self::tx_namespaces(tx, &fence.registry)? {
+            if record.provisional.session == own.session {
+                continue;
+            }
+            others = others.saturating_add(record.provisional.bytes);
+            if record.provisional.source == own.source {
+                source = source.saturating_add(record.provisional.bytes);
+            }
+        }
+        Ok(StagingQuota::new(limits, others, source))
     }
 
     /// Empty every slot whose session ended, one bounded transaction at a time.

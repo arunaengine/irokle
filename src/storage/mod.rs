@@ -633,7 +633,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// from one view.
     fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>>;
 
-    /// The limits this store applies to provisional bootstraps.
+    /// The limits this store applies to provisional bootstraps. Every handle
+    /// checks its own limits against the bytes all namespaces of the backing
+    /// store hold, when those bytes commit.
     fn staging_limits(&self) -> StagingLimits;
     /// Every provisional bootstrap namespace, read at one moment.
     fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>>;
@@ -654,7 +656,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// the session is still registered and each write, in the transaction that
     /// commits it, that the session still stages; otherwise
     /// [`crate::Error::StaleIncarnation`] before any effect. A write past the
-    /// namespace byte limit is refused with
+    /// namespace, total or source byte limit is refused with
     /// [`crate::Error::StagingCapacity`].
     fn provisional_store(&self, provisional: &ProvisionalTopic) -> Result<Option<Self>>;
     /// Serialized op bytes this store holds, admitted and buffered.
@@ -840,14 +842,46 @@ pub(super) fn check_namespaces(
     Ok(())
 }
 
-/// Refuse `charge` more bytes in a namespace holding `held` of `limit`.
-pub(super) fn check_namespace(held: u64, charge: u64, limit: u64) -> Result<()> {
-    if held.saturating_add(charge) > limit {
-        return Err(crate::Error::StagingCapacity(
-            "bootstrap namespace byte quota exceeded".into(),
-        ));
+/// Bytes one namespace may hold: its own limit and what the other namespaces
+/// leave of the total and of its source's quota, read where the bytes commit.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StagingQuota {
+    namespace: u64,
+    total: u64,
+    source: u64,
+}
+
+impl StagingQuota {
+    /// The quota of a namespace beside others holding `others` bytes in
+    /// total, of which `source` belong to its own source.
+    pub(super) fn new(limits: &StagingLimits, others: u64, source: u64) -> Self {
+        Self {
+            namespace: limits.namespace_bytes,
+            total: limits.total_bytes.saturating_sub(others),
+            source: limits.source_bytes.saturating_sub(source),
+        }
     }
-    Ok(())
+
+    /// Refuse `charge` more bytes in a namespace holding `held`.
+    pub(super) fn check(&self, held: u64, charge: u64) -> Result<()> {
+        if charge == 0 {
+            return Ok(());
+        }
+        let refuse = |message: &str| Err(crate::Error::StagingCapacity(message.into()));
+        let Some(after) = held.checked_add(charge) else {
+            return refuse("bootstrap staging byte count overflow");
+        };
+        if after > self.namespace {
+            return refuse("bootstrap namespace byte quota exceeded");
+        }
+        if after > self.total {
+            return refuse("bootstrap staging byte budget is full");
+        }
+        if after > self.source {
+            return refuse("bootstrap staging byte quota exceeded for source");
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn topic_fingerprint_for(

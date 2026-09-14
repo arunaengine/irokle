@@ -4,7 +4,7 @@
 //! becomes the topic once that history makes this node and the source members.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::oplog::is_structural_genesis;
 use crate::storage::{
@@ -15,38 +15,12 @@ use crate::{ActorClock, Error, OpId, PeerId, Result, Storage, TopicId, TopicPayl
 
 use super::{Bootstrap, Irokle, now_millis};
 
-/// Owner locks per topic and byte reservations of admissions in flight. The
-/// registry lock is never held while storage work runs.
+/// Owner locks per topic. They only spare redundant work between callers of
+/// one node: the store checks every namespace write and activation itself.
+/// The registry lock is never held while storage work runs.
 #[derive(Default)]
 pub(crate) struct Bootstraps {
     owners: Mutex<BTreeMap<TopicId, Weak<Mutex<()>>>>,
-    reserved: Mutex<Reserved>,
-}
-
-#[derive(Default)]
-struct Reserved {
-    total: u64,
-    by_source: BTreeMap<PeerId, u64>,
-}
-
-/// Bytes an admission in flight holds against the staging limits until dropped.
-struct Reservation<'a> {
-    bootstraps: &'a Bootstraps,
-    source: PeerId,
-    bytes: u64,
-}
-
-impl Drop for Reservation<'_> {
-    fn drop(&mut self) {
-        let mut reserved = self.bootstraps.reserved();
-        reserved.total = reserved.total.saturating_sub(self.bytes);
-        if let Some(bytes) = reserved.by_source.get_mut(&self.source) {
-            *bytes = bytes.saturating_sub(self.bytes);
-            if *bytes == 0 {
-                reserved.by_source.remove(&self.source);
-            }
-        }
-    }
 }
 
 impl Bootstraps {
@@ -64,87 +38,81 @@ impl Bootstraps {
         owners.insert(topic_id, Arc::downgrade(&owner));
         owner
     }
+}
 
-    fn reserved(&self) -> MutexGuard<'_, Reserved> {
-        // Counters only, so a poisoned lock is still consistent.
-        self.reserved
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Make room for `incoming` bytes of `current`: refuse them when they exceed
+/// the source quota or when discarding every less advanced staging of the same
+/// topic would still leave the total full, else discard those stagings, weakest
+/// first, until they fit. Stagings of one topic thus cannot block each other,
+/// and a fragment that cannot fit stages nothing. The store checks the limits
+/// again where the bytes commit, against usage this read may have missed.
+fn make_room<S: Storage>(storage: &S, current: &ProvisionalTopic, incoming: u64) -> Result<()> {
+    let limits = storage.staging_limits();
+    let held = storage.provisional_topics()?;
+    let sum = |bytes: &mut dyn Iterator<Item = u64>| bytes.fold(0_u64, u64::saturating_add);
+    let from_source = sum(&mut held
+        .iter()
+        .filter(|provisional| provisional.source == current.source)
+        .map(|provisional| provisional.bytes));
+    if from_source.saturating_add(incoming) > limits.source_bytes {
+        return Err(Error::StagingCapacity(
+            "bootstrap staging byte quota exceeded for source".into(),
+        ));
     }
-
-    /// Reserve `bytes` for `current` against the total and per-source limits,
-    /// counting what the namespaces hold and what other admissions reserved.
-    /// When the total is full, less advanced stagings of the same topic are
-    /// discarded first, so stagings of one topic cannot block each other.
-    fn reserve<S: Storage>(
-        &self,
-        storage: &S,
-        current: &ProvisionalTopic,
-        bytes: u64,
-    ) -> Result<Reservation<'_>> {
-        let limits = storage.staging_limits();
-        let source = current.source;
-        let mut held = Vec::new();
-        for provisional in storage.provisional_topics()? {
-            let bytes = match storage.provisional_store(&provisional)? {
-                Some(store) => store.stored_bytes()?,
-                None => 0,
-            };
-            held.push((provisional, bytes));
-        }
-        let rank = |(provisional, bytes): &(ProvisionalTopic, u64)| (*bytes, provisional.source);
-        let topic = |provisional: &ProvisionalTopic| provisional.topic_id == current.topic_id;
-        let own = held
-            .iter()
-            .find(|(provisional, _)| topic(provisional) && provisional.source == source)
-            .map(rank)
-            .unwrap_or((0, source));
-        let mut losers = held
-            .iter()
-            .filter(|entry| {
-                let provisional = &entry.0;
-                topic(provisional)
-                    && provisional.source != source
-                    && !provisional.activating
-                    && rank(entry) < own
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        losers.sort_by_key(rank);
-        let mut total = held.iter().map(|(_, bytes)| bytes).sum::<u64>();
-        for (loser, bytes) in losers {
-            if total + self.reserved().total + bytes <= limits.total_bytes {
-                break;
-            }
-            if storage.discard_provisional(&loser)? {
-                total -= bytes;
-            }
-        }
-        let from_source = held
-            .iter()
-            .filter(|(provisional, _)| provisional.source == source)
-            .map(|(_, bytes)| bytes)
-            .sum::<u64>();
-        let mut reserved = self.reserved();
-        let source_reserved = reserved.by_source.get(&source).copied().unwrap_or_default();
-        if total + reserved.total + bytes > limits.total_bytes {
-            return Err(Error::StagingCapacity(
-                "bootstrap staging byte budget is full".into(),
-            ));
-        }
-        if from_source + source_reserved + bytes > limits.source_bytes {
-            return Err(Error::StagingCapacity(
-                "bootstrap staging byte quota exceeded for source".into(),
-            ));
-        }
-        reserved.total += bytes;
-        *reserved.by_source.entry(source).or_default() += bytes;
-        Ok(Reservation {
-            bootstraps: self,
-            source,
-            bytes,
+    let rank = |provisional: &ProvisionalTopic| (provisional.bytes, provisional.source);
+    let own = held
+        .iter()
+        .find(|provisional| {
+            provisional.topic_id == current.topic_id && provisional.source == current.source
         })
+        .map_or((0, current.source), rank);
+    let mut losers = held
+        .iter()
+        .filter(|provisional| {
+            provisional.topic_id == current.topic_id
+                && provisional.source != current.source
+                && !provisional.activating
+                && rank(provisional) < own
+        })
+        .collect::<Vec<_>>();
+    losers.sort_by_key(|provisional| rank(provisional));
+    let total = sum(&mut held.iter().map(|provisional| provisional.bytes));
+    let sizes = losers.iter().map(|provisional| provisional.bytes);
+    let Some(count) = reclaim_count(total, incoming, limits.total_bytes, sizes) else {
+        return Err(Error::StagingCapacity(
+            "bootstrap staging byte budget is full".into(),
+        ));
+    };
+    for loser in losers.into_iter().take(count) {
+        // A loser that changed since it was read is left alone; the store's
+        // own check then decides whether the incoming bytes fit.
+        storage.discard_provisional(loser)?;
     }
+    Ok(())
+}
+
+/// How many of `losers`, taken in order, must go before `incoming` bytes fit
+/// beside `total` within `limit`: zero when they already fit, `None` when even
+/// all of them would not make room.
+fn reclaim_count(
+    total: u64,
+    incoming: u64,
+    limit: u64,
+    losers: impl IntoIterator<Item = u64>,
+) -> Option<usize> {
+    let fits = |total: u64| {
+        total
+            .checked_add(incoming)
+            .is_some_and(|after| after <= limit)
+    };
+    let mut remaining = total;
+    for (count, bytes) in std::iter::once(0).chain(losers).enumerate() {
+        remaining = remaining.saturating_sub(bytes);
+        if fits(remaining) {
+            return Some(count);
+        }
+    }
+    None
 }
 
 impl<S: Storage> Irokle<S> {
@@ -192,7 +160,10 @@ impl<S: Storage> Irokle<S> {
                 return self.activate_proven(&current, current.source);
             }
             (Some(current), Some(genesis)) if genesis < current.genesis => {
-                storage.discard_provisional(&current)?;
+                // A staging that changed since it was read is not replaced blindly.
+                if !storage.discard_provisional(&current)? {
+                    return Err(Error::AdmissionConflict);
+                }
                 storage.open_provisional(source, topic_id, genesis, now_ms)?
             }
             (Some(current), Some(genesis)) if genesis > current.genesis => {
@@ -206,16 +177,15 @@ impl<S: Storage> Irokle<S> {
         let store = storage
             .provisional_store(&provisional)?
             .ok_or(Error::StaleIncarnation)?;
-        let mut bytes = 0;
+        let mut bytes = 0_u64;
         for op in &data.ops {
-            bytes += crate::storage::pending_op_bytes(op)? as u64;
+            bytes = bytes.saturating_add(crate::storage::pending_op_bytes(op)? as u64);
         }
-        let reservation = self.bootstraps.reserve(storage, &provisional, bytes)?;
+        make_room(storage, &provisional, bytes)?;
         let admitted = self
             .oplog
             .sharing_membership(store)
             .receive_ops_from_peer_preverified(Some(source), data.ops.clone(), verified, None);
-        drop(reservation);
         storage.touch_provisional(&provisional, now_ms)?;
         // The ack of an activating fragment names its ops the topic now holds.
         let outcome = match self.activate_proven(&provisional, source) {
@@ -351,8 +321,10 @@ impl<S: Storage> Irokle<S> {
         }
     }
 
-    /// End namespaces with no write for `MAX_STAGED_IDLE_MS`, unless activating.
-    fn expire_bootstraps(&self, now_ms: u64) -> Result<()> {
+    /// End namespaces with no touch for `MAX_STAGED_IDLE_MS`, unless
+    /// activating. Each ends only while it is exactly as this scan read it, so
+    /// a write or touch in between keeps it.
+    pub(crate) fn expire_bootstraps(&self, now_ms: u64) -> Result<()> {
         let storage = self.storage();
         for provisional in storage.provisional_topics()? {
             if !provisional.activating
@@ -374,4 +346,22 @@ fn staged_of<S: Storage>(provisional: &ProvisionalTopic, store: &S) -> Result<St
         clock,
         bytes: store.stored_bytes()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reclaim_count;
+
+    /// Weaker stagings are discarded only as far as the incoming bytes need,
+    /// and not at all when discarding every one would not make room.
+    #[test]
+    fn reclaim_counts() {
+        // Limit 100 with 50 held by the incoming staging and 5 and 35 by weaker ones.
+        assert_eq!(reclaim_count(90, 10, 100, [5, 35]), Some(0));
+        assert_eq!(reclaim_count(90, 15, 100, [5, 35]), Some(1));
+        assert_eq!(reclaim_count(90, 30, 100, [5, 35]), Some(2));
+        assert_eq!(reclaim_count(90, 51, 100, [5, 35]), None);
+        assert_eq!(reclaim_count(90, 40, 100, [35, 5]), Some(1));
+        assert_eq!(reclaim_count(u64::MAX, 1, u64::MAX, [0]), None);
+    }
 }
