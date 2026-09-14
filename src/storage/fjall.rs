@@ -2164,8 +2164,9 @@ impl Storage for FjallStorage {
     }
 }
 
-/// A stored [`OpMeta`]: its observed clock named by the hash of the clock's
-/// root node, whose nodes the op's topic keeps under [`CLOCK_NODE`].
+/// A stored [`OpMeta`]: a small observed clock held inline, a larger one
+/// named by the hash of its root node, whose nodes the op's topic keeps under
+/// [`CLOCK_NODE`].
 #[cfg(feature = "fjall")]
 #[derive(Serialize, Deserialize)]
 struct StoredMeta {
@@ -2177,10 +2178,22 @@ struct StoredMeta {
     actor_prev: Option<OpId>,
     deps: BTreeSet<OpId>,
     generation: u64,
-    observed_clock: Option<[u8; 32]>,
+    observed_clock: StoredClock,
     ready: bool,
     missing_deps: BTreeSet<OpId>,
 }
+
+#[cfg(feature = "fjall")]
+#[derive(Serialize, Deserialize)]
+enum StoredClock {
+    Inline(ActorClock),
+    Nodes([u8; 32]),
+}
+
+/// Entries a stored clock holds inline at most. Each op's record stays within
+/// a fixed size, and a small clock costs no node records to write, read or copy.
+#[cfg(feature = "fjall")]
+const INLINE_CLOCK_ENTRIES: usize = 32;
 
 /// The next records the schema 7 upgrade rewrites: those after `after` in
 /// the keyspace of `slot`, the main keyspace for `None`.
@@ -2203,7 +2216,7 @@ fn clock_node_key(topic_id: &TopicId, hash: &[u8; 32]) -> Vec<u8> {
 
 #[cfg(feature = "fjall")]
 impl FjallStorage {
-    /// Store `meta` in `records` with the nodes of its observed clock that
+    /// Store `meta` in `records`, a large observed clock with the nodes
     /// `records` does not hold yet, in the same transaction.
     pub(super) fn tx_put_meta(
         &self,
@@ -2211,16 +2224,23 @@ impl FjallStorage {
         records: &fjall::OptimisticTxKeyspace,
         meta: &OpMeta,
     ) -> Result<()> {
-        let nodes = meta.observed_clock.unstored_nodes(|hash| {
-            Ok(fjall::Readable::contains_key(
-                tx,
-                records,
-                clock_node_key(&meta.topic_id, hash),
-            )?)
-        })?;
-        for (hash, bytes) in nodes {
-            tx.insert(records, clock_node_key(&meta.topic_id, &hash), bytes);
-        }
+        let observed_clock = match meta.observed_clock.root_hash() {
+            Some(root) if meta.observed_clock.len() > INLINE_CLOCK_ENTRIES => {
+                let nodes = meta.observed_clock.unstored_nodes(|hash| {
+                    Ok(fjall::Readable::contains_key(
+                        tx,
+                        records,
+                        clock_node_key(&meta.topic_id, hash),
+                    )?)
+                })?;
+                for (hash, bytes) in nodes {
+                    tx.insert(records, clock_node_key(&meta.topic_id, &hash), bytes);
+                }
+                self.clocks.keep(&meta.observed_clock);
+                StoredClock::Nodes(root)
+            }
+            _ => StoredClock::Inline(meta.observed_clock.clone()),
+        };
         let stored = StoredMeta {
             id: meta.id,
             topic_id: meta.topic_id,
@@ -2230,12 +2250,11 @@ impl FjallStorage {
             actor_prev: meta.actor_prev,
             deps: meta.deps.clone(),
             generation: meta.generation,
-            observed_clock: meta.observed_clock.root_hash(),
+            observed_clock,
             ready: meta.ready,
             missing_deps: meta.missing_deps.clone(),
         };
         Self::tx_put(tx, records, Self::key_id(b"m", &meta.id), &stored)?;
-        self.clocks.keep(&meta.observed_clock);
         Ok(())
     }
 
@@ -2246,9 +2265,9 @@ impl FjallStorage {
         records: &fjall::OptimisticTxKeyspace,
         stored: StoredMeta,
     ) -> Result<OpMeta> {
-        let observed_clock = match &stored.observed_clock {
-            Some(root) => {
-                let clock = ActorClock::load(root, &self.clocks, |hash| {
+        let observed_clock = match stored.observed_clock {
+            StoredClock::Nodes(root) => {
+                let clock = ActorClock::load(&root, &self.clocks, |hash| {
                     Ok(
                         fjall::Readable::get(tx, records, clock_node_key(&stored.topic_id, hash))?
                             .map(|bytes| bytes.to_vec()),
@@ -2257,7 +2276,7 @@ impl FjallStorage {
                 self.clocks.keep(&clock);
                 clock
             }
-            None => ActorClock::new(),
+            StoredClock::Inline(clock) => clock,
         };
         Ok(OpMeta {
             id: stored.id,
@@ -2273,6 +2292,57 @@ impl FjallStorage {
             missing_deps: stored.missing_deps,
         })
     }
+}
+
+/// Rewrite every metadata record of `records` in the layout before schema 7,
+/// which held every clock entry, and drop the clock nodes, as an old store has.
+#[cfg(test)]
+pub(crate) fn write_legacy_metas(
+    tx: &mut fjall::OptimisticWriteTx,
+    records: &fjall::OptimisticTxKeyspace,
+) -> Result<()> {
+    let cache = crate::clock::ClockCache::default();
+    let mut legacy = Vec::new();
+    for item in fjall::Readable::prefix(tx, records, b"m") {
+        let (key, value) = item.into_inner()?;
+        if key.len() != 1 + OpId::LEN {
+            continue;
+        }
+        let stored: StoredMeta = postcard::from_bytes(value.as_ref())?;
+        let observed_clock = match stored.observed_clock {
+            StoredClock::Inline(clock) => clock,
+            StoredClock::Nodes(root) => ActorClock::load(&root, &cache, |hash| {
+                Ok(
+                    fjall::Readable::get(tx, records, clock_node_key(&stored.topic_id, hash))?
+                        .map(|bytes| bytes.to_vec()),
+                )
+            })?,
+        };
+        let meta = OpMeta {
+            id: stored.id,
+            topic_id: stored.topic_id,
+            author: stored.author,
+            actor_id: stored.actor_id,
+            actor_seq: stored.actor_seq,
+            actor_prev: stored.actor_prev,
+            deps: stored.deps,
+            generation: stored.generation,
+            observed_clock,
+            ready: stored.ready,
+            missing_deps: stored.missing_deps,
+        };
+        legacy.push((key.to_vec(), postcard::to_allocvec(&meta)?));
+    }
+    let nodes = fjall::Readable::prefix(tx, records, CLOCK_NODE)
+        .map(|item| Ok(item.key()?.to_vec()))
+        .collect::<Result<Vec<_>>>()?;
+    for key in nodes {
+        tx.remove(records, key);
+    }
+    for (key, value) in legacy {
+        tx.insert(records, key, value);
+    }
+    Ok(())
 }
 
 /// The leading fields of a [`StoredMeta`], in its field order. Postcard

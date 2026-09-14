@@ -2313,6 +2313,7 @@ fn downgrade_to_schema_two(
         .keyspace("records", fjall::KeyspaceCreateOptions::default)
         .unwrap();
     let mut tx = db.write_tx().unwrap();
+    crate_storage::write_legacy_metas(&mut tx, &records).unwrap();
     let mut pending = Vec::new();
     for item in fjall::Readable::prefix(&tx, &records, b"pm") {
         let (key, value) = item.into_inner().unwrap();

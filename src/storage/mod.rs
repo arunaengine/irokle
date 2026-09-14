@@ -731,6 +731,8 @@ mod fjall_provisional;
 pub use fjall::FjallStorage;
 #[cfg(all(test, feature = "fjall"))]
 pub(crate) use fjall::Hook;
+#[cfg(all(test, feature = "fjall"))]
+pub(crate) use fjall::write_legacy_metas;
 
 pub(super) fn validate_batch(batch: &AdmittedBatch) -> Result<()> {
     for state in [&batch.expected_topic_state, &batch.topic_state]

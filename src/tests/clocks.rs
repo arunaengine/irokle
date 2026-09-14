@@ -7,6 +7,8 @@ use super::support::*;
 use crate::oplog::Oplog;
 use crate::storage::FjallStorage;
 
+const WRITERS: usize = 40;
+
 /// A seeded generator, so every run builds the same graph.
 struct Draw(u64);
 
@@ -19,12 +21,17 @@ impl Draw {
     }
 }
 
-/// A genesis and `count` events of six writers, each depending on its own
-/// previous op and on up to three random earlier ops.
+/// A genesis and `count` events of forty writers, each depending on its own
+/// previous op and on up to three random earlier ops, so later clocks pass the
+/// size a store holds inline.
 fn random_graph(count: usize) -> (TopicId, Vec<Op>) {
     let owner = Ed25519Signer::from_bytes(&[236; 32]);
-    let writers = (0..6)
-        .map(|index| Ed25519Signer::from_bytes(&[237 + index; 32]))
+    let writers = (0..WRITERS)
+        .map(|index| {
+            let mut seed = [237; 32];
+            seed[0] = index as u8;
+            Ed25519Signer::from_bytes(&seed)
+        })
         .collect::<Vec<_>>();
     let topic_id = TopicId::hash(b"random-clock-graph");
     let members = writers
@@ -48,9 +55,9 @@ fn random_graph(count: usize) -> (TopicId, Vec<Op>) {
     .unwrap();
     let mut draw = Draw(0x2545_f491_4f6c_dd1d);
     let mut ops = vec![genesis];
-    let mut last = [None::<usize>; 6];
+    let mut last = [None::<usize>; WRITERS];
     for _ in 0..count {
-        let writer = draw.below(6);
+        let writer = draw.below(WRITERS);
         let mut deps = BTreeSet::new();
         for _ in 0..1 + draw.below(3) {
             deps.insert(draw.below(ops.len()));
@@ -131,23 +138,23 @@ fn fjall_clocks_match() {
     assert_same_metas(&memory, &fjall, &ops);
     drop(fjall);
 
+    let nodes = || {
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .open()
+            .unwrap();
+        let records = db
+            .keyspace("records", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let prefix = [b"cn".as_slice(), topic_id.as_ref()].concat();
+        fjall::Readable::prefix(&db.read_tx(), &records, prefix).count()
+    };
+    assert!(nodes() > 0, "large clocks are stored as nodes");
     let fjall = FjallStorage::open(dir.path()).unwrap();
     assert_same_metas(&memory, &fjall, &ops);
     assert_eq!(fjall.reset_topic(&topic_id).unwrap(), ops.len());
     assert!(fjall.get_meta(&ops[1].id).unwrap().is_none());
     drop(fjall);
-    let db = fjall::OptimisticTxDatabase::builder(dir.path())
-        .open()
-        .unwrap();
-    let records = db
-        .keyspace("records", fjall::KeyspaceCreateOptions::default)
-        .unwrap();
-    let prefix = [b"cn".as_slice(), topic_id.as_ref()].concat();
-    assert_eq!(
-        fjall::Readable::prefix(&db.read_tx(), &records, prefix).count(),
-        0
-    );
-    drop((records, db));
+    assert_eq!(nodes(), 0);
 
     let fjall = FjallStorage::open(dir.path()).unwrap();
     Oplog::with_storage(fjall.clone())
