@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::storage::{OpPosition, SnapshotRead, Storage};
 use crate::{ActorClock, ActorId, Error, OpId, Result, TopicId};
 
+use super::request::need;
 use super::{
     ActorScope, MAX_PAGE_BYTES, MAX_PAGE_MISSING, PageBudget, PlannedPage, RangeHead, SyncEngine,
 };
@@ -54,6 +55,10 @@ impl PageWork {
     }
 }
 
+/// A planned page, the actors whose positions it needed by the lowest
+/// generation needing each, and the frontier of a slice that ended empty.
+pub(super) type PlannedSlice = (PlannedPage, BTreeMap<ActorId, u64>, Option<Frontier>);
+
 /// How far one actor of a page plan got.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActorState {
@@ -79,7 +84,7 @@ pub(super) struct Frontier {
     covered: ActorClock,
     blocked: BTreeSet<OpId>,
     missing: BTreeSet<OpId>,
-    positions: BTreeSet<ActorId>,
+    positions: BTreeMap<ActorId, u64>,
 }
 
 impl Frontier {
@@ -135,6 +140,8 @@ struct Pager<'a> {
     scope: &'a ActorScope<'a>,
     sent: &'a BTreeSet<OpId>,
     window: usize,
+    /// Positions one page result names at most.
+    position_limit: usize,
     work: &'a PageWork,
     /// Storage reads this slice made, and the most it may make.
     visits: usize,
@@ -152,7 +159,8 @@ struct Pager<'a> {
     covered: ActorClock,
     blocked: BTreeSet<OpId>,
     missing: BTreeSet<OpId>,
-    positions: BTreeSet<ActorId>,
+    /// Actors the request left unknown, with the lowest generation needing each.
+    positions: BTreeMap<ActorId, u64>,
     more: bool,
 }
 
@@ -175,9 +183,10 @@ impl Pager<'_> {
     }
 
     /// Plan one slice. A fresh plan starts from the actors behind; a resumed one
-    /// goes on from its frontier. Returns the frontier when the slice ended on
-    /// its read budget before sending anything.
-    fn plan(mut self, budget: PageBudget, fresh: bool) -> Result<(PlannedPage, Option<Frontier>)> {
+    /// goes on from its frontier. Returns the actors whose positions the page
+    /// needed, by the lowest generation needing each, and the frontier when the
+    /// slice ended on its read budget before sending anything.
+    fn plan(mut self, budget: PageBudget, fresh: bool) -> Result<PlannedSlice> {
         if fresh {
             let behind = self
                 .local
@@ -192,7 +201,7 @@ impl Pager<'_> {
                     more: !behind.is_empty(),
                     ..PlannedPage::default()
                 };
-                return Ok((page, None));
+                return Ok((page, BTreeMap::new(), None));
             }
             self.deferred = behind;
         }
@@ -260,12 +269,9 @@ impl Pager<'_> {
                 .deferred
                 .iter()
                 .any(|actor_id| !self.states.contains_key(actor_id));
-        let (mut missing, mut positions) = (self.missing.clone(), self.positions.clone());
+        let (mut missing, positions) = (self.missing.clone(), self.positions.clone());
         while missing.len() > MAX_PAGE_MISSING {
             missing.pop_last();
-        }
-        while positions.len() > MAX_PAGE_MISSING {
-            positions.pop_last();
         }
         let frontier = (self.ended && ops.is_empty() && too_large.is_none()).then(|| {
             self.work.ended.fetch_add(1, Ordering::Relaxed);
@@ -287,10 +293,10 @@ impl Pager<'_> {
             more,
             missing,
             too_large,
-            positions,
+            positions: BTreeSet::new(),
             continued: false,
         };
-        Ok((page, frontier))
+        Ok((page, positions, frontier))
     }
 
     /// Fill free slots: resumed heads first, then deferred actors in order.
@@ -371,21 +377,24 @@ impl Pager<'_> {
                 continue;
             }
             let position = match self.metas.get(dep) {
-                Some(dep_meta) => Some((dep_meta.actor_id, dep_meta.actor_seq)),
+                Some(dep_meta) => {
+                    Some((dep_meta.actor_id, dep_meta.actor_seq, dep_meta.generation))
+                }
                 None => {
                     self.visit();
-                    self.read
-                        .get_position(dep)?
-                        .map(|dep_meta| (dep_meta.actor_id, dep_meta.actor_seq))
+                    self.read.get_position(dep)?.map(|dep_meta| {
+                        (dep_meta.actor_id, dep_meta.actor_seq, dep_meta.generation)
+                    })
                 }
             };
-            let Some((dep_actor, dep_seq)) = position else {
+            let Some((dep_actor, dep_seq, dep_generation)) = position else {
                 self.missing.insert(*dep);
                 return Ok(Wait::Blocked);
             };
             // Omitted from the request is not held: the requester names it next.
             if self.scope.unknown(&dep_actor) {
-                self.positions.insert(dep_actor);
+                need(&mut self.positions, dep_actor, dep_generation);
+                self.unknown_ancestors(*dep)?;
                 unknown = true;
             } else if waits.is_none() && self.covered.get(&dep_actor) < dep_seq {
                 waits = Some(Wait::Position(dep_actor, dep_seq));
@@ -396,6 +405,40 @@ impl Pager<'_> {
             (false, Some(waits)) => waits,
             (false, None) => Wait::Ready,
         })
+    }
+
+    /// Name the unknown actors of `id`'s ancestry too, up to the page's
+    /// position limit, so one result names a run of a dependency chain instead
+    /// of one link per request. A walk stops at actors the request describes
+    /// and at actors already named, so shared ancestry is walked once.
+    fn unknown_ancestors(&mut self, id: OpId) -> Result<()> {
+        let mut queue = vec![id];
+        let mut found = 0;
+        while let Some(next) = queue.pop() {
+            if found >= self.position_limit || self.exhausted() {
+                return Ok(());
+            }
+            self.visit();
+            let Some(meta) = self.read.get_position(&next)? else {
+                continue;
+            };
+            for dep in &meta.deps {
+                self.work.edges.fetch_add(1, Ordering::Relaxed);
+                self.visit();
+                let Some(dep_meta) = self.read.get_position(dep)? else {
+                    continue;
+                };
+                if !self.scope.unknown(&dep_meta.actor_id)
+                    || self.positions.contains_key(&dep_meta.actor_id)
+                {
+                    continue;
+                }
+                need(&mut self.positions, dep_meta.actor_id, dep_meta.generation);
+                found += 1;
+                queue.push(*dep);
+            }
+        }
+        Ok(())
     }
 
     /// Park `head` until `dep_actor` reaches `dep_seq`, activating that actor
@@ -511,7 +554,7 @@ impl<S: Storage> SyncEngine<S> {
         (scope, sent): (&ActorScope<'_>, &BTreeSet<OpId>),
         excluded: &BTreeSet<OpId>,
         budget: PageBudget,
-    ) -> Result<(PlannedPage, Option<Frontier>)> {
+    ) -> Result<PlannedSlice> {
         let pager = Pager {
             read,
             topic_id,
@@ -520,6 +563,7 @@ impl<S: Storage> SyncEngine<S> {
             scope,
             sent,
             window: self.page_actors,
+            position_limit: self.page_positions,
             work: &self.work,
             visits: 0,
             visit_limit: self.page_visits,
@@ -533,7 +577,7 @@ impl<S: Storage> SyncEngine<S> {
             covered: peer.clone(),
             blocked: excluded.clone(),
             missing: BTreeSet::new(),
-            positions: BTreeSet::new(),
+            positions: BTreeMap::new(),
             more: false,
         };
         pager.plan(budget, true)
@@ -548,7 +592,7 @@ impl<S: Storage> SyncEngine<S> {
         (local, goal, frontier): (&ActorClock, &ActorClock, Frontier),
         scope: &ActorScope<'_>,
         budget: PageBudget,
-    ) -> Result<(PlannedPage, Option<Frontier>)> {
+    ) -> Result<PlannedSlice> {
         const SENT: BTreeSet<OpId> = BTreeSet::new();
         let pager = Pager {
             read,
@@ -558,6 +602,7 @@ impl<S: Storage> SyncEngine<S> {
             scope,
             sent: &SENT,
             window: self.page_actors,
+            position_limit: self.page_positions,
             work: &self.work,
             visits: 0,
             visit_limit: self.page_visits,

@@ -89,6 +89,8 @@ pub struct SyncEngine<S> {
     request_items: usize,
     /// Storage reads of one page slice; tests scale it down.
     page_visits: usize,
+    /// Positions one page result names; tests scale it down.
+    page_positions: usize,
     /// Plans kept across slices, shared by the engine's clones.
     continuations: Arc<Mutex<Continuations>>,
     work: Arc<PageWork>,
@@ -109,6 +111,7 @@ impl<S: Storage> SyncEngine<S> {
             page_actors: MAX_PAGE_ACTORS,
             request_items: MAX_REQUEST_ITEMS,
             page_visits: MAX_PAGE_VISITS,
+            page_positions: MAX_PAGE_MISSING,
             continuations: Arc::new(Mutex::new(Continuations::new(MAX_CONTINUATIONS))),
             work: Arc::default(),
         }
@@ -375,7 +378,7 @@ impl<S: Storage> SyncEngine<S> {
                     &view.state.heads,
                 )?,
                 SendSet::Page(budget) => {
-                    let (page, _) = self.plan_page(
+                    let (page, _, _) = self.plan_page(
                         read,
                         &remote.topic_id,
                         (&view.clock, &empty, None),
@@ -413,7 +416,7 @@ impl<S: Storage> SyncEngine<S> {
         let send = match send_set {
             SendSet::Closure => self.missing_closure_in(read, remote, &view.state.heads)?,
             SendSet::Page(budget) => {
-                let (page, _) = self.plan_page(
+                let (page, _, _) = self.plan_page(
                     read,
                     &remote.topic_id,
                     (&view.clock, &remote.actor_clock, None),
@@ -723,10 +726,17 @@ impl<S: Storage> SyncEngine<S> {
             more: !repair.unsent.is_empty(),
             missing: repair.missing,
             too_large: repair.too_large,
-            positions: repair.positions,
+            positions: BTreeSet::new(),
             continued: false,
         };
+        let mut needed = repair.positions;
+        // A requester names what one page result needs in its next request, so
+        // a result names no more than the hints this request could spare
+        // beside one actor of its window, deepest first.
+        let named = request.actor_range_hints.len().saturating_sub(1).max(1);
+        let position_limit = self.page_positions.min(named);
         if rest.ops == 0 || rest.bytes == 0 || page.too_large.is_some() {
+            page.positions = request::deepest(&needed, position_limit);
             return Ok(page);
         }
         // Only a request without wants is repeated after an empty slice, so
@@ -738,15 +748,14 @@ impl<S: Storage> SyncEngine<S> {
             .flatten();
         // Wants this page could not carry keep their dependents out of the
         // forward ranges, which still serve every independent actor.
-        let (planned, frontier) = match kept {
+        let (planned, positions, frontier) = match kept {
             Some(kept) => {
                 self.work.resumed();
                 let clocks = (&kept.local, &kept.goal, kept.frontier);
-                let planned = self.resume_page(read, &request.topic_id, clocks, &scope, rest)?;
-                (
-                    planned.0,
-                    planned.1.map(|frontier| (frontier, kept.local, kept.goal)),
-                )
+                let (planned, positions, frontier) =
+                    self.resume_page(read, &request.topic_id, clocks, &scope, rest)?;
+                let frontier = frontier.map(|frontier| (frontier, kept.local, kept.goal));
+                (planned, positions, frontier)
             }
             None => {
                 let planned = self.plan_page(
@@ -758,7 +767,7 @@ impl<S: Storage> SyncEngine<S> {
                     rest,
                 )?;
                 let clocks = |frontier| (frontier, local.clone(), goal.clone());
-                (planned.0, planned.1.map(clocks))
+                (planned.0, planned.1, planned.2.map(clocks))
             }
         };
         if let Some((frontier, local, goal)) = frontier
@@ -776,13 +785,13 @@ impl<S: Storage> SyncEngine<S> {
         page.more = planned.more || !repair.unsent.is_subset(&forwarded);
         page.ops.extend(planned.ops);
         page.missing.extend(planned.missing);
-        page.positions.extend(planned.positions);
+        for (actor_id, generation) in positions {
+            request::need(&mut needed, actor_id, generation);
+        }
+        page.positions = request::deepest(&needed, position_limit);
         page.too_large = page.too_large.or(planned.too_large);
         while page.missing.len() > MAX_PAGE_MISSING {
             page.missing.pop_last();
-        }
-        while page.positions.len() > MAX_PAGE_MISSING {
-            page.positions.pop_last();
         }
         Ok(page)
     }

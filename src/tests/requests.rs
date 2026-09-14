@@ -58,7 +58,12 @@ fn page_truncated<S: Storage>(source: &Source<S>, reader: &Oplog, items: usize) 
         }
         assert_eq!(reader.receive_ops(page.ops).unwrap(), earlier);
         assert!(reader.storage().ready_pending_ops().unwrap().is_empty());
-        knowledge.settle(&request.window, &page.positions, page.continued);
+        let actors = summary.actor_clock.iter().count();
+        knowledge.settle(
+            &request.window,
+            (&page.positions, page.continued),
+            (!earlier.is_empty(), actors),
+        );
         rounds += 1;
     }
     let (source_storage, reader_storage) = (source.log.storage(), reader.storage());

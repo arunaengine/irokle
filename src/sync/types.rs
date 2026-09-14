@@ -100,13 +100,19 @@ impl ActorFilter {
         if bytes > max_bytes {
             return None;
         }
+        Some(Self::sized(actors, bytes))
+    }
+
+    /// A filter of `actors` in `bytes` bytes, at least one.
+    pub(crate) fn sized(actors: &[ActorId], bytes: usize) -> Self {
+        let bytes = bytes.max(1);
         let mut bits = vec![0; bytes];
         for actor_id in actors {
             for bit in Self::probes(bytes * 8, actor_id) {
                 bits[bit / 8] |= 1 << (bit % 8);
             }
         }
-        Some(Self { bits })
+        Self { bits }
     }
 
     pub fn contains(&self, actor_id: &ActorId) -> bool {

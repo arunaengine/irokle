@@ -51,8 +51,14 @@ fn page_slices<S: Storage>(source: &Source<S>) -> (usize, usize) {
             continued += 1;
         }
         let ids = page.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+        let received = !ids.is_empty();
         assert_eq!(reader.receive_ops(page.ops).unwrap(), ids, "page {pages}");
-        knowledge.settle(&request.window, &page.positions, page.continued);
+        let actors = summary.actor_clock.iter().count();
+        knowledge.settle(
+            &request.window,
+            (&page.positions, page.continued),
+            (received, actors),
+        );
         pages += 1;
     }
     assert_eq!(

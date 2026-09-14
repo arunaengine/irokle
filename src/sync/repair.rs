@@ -2,11 +2,12 @@
 //! Retained explicit-hole repair: requested ids a store holds, served oldest
 //! generation first once their dependencies are held or sent.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::storage::{SnapshotRead, Storage};
 use crate::{ActorClock, ActorId, Op, OpId, Result, TopicId};
 
+use super::request::need;
 use super::{ActorScope, PageBudget, SyncEngine};
 
 impl<S: Storage> SyncEngine<S> {
@@ -51,7 +52,7 @@ impl<S: Storage> SyncEngine<S> {
                 match read.get_position(dep)? {
                     // Every unknown actor of the want is named at once.
                     Some(meta) if scope.unknown(&meta.actor_id) => {
-                        page.positions.insert(meta.actor_id);
+                        need(&mut page.positions, meta.actor_id, meta.generation);
                         ready = false;
                     }
                     Some(meta) if peer.get(&meta.actor_id) >= meta.actor_seq => {}
@@ -94,6 +95,7 @@ pub(super) struct RepairPage {
     pub(super) unsent: BTreeSet<OpId>,
     pub(super) missing: BTreeSet<OpId>,
     pub(super) too_large: Option<OpId>,
-    /// Actors the request did not describe whose positions a want needed.
-    pub(super) positions: BTreeSet<ActorId>,
+    /// Actors the request did not describe whose positions a want needed,
+    /// with the lowest generation needing each.
+    pub(super) positions: BTreeMap<ActorId, u64>,
 }

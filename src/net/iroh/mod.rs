@@ -140,6 +140,8 @@ struct RequestEntry {
     knowledge: crate::sync::RequestKnowledge,
     /// The window the newest request described.
     window: crate::sync::ActorWindow,
+    /// Actors of the peer's clock that request planned toward.
+    actors: usize,
 }
 
 impl RequestEntry {
@@ -164,13 +166,15 @@ impl RequestLog {
             .unwrap_or_default()
     }
 
-    /// Remember the window of a request planned on `genesis` and `session`.
+    /// Remember the window of a request planned on `genesis` and `session`
+    /// toward a clock of `actors` actors. A continued entry moves to the back,
+    /// so entries other peers add do not push out one still in use.
     fn sent(
         &mut self,
         key: (PeerId, crate::TopicId),
-        genesis: crate::OpId,
-        session: Option<u64>,
+        (genesis, session): (crate::OpId, Option<u64>),
         window: crate::sync::ActorWindow,
+        actors: usize,
     ) {
         if let Some(entry) = self
             .entries
@@ -179,6 +183,9 @@ impl RequestLog {
         {
             entry.session = session;
             entry.window = window;
+            entry.actors = actors;
+            self.order.retain(|kept| *kept != key);
+            self.order.push_back(key);
             return;
         }
         let entry = RequestEntry {
@@ -186,6 +193,7 @@ impl RequestLog {
             session,
             knowledge: Default::default(),
             window,
+            actors,
         };
         if self.entries.insert(key, entry).is_none() {
             self.order.push_back(key);
@@ -197,21 +205,25 @@ impl RequestLog {
         }
     }
 
-    /// Fold a page result for a request planned on `genesis`.
+    /// Fold a page result for a request planned on `genesis`, whose data
+    /// this node `received` in the same exchange or not.
     fn settle(
         &mut self,
         key: &(PeerId, crate::TopicId),
         genesis: Option<crate::OpId>,
         page: &crate::sync::SyncPage,
+        received: bool,
     ) {
         if let Some(entry) = self
             .entries
             .get_mut(key)
             .filter(|entry| Some(entry.genesis) == genesis)
         {
-            entry
-                .knowledge
-                .settle(&entry.window, &page.positions, page.continued);
+            entry.knowledge.settle(
+                &entry.window,
+                (&page.positions, page.continued),
+                (received, entry.actors),
+            );
         }
     }
 
@@ -2062,9 +2074,9 @@ impl<S: Storage> SharedNet<S> {
             credit_ops = request.credit.ops as usize;
             self.request_log().sent(
                 (remote_peer_id, topic_id),
-                planned,
-                None,
+                (planned, None),
                 request.window.clone(),
+                summary.actor_clock.iter().count(),
             );
             controls.push(SyncMessage::Request(request));
         }
@@ -2263,8 +2275,12 @@ impl<S: Storage> SharedNet<S> {
             actor_range_hints,
             window,
         };
-        self.request_log()
-            .sent(key, genesis, session, plan.window.clone());
+        self.request_log().sent(
+            key,
+            (genesis, session),
+            plan.window.clone(),
+            summary.actor_clock.iter().count(),
+        );
         let request = crate::sync::page_request(plan, Some(genesis));
         let credit_ops = request.credit.ops as usize;
         Ok(Some(PlannedTopicSync {
@@ -2644,6 +2660,7 @@ impl<S: Storage> SharedNet<S> {
         let mut followups: BTreeMap<crate::TopicId, Vec<SyncMessage>> = BTreeMap::new();
         let mut pages = BTreeMap::new();
         let mut outcomes = BTreeMap::new();
+        let mut received = BTreeSet::new();
         for response in responses {
             match response {
                 SyncMessage::Ack(ack) if group_topics.contains(&ack.topic_id) => {
@@ -2678,8 +2695,12 @@ impl<S: Storage> SharedNet<S> {
                         more.insert(page.topic_id);
                     }
                     let genesis = geneses.get(&page.topic_id).copied().flatten();
-                    self.request_log()
-                        .settle(&(remote_peer_id, page.topic_id), genesis, &page);
+                    self.request_log().settle(
+                        &(remote_peer_id, page.topic_id),
+                        genesis,
+                        &page,
+                        received.contains(&page.topic_id),
+                    );
                 }
                 SyncMessage::Request(request) if group_topics.contains(&request.topic_id) => {
                     let topic_id = request.topic_id;
@@ -2698,6 +2719,9 @@ impl<S: Storage> SharedNet<S> {
                 }
                 SyncMessage::Data(data) if group_topics.contains(&data.topic_id) => {
                     let data_topic_id = data.topic_id;
+                    if !data.ops.is_empty() {
+                        received.insert(data_topic_id);
+                    }
                     let received = self
                         .node
                         .ensure_iroh_peer_whitelisted(remote_peer_id, &data)
@@ -3675,7 +3699,7 @@ mod tests {
             behind: None,
         };
         let mut log = RequestLog::default();
-        log.sent(key, genesis, None, window);
+        log.sent(key, (genesis, None), window, 2);
         let positions = BTreeSet::from([crate::ActorId::from_bytes([9; 32])]);
         let page = crate::sync::SyncPage {
             topic_id: topic(1),
@@ -3684,18 +3708,18 @@ mod tests {
             positions: positions.clone(),
             continued: false,
         };
-        log.settle(&key, Some(genesis), &page);
+        log.settle(&key, Some(genesis), &page, false);
         let learned = log.knowledge(&key, genesis, None);
         assert_eq!((learned.positions(), learned.revision()), (1, 1));
         assert_eq!(log.knowledge(&key, genesis, Some(3)), learned);
-        log.sent(key, genesis, Some(3), Default::default());
+        log.sent(key, (genesis, Some(3)), Default::default(), 2);
         assert_eq!(log.knowledge(&key, genesis, Some(3)), learned);
         assert_eq!(log.knowledge(&key, genesis, Some(4)), Default::default());
         assert_eq!(log.knowledge(&key, other, Some(3)), Default::default());
         assert_eq!(log.revision(&key, Some(other)), 0);
-        log.settle(&key, Some(other), &page);
+        log.settle(&key, Some(other), &page, false);
         assert_eq!(log.knowledge(&key, genesis, Some(3)), learned);
-        log.sent(key, other, None, Default::default());
+        log.sent(key, (other, None), Default::default(), 2);
         assert_eq!(log.knowledge(&key, genesis, Some(3)), Default::default());
     }
 

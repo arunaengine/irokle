@@ -3,56 +3,88 @@
 //! bounded builder of their ranges, what a responder may take from them, and
 //! what a requester carries from one page result to its next request.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{ActorClock, ActorId};
 
 use super::{
     ActorFilter, ActorRangeHint, ActorWindow, MAX_ACTOR_FILTER_BYTES, MAX_ACTOR_RANGE_HINT_SPAN,
+    MAX_PAGE_MISSING,
 };
 
 /// What a requester carries between requests for one peer, topic and branch:
-/// where the next actor window starts and the actors whose positions the last
-/// page needed. A new branch or staging session starts from the default.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// where the next actor window starts and the actors whose positions page
+/// results needed, newest first. A new branch or staging session starts over.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RequestKnowledge {
     after: Option<ActorId>,
-    positions: BTreeSet<ActorId>,
-    /// Grows when a page result names positions not asked for before.
+    positions: VecDeque<ActorId>,
+    /// Positions kept at most; the oldest gives way to a newer one.
+    capacity: usize,
+    /// Grows when a page result advances the request without data.
     revision: u64,
+    /// Page results in a row that carried no data.
+    quiet: usize,
+}
+
+impl Default for RequestKnowledge {
+    fn default() -> Self {
+        Self::with_capacity(MAX_PAGE_MISSING)
+    }
 }
 
 impl RequestKnowledge {
-    /// Fold the result of a page served for a request with `window`. A page
-    /// the responder `continued` wants the same request again. New positions
-    /// keep the window for the next request, which names them first; otherwise
-    /// the next window starts after this one, so positions no request could
-    /// satisfy do not hold every other actor back.
+    /// Knowledge keeping at most `capacity` needed positions.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            after: None,
+            positions: VecDeque::new(),
+            capacity: capacity.max(1),
+            revision: 0,
+            quiet: 0,
+        }
+    }
+
+    /// Fold the result of a page served for a request with `window` from a
+    /// peer whose clock names `actors` actors. A page the responder `continued`
+    /// wants the same request again. Positions a page names go first and keep
+    /// the window, so a dependency chain is followed from its deepest named
+    /// actor and kept positions a request could not name take turns; a page
+    /// naming none moves the window on. Without data, a result advances the
+    /// request only a bounded number of times in a row, so a request that
+    /// cannot describe what one operation needs ends instead of cycling.
     #[cfg(any(feature = "iroh", test))]
     pub(crate) fn settle(
         &mut self,
         window: &ActorWindow,
-        positions: &BTreeSet<ActorId>,
-        continued: bool,
+        page: (&BTreeSet<ActorId>, bool),
+        (received, actors): (bool, usize),
     ) {
+        let (positions, continued) = page;
+        self.quiet = if received { 0 } else { self.quiet + 1 };
+        // Enough empty results to discover every actor twice and move the
+        // window past each one, plus kept slices.
+        let advancing = self.quiet <= actors.saturating_mul(4).saturating_add(64);
         if continued {
-            self.revision += 1;
+            self.revision += u64::from(advancing);
             return;
         }
-        let known = self.positions.len();
-        self.positions.extend(positions.iter().copied());
-        while self.positions.len() > super::MAX_PAGE_MISSING {
-            self.positions.pop_last();
-        }
-        if self.positions.len() > known {
+        if !positions.is_empty() {
+            self.positions
+                .retain(|actor_id| !positions.contains(actor_id));
+            for actor_id in positions.iter().rev() {
+                self.positions.push_front(*actor_id);
+            }
+            self.positions.truncate(self.capacity);
             self.after = window.after;
-            self.revision += 1;
+            self.revision += u64::from(advancing);
             return;
         }
         self.after = window.through;
-        if positions.is_empty() {
-            self.positions.clear();
-        }
+        self.positions.clear();
+        // Only a partial window moves on to actors the last request left out.
+        let partial = window.after.is_some() || window.through.is_some();
+        self.revision += u64::from(advancing && !received && partial);
     }
 
     /// How many positions the next request names before anything else.
@@ -60,12 +92,35 @@ impl RequestKnowledge {
         self.positions.len()
     }
 
-    /// How often page results named new positions or a kept plan, so a page
-    /// that carried nothing but either still counts as progress.
+    /// How often page results advanced requests without data, so a page that
+    /// carried nothing but a position, a kept plan or a moved window still
+    /// counts as progress, a bounded number of times in a row.
     #[cfg(any(feature = "iroh", test))]
     pub(crate) fn revision(&self) -> u64 {
         self.revision
     }
+}
+
+/// The `limit` actors of `needed` whose needed records have the lowest
+/// generation: a page that cannot name every position names the deepest
+/// ancestors first, whose dependents can follow once they are served.
+pub(crate) fn deepest(needed: &BTreeMap<ActorId, u64>, limit: usize) -> BTreeSet<ActorId> {
+    let mut ordered = needed
+        .iter()
+        .map(|(actor_id, generation)| (*generation, *actor_id))
+        .collect::<Vec<_>>();
+    ordered.sort_unstable();
+    ordered
+        .into_iter()
+        .take(limit)
+        .map(|(_, actor_id)| actor_id)
+        .collect()
+}
+
+/// Record that `actor_id` is needed for a record of `generation`.
+pub(crate) fn need(needed: &mut BTreeMap<ActorId, u64>, actor_id: ActorId, generation: u64) {
+    let kept = needed.entry(actor_id).or_insert(generation);
+    *kept = (*kept).min(generation);
 }
 
 /// What a request says about the requester's positions: a named actor is at
@@ -105,10 +160,11 @@ impl<'a> ActorScope<'a> {
 /// The ranges one request names in at most `items` hints and the window they
 /// describe. When every actor `remote` is ahead of `local` on fits, all are
 /// named and the window holds every actor. Otherwise the request first names
-/// the positions `knowledge` carries, then a run of actors behind in id order
-/// after its cursor; the window covers that run and filters the actors behind
-/// it leaves out. Spans share [`MAX_ACTOR_RANGE_HINT_SPAN`]; an actor past it
-/// gets a zero-span hint.
+/// the positions `knowledge` carries, newest first: actors behind, then held
+/// actors its window would not hold. Then it names a run of actors behind in
+/// id order after its cursor; the window covers that run and filters the
+/// actors behind it leaves out. Spans share [`MAX_ACTOR_RANGE_HINT_SPAN`]; an
+/// actor past it gets a zero-span hint.
 pub(crate) fn request_ranges(
     local: &ActorClock,
     remote: &ActorClock,
@@ -120,23 +176,12 @@ pub(crate) fn request_ranges(
         .filter(|(actor_id, seq)| **seq > local.get(actor_id))
         .map(|(actor_id, _)| *actor_id)
         .collect::<Vec<_>>();
-    let mut span = MAX_ACTOR_RANGE_HINT_SPAN;
-    let mut hint = |actor_id: ActorId| {
-        let from = local.get(&actor_id);
-        let to = remote
-            .get(&actor_id)
-            .saturating_sub(from)
-            .min(span)
-            .saturating_add(from);
-        span -= to - from;
-        ActorRangeHint {
-            actor_id,
-            from_exclusive: from,
-            to_inclusive: to,
-        }
-    };
     if behind.len() <= items {
-        let hints = behind.into_iter().map(&mut hint).collect();
+        let mut span = MAX_ACTOR_RANGE_HINT_SPAN;
+        let hints = behind
+            .into_iter()
+            .map(|actor_id| hint(local, remote, &mut span, actor_id))
+            .collect();
         return (hints, ActorWindow::default());
     }
     if items == 0 {
@@ -149,17 +194,65 @@ pub(crate) fn request_ranges(
         };
         return (Vec::new(), window);
     }
-    let named = knowledge
+    let (ahead, held) = knowledge
         .positions
         .iter()
-        .take(items - 1)
-        .copied()
+        .partition::<Vec<_>, _>(|actor_id| remote.get(actor_id) > local.get(actor_id));
+    let mut named = ahead.into_iter().take(items - 1).collect::<Vec<_>>();
+    let ranges = window_ranges(local, remote, (items, &behind), knowledge.after, &named);
+    // A held actor is named only where the filter would take it as behind.
+    let unheld = held
+        .into_iter()
+        .filter(|actor_id| !ranges.1.holds(actor_id))
+        .collect::<Vec<_>>();
+    if unheld.is_empty() || named.len() == items - 1 {
+        return ranges;
+    }
+    named.extend(unheld.into_iter().take(items - 1 - named.len()));
+    window_ranges(local, remote, (items, &behind), knowledge.after, &named)
+}
+
+/// The hint of `actor_id` from `local` toward `remote`, within what is left
+/// of `span`.
+fn hint(
+    local: &ActorClock,
+    remote: &ActorClock,
+    span: &mut u64,
+    actor_id: ActorId,
+) -> ActorRangeHint {
+    let from = local.get(&actor_id);
+    let to = remote
+        .get(&actor_id)
+        .saturating_sub(from)
+        .min(*span)
+        .saturating_add(from);
+    *span -= to - from;
+    ActorRangeHint {
+        actor_id,
+        from_exclusive: from,
+        to_inclusive: to,
+    }
+}
+
+/// Hints for `named`, then a run of `behind` after `after` up to `items`
+/// hints, and the window over that run.
+fn window_ranges(
+    local: &ActorClock,
+    remote: &ActorClock,
+    (items, behind): (usize, &[ActorId]),
+    after: Option<ActorId>,
+    named: &[&ActorId],
+) -> (Vec<ActorRangeHint>, ActorWindow) {
+    let mut span = MAX_ACTOR_RANGE_HINT_SPAN;
+    let named = named
+        .iter()
+        .map(|actor_id| **actor_id)
         .collect::<BTreeSet<_>>();
     let mut hints = named
         .iter()
-        .map(|actor_id| hint(*actor_id))
+        .map(|actor_id| hint(local, remote, &mut span, *actor_id))
         .collect::<Vec<_>>();
-    let mut after = knowledge.after;
+    let mut after = after;
     let mut start = behind.partition_point(|actor_id| Some(*actor_id) <= after);
     if start == behind.len() {
         (after, start) = (None, 0);
@@ -171,7 +264,7 @@ pub(crate) fn request_ranges(
             if hints.len() == items {
                 break;
             }
-            hints.push(hint(*actor_id));
+            hints.push(hint(local, remote, &mut span, *actor_id));
         }
         through = Some(*actor_id);
         end += 1;
@@ -190,8 +283,31 @@ pub(crate) fn request_ranges(
         .filter(|actor_id| !named.contains(*actor_id) && !window.contains(actor_id))
         .copied()
         .collect::<Vec<_>>();
-    window.behind = ActorFilter::new(&omitted, MAX_ACTOR_FILTER_BYTES);
+    window.behind = exact_filter(remote, local, &window, &omitted);
     (hints, window)
+}
+
+/// The filter of `omitted` that takes no actor of `remote` this node holds
+/// outside `window` as behind, grown from ten bits per actor within
+/// [`MAX_ACTOR_FILTER_BYTES`]. Past that, the largest filter keeps its few
+/// collisions, which a later request names like any needed position.
+fn exact_filter(
+    remote: &ActorClock,
+    local: &ActorClock,
+    window: &ActorWindow,
+    omitted: &[ActorId],
+) -> Option<ActorFilter> {
+    let mut filter = ActorFilter::new(omitted, MAX_ACTOR_FILTER_BYTES)?;
+    loop {
+        let collides = remote.iter().any(|(actor_id, seq)| {
+            *seq <= local.get(actor_id) && !window.contains(actor_id) && filter.contains(actor_id)
+        });
+        let bytes = filter.bits.len() * 2;
+        if !collides || bytes > MAX_ACTOR_FILTER_BYTES {
+            return Some(filter);
+        }
+        filter = ActorFilter::sized(omitted, bytes);
+    }
 }
 
 #[cfg(test)]
@@ -265,8 +381,8 @@ mod tests {
     }
 
     /// A page naming positions keeps the window and the next request names
-    /// them first, held or behind; a page naming none moves the window on and
-    /// wraps after the last actor.
+    /// them first, newest first and behind before held; a page naming none moves
+    /// the window on and wraps after the last actor.
     #[test]
     fn knowledge_moves_window() {
         let local = clock(&[(9, 4)]);
@@ -274,32 +390,34 @@ mod tests {
         let mut knowledge = RequestKnowledge::default();
         let first = request_ranges(&local, &remote, 2, &knowledge);
         assert_eq!(first.1.through, Some(actor(2)));
-        knowledge.settle(&first.1, &[actor(9), actor(4)].into(), false);
+        knowledge.settle(&first.1, (&[actor(9), actor(4)].into(), false), (false, 5));
         assert_eq!(knowledge.revision(), 1);
         let asked = request_ranges(&local, &remote, 2, &knowledge);
         assert_described(&local, &remote, &asked);
         assert_eq!(asked.0[0].actor_id, actor(4));
         assert_eq!(asked.1.after, None);
-        knowledge.settle(&asked.1, &[actor(4)].into(), false);
+        // Held and outside the filter, actor 9 needs no hint.
+        assert!(asked.0.iter().all(|hint| hint.actor_id != actor(9)));
+        knowledge.settle(&asked.1, (&[actor(4)].into(), false), (false, 5));
         assert_eq!(
             knowledge.revision(),
-            1,
-            "a repeated position is no progress"
+            2,
+            "a position named again takes its turn"
         );
-        let named = request_ranges(&local, &remote, 3, &knowledge);
-        let zero = named
-            .0
-            .iter()
-            .find(|hint| hint.actor_id == actor(9))
-            .unwrap();
-        assert_eq!((zero.from_exclusive, zero.to_inclusive), (4, 4));
-        knowledge.settle(&named.1, &BTreeSet::new(), false);
+        assert_eq!((knowledge.after, knowledge.positions[0]), (None, actor(4)));
+        knowledge.settle(&asked.1, (&BTreeSet::new(), false), (false, 5));
+        assert_eq!(knowledge.revision(), 3, "the window moved on");
+        assert_eq!(knowledge.after, asked.1.through);
+        knowledge.settle(&asked.1, (&BTreeSet::new(), false), (true, 5));
+        assert_eq!(knowledge.revision(), 3, "data is progress of its own");
         let next = request_ranges(&local, &remote, 2, &knowledge);
         assert_described(&local, &remote, &next);
-        assert_eq!(next.1.after, named.1.through);
-        knowledge.settle(&next.1, &BTreeSet::new(), false);
+        knowledge.settle(&next.1, (&BTreeSet::new(), false), (false, 5));
         let wrapped = request_ranges(&local, &remote, 2, &knowledge);
-        assert_eq!(wrapped.1, first.1, "after the last actor the window wraps");
+        assert_described(&local, &remote, &wrapped);
+        knowledge.settle(&wrapped.1, (&BTreeSet::new(), false), (false, 5));
+        let again = request_ranges(&local, &remote, 2, &knowledge);
+        assert_eq!(again.1, first.1, "after the last actor the window wraps");
     }
 
     /// A request at every real limit, hints and wants at their largest
