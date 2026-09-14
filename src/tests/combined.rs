@@ -74,13 +74,16 @@ async fn late_invite_faults() {
     }
     let topic = chosen.expect("a topic preferring the unreachable replica");
     let topic_id = topic.id();
+    let mut before_invite = None;
     for index in 0..4200 {
-        topic
+        let record = topic
             .publish(Note {
                 text: format!("before {index}"),
             })
             .unwrap();
+        before_invite = Some(record.meta.op_id);
     }
+    let before_invite = before_invite.unwrap();
     topic.add_peer(carol_peer).unwrap();
 
     let carol = Irokle::builder()
@@ -149,18 +152,21 @@ async fn late_invite_faults() {
         "work owed to the unreachable replica stays outstanding"
     );
     assert!(carol.topic_unresolved(topic_id).unwrap().is_empty());
-    // Obligations keep their peer: the replica's still names the final writes,
-    // while the member that caught up owes nothing once its ack is applied.
+    // Obligations keep their peer: the replica's still names what was written
+    // while it was the target, while the member that caught up owes nothing
+    // once its ack is applied. Writes after the replica ran out of retries go to
+    // the member instead, so which later writes it is owed depends on timing.
     let last = oplog::topological(alice.storage(), &topic_id)
         .unwrap()
         .pop()
         .unwrap()
         .id;
-    let owed = |peer: &PeerId| {
+    let covers = |peer: &PeerId, op_id: &OpId| {
         let obligations = alice.storage().sync_obligations(peer, &topic_id).unwrap();
-        obligation_covers(alice.storage(), &obligations, &last)
+        obligation_covers(alice.storage(), &obligations, op_id)
     };
-    assert!(owed(&down));
+    let owed = |peer: &PeerId| covers(peer, &last);
+    assert!(covers(&down, &before_invite));
     tokio::time::timeout(Duration::from_secs(120), async {
         while owed(&carol_peer) {
             tokio::task::yield_now().await;
@@ -168,6 +174,10 @@ async fn late_invite_faults() {
     })
     .await
     .expect("the caught-up member's ack never settled what it was owed");
+    assert!(
+        covers(&down, &before_invite),
+        "another peer's ack settles nothing of the replica"
+    );
 
     alice.shutdown_iroh().await;
     carol.shutdown_iroh().await;
