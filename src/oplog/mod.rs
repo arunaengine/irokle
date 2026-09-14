@@ -1140,7 +1140,7 @@ impl<S: Storage> Oplog<S> {
         let mut overlay_meta = BTreeMap::new();
         let mut overlay_tips = BTreeMap::new();
         let mut overlay_index = BTreeMap::new();
-        let mut entries = Vec::new();
+        let mut admitted = Vec::new();
         let mut pending = Vec::new();
         // Reuse immutable causal states only within the current genesis.
         let (projection_epoch, mut projections) = {
@@ -1273,10 +1273,10 @@ impl<S: Storage> Oplog<S> {
                     {
                         return Err(Error::InvalidOpId);
                     }
-                    overlay_meta.insert(op.id, meta.clone());
-                    overlay_ops.insert(op.id, op.clone());
+                    overlay_meta.insert(op.id, meta);
                     accepted.insert(op.id);
-                    entries.push((op, meta));
+                    admitted.push(op.id);
+                    overlay_ops.insert(op.id, op);
                 } else {
                     pending.push((op, missing_deps));
                 }
@@ -1348,11 +1348,18 @@ impl<S: Storage> Oplog<S> {
 
             overlay_index.insert((topic_id, meta.actor_id, meta.actor_seq), op.id);
             overlay_tips.insert((topic_id, meta.actor_id), (meta.actor_seq, op.id));
-            overlay_meta.insert(op.id, meta.clone());
-            overlay_ops.insert(op.id, op.clone());
+            overlay_meta.insert(op.id, meta);
             accepted.insert(op.id);
-            entries.push((op, meta));
+            admitted.push(op.id);
+            overlay_ops.insert(op.id, op);
         }
+        // Records move out of the overlay, so the batch holds one copy of each
+        // op and its observed clock. Ops are unique by id, so each is there.
+        let entries = admitted
+            .into_iter()
+            .map(|id| Some((overlay_ops.remove(&id)?, overlay_meta.remove(&id)?)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| Error::Storage("admitted op left the batch overlay".into()))?;
 
         // Effects commit with the entries under the same expected state, so a
         // reset cannot slip between the ops and the work they create.
