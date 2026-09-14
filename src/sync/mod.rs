@@ -104,6 +104,18 @@ impl<S: Storage> SyncEngine<S> {
         self
     }
 
+    /// The ranges and window of a request from `local` toward `remote` that
+    /// continues from `knowledge` within this engine's item limit.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn request_ranges(
+        &self,
+        local: &ActorClock,
+        remote: &ActorClock,
+        knowledge: &RequestKnowledge,
+    ) -> (Vec<ActorRangeHint>, ActorWindow) {
+        request_ranges(local, remote, self.request_items, knowledge)
+    }
+
     pub fn open(topic_id: TopicId, peer_id: PeerId, event_type_id: Option<String>) -> SyncOpen {
         SyncOpen {
             protocol: SYNC_PROTOCOL.into(),

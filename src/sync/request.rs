@@ -18,12 +18,43 @@ use super::{
 pub(crate) struct RequestKnowledge {
     after: Option<ActorId>,
     positions: BTreeSet<ActorId>,
+    /// Grows when a page result names positions not asked for before.
+    revision: u64,
 }
 
 impl RequestKnowledge {
+    /// Fold the result of a page served for a request with `window`. New
+    /// positions keep the window for the next request, which names them first;
+    /// otherwise the next window starts after this one, so positions no
+    /// request could satisfy do not hold every other actor back.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn settle(&mut self, window: &ActorWindow, positions: &BTreeSet<ActorId>) {
+        let known = self.positions.len();
+        self.positions.extend(positions.iter().copied());
+        while self.positions.len() > super::MAX_PAGE_MISSING {
+            self.positions.pop_last();
+        }
+        if self.positions.len() > known {
+            self.after = window.after;
+            self.revision += 1;
+            return;
+        }
+        self.after = window.through;
+        if positions.is_empty() {
+            self.positions.clear();
+        }
+    }
+
     /// How many positions the next request names before anything else.
     pub(crate) fn positions(&self) -> usize {
         self.positions.len()
+    }
+
+    /// How often page results named new positions, so a page that only asked
+    /// for them still counts as progress.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 }
 

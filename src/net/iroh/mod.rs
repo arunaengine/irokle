@@ -125,6 +125,102 @@ impl ReceiptLog {
     }
 }
 
+/// What each peer's page results told this node about its requests for a
+/// topic, kept in memory only and bounded like the receipt log. An entry
+/// continues one branch and staging session; another starts over.
+#[derive(Default)]
+struct RequestLog {
+    entries: BTreeMap<(PeerId, crate::TopicId), RequestEntry>,
+    order: std::collections::VecDeque<(PeerId, crate::TopicId)>,
+}
+
+struct RequestEntry {
+    genesis: crate::OpId,
+    session: Option<u64>,
+    knowledge: crate::sync::RequestKnowledge,
+    /// The window the newest request described.
+    window: crate::sync::ActorWindow,
+}
+
+impl RequestEntry {
+    /// Whether a request on `genesis` and staging `session` continues this
+    /// entry. The first staging session continues requests made before it.
+    fn continues(&self, genesis: crate::OpId, session: Option<u64>) -> bool {
+        self.genesis == genesis && (self.session == session || self.session.is_none())
+    }
+}
+
+impl RequestLog {
+    fn knowledge(
+        &self,
+        key: &(PeerId, crate::TopicId),
+        genesis: crate::OpId,
+        session: Option<u64>,
+    ) -> crate::sync::RequestKnowledge {
+        self.entries
+            .get(key)
+            .filter(|entry| entry.continues(genesis, session))
+            .map(|entry| entry.knowledge.clone())
+            .unwrap_or_default()
+    }
+
+    /// Remember the window of a request planned on `genesis` and `session`.
+    fn sent(
+        &mut self,
+        key: (PeerId, crate::TopicId),
+        genesis: crate::OpId,
+        session: Option<u64>,
+        window: crate::sync::ActorWindow,
+    ) {
+        if let Some(entry) = self
+            .entries
+            .get_mut(&key)
+            .filter(|entry| entry.continues(genesis, session))
+        {
+            entry.session = session;
+            entry.window = window;
+            return;
+        }
+        let entry = RequestEntry {
+            genesis,
+            session,
+            knowledge: Default::default(),
+            window,
+        };
+        if self.entries.insert(key, entry).is_none() {
+            self.order.push_back(key);
+            if self.order.len() > MAX_BOOTSTRAP_RECEIPTS
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    /// Fold a page result for a request planned on `genesis`.
+    fn settle(
+        &mut self,
+        key: &(PeerId, crate::TopicId),
+        genesis: Option<crate::OpId>,
+        positions: &BTreeSet<crate::ActorId>,
+    ) {
+        if let Some(entry) = self
+            .entries
+            .get_mut(key)
+            .filter(|entry| Some(entry.genesis) == genesis)
+        {
+            entry.knowledge.settle(&entry.window, positions);
+        }
+    }
+
+    fn revision(&self, key: &(PeerId, crate::TopicId), genesis: Option<crate::OpId>) -> u64 {
+        self.entries
+            .get(key)
+            .filter(|entry| Some(entry.genesis) == genesis)
+            .map_or(0, |entry| entry.knowledge.revision())
+    }
+}
+
 pub struct IrohNet<S: Storage = MemoryStorage> {
     pool: ConnectionPool,
     accept_started: AtomicBool,
@@ -156,6 +252,7 @@ pub struct SharedNet<S: Storage> {
     outbound: Arc<tokio::sync::Semaphore>,
     served: Arc<tokio::sync::Semaphore>,
     receipts: Mutex<ReceiptLog>,
+    requests: Mutex<RequestLog>,
     shutdown: tokio::sync::watch::Sender<bool>,
     tasks: Arc<TaskTracker>,
     control_lane: Arc<tokio::sync::Semaphore>,
@@ -258,6 +355,7 @@ impl<S: Storage> IrohNet<S> {
                 outbound: Arc::new(tokio::sync::Semaphore::new(MAX_RESYNC_PEER_CONCURRENCY)),
                 served: Arc::new(tokio::sync::Semaphore::new(MAX_SERVED_STREAMS)),
                 receipts: Mutex::default(),
+                requests: Mutex::default(),
                 shutdown,
                 tasks: Arc::default(),
                 control_lane: Arc::new(tokio::sync::Semaphore::new(CONTROL_JOBS)),
@@ -1842,11 +1940,16 @@ impl<S: Storage> SharedNet<S> {
         let receipt = summary.staged.clone();
         // Authorization, branch, pages and the summary sent all come from one
         // snapshot; the evidence write below re-checks its own preconditions.
+        let knowledge = summary.genesis.map(|genesis| {
+            self.request_log()
+                .knowledge(&(remote_peer_id, topic_id), genesis, None)
+        });
         let Some(read) = self
             .node
             .storage()
             .read_snapshot(|read| {
-                self.snapshot_plan(read, remote_peer_id, summary, receipt, budget)
+                let knowledge = knowledge.clone().unwrap_or_default();
+                self.snapshot_plan(read, remote_peer_id, summary, receipt, budget, &knowledge)
             })
             .map_err(invalid_data)?
         else {
@@ -1916,6 +2019,12 @@ impl<S: Storage> SharedNet<S> {
         if wants {
             let request = crate::sync::page_request(plan, Some(planned));
             credit_ops = request.credit.ops as usize;
+            self.request_log().sent(
+                (remote_peer_id, topic_id),
+                planned,
+                None,
+                request.window.clone(),
+            );
             controls.push(SyncMessage::Request(request));
         }
         if let Some(local_summary) = local_summary.filter(|_| !terminal) {
@@ -1965,6 +2074,7 @@ impl<S: Storage> SharedNet<S> {
         summary: &SyncSummary,
         receipt: Option<crate::sync::SyncReceipt>,
         budget: crate::sync::PageBudget,
+        knowledge: &crate::sync::RequestKnowledge,
     ) -> crate::Result<Option<SnapshotPlan>> {
         let topic_id = summary.topic_id;
         let Some(view) = read.topic_view(&topic_id, None)? else {
@@ -1985,7 +2095,7 @@ impl<S: Storage> SharedNet<S> {
             remote_peer_id,
             staged.as_ref().unwrap_or(summary),
             budget,
-            &Default::default(),
+            knowledge,
         )?;
         let converged = view.state.members.contains(&remote_peer_id)
             && summary.genesis == Some(view.state.genesis)
@@ -2059,7 +2169,7 @@ impl<S: Storage> SharedNet<S> {
             .map_err(invalid_data)?;
         // Staging of another branch from this peer is continued only by a
         // smaller genesis, whose first fragment replaces it.
-        let staged = match self
+        let (staged, session) = match self
             .node
             .staged_topic(remote_peer_id, topic_id)
             .map_err(invalid_data)?
@@ -2068,25 +2178,27 @@ impl<S: Storage> SharedNet<S> {
                     .genesis
                     .map(|staged_genesis| (staged_genesis, staged))
             }) {
-            Some((staged_genesis, staged)) if staged_genesis == genesis => staged.clock,
-            Some((staged_genesis, _)) if genesis < staged_genesis => crate::ActorClock::new(),
+            Some((staged_genesis, staged)) if staged_genesis == genesis => {
+                (staged.clock, Some(staged.session))
+            }
+            Some((staged_genesis, _)) if genesis < staged_genesis => {
+                (crate::ActorClock::new(), None)
+            }
             Some(_) => {
                 return Err(invalid_data(
                     "peer offers a larger branch than the one staged from it",
                 ));
             }
-            None => crate::ActorClock::new(),
+            None => (crate::ActorClock::new(), None),
         };
-        let actor_range_hints = summary
-            .actor_clock
-            .iter()
-            .filter(|(actor_id, seq)| staged.get(actor_id) < **seq)
-            .map(|(actor_id, seq)| crate::sync::ActorRangeHint {
-                actor_id: *actor_id,
-                from_exclusive: staged.get(actor_id),
-                to_inclusive: *seq,
-            })
-            .collect::<Vec<_>>();
+        // Staged progress is no replication evidence: the request only names
+        // what the staging holds, continued within this staging session.
+        let key = (remote_peer_id, topic_id);
+        let knowledge = self.request_log().knowledge(&key, genesis, session);
+        let (actor_range_hints, window) =
+            self.node
+                .sync_engine()
+                .request_ranges(&staged, &summary.actor_clock, &knowledge);
         // Everything the peer holds is staged: finish the activation that
         // history owes instead of reporting nothing left to pull.
         if actor_range_hints.is_empty() {
@@ -2108,8 +2220,10 @@ impl<S: Storage> SharedNet<S> {
             send: Vec::new(),
             need: BTreeSet::new(),
             actor_range_hints,
-            window: crate::sync::ActorWindow::default(),
+            window,
         };
+        self.request_log()
+            .sent(key, genesis, session, plan.window.clone());
         let request = crate::sync::page_request(plan, Some(genesis));
         let credit_ops = request.credit.ops as usize;
         Ok(Some(PlannedTopicSync {
@@ -2522,6 +2636,12 @@ impl<S: Storage> SharedNet<S> {
                     if page.more {
                         more.insert(page.topic_id);
                     }
+                    let genesis = geneses.get(&page.topic_id).copied().flatten();
+                    self.request_log().settle(
+                        &(remote_peer_id, page.topic_id),
+                        genesis,
+                        &page.positions,
+                    );
                 }
                 SyncMessage::Request(request) if group_topics.contains(&request.topic_id) => {
                     let topic_id = request.topic_id;
@@ -2685,6 +2805,9 @@ impl<S: Storage> SharedNet<S> {
             let staged = self.staged_clock(peer_id, topic_id, goal.genesis)?;
             return Ok(GoalProgress {
                 staged: covered(&staged, &goal.inbound),
+                requested: self
+                    .request_log()
+                    .revision(&(peer_id, topic_id), goal.genesis),
                 ..GoalProgress::default()
             });
         };
@@ -2707,12 +2830,22 @@ impl<S: Storage> SharedNet<S> {
             inbound: covered(&view.clock, &goal.inbound),
             outbound: covered(&certified, &goal.outbound),
             staged,
+            requested: self
+                .request_log()
+                .revision(&(peer_id, topic_id), goal.genesis),
             holes: self
                 .node
                 .view_unresolved(&view)
                 .map_err(invalid_data)?
                 .len(),
         })
+    }
+
+    fn request_log(&self) -> std::sync::MutexGuard<'_, RequestLog> {
+        // Like the receipt log, only a planning hint.
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn receipt_log(&self) -> std::sync::MutexGuard<'_, ReceiptLog> {
@@ -3185,6 +3318,8 @@ struct GoalProgress {
     /// Staged positions: the peer's receipts for a push, or this node's own
     /// staging for a pull.
     staged: u64,
+    /// Page results that named positions this node's requests had not given.
+    requested: u64,
 }
 
 impl GoalProgress {
@@ -3199,6 +3334,7 @@ impl GoalProgress {
             || self.outbound > before.outbound
             || self.holes < before.holes
             || self.staged > before.staged
+            || self.requested > before.requested
     }
 }
 
