@@ -132,6 +132,12 @@ impl Continuations {
         self.entries.insert(key, continuation);
         Ok(())
     }
+
+    /// Estimated bytes all kept plans hold.
+    #[cfg(test)]
+    pub(super) fn bytes(&self) -> usize {
+        self.entries.values().map(Continuation::bytes).sum()
+    }
 }
 
 /// The requester's position of every actor `request` names.

@@ -29,6 +29,7 @@ mod progress;
 mod protocol;
 mod provisional;
 mod requests;
+mod slices;
 mod snapshot;
 mod staging;
 mod storage;

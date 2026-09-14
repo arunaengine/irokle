@@ -26,9 +26,31 @@ pub(crate) struct PageWork {
     resumed: AtomicU64,
 }
 
+/// A copy of [`PageWork`] with the bytes kept plans hold at one moment.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PageWorkSnapshot {
+    pub(crate) visits: u64,
+    pub(crate) edges: u64,
+    pub(crate) ended: u64,
+    pub(crate) resumed: u64,
+    pub(crate) kept_bytes: u64,
+}
+
 impl PageWork {
     pub(super) fn resumed(&self) {
         self.resumed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn snapshot(&self, kept_bytes: usize) -> PageWorkSnapshot {
+        PageWorkSnapshot {
+            visits: self.visits.load(Ordering::Relaxed),
+            edges: self.edges.load(Ordering::Relaxed),
+            ended: self.ended.load(Ordering::Relaxed),
+            resumed: self.resumed.load(Ordering::Relaxed),
+            kept_bytes: kept_bytes as u64,
+        }
     }
 }
 

@@ -11,7 +11,7 @@ use crate::sync::{PageBudget, SyncCredit, SyncEngine, SyncSummary};
 /// `actors` writers with one op each, sorted by actor key, where every writer's
 /// op depends on the op of the writer with the next larger key and the last one
 /// on the genesis. A window taken in key order selects dependents first.
-fn reverse_chain<S: Storage>(storage: S, actors: usize) -> Source<S> {
+pub(super) fn reverse_chain<S: Storage>(storage: S, actors: usize) -> Source<S> {
     let owner = Ed25519Signer::from_bytes(&[230; 32]);
     let reader = Ed25519Signer::from_bytes(&[231; 32]).peer_id();
     let topic_id = TopicId::hash([b"reverse-chain".as_slice(), &actors.to_le_bytes()].concat());

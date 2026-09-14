@@ -488,6 +488,13 @@ impl<S: Storage> Irokle<S> {
         self
     }
 
+    /// The same node ending a page slice after `visits` storage reads.
+    #[cfg(all(test, feature = "iroh"))]
+    pub(crate) fn with_page_visits(mut self, visits: usize) -> Self {
+        self.sync = self.sync.with_page_visits(visits, 16);
+        self
+    }
+
     /// Ids `view`'s topic cannot resolve, where `view` came from `read`.
     #[cfg(feature = "iroh")]
     pub(crate) fn unresolved_in(

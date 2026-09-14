@@ -18,6 +18,8 @@ mod request;
 mod types;
 
 use continuation::{Continuation, Continuations, MAX_CONTINUATIONS};
+#[cfg(test)]
+pub(crate) use plan::PageWorkSnapshot;
 use plan::{MAX_PAGE_VISITS, PageWork};
 pub(crate) use request::RequestKnowledge;
 use request::{ActorScope, request_ranges};
@@ -117,6 +119,21 @@ impl<S: Storage> SyncEngine<S> {
         self.continuations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Work page plans of this engine and its clones performed so far.
+    #[cfg(test)]
+    pub(crate) fn page_work(&self) -> PageWorkSnapshot {
+        self.work.snapshot(self.continuations().bytes())
+    }
+
+    /// The same engine ending a page slice after `visits` storage reads and
+    /// keeping at most `kept` plans.
+    #[cfg(test)]
+    pub(crate) fn with_page_visits(mut self, visits: usize, kept: usize) -> Self {
+        self.page_visits = visits.max(1);
+        self.continuations = Arc::new(Mutex::new(Continuations::new(kept)));
+        self
     }
 
     /// The same engine planning pages with at most `actors` active actors.
