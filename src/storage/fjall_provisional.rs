@@ -35,6 +35,18 @@ struct NamespaceRecord {
     slot: u32,
 }
 
+/// Schema 5 layout of a namespace record, without revision and bytes.
+#[derive(Deserialize)]
+struct LegacyNamespaceRecord {
+    source: PeerId,
+    topic_id: TopicId,
+    genesis: OpId,
+    session: u64,
+    updated_ms: u64,
+    activating: bool,
+    slot: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SlotRecord {
     source: PeerId,
@@ -186,6 +198,8 @@ impl FjallStorage {
                 session,
                 updated_ms: now_ms,
                 activating: false,
+                revision: 0,
+                bytes: 0,
             };
             Self::tx_put(tx, &self.records, SESSIONS, &session)?;
             Self::tx_put(
@@ -282,7 +296,7 @@ impl FjallStorage {
             else {
                 return Ok(false);
             };
-            if record.provisional.session != provisional.session || record.provisional.activating {
+            if record.provisional != *provisional || record.provisional.activating {
                 return Ok(false);
             }
             Self::tx_end_namespace(tx, &self.records, &record)?;
@@ -456,5 +470,43 @@ impl FjallStorage {
             debug_assert!(current.provisional.activating);
             Ok(())
         })
+    }
+
+    /// Rewrite schema 5 namespace records in `tx` with a first revision and
+    /// the bytes their keyspace's counters hold.
+    pub(super) fn tx_migrate_namespaces(&self, tx: &mut Tx) -> Result<()> {
+        let mut legacy = Vec::new();
+        for item in fjall::Readable::prefix(tx, &self.records, NAMESPACE) {
+            let (key, value) = item.into_inner()?;
+            legacy.push((
+                key.to_vec(),
+                postcard::from_bytes::<LegacyNamespaceRecord>(value.as_ref())?,
+            ));
+        }
+        for (key, record) in legacy {
+            let store = self.slot_store(record.slot)?.records;
+            let admitted: u64 = Self::tx_get(tx, &store, ADMITTED_BYTES)?.unwrap_or_default();
+            let bytes = admitted + Self::tx_pending_bytes(tx, &store)?;
+            let provisional = ProvisionalTopic {
+                source: record.source,
+                topic_id: record.topic_id,
+                genesis: record.genesis,
+                session: record.session,
+                updated_ms: record.updated_ms,
+                activating: record.activating,
+                revision: 0,
+                bytes,
+            };
+            Self::tx_put(
+                tx,
+                &self.records,
+                key,
+                &NamespaceRecord {
+                    provisional,
+                    slot: record.slot,
+                },
+            )?;
+        }
+        Ok(())
     }
 }

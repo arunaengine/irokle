@@ -77,6 +77,10 @@ impl StagingLimits {
 /// A provisional bootstrap: history one source served for a topic this store
 /// does not hold, kept in its own namespace and invisible to every topic query
 /// until it proves this node's membership and is activated.
+///
+/// The value is also the capability of the namespace: a store of it
+/// ([`Storage::provisional_store`]) reads and writes only while the backing
+/// store still registers `session`, and writes only until activation begins.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvisionalTopic {
     pub source: PeerId,
@@ -85,10 +89,15 @@ pub struct ProvisionalTopic {
     pub genesis: OpId,
     /// Durable identity of the namespace; a replacement gets a new one.
     pub session: u64,
-    /// Last write, for idle expiry.
+    /// Last touch, for idle expiry. Wall-clock milliseconds, kept across a restart.
     pub updated_ms: u64,
-    /// Activation began, so part of the history may be in the active records.
+    /// Activation began: the namespace is frozen at the state it validated.
     pub activating: bool,
+    /// Grows with every write to the namespace, so a decision taken on an
+    /// older observation of it is refused.
+    pub revision: u64,
+    /// Serialized op bytes the namespace holds, admitted and buffered.
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -626,7 +635,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
 
     /// The limits this store applies to provisional bootstraps.
     fn staging_limits(&self) -> StagingLimits;
-    /// Every provisional bootstrap namespace.
+    /// Every provisional bootstrap namespace, read at one moment.
     fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>>;
     /// The namespace of `source` for `topic_id`, opened empty for `genesis` when
     /// the source has none. An existing namespace is returned unchanged, whatever
@@ -641,8 +650,12 @@ pub trait Storage: Clone + Send + Sync + 'static {
         now_ms: u64,
     ) -> Result<ProvisionalTopic>;
     /// The store holding the history of `provisional`, or `None` once its
-    /// session ended. It sees only that namespace and refuses a write past the
-    /// namespace byte limit with [`crate::Error::StagingCapacity`].
+    /// session ended. It sees only that namespace. Each of its reads checks that
+    /// the session is still registered and each write, in the transaction that
+    /// commits it, that the session still stages; otherwise
+    /// [`crate::Error::StaleIncarnation`] before any effect. A write past the
+    /// namespace byte limit is refused with
+    /// [`crate::Error::StagingCapacity`].
     fn provisional_store(&self, provisional: &ProvisionalTopic) -> Result<Option<Self>>;
     /// Serialized op bytes this store holds, admitted and buffered.
     fn stored_bytes(&self) -> Result<u64>;
@@ -659,8 +672,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
         expected: &TopicState,
         effects: AdmissionEffects,
     ) -> Result<()>;
-    /// End the namespace of `provisional` while its session is current and it
-    /// is not activating. Returns whether it ended.
+    /// End the namespace of `provisional` while it is still exactly as
+    /// observed, same session, revision and touch, and not activating. Returns
+    /// whether it ended.
     fn discard_provisional(&self, provisional: &ProvisionalTopic) -> Result<bool>;
 }
 

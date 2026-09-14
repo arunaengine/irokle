@@ -201,8 +201,10 @@ fn assert_namespace_limits<S: Storage>(storage: S) {
     assert_eq!(store.stored_bytes().unwrap(), held);
     assert!(store.get_op(&ops[40].id).unwrap().is_none());
 
-    assert!(storage.discard_provisional(&provisional).unwrap());
-    assert!(!storage.discard_provisional(&provisional).unwrap());
+    // A discard ends the namespace as it currently is.
+    let current = storage.provisional_topics().unwrap().remove(0);
+    assert!(storage.discard_provisional(&current).unwrap());
+    assert!(!storage.discard_provisional(&current).unwrap());
     assert!(storage.provisional_store(&provisional).unwrap().is_none());
     let reopened = storage
         .open_provisional(source.peer_id(), topic_id, ops[0].id, now())

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{
@@ -25,8 +26,10 @@ pub struct MemoryStorage {
     inner: Arc<Mutex<MemoryInner>>,
     counters: Arc<StorageCounters>,
     limits: StagingLimits,
-    /// Byte limit of a provisional namespace store; `None` for the main store.
-    namespace: Option<u64>,
+    /// Provisional namespaces, shared by the store and every namespace view.
+    staging: Arc<Mutex<Staging>>,
+    /// Source, topic and session a namespace view stages under; `None` for the main store.
+    namespace: Option<(PeerId, TopicId, u64)>,
 }
 
 impl Default for MemoryStorage {
@@ -35,7 +38,52 @@ impl Default for MemoryStorage {
             inner: Arc::default(),
             counters: Arc::default(),
             limits: StagingLimits::MEMORY,
+            staging: Arc::default(),
             namespace: None,
+        }
+    }
+}
+
+/// Registered provisional namespaces with their records. Lock order: this
+/// registry, then the active records, then a namespace's records.
+#[derive(Default)]
+struct Staging {
+    namespaces: BTreeMap<(PeerId, TopicId), Namespace>,
+    sessions: u64,
+}
+
+type Namespace = (ProvisionalTopic, Arc<Mutex<MemoryInner>>);
+
+/// A store's records, locked after a view's registry entry was checked. A
+/// change through a view updates that entry's bytes and revision on release.
+struct Locked<'a> {
+    inner: MutexGuard<'a, MemoryInner>,
+    staging: Option<(MutexGuard<'a, Staging>, (PeerId, TopicId))>,
+    changed: bool,
+}
+
+impl Deref for Locked<'_> {
+    type Target = MemoryInner;
+
+    fn deref(&self) -> &MemoryInner {
+        &self.inner
+    }
+}
+
+impl DerefMut for Locked<'_> {
+    fn deref_mut(&mut self) -> &mut MemoryInner {
+        self.changed = true;
+        &mut self.inner
+    }
+}
+
+impl Drop for Locked<'_> {
+    fn drop(&mut self) {
+        if let (true, Some((staging, key))) = (self.changed, &mut self.staging)
+            && let Some((provisional, _)) = staging.namespaces.get_mut(key)
+        {
+            provisional.revision = provisional.revision.saturating_add(1);
+            provisional.bytes = self.inner.admitted_bytes + self.inner.pending_usage.bytes;
         }
     }
 }
@@ -71,9 +119,6 @@ struct MemoryInner {
     /// Destructive data epochs; a reset keeps and advances them.
     topic_epochs: BTreeMap<TopicId, u64>,
     attempt_epoch: u64,
-    /// Provisional bootstraps by source and topic, each in its own store.
-    provisional: BTreeMap<(PeerId, TopicId), (ProvisionalTopic, MemoryStorage)>,
-    staging_sessions: u64,
     /// Serialized bytes of admitted ops, counted in a namespace store only.
     admitted_bytes: u64,
 }
@@ -101,8 +146,42 @@ impl MemoryStorage {
         self.counters.snapshot()
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, MemoryInner>> {
-        self.inner.lock().map_err(Error::from)
+    /// The records of this store. A view first checks, under the registry
+    /// lock it keeps, that its session is still registered.
+    fn lock(&self) -> Result<Locked<'_>> {
+        let staging = match self.namespace {
+            Some((source, topic_id, session)) => {
+                let staging = self.staging()?;
+                let current = staging
+                    .namespaces
+                    .get(&(source, topic_id))
+                    .is_some_and(|(provisional, _)| provisional.session == session);
+                if !current {
+                    return Err(Error::StaleIncarnation);
+                }
+                Some((staging, (source, topic_id)))
+            }
+            None => None,
+        };
+        Ok(Locked {
+            inner: self.inner.lock()?,
+            staging,
+            changed: false,
+        })
+    }
+
+    fn staging(&self) -> Result<MutexGuard<'_, Staging>> {
+        self.staging
+            .lock()
+            .map_err(|_| Error::Storage("staging lock poisoned".into()))
+    }
+
+    /// Refuse a registry operation on a namespace view.
+    fn main_store(&self) -> Result<()> {
+        match self.namespace {
+            Some(_) => Err(Error::StaleIncarnation),
+            None => Ok(()),
+        }
     }
 }
 
@@ -180,7 +259,8 @@ impl Storage for MemoryStorage {
     }
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
         let mut inner = self.lock()?;
-        admit_batch_locked(&mut inner, batch, self.namespace)
+        let limit = self.namespace.map(|_| self.limits.namespace_bytes);
+        admit_batch_locked(&mut inner, batch, limit)
     }
 
     fn get_op(&self, id: &OpId) -> Result<Option<Op>> {
@@ -210,7 +290,6 @@ impl Storage for MemoryStorage {
     }
     fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         Ok(self
-            .inner
             .lock()?
             .heads
             .get(topic_id)
@@ -219,7 +298,6 @@ impl Storage for MemoryStorage {
     }
     fn children(&self, op_id: &OpId) -> Result<BTreeSet<OpId>> {
         Ok(self
-            .inner
             .lock()?
             .children
             .get(op_id)
@@ -227,12 +305,7 @@ impl Storage for MemoryStorage {
             .unwrap_or_default())
     }
     fn actor_tip(&self, topic_id: &TopicId, actor_id: &ActorId) -> Result<Option<(u64, OpId)>> {
-        Ok(self
-            .inner
-            .lock()?
-            .actor_tip
-            .get(&(*topic_id, *actor_id))
-            .cloned())
+        Ok(self.lock()?.actor_tip.get(&(*topic_id, *actor_id)).cloned())
     }
     fn actor_index(
         &self,
@@ -241,7 +314,6 @@ impl Storage for MemoryStorage {
         seq: u64,
     ) -> Result<Option<OpId>> {
         Ok(self
-            .inner
             .lock()?
             .actor_by_seq
             .get(&(*topic_id, *actor_id, seq))
@@ -260,7 +332,6 @@ impl Storage for MemoryStorage {
     }
     fn actor_clock(&self, topic_id: &TopicId) -> Result<ActorClock> {
         Ok(self
-            .inner
             .lock()?
             .actor_clock
             .get(topic_id)
@@ -283,7 +354,6 @@ impl Storage for MemoryStorage {
     }
     fn max_generation(&self, topic_id: &TopicId) -> Result<u64> {
         Ok(self
-            .inner
             .lock()?
             .max_generation
             .get(topic_id)
@@ -299,7 +369,6 @@ impl Storage for MemoryStorage {
     }
     fn list_topics(&self) -> Result<Vec<TopicInfo>> {
         Ok(self
-            .inner
             .lock()?
             .topics
             .values()
@@ -393,13 +462,11 @@ impl Storage for MemoryStorage {
                 return Err(Error::Storage("pending waiter quota exceeded".into()));
             }
         }
-        if previous.is_none()
-            && let Some(limit) = self.namespace
-        {
+        if previous.is_none() && self.namespace.is_some() {
             check_namespace(
                 inner.admitted_bytes + inner.pending_usage.bytes,
                 charge,
-                limit,
+                self.limits.namespace_bytes,
             )?;
         }
         if previous.is_none() {
@@ -719,7 +786,7 @@ impl Storage for MemoryStorage {
         // an empty topic with nothing installed in its place.
         let mut staged = inner.clone();
         let removed = reset_topic_locked(&mut staged, topic_id)?;
-        admit_batch_locked(&mut staged, batch, self.namespace)?;
+        admit_batch_locked(&mut staged, batch, None)?;
         // The journal entry is part of the same swap: after it the discarded
         // payloads exist nowhere else, so no ordering here can lose them.
         if let Some((key, eviction)) = journalled_eviction(eviction) {
@@ -757,8 +824,8 @@ impl Storage for MemoryStorage {
 
     fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>> {
         Ok(self
-            .lock()?
-            .provisional
+            .staging()?
+            .namespaces
             .values()
             .map(|(provisional, _)| provisional.clone())
             .collect())
@@ -771,43 +838,55 @@ impl Storage for MemoryStorage {
         genesis: OpId,
         now_ms: u64,
     ) -> Result<ProvisionalTopic> {
-        let mut inner = self.lock()?;
-        if inner.topics.contains_key(&topic_id) {
+        self.main_store()?;
+        let mut staging = self.staging()?;
+        if self.lock()?.topics.contains_key(&topic_id) {
             return Err(Error::AdmissionConflict);
         }
-        if let Some((provisional, _)) = inner.provisional.get(&(source, topic_id)) {
+        if let Some((provisional, _)) = staging.namespaces.get(&(source, topic_id)) {
             return Ok(provisional.clone());
         }
-        let from_source = inner.provisional.keys().filter(|(peer, _)| *peer == source);
-        check_namespaces(&self.limits, inner.provisional.len(), from_source.count())?;
-        inner.staging_sessions += 1;
+        let from_source = staging
+            .namespaces
+            .keys()
+            .filter(|(peer, _)| *peer == source)
+            .count();
+        check_namespaces(&self.limits, staging.namespaces.len(), from_source)?;
+        staging.sessions += 1;
         let provisional = ProvisionalTopic {
             source,
             topic_id,
             genesis,
-            session: inner.staging_sessions,
+            session: staging.sessions,
             updated_ms: now_ms,
             activating: false,
+            revision: 0,
+            bytes: 0,
         };
-        let store = MemoryStorage {
-            inner: Arc::default(),
-            counters: Arc::clone(&self.counters),
-            limits: self.limits,
-            namespace: Some(self.limits.namespace_bytes),
-        };
-        inner
-            .provisional
-            .insert((source, topic_id), (provisional.clone(), store));
+        staging
+            .namespaces
+            .insert((source, topic_id), (provisional.clone(), Arc::default()));
         Ok(provisional)
     }
 
     fn provisional_store(&self, provisional: &ProvisionalTopic) -> Result<Option<Self>> {
+        self.main_store()?;
         Ok(self
-            .lock()?
-            .provisional
+            .staging()?
+            .namespaces
             .get(&(provisional.source, provisional.topic_id))
             .filter(|(current, _)| current.session == provisional.session)
-            .map(|(_, store)| store.clone()))
+            .map(|(_, records)| MemoryStorage {
+                inner: Arc::clone(records),
+                counters: Arc::clone(&self.counters),
+                limits: self.limits,
+                staging: Arc::clone(&self.staging),
+                namespace: Some((
+                    provisional.source,
+                    provisional.topic_id,
+                    provisional.session,
+                )),
+            }))
     }
 
     fn stored_bytes(&self) -> Result<u64> {
@@ -816,9 +895,10 @@ impl Storage for MemoryStorage {
     }
 
     fn touch_provisional(&self, provisional: &ProvisionalTopic, now_ms: u64) -> Result<()> {
-        let mut inner = self.lock()?;
-        if let Some((current, _)) = inner
-            .provisional
+        self.main_store()?;
+        if let Some((current, _)) = self
+            .staging()?
+            .namespaces
             .get_mut(&(provisional.source, provisional.topic_id))
             .filter(|(current, _)| current.session == provisional.session)
         {
@@ -833,23 +913,8 @@ impl Storage for MemoryStorage {
         expected: &TopicState,
         effects: AdmissionEffects,
     ) -> Result<()> {
+        self.main_store()?;
         let topic_id = provisional.topic_id;
-        let mut inner = self.lock()?;
-        if inner.topics.contains_key(&topic_id) {
-            return Err(Error::AdmissionConflict);
-        }
-        let Some((_, store)) = inner
-            .provisional
-            .get(&(provisional.source, topic_id))
-            .filter(|(current, _)| current.session == provisional.session)
-        else {
-            return Err(Error::StaleIncarnation);
-        };
-        let store = store.clone();
-        let staged = store.lock()?;
-        if memory_topic_state_locked(&staged, &topic_id).as_ref() != Some(expected) {
-            return Err(Error::AdmissionConflict);
-        }
         if effects
             .sync_obligations
             .iter()
@@ -857,7 +922,25 @@ impl Storage for MemoryStorage {
         {
             return Err(Error::TopicMismatch);
         }
-        // One guard over both stores: nothing sees part of the history.
+        // Registry, active and staged records stay locked together, so no view
+        // writes and no reader sees part of the history.
+        let mut staging = self.staging()?;
+        let mut inner = self.lock()?;
+        if inner.topics.contains_key(&topic_id) {
+            return Err(Error::AdmissionConflict);
+        }
+        let Some((_, records)) = staging
+            .namespaces
+            .get(&(provisional.source, topic_id))
+            .filter(|(current, _)| current.session == provisional.session)
+        else {
+            return Err(Error::StaleIncarnation);
+        };
+        let records = Arc::clone(records);
+        let staged = records.lock()?;
+        if memory_topic_state_locked(&staged, &topic_id).as_ref() != Some(expected) {
+            return Err(Error::AdmissionConflict);
+        }
         copy_topic_locked(&staged, &mut inner, &topic_id);
         inner.topics.insert(topic_id, expected.clone());
         for obligation in effects.sync_obligations {
@@ -868,21 +951,23 @@ impl Storage for MemoryStorage {
             let merged = merged_obligation_locked(&inner, &obligation)?;
             put_obligation_locked(&mut inner, merged);
         }
-        inner
-            .provisional
+        drop(staged);
+        staging
+            .namespaces
             .retain(|(_, staged_topic), _| *staged_topic != topic_id);
         Ok(())
     }
 
     fn discard_provisional(&self, provisional: &ProvisionalTopic) -> Result<bool> {
-        let mut inner = self.lock()?;
+        self.main_store()?;
+        let mut staging = self.staging()?;
         let key = (provisional.source, provisional.topic_id);
-        let current = inner
-            .provisional
+        let current = staging
+            .namespaces
             .get(&key)
-            .is_some_and(|(current, _)| current.session == provisional.session);
+            .is_some_and(|(current, _)| current == provisional && !current.activating);
         if current {
-            inner.provisional.remove(&key);
+            staging.namespaces.remove(&key);
         }
         Ok(current)
     }

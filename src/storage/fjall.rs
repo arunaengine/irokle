@@ -37,7 +37,7 @@ pub struct FjallStorage {
 }
 
 #[cfg(feature = "fjall")]
-const FJALL_SCHEMA_VERSION: u32 = 5;
+const FJALL_SCHEMA_VERSION: u32 = 6;
 /// Eviction journal records. No other keyspace begins with `e`, so this is the
 /// whole prefix: unlike `ob`, it cannot be shadowed by a single-letter prefix.
 #[cfg(feature = "fjall")]
@@ -215,18 +215,25 @@ impl FjallStorage {
                 self.migrate_to_schema_two()?;
                 self.migrate_to_schema_three()?;
                 self.migrate_to_schema_four()?;
-                self.migrate_to_schema_five()
+                self.migrate_to_schema_five()?;
+                self.migrate_to_schema_six()
             }
             Some(2) => {
                 self.migrate_to_schema_three()?;
                 self.migrate_to_schema_four()?;
-                self.migrate_to_schema_five()
+                self.migrate_to_schema_five()?;
+                self.migrate_to_schema_six()
             }
             Some(3) => {
                 self.migrate_to_schema_four()?;
-                self.migrate_to_schema_five()
+                self.migrate_to_schema_five()?;
+                self.migrate_to_schema_six()
             }
-            Some(4) => self.migrate_to_schema_five(),
+            Some(4) => {
+                self.migrate_to_schema_five()?;
+                self.migrate_to_schema_six()
+            }
+            Some(5) => self.migrate_to_schema_six(),
             Some(version) => Err(Error::Storage(format!(
                 "unsupported fjall schema version {version}"
             ))),
@@ -457,6 +464,21 @@ impl FjallStorage {
             for prefix in [b"bm".as_slice(), b"bo".as_slice()] {
                 Self::tx_remove_prefix(tx, &self.records, prefix)?;
             }
+            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &5_u32)?;
+            Ok(())
+        })
+    }
+
+    /// Upgrade a schema 5 database. Namespace records gain a revision and the
+    /// bytes their keyspace holds, measured from its stored counters. An
+    /// interrupted activation keeps its claim and its copies, which the root
+    /// reads now hide until it completes.
+    fn migrate_to_schema_six(&self) -> Result<()> {
+        self.transaction(|tx| {
+            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(5) {
+                return Ok(());
+            }
+            self.tx_migrate_namespaces(tx)?;
             Self::tx_put(
                 tx,
                 &self.records,

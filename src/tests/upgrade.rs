@@ -95,7 +95,7 @@ fn check_upgrade(name: &str, certified: bool) {
     let m = Manifest::read(dir.path());
     let path = dir.path().join("db");
     drop(FjallStorage::open(&path).unwrap());
-    assert_eq!(stored_version(&path), 5);
+    assert_eq!(stored_version(&path), 6);
     let storage = FjallStorage::open(&path).unwrap();
 
     let topic: TopicId = m.id("topic");
@@ -257,7 +257,7 @@ fn concurrent_open_agrees() {
             .collect::<Vec<_>>();
         assert_eq!(seen[0], seen[1], "{name}");
         drop(db);
-        assert_eq!(stored_version(&dir.path().join("db")), 5, "{name}");
+        assert_eq!(stored_version(&dir.path().join("db")), 6, "{name}");
     }
 }
 
@@ -280,7 +280,7 @@ fn upgrade_rolls_back() {
 
         raw_write(&path, &key, value);
         drop(FjallStorage::open(&path).unwrap());
-        assert_eq!(stored_version(&path), 5, "{name}");
+        assert_eq!(stored_version(&path), 6, "{name}");
     }
 }
 
@@ -323,7 +323,7 @@ fn upgrades_staged_schema_four() {
     let staged: TopicId = m.id("staged");
     assert!(storage.topic_state(&staged).unwrap().is_none());
     drop(storage);
-    assert_eq!(stored_version(&path), 5);
+    assert_eq!(stored_version(&path), 6);
     assert_eq!(staging(&raw_records(&path)), 0);
 }
 
