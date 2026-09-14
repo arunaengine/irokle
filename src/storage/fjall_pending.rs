@@ -376,7 +376,7 @@ impl FjallStorage {
     }
 
     pub(super) fn read_pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>> {
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         let mut out = Vec::new();
         for item in
             fjall::Readable::prefix(&read_tx, &self.records, key(&[WAITER, dep_id.as_ref()]))
@@ -393,7 +393,7 @@ impl FjallStorage {
         after: Option<&OpId>,
         limit: usize,
     ) -> Result<Vec<(PeerId, Op)>> {
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         let start = match after {
             Some(after) => Bound::Excluded(key(&[READY, after.as_ref()])),
             None => Bound::Included(READY.to_vec()),
@@ -464,7 +464,7 @@ impl FjallStorage {
     /// Stored pool usage in total and for `source_peer`, for tests.
     #[cfg(test)]
     pub(crate) fn pending_usage(&self, source_peer: &PeerId) -> (u64, u64, u64, u64) {
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot().expect("fjall snapshot");
         let total = Self::tx_usage(&read_tx, &self.records, TOTAL_USAGE).unwrap();
         let source = Self::tx_usage(
             &read_tx,

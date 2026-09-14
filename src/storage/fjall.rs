@@ -10,7 +10,7 @@ use crate::{
     TopicInfo,
 };
 
-use super::fjall_provisional::{ACTIVATING, ADMITTED_BYTES};
+use super::fjall_provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
 use super::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
     ObligationTarget, OpMeta, PeerAck, ProvisionalTopic, SnapshotRead, StagingLimits, Storage,
@@ -29,8 +29,9 @@ pub struct FjallStorage {
     persist_mode: fjall::PersistMode,
     pub(super) counters: std::sync::Arc<StorageCounters>,
     pub(super) limits: StagingLimits,
-    /// Byte limit of a provisional namespace store; `None` for the main store.
-    namespace: Option<u64>,
+    /// The registry record a provisional namespace view stages under; `None`
+    /// for the main store.
+    pub(super) namespace: Option<Fence>,
     /// Key a test rewrites before every single-attempt commit, forcing a conflict.
     #[cfg(test)]
     conflict_key: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
@@ -183,17 +184,39 @@ impl FjallStorage {
         self
     }
 
-    /// This store over the keyspace of a provisional namespace.
-    pub(super) fn namespace_view(&self, records: fjall::OptimisticTxKeyspace) -> Self {
+    /// This store over the keyspace of a provisional namespace, fenced by `fence`.
+    pub(super) fn namespace_view(
+        &self,
+        records: fjall::OptimisticTxKeyspace,
+        fence: Fence,
+    ) -> Self {
         Self {
             db: self.db.clone(),
             records,
             persist_mode: self.persist_mode,
             counters: std::sync::Arc::clone(&self.counters),
             limits: self.limits,
-            namespace: Some(self.limits.namespace_bytes),
+            namespace: Some(fence),
             #[cfg(test)]
             conflict_key: Default::default(),
+        }
+    }
+
+    /// A read snapshot. A namespace view first checks in it that its session
+    /// is still registered.
+    pub(super) fn snapshot(&self) -> Result<fjall::Snapshot> {
+        let snapshot = self.db.read_tx();
+        if let Some(fence) = &self.namespace {
+            Self::check_fence(&snapshot, fence)?;
+        }
+        Ok(snapshot)
+    }
+
+    /// Refuse a registry operation on a namespace view.
+    pub(super) fn main_store(&self) -> Result<()> {
+        match self.namespace {
+            Some(_) => Err(Error::StaleIncarnation),
+            None => Ok(()),
         }
     }
 
@@ -496,7 +519,15 @@ impl FjallStorage {
         for _ in 0..64 {
             self.counters.count_attempt();
             let mut tx = self.db.write_tx()?.durability(Some(self.persist_mode));
-            let result = f(&mut tx)?;
+            let result = match &self.namespace {
+                Some(fence) => {
+                    Self::tx_fence_write(&tx, fence)?;
+                    let result = f(&mut tx)?;
+                    Self::tx_fence_commit(&mut tx, fence, &self.records)?;
+                    result
+                }
+                None => f(&mut tx)?,
+            };
             match tx.commit()? {
                 Ok(()) => return Ok(result),
                 Err(_) => continue,
@@ -513,7 +544,15 @@ impl FjallStorage {
     ) -> Result<R> {
         self.counters.count_attempt();
         let mut tx = self.db.write_tx()?.durability(Some(self.persist_mode));
-        let result = f(&mut tx)?;
+        let result = match &self.namespace {
+            Some(fence) => {
+                Self::tx_fence_write(&tx, fence)?;
+                let result = f(&mut tx)?;
+                Self::tx_fence_commit(&mut tx, fence, &self.records)?;
+                result
+            }
+            None => f(&mut tx)?,
+        };
         #[cfg(test)]
         self.race_commit()?;
         match tx.commit()? {
@@ -656,11 +695,9 @@ impl FjallStorage {
         &self,
         key: impl AsRef<[u8]>,
     ) -> Result<Option<T>> {
-        Ok(
-            fjall::Readable::get(&self.db.read_tx(), &self.records, key)?
-                .map(|v| postcard::from_bytes(v.as_ref()))
-                .transpose()?,
-        )
+        Ok(fjall::Readable::get(&self.snapshot()?, &self.records, key)?
+            .map(|v| postcard::from_bytes(v.as_ref()))
+            .transpose()?)
     }
 
     /// How `ack` may commit against the topic as this transaction sees it. The
@@ -857,7 +894,7 @@ impl FjallStorage {
                             .is_some(),
                 )
             })?;
-            if let Some(limit) = self.namespace {
+            if self.namespace.is_some() {
                 let mut charge = 0;
                 for (op, _) in &new_entries {
                     if !fjall::Readable::contains_key(
@@ -873,7 +910,7 @@ impl FjallStorage {
                 check_namespace(
                     admitted + Self::tx_pending_bytes(tx, &self.records)?,
                     charge,
-                    limit,
+                    self.limits.namespace_bytes,
                 )?;
                 Self::tx_put(tx, &self.records, ADMITTED_BYTES, &(admitted + charge))?;
             }
@@ -1274,7 +1311,7 @@ impl FjallStorage {
 impl Storage for FjallStorage {
     fn read_snapshot<R>(&self, read: impl FnOnce(&dyn SnapshotRead) -> Result<R>) -> Result<R> {
         read(&FjallSnapshot {
-            tx: self.db.read_tx(),
+            tx: self.snapshot()?,
             records: &self.records,
             counters: &self.counters,
         })
@@ -1357,7 +1394,7 @@ impl Storage for FjallStorage {
 
     fn pending_evictions(&self) -> Result<Vec<TopicEviction>> {
         let mut out = Vec::new();
-        for item in fjall::Readable::prefix(&self.db.read_tx(), &self.records, EVICTION_PREFIX) {
+        for item in fjall::Readable::prefix(&self.snapshot()?, &self.records, EVICTION_PREFIX) {
             let (_, value) = item.into_inner()?;
             out.push(postcard::from_bytes(value.as_ref())?);
         }
@@ -1379,10 +1416,10 @@ impl Storage for FjallStorage {
         self.get(Self::key_id(b"m", id))
     }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
-        Self::read_resolvable(&self.db.read_tx(), &self.records, id)
+        Self::read_resolvable(&self.snapshot()?, &self.records, id)
     }
     fn list_ops(&self, topic_id: &TopicId) -> Result<Vec<Op>> {
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         let prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
         let mut out = Vec::new();
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
@@ -1395,7 +1432,7 @@ impl Storage for FjallStorage {
         Ok(out)
     }
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
-        Self::read_topic_ids(&self.db.read_tx(), &self.records, topic_id)
+        Self::read_topic_ids(&self.snapshot()?, &self.records, topic_id)
     }
     fn heads(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         Ok(self.get(Self::key_id(b"h", topic_id))?.unwrap_or_default())
@@ -1403,7 +1440,7 @@ impl Storage for FjallStorage {
     fn children(&self, op_id: &OpId) -> Result<BTreeSet<OpId>> {
         let prefix = [b"ch".as_slice(), op_id.as_ref()].concat();
         let mut out = BTreeSet::new();
-        for item in fjall::Readable::prefix(&self.db.read_tx(), &self.records, prefix) {
+        for item in fjall::Readable::prefix(&self.snapshot()?, &self.records, prefix) {
             let (key, _) = item.into_inner()?;
             out.insert(Self::op_id_from_key(key.as_ref(), 2 + OpId::LEN)?);
         }
@@ -1435,7 +1472,7 @@ impl Storage for FjallStorage {
         after: u64,
         limit: usize,
     ) -> Result<Vec<(u64, OpId)>> {
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         let out =
             Self::read_actor_range(&read_tx, &self.records, (topic_id, actor_id), after, limit)?;
         self.counters.count_index(out.len());
@@ -1454,7 +1491,7 @@ impl Storage for FjallStorage {
         Ok(self.get(Self::key_id(b"mg", topic_id))?.unwrap_or_default())
     }
     fn topic_state(&self, topic_id: &TopicId) -> Result<Option<TopicState>> {
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         let Some(value) =
             fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"ts", topic_id))?
         else {
@@ -1470,7 +1507,7 @@ impl Storage for FjallStorage {
     fn list_topics(&self) -> Result<Vec<TopicInfo>> {
         // v0 keeps this simple: scan durable topic records instead of maintaining a second index.
         let mut out = Vec::new();
-        for item in fjall::Readable::prefix(&self.db.read_tx(), &self.records, b"ts") {
+        for item in fjall::Readable::prefix(&self.snapshot()?, &self.records, b"ts") {
             let value = item.value()?;
             let s: TopicState = postcard::from_bytes(value.as_ref())?;
             out.push(TopicInfo {
@@ -1486,10 +1523,10 @@ impl Storage for FjallStorage {
         topic_id: &TopicId,
         peer_id: Option<&PeerId>,
     ) -> Result<Option<TopicView>> {
-        Self::read_topic_view(&self.db.read_tx(), &self.records, topic_id, peer_id)
+        Self::read_topic_view(&self.snapshot()?, &self.records, topic_id, peer_id)
     }
     fn peer_reached_op(&self, peer_id: &PeerId, op_id: &OpId) -> Result<bool> {
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         let Some((meta, genesis)) = Self::read_op_branch(&read_tx, &self.records, op_id)? else {
             return Ok(false);
         };
@@ -1501,7 +1538,7 @@ impl Storage for FjallStorage {
         Ok(ack.is_some_and(|ack| ack_reached_op(&ack, genesis, &meta)))
     }
     fn peers_reached_op(&self, op_id: &OpId) -> Result<Vec<PeerId>> {
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         let Some((meta, genesis)) = Self::read_op_branch(&read_tx, &self.records, op_id)? else {
             return Ok(Vec::new());
         };
@@ -1520,7 +1557,7 @@ impl Storage for FjallStorage {
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         let charge = Self::pending_charge(&op, &meta)?;
         self.transaction(|tx| {
-            if let Some(limit) = self.namespace
+            if self.namespace.is_some()
                 && Self::tx_pending_record(tx, &self.records, &op.id)?.is_none()
             {
                 let admitted: u64 =
@@ -1528,7 +1565,7 @@ impl Storage for FjallStorage {
                 check_namespace(
                     admitted + Self::tx_pending_bytes(tx, &self.records)?,
                     charge,
-                    limit,
+                    self.limits.namespace_bytes,
                 )?;
             }
             Self::tx_put_pending(tx, &self.records, source_peer, &op, &meta, charge)
@@ -1541,7 +1578,7 @@ impl Storage for FjallStorage {
         self.read_ready_after(after, limit)
     }
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
-        Self::read_pending_missing(&self.db.read_tx(), &self.records, topic_id)
+        Self::read_pending_missing(&self.snapshot()?, &self.records, topic_id)
     }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         self.transaction(|tx| Self::tx_remove_pending_op(tx, &self.records, op_id))
@@ -1559,7 +1596,7 @@ impl Storage for FjallStorage {
     }
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>> {
         let mut out = Vec::new();
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         let prefix = [PEER_ACK_PREFIX, topic_id.as_ref()].concat();
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
             out.push(postcard::from_bytes(item.value()?.as_ref())?);
@@ -1581,7 +1618,7 @@ impl Storage for FjallStorage {
 
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>> {
         let mut out = Vec::new();
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         for item in fjall::Readable::prefix(&read_tx, &self.records, OBLIGATION_PREFIX) {
             let (key, value) = item.into_inner()?;
             if key.len() != OBLIGATION_KEY_LEN {
@@ -1628,7 +1665,7 @@ impl Storage for FjallStorage {
     ) -> Result<Vec<SyncObligation>> {
         let prefix = Self::obligation_prefix(topic_id, peer_id);
         let mut out = Vec::new();
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
             let value = item.value()?;
             out.push(postcard::from_bytes(value.as_ref())?);
@@ -1638,7 +1675,7 @@ impl Storage for FjallStorage {
     }
 
     fn sync_obligation_count(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<usize> {
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         let mut count = 0;
         for target in [
             ObligationTarget::Clock(ActorClock::new()),
@@ -1656,7 +1693,7 @@ impl Storage for FjallStorage {
 
     fn has_sync_obligations(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<bool> {
         let prefix = Self::obligation_prefix(topic_id, peer_id);
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         Ok(fjall::Readable::prefix(&read_tx, &self.records, prefix)
             .next()
             .is_some())
@@ -1707,7 +1744,7 @@ impl Storage for FjallStorage {
 
     fn topic_obligation_counts(&self, topic_id: &TopicId) -> Result<BTreeMap<PeerId, usize>> {
         let mut counts = BTreeMap::new();
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         let prefix = [OBLIGATION_PREFIX, topic_id.as_ref()].concat();
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
             let key = item.key()?;
@@ -1749,7 +1786,7 @@ impl Storage for FjallStorage {
     fn sync_statuses(&self, topic_id: &TopicId) -> Result<Vec<SyncPeerStatus>> {
         let prefix = [b"ss".as_slice(), topic_id.as_ref()].concat();
         let mut out = Vec::new();
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
             let value = item.value()?;
             out.push(decode_status(value.as_ref())?);
@@ -1784,7 +1821,7 @@ impl Storage for FjallStorage {
     }
 
     fn stored_bytes(&self) -> Result<u64> {
-        let read_tx = self.db.read_tx();
+        let read_tx = self.snapshot()?;
         let admitted: u64 =
             Self::tx_get(&read_tx, &self.records, ADMITTED_BYTES)?.unwrap_or_default();
         Ok(admitted + Self::tx_pending_bytes(&read_tx, &self.records)?)

@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Provisional bootstrap namespaces in Fjall. Each namespace takes one slot of
 //! a fixed pool of keyspaces, which is cleared before another session reuses it.
+//!
+//! The registry in the main keyspace owns every namespace. `bn<source><topic>`
+//! names its session and `bs<slot>` gives it a slot. A view reads while `bn`
+//! names its session and writes, checked in the writing transaction, while
+//! that session is not activating. Activation marks `ba<topic>` and copies the
+//! history into the active records; one transaction then installs the topic
+//! and ends every namespace of it, whose slots clear before reuse.
 
 use std::collections::BTreeSet;
 
@@ -56,6 +63,14 @@ struct SlotRecord {
     clearing: bool,
 }
 
+/// The capability of a namespace view: the registry record it stages under.
+#[derive(Clone)]
+pub(super) struct Fence {
+    registry: Records,
+    key: Vec<u8>,
+    session: u64,
+}
+
 fn namespace_key(source: &PeerId, topic_id: &TopicId) -> Vec<u8> {
     [NAMESPACE, source.as_ref(), topic_id.as_ref()].concat()
 }
@@ -82,19 +97,50 @@ impl FjallStorage {
         Ok(out)
     }
 
-    /// The keyspace store of `slot`, applying the namespace byte limit.
-    fn slot_store(&self, slot: u32) -> Result<Self> {
-        let records = self.db.keyspace(
+    /// The keyspace of `slot`.
+    fn slot_records(&self, slot: u32) -> Result<Records> {
+        Ok(self.db.keyspace(
             &format!("bootstrap-{slot}"),
             fjall::KeyspaceCreateOptions::default,
-        )?;
-        Ok(self.namespace_view(records))
+        )?)
     }
 
     fn current_record(&self, provisional: &ProvisionalTopic) -> Result<Option<NamespaceRecord>> {
         let record: Option<NamespaceRecord> =
             self.get(namespace_key(&provisional.source, &provisional.topic_id))?;
         Ok(record.filter(|record| record.provisional.session == provisional.session))
+    }
+
+    /// The registry record of `fence`, while its session is registered.
+    fn fenced(tx: &impl fjall::Readable, fence: &Fence) -> Result<NamespaceRecord> {
+        Self::tx_get::<NamespaceRecord>(tx, &fence.registry, fence.key.as_slice())?
+            .filter(|record| record.provisional.session == fence.session)
+            .ok_or(Error::StaleIncarnation)
+    }
+
+    /// Refuse a view's read once its session ended.
+    pub(super) fn check_fence(tx: &impl fjall::Readable, fence: &Fence) -> Result<()> {
+        Self::fenced(tx, fence).map(drop)
+    }
+
+    /// Refuse a view's write unless its session still stages. Read in the
+    /// writing transaction, so an end or activation committed meanwhile makes
+    /// the write conflict instead of landing after it.
+    pub(super) fn tx_fence_write(tx: &Tx, fence: &Fence) -> Result<()> {
+        if Self::fenced(tx, fence)?.provisional.activating {
+            return Err(Error::StaleIncarnation);
+        }
+        Ok(())
+    }
+
+    /// Record a view's write in its registry record: the bytes its keyspace
+    /// holds now and a new revision.
+    pub(super) fn tx_fence_commit(tx: &mut Tx, fence: &Fence, records: &Records) -> Result<()> {
+        let mut record = Self::fenced(tx, fence)?;
+        let admitted: u64 = Self::tx_get(tx, records, ADMITTED_BYTES)?.unwrap_or_default();
+        record.provisional.bytes = admitted + Self::tx_pending_bytes(tx, records)?;
+        record.provisional.revision = record.provisional.revision.saturating_add(1);
+        Self::tx_put(tx, &fence.registry, fence.key.as_slice(), &record)
     }
 
     /// Empty every slot whose session ended, one bounded transaction at a time.
@@ -113,15 +159,15 @@ impl FjallStorage {
                 .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
                 .map(u32::from_be_bytes)
                 .ok_or_else(|| Error::Storage("corrupt fjall bootstrap slot key".into()))?;
-            let store = self.slot_store(slot)?;
+            let store = self.slot_records(slot)?;
             loop {
-                let removed = store.transaction(|tx| {
+                let removed = self.transaction(|tx| {
                     let mut keys = Vec::new();
-                    for item in fjall::Readable::iter(tx, &store.records).take(CHUNK) {
+                    for item in fjall::Readable::iter(tx, &store).take(CHUNK) {
                         keys.push(item.key()?.to_vec());
                     }
                     for key in &keys {
-                        tx.remove(&store.records, key.clone());
+                        tx.remove(&store, key.clone());
                     }
                     Ok(keys.len())
                 })?;
@@ -154,6 +200,7 @@ impl FjallStorage {
         genesis: OpId,
         now_ms: u64,
     ) -> Result<ProvisionalTopic> {
+        self.main_store()?;
         self.reclaim_slots()?;
         let limits = self.limits;
         self.transaction(|tx| {
@@ -227,9 +274,18 @@ impl FjallStorage {
     }
 
     pub(super) fn namespace_store(&self, provisional: &ProvisionalTopic) -> Result<Option<Self>> {
-        self.current_record(provisional)?
-            .map(|record| self.slot_store(record.slot))
-            .transpose()
+        self.main_store()?;
+        let Some(record) = self.current_record(provisional)? else {
+            return Ok(None);
+        };
+        let fence = Fence {
+            registry: self.records.clone(),
+            key: namespace_key(&provisional.source, &provisional.topic_id),
+            session: provisional.session,
+        };
+        Ok(Some(
+            self.namespace_view(self.slot_records(record.slot)?, fence),
+        ))
     }
 
     pub(super) fn touch_namespace(
@@ -237,6 +293,7 @@ impl FjallStorage {
         provisional: &ProvisionalTopic,
         now_ms: u64,
     ) -> Result<()> {
+        self.main_store()?;
         let key = namespace_key(&provisional.source, &provisional.topic_id);
         self.transaction(|tx| {
             if let Some(mut record) =
@@ -290,6 +347,7 @@ impl FjallStorage {
     }
 
     pub(super) fn discard_namespace(&self, provisional: &ProvisionalTopic) -> Result<bool> {
+        self.main_store()?;
         let key = namespace_key(&provisional.source, &provisional.topic_id);
         let ended = self.transaction(|tx| {
             let Some(record) = Self::tx_get::<NamespaceRecord>(tx, &self.records, key.as_slice())?
@@ -314,6 +372,7 @@ impl FjallStorage {
         expected: &TopicState,
         effects: &AdmissionEffects,
     ) -> Result<()> {
+        self.main_store()?;
         if effects
             .sync_obligations
             .iter()
@@ -321,7 +380,8 @@ impl FjallStorage {
         {
             return Err(Error::TopicMismatch);
         }
-        let store = self.copy_namespace(provisional, expected)?;
+        let store = self.mark_activation(provisional, expected)?;
+        self.copy_namespace(&store)?;
         self.finish_activation(provisional, &store, expected, effects)?;
         self.reclaim_slots()
     }
@@ -329,39 +389,40 @@ impl FjallStorage {
     /// Stop an activation after its copies, as a crash there would.
     #[cfg(test)]
     pub(crate) fn interrupt_activation(&self, provisional: &ProvisionalTopic) {
-        let store = self.namespace_store(provisional).unwrap().unwrap();
-        let state =
-            Self::tx_namespace_state(&self.db.read_tx(), &store.records, &provisional.topic_id)
-                .unwrap()
-                .unwrap();
-        self.copy_namespace(provisional, &state).unwrap();
+        let record = self.current_record(provisional).unwrap().unwrap();
+        let records = self.slot_records(record.slot).unwrap();
+        let state = Self::tx_namespace_state(&self.db.read_tx(), &records, &provisional.topic_id)
+            .unwrap()
+            .unwrap();
+        let store = self.mark_activation(provisional, &state).unwrap();
+        self.copy_namespace(&store).unwrap();
     }
 
-    /// Mark the namespace activating and copy its records into the active
-    /// records in bounded transactions. Returns the namespace store.
-    fn copy_namespace(
+    /// Mark the namespace activating after checking, before any copy, that the
+    /// topic is inactive and the namespace state is `expected`. Returns the
+    /// namespace keyspace.
+    fn mark_activation(
         &self,
         provisional: &ProvisionalTopic,
         expected: &TopicState,
-    ) -> Result<Self> {
+    ) -> Result<Records> {
         let topic_id = provisional.topic_id;
         let key = namespace_key(&provisional.source, &topic_id);
-        let record = self.transaction(|tx| {
-            let record = Self::tx_get::<NamespaceRecord>(tx, &self.records, key.as_slice())?
+        let slot = self.transaction(|tx| {
+            let mut record = Self::tx_get::<NamespaceRecord>(tx, &self.records, key.as_slice())?
                 .filter(|record| record.provisional.session == provisional.session)
                 .ok_or(Error::StaleIncarnation)?;
             if fjall::Readable::contains_key(tx, &self.records, Self::key_id(b"ts", &topic_id))? {
                 return Err(Error::AdmissionConflict);
             }
-            // Checked before any copy, so a stale expectation leaves nothing behind.
-            let store = self.slot_store(record.slot)?;
-            if Self::tx_namespace_state(tx, &store.records, &topic_id)?.as_ref() != Some(expected) {
+            let store = self.slot_records(record.slot)?;
+            if Self::tx_namespace_state(tx, &store, &topic_id)?.as_ref() != Some(expected) {
                 return Err(Error::AdmissionConflict);
             }
             if !record.provisional.activating {
-                let mut marked = record.clone();
-                marked.provisional.activating = true;
-                Self::tx_put(tx, &self.records, key.as_slice(), &marked)?;
+                record.provisional.activating = true;
+                record.provisional.revision = record.provisional.revision.saturating_add(1);
+                Self::tx_put(tx, &self.records, key.as_slice(), &record)?;
                 Self::tx_put(
                     tx,
                     &self.records,
@@ -369,37 +430,41 @@ impl FjallStorage {
                     &provisional.session,
                 )?;
             }
-            Ok(record)
+            Ok(record.slot)
         })?;
-        let store = self.slot_store(record.slot)?;
-        // Copies stay invisible until the state record below names the topic.
+        self.slot_records(slot)
+    }
+
+    /// Copy the namespace into the active records in bounded transactions.
+    /// Copies stay invisible until the state record names the topic.
+    fn copy_namespace(&self, store: &Records) -> Result<()> {
         let mut after: Option<Vec<u8>> = None;
         loop {
-            let (copied, last) = self.transaction(|tx| {
-                let mut copied = 0;
+            let (seen, last) = self.transaction(|tx| {
+                let mut seen = 0;
                 let mut last = None;
                 let start = after
                     .clone()
                     .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
                 for item in fjall::Readable::range::<Vec<u8>, _>(
                     tx,
-                    &store.records,
+                    store,
                     (start, std::ops::Bound::Unbounded),
                 )
                 .take(CHUNK)
                 {
                     let (key, value) = item.into_inner()?;
-                    copied += 1;
+                    seen += 1;
                     if copied_record(&key) {
                         tx.insert(&self.records, key.to_vec(), value);
                     }
                     last = Some(key.to_vec());
                 }
-                Ok((copied, last))
+                Ok((seen, last))
             })?;
             after = last.or(after);
-            if copied < CHUNK {
-                return Ok(store);
+            if seen < CHUNK {
+                return Ok(());
             }
         }
     }
@@ -408,32 +473,30 @@ impl FjallStorage {
     fn finish_activation(
         &self,
         provisional: &ProvisionalTopic,
-        store: &Self,
+        store: &Records,
         expected: &TopicState,
         effects: &AdmissionEffects,
     ) -> Result<()> {
         let topic_id = provisional.topic_id;
         let key = namespace_key(&provisional.source, &topic_id);
         self.transaction(|tx| {
-            let current = Self::tx_get::<NamespaceRecord>(tx, &self.records, key.as_slice())?
+            Self::tx_get::<NamespaceRecord>(tx, &self.records, key.as_slice())?
                 .filter(|current| current.provisional.session == provisional.session)
                 .ok_or(Error::StaleIncarnation)?;
             if fjall::Readable::contains_key(tx, &self.records, Self::key_id(b"ts", &topic_id))? {
                 return Err(Error::AdmissionConflict);
             }
-            if Self::tx_namespace_state(tx, &store.records, &topic_id)?.as_ref() != Some(expected) {
+            if Self::tx_namespace_state(tx, store, &topic_id)?.as_ref() != Some(expected) {
                 return Err(Error::AdmissionConflict);
             }
             let heads: BTreeSet<OpId> =
-                Self::tx_get(tx, &store.records, Self::key_id(b"h", &topic_id))?
-                    .unwrap_or_default();
+                Self::tx_get(tx, store, Self::key_id(b"h", &topic_id))?.unwrap_or_default();
             let clock: ActorClock =
-                Self::tx_get(tx, &store.records, Self::key_id(b"ac", &topic_id))?
-                    .unwrap_or_default();
+                Self::tx_get(tx, store, Self::key_id(b"ac", &topic_id))?.unwrap_or_default();
             let fingerprint: Option<[u8; 32]> =
-                Self::tx_get(tx, &store.records, Self::key_id(b"fp", &topic_id))?;
-            let generation: u64 = Self::tx_get(tx, &store.records, Self::key_id(b"mg", &topic_id))?
-                .unwrap_or_default();
+                Self::tx_get(tx, store, Self::key_id(b"fp", &topic_id))?;
+            let generation: u64 =
+                Self::tx_get(tx, store, Self::key_id(b"mg", &topic_id))?.unwrap_or_default();
             tx.remove(&self.records, Self::key_id(ACTIVATING, &topic_id));
             Self::tx_put(tx, &self.records, Self::key_id(b"ts", &topic_id), expected)?;
             Self::tx_put(tx, &self.records, Self::key_id(b"h", &topic_id), &heads)?;
@@ -467,7 +530,6 @@ impl FjallStorage {
                     Self::tx_end_namespace(tx, &self.records, &other)?;
                 }
             }
-            debug_assert!(current.provisional.activating);
             Ok(())
         })
     }
@@ -484,7 +546,7 @@ impl FjallStorage {
             ));
         }
         for (key, record) in legacy {
-            let store = self.slot_store(record.slot)?.records;
+            let store = self.slot_records(record.slot)?;
             let admitted: u64 = Self::tx_get(tx, &store, ADMITTED_BYTES)?.unwrap_or_default();
             let bytes = admitted + Self::tx_pending_bytes(tx, &store)?;
             let provisional = ProvisionalTopic {
