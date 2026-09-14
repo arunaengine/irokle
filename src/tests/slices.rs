@@ -6,7 +6,7 @@ use super::progress::reverse_chain;
 use super::support::*;
 
 use crate::oplog::Oplog;
-use crate::sync::{PageBudget, RequestKnowledge, SyncEngine};
+use crate::sync::{MAX_CONTINUATIONS, PageBudget, RequestKnowledge, SyncEngine};
 
 /// Storage reads one slice of the tests may make.
 const VISITS: usize = 12;
@@ -116,6 +116,80 @@ fn slice_kept_or_refused() {
         matches!(&refused, Err(Error::Storage(message)) if message.contains("work")),
         "{refused:?}"
     );
+}
+
+/// At the real capacity every peer below and at it keeps a plan of one deep
+/// topic; one more is refused with a capacity error instead of an empty page,
+/// while a request that needs no kept plan is still served. Once a kept plan
+/// completes, its place serves the refused peer.
+#[test]
+fn plans_at_capacity() {
+    let storage = MemoryStorage::new();
+    let mut source = reverse_chain(storage.clone(), 40);
+    let small = reverse_chain(storage, 2);
+    source.engine = source.engine.clone().with_page_actors(2);
+    let responder = source
+        .engine
+        .clone()
+        .with_page_visits(VISITS, MAX_CONTINUATIONS);
+    let reader = Oplog::new();
+    reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+    let summary = responder.summary(source.topic_id).unwrap();
+    let request = SyncEngine::new(reader, source.reader)
+        .plan_request(source.reader, &summary)
+        .unwrap();
+    // The chain's writers are members, so each asks as its own peer.
+    let state = source
+        .log
+        .storage()
+        .topic_state(&source.topic_id)
+        .unwrap()
+        .unwrap();
+    let peers = state
+        .members
+        .iter()
+        .copied()
+        .filter(|peer| *peer != source.reader)
+        .take(MAX_CONTINUATIONS + 1)
+        .collect::<Vec<_>>();
+    let budget = PageBudget::from_credit(request.credit);
+    for peer in &peers[..MAX_CONTINUATIONS] {
+        let page = responder.response_page(*peer, &request, budget).unwrap();
+        assert!(page.continued && page.ops.is_empty());
+    }
+    let refused = responder.response_page(peers[MAX_CONTINUATIONS], &request, budget);
+    assert!(
+        matches!(&refused, Err(Error::Storage(message)) if message.contains("work")),
+        "{refused:?}"
+    );
+    let small_reader = Oplog::new();
+    small_reader
+        .receive_ops(vec![small.genesis.clone()])
+        .unwrap();
+    let small_summary = responder.summary(small.topic_id).unwrap();
+    let small_request = SyncEngine::new(small_reader, small.reader)
+        .plan_request(small.reader, &small_summary)
+        .unwrap();
+    let served = responder
+        .response_page(small.reader, &small_request, budget)
+        .unwrap();
+    assert_eq!(served.ops.len(), 2);
+
+    let first = peers[0];
+    let mut resumed = 0;
+    while responder
+        .response_page(first, &request, budget)
+        .unwrap()
+        .ops
+        .is_empty()
+    {
+        resumed += 1;
+        assert!(resumed < 256, "the kept plan did not complete");
+    }
+    let page = responder
+        .response_page(peers[MAX_CONTINUATIONS], &request, budget)
+        .unwrap();
+    assert!(page.continued, "the freed place serves the refused peer");
 }
 
 /// Appends after a plan was kept are later work: the same request, whose goal

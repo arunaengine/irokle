@@ -13,7 +13,7 @@ use super::plan::Frontier;
 use super::{ActorWindow, SyncRequest};
 
 /// Plans one engine keeps at once.
-pub(super) const MAX_CONTINUATIONS: usize = 16;
+pub(crate) const MAX_CONTINUATIONS: usize = 16;
 /// Estimated bytes one kept plan may hold.
 pub(super) const MAX_CONTINUATION_BYTES: usize = 4 * 1024 * 1024;
 /// A kept plan nobody resumed for this long gives its place to a new one.

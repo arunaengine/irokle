@@ -17,7 +17,9 @@ mod repair;
 mod request;
 mod types;
 
-use continuation::{Continuation, Continuations, MAX_CONTINUATIONS};
+#[cfg(test)]
+pub(crate) use continuation::MAX_CONTINUATIONS;
+use continuation::{Continuation, Continuations};
 #[cfg(test)]
 pub(crate) use plan::PageWorkSnapshot;
 use plan::{MAX_PAGE_VISITS, PageWork};
@@ -112,7 +114,9 @@ impl<S: Storage> SyncEngine<S> {
             request_items: MAX_REQUEST_ITEMS,
             page_visits: MAX_PAGE_VISITS,
             page_positions: MAX_PAGE_MISSING,
-            continuations: Arc::new(Mutex::new(Continuations::new(MAX_CONTINUATIONS))),
+            continuations: Arc::new(Mutex::new(Continuations::new(
+                continuation::MAX_CONTINUATIONS,
+            ))),
             work: Arc::default(),
         }
     }
