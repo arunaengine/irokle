@@ -154,6 +154,10 @@ pub(crate) enum GatePoint {
     Meta(OpId),
     PeerAck(PeerId),
     Topics,
+    /// An admission write of the topic, before it reaches the store.
+    Admit(TopicId),
+    /// A discard of a namespace of the topic, before it reaches the store.
+    Discard(TopicId),
 }
 
 impl Gate {
@@ -458,6 +462,7 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
         })
     }
     fn put_admitted_batch(&self, batch: crate::storage::AdmittedBatch) -> Result<(), Error> {
+        self.gate_read(GatePoint::Admit(batch.topic_id));
         if self.failed_writes.lock().unwrap().contains(&batch.topic_id) {
             return Err(Error::Storage("injected admission write failure".into()));
         }
@@ -769,6 +774,7 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
         &self,
         provisional: &crate::storage::ProvisionalTopic,
     ) -> Result<bool, Error> {
+        self.gate_read(GatePoint::Discard(provisional.topic_id));
         self.inner.discard_provisional(provisional)
     }
 }

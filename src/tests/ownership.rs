@@ -4,13 +4,26 @@
 
 use super::support::*;
 
+use crate::node::ReceiveOutcome;
 use crate::oplog::Oplog;
 use crate::storage::{AdmissionEffects, ProvisionalTopic, StagingLimits, pending_op_bytes};
+use crate::sync::SyncData;
 
 const READER_SEED: u8 = 139;
 
 fn reader() -> PeerId {
     Ed25519Signer::from_bytes(&[READER_SEED; 32]).peer_id()
+}
+
+fn reader_node<S: Storage>(storage: S) -> Irokle<S> {
+    Irokle::with_storage(
+        storage,
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[READER_SEED; 32]),
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap()
 }
 
 /// A topic of `seed` with `events` notes of `text_len` characters, then an
@@ -301,4 +314,198 @@ fn fjall_commit_quota() {
         dirs.lock().unwrap().push(dir);
         storage
     });
+}
+
+/// A fragment that fits once weaker stagings of its topic are discarded makes
+/// progress; one that no discard could fit is refused and discards nothing.
+fn assert_reclaim_fits<S: Storage>(open: impl Fn(StagingLimits) -> S) {
+    let (_, topic_id, ops) = history(147, 40, 64);
+    let strong = PeerId::hash(b"reclaim-strong");
+    let middle = PeerId::hash(b"reclaim-middle");
+    let weak = PeerId::hash(b"reclaim-weak");
+    let limit = bytes(&ops[..23]);
+    let (held, weak_bytes, middle_bytes) = (bytes(&ops[..11]), bytes(&ops[..2]), bytes(&ops[..8]));
+    let incoming = bytes(&ops[11..23]);
+    assert!(held + weak_bytes + middle_bytes <= limit);
+    assert!(held + middle_bytes + incoming > limit);
+    let receive = |reader: &Irokle<S>, source: PeerId, ops: &[Op]| {
+        reader.receive_sync_outcome(
+            source,
+            SyncData {
+                topic_id,
+                ops: ops.to_vec(),
+            },
+        )
+    };
+    let staged = |outcome: Result<ReceiveOutcome, Error>| match outcome {
+        Ok(ReceiveOutcome::Staged(staged)) => staged,
+        other => panic!("expected staging, got {other:?}"),
+    };
+
+    let storage = open(StagingLimits {
+        total_bytes: limit,
+        ..StagingLimits::MEMORY
+    });
+    let reader = reader_node(storage.clone());
+    staged(receive(&reader, strong, &ops[..11]));
+    staged(receive(&reader, weak, &ops[..2]));
+    staged(receive(&reader, middle, &ops[..8]));
+    let progressed = staged(receive(&reader, strong, &ops[11..23]));
+    assert_eq!(progressed.bytes, limit);
+    let left = storage.provisional_topics().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!((left[0].source, left[0].bytes), (strong, limit));
+    assert_bytes_exact(&storage);
+
+    let storage = open(StagingLimits {
+        total_bytes: limit - 1,
+        ..StagingLimits::MEMORY
+    });
+    let reader = reader_node(storage.clone());
+    staged(receive(&reader, strong, &ops[..11]));
+    staged(receive(&reader, weak, &ops[..2]));
+    staged(receive(&reader, middle, &ops[..8]));
+    let refused = receive(&reader, strong, &ops[11..23]);
+    assert!(
+        matches!(refused, Err(Error::StagingCapacity(_))),
+        "{refused:?}"
+    );
+    assert_eq!(storage.provisional_topics().unwrap().len(), 3);
+    assert_bytes_exact(&storage);
+}
+
+#[test]
+fn memory_reclaim_fits() {
+    assert_reclaim_fits(|limits| MemoryStorage::new().with_staging_limits(limits));
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reclaim_fits() {
+    let dirs = std::sync::Mutex::new(Vec::new());
+    assert_reclaim_fits(|limits| {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::FjallStorage::open(dir.path())
+            .unwrap()
+            .with_staging_limits(limits);
+        dirs.lock().unwrap().push(dir);
+        storage
+    });
+}
+
+/// Two nodes over one store, each checking staging usage before the other
+/// commits: the fragment committing second is refused, and staging never holds
+/// more than the total.
+fn assert_raced_quota<S: Storage>(open: impl Fn(StagingLimits) -> S) {
+    let (a_source, a_topic, a_ops) = history(148, 12, 256);
+    let (b_source, b_topic, b_ops) = history(149, 12, 256);
+    let (a_ops, b_ops) = (a_ops[..7].to_vec(), b_ops[..7].to_vec());
+    let limit = bytes(&a_ops).max(bytes(&b_ops)) + 64;
+    let storage = StaleReadStorage::new(open(StagingLimits {
+        total_bytes: limit,
+        ..StagingLimits::MEMORY
+    }));
+    let first = reader_node(storage.clone());
+    let second = reader_node(storage.clone());
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    storage.arm_read(GatePoint::Admit(a_topic), Arc::clone(&gate));
+    let racing = thread::spawn(move || {
+        first.receive_sync_outcome(
+            a_source.peer_id(),
+            SyncData {
+                topic_id: a_topic,
+                ops: a_ops,
+            },
+        )
+    });
+    gate.wait_arrival();
+    let committed = second
+        .receive_sync_outcome(
+            b_source.peer_id(),
+            SyncData {
+                topic_id: b_topic,
+                ops: b_ops.clone(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(committed, ReceiveOutcome::Staged(_)));
+    drop(release);
+    let refused = racing.join().unwrap();
+    assert!(
+        matches!(refused, Err(Error::StagingCapacity(_))),
+        "{refused:?}"
+    );
+    let held = storage.provisional_topics().unwrap();
+    let total: u64 = held.iter().map(|provisional| provisional.bytes).sum();
+    assert_eq!(total, bytes(&b_ops));
+    assert!(total <= limit);
+    assert_bytes_exact(&storage.inner);
+}
+
+#[test]
+fn memory_raced_quota() {
+    assert_raced_quota(|limits| MemoryStorage::new().with_staging_limits(limits));
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_raced_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_raced_quota(|limits| {
+        crate::storage::FjallStorage::open(dir.path())
+            .unwrap()
+            .with_staging_limits(limits)
+    });
+}
+
+/// Expiry that found a namespace idle keeps it when the namespace is written
+/// before the discard: the written fragment stays staged.
+fn assert_raced_expiry<S: Storage>(storage: S) {
+    let (source, topic_id, ops) = history(150, 12, 8);
+    let storage = StaleReadStorage::new(storage);
+    let reader = reader_node(storage.clone());
+    let receive = |ops: &[Op]| {
+        reader
+            .receive_sync_outcome(
+                source.peer_id(),
+                SyncData {
+                    topic_id,
+                    ops: ops.to_vec(),
+                },
+            )
+            .unwrap()
+    };
+    assert!(matches!(receive(&ops[..5]), ReceiveOutcome::Staged(_)));
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    storage.arm_read(GatePoint::Discard(topic_id), Arc::clone(&gate));
+    let expiring = thread::spawn({
+        let reader = reader.clone();
+        move || reader.expire_bootstraps(u64::MAX)
+    });
+    gate.wait_arrival();
+    let ReceiveOutcome::Staged(written) = receive(&ops[5..10]) else {
+        panic!("expected staging");
+    };
+    drop(release);
+    expiring.join().unwrap().unwrap();
+    let kept = reader
+        .staged_topic(source.peer_id(), topic_id)
+        .unwrap()
+        .expect("a written namespace is not expired");
+    assert_eq!(kept, written);
+    assert_eq!(kept.bytes, bytes(&ops[..10]));
+}
+
+#[test]
+fn memory_raced_expiry() {
+    assert_raced_expiry(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_raced_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_raced_expiry(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
