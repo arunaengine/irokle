@@ -116,6 +116,7 @@ pub(super) fn request_for<S: Storage>(
         actor_range_hints: plan.actor_range_hints,
         genesis: Some(source.genesis.id),
         credit,
+        window: plan.window,
     }
 }
 

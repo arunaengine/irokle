@@ -51,6 +51,84 @@ pub struct ActorRangeHint {
     pub to_inclusive: u64,
 }
 
+/// The actors a request's hints describe completely. Every actor of the id
+/// interval from `after`, exclusive, to `through`, inclusive, that the
+/// requester is behind on is named by a hint; `None` leaves an end open. An
+/// unnamed actor inside the interval is held. An unnamed actor outside it is
+/// held when `behind` excludes it, and otherwise unknown: a responder never
+/// takes it as held. The default window holds every actor.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActorWindow {
+    pub after: Option<ActorId>,
+    pub through: Option<ActorId>,
+    /// The actors outside the interval the requester is behind on, when their
+    /// filter fits [`MAX_ACTOR_FILTER_BYTES`](super::MAX_ACTOR_FILTER_BYTES).
+    pub behind: Option<ActorFilter>,
+}
+
+impl ActorWindow {
+    /// Whether `actor_id` lies inside the id interval.
+    pub fn contains(&self, actor_id: &ActorId) -> bool {
+        self.after.is_none_or(|after| *actor_id > after)
+            && self.through.is_none_or(|through| *actor_id <= through)
+    }
+
+    /// Whether the requester holds `actor_id` when no hint names it.
+    pub fn holds(&self, actor_id: &ActorId) -> bool {
+        self.contains(actor_id)
+            || self
+                .behind
+                .as_ref()
+                .is_some_and(|behind| !behind.contains(actor_id))
+    }
+}
+
+/// A Bloom filter of actor ids: it contains every inserted actor and may
+/// contain others. Actor ids are hashes, so their bytes choose the bits.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActorFilter {
+    pub bits: Vec<u8>,
+}
+
+impl ActorFilter {
+    /// Bits of each actor, from separate four-byte slices of its id.
+    const PROBES: usize = 7;
+
+    /// A filter of `actors` at ten bits each, or `None` past `max_bytes`.
+    pub fn new(actors: &[ActorId], max_bytes: usize) -> Option<Self> {
+        let bytes = actors.len().checked_mul(10)?.div_ceil(8).max(1);
+        if bytes > max_bytes {
+            return None;
+        }
+        let mut bits = vec![0; bytes];
+        for actor_id in actors {
+            for bit in Self::probes(bytes * 8, actor_id) {
+                bits[bit / 8] |= 1 << (bit % 8);
+            }
+        }
+        Some(Self { bits })
+    }
+
+    pub fn contains(&self, actor_id: &ActorId) -> bool {
+        !self.bits.is_empty()
+            && Self::probes(self.bits.len() * 8, actor_id)
+                .all(|bit| self.bits[bit / 8] & (1 << (bit % 8)) != 0)
+    }
+
+    fn probes(bits: usize, actor_id: &ActorId) -> impl Iterator<Item = usize> + use<> {
+        let id = *actor_id.as_bytes();
+        (0..Self::PROBES).map(move |probe| {
+            let slice = [
+                id[probe * 4],
+                id[probe * 4 + 1],
+                id[probe * 4 + 2],
+                id[probe * 4 + 3],
+            ];
+            u32::from_le_bytes(slice) as usize % bits
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncPlan {
     pub topic_id: TopicId,
@@ -59,6 +137,8 @@ pub struct SyncPlan {
     pub send: Vec<Op>,
     pub need: BTreeSet<OpId>,
     pub actor_range_hints: Vec<ActorRangeHint>,
+    /// The actors `actor_range_hints` describe, see [`ActorWindow`].
+    pub window: ActorWindow,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -70,6 +150,8 @@ pub struct SyncRequest {
     /// Branch the requester plans against; a responder on another branch refuses.
     pub genesis: Option<OpId>,
     pub credit: SyncCredit,
+    /// The actors `actor_range_hints` describe, see [`ActorWindow`].
+    pub window: ActorWindow,
 }
 
 /// What a requester is willing to receive for one page: a number of operations
@@ -98,6 +180,9 @@ pub struct SyncPage {
     pub more: bool,
     /// Records the requested goal depends on that the responder does not hold.
     pub missing: BTreeSet<OpId>,
+    /// Actors outside the request's window whose positions the page needed:
+    /// the requester names them in its next request.
+    pub positions: BTreeSet<ActorId>,
 }
 
 /// Staged progress of data for a topic the receiver does not hold yet. It is

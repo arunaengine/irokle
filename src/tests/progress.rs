@@ -313,6 +313,7 @@ fn unknown_want_named() {
         actor_range_hints: Vec::new(),
         genesis: Some(genesis.id),
         credit: SyncCredit::default(),
+        window: crate::sync::ActorWindow::default(),
     };
     let page = engine
         .response_page(reader_id, &request, PageBudget::from_credit(request.credit))
@@ -372,6 +373,7 @@ fn reset_between_pages() {
             ops: 1,
             bytes: u64::MAX,
         },
+        window: crate::sync::ActorWindow::default(),
     };
     let member = branches.member.peer_id();
     let first = engine
@@ -433,6 +435,7 @@ async fn stream_names_missing() {
         }],
         genesis: genesis_of(&storage, &topic.id()),
         credit: SyncCredit::default(),
+        window: crate::sync::ActorWindow::default(),
     };
     let requester = iroh::EndpointId::from_bytes(reader.as_bytes()).unwrap();
     let responses = net

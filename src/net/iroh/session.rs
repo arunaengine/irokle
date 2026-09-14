@@ -256,6 +256,7 @@ impl SyncSession {
             topic_id: crate::TopicId::default(),
             more: false,
             missing: BTreeSet::new(),
+            positions: BTreeSet::new(),
         }))?;
         let mut bytes = requests.len() * page_len;
         for response in &responses {
@@ -308,7 +309,12 @@ impl SyncSession {
                 let data =
                     crate::net::sync_data_page(topic_id, page.ops, share_messages, share_bytes)?;
                 let more = page.more || data.cut;
-                if !pass && data.messages.is_empty() && more && page.missing.is_empty() {
+                if !pass
+                    && data.messages.is_empty()
+                    && more
+                    && page.missing.is_empty()
+                    && page.positions.is_empty()
+                {
                     deferred.push((topic_id, request));
                     continue;
                 }
@@ -321,15 +327,19 @@ impl SyncSession {
                 held = held.saturating_add(ByteBudget::page_bound(data.bytes, ops));
                 responses.extend(data.messages);
                 // Missing ids are advisory: they take only bytes no share needs.
+                // Positions go last, since the next request depends on them.
                 let mut result = crate::sync::SyncPage {
                     topic_id,
                     more,
                     missing: page.missing,
+                    positions: page.positions,
                 };
                 let mut extra =
                     crate::net::framed_message_len(&SyncMessage::Page(result.clone()))? - page_len;
                 while extra > limits.bytes - bytes {
-                    result.missing.pop_last();
+                    if result.missing.pop_last().is_none() {
+                        result.positions.pop_last();
+                    }
                     extra = crate::net::framed_message_len(&SyncMessage::Page(result.clone()))?
                         - page_len;
                 }

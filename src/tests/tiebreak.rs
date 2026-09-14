@@ -880,6 +880,7 @@ fn assert_quarantines_orphan<S: Corrupt>(storage: S) {
                 actor_range_hints: Vec::new(),
                 genesis: None,
                 credit: Default::default(),
+                window: crate::sync::ActorWindow::default(),
             },
         )
         .unwrap();

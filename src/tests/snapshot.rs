@@ -123,6 +123,7 @@ fn assert_reset_excluded<S: Storage>(inner: S, isolation: Isolation) {
         }],
         genesis: Some(branches.old.0.id),
         credit: SyncCredit::default(),
+        window: crate::sync::ActorWindow::default(),
     };
     let member = branches.member.peer_id();
     let new_genesis = branches.new.0.id;
@@ -211,6 +212,7 @@ fn assert_snapshot_counted<S: Storage>(
             .collect(),
         genesis: summary.genesis,
         credit: SyncCredit::default(),
+        window: crate::sync::ActorWindow::default(),
     };
     let before = counters(&storage);
     let page = owner

@@ -40,6 +40,7 @@ fn request(topic_id: TopicId, actor_id: ActorId, genesis: OpId) -> SyncMessage {
         }],
         genesis: Some(genesis),
         credit: SyncCredit::default(),
+        window: crate::sync::ActorWindow::default(),
     })
 }
 

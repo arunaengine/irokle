@@ -583,6 +583,7 @@ fn assert_reset_pauses<S: Storage>(
                 }],
                 genesis: Some(old_genesis),
                 credit: sync::SyncCredit::default(),
+                window: crate::sync::ActorWindow::default(),
             };
             move || {
                 node.response_page(

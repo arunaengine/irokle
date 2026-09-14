@@ -146,6 +146,7 @@ impl Pager<'_> {
             more,
             missing,
             too_large,
+            positions: BTreeSet::new(),
         })
     }
 

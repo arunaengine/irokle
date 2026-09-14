@@ -581,6 +581,7 @@ fn full_request(node: &Irokle, author: PeerId, topic_id: TopicId) -> Vec<crate::
         }],
         genesis: Some(genesis),
         credit: crate::sync::SyncCredit::default(),
+        window: crate::sync::ActorWindow::default(),
     };
     vec![
         crate::sync::SyncMessage::Open(node.sync_open(topic_id)),

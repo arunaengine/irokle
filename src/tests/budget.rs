@@ -188,6 +188,7 @@ async fn session_bytes_charged() {
         actor_range_hints: Vec::new(),
         genesis,
         credit: SyncCredit::default(),
+        window: crate::sync::ActorWindow::default(),
     });
     let mut ack = SyncAck {
         topic_id,

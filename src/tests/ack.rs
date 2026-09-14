@@ -740,6 +740,7 @@ fn ack_needs_closure() {
                 actor_range_hints: plan.actor_range_hints,
                 genesis: None,
                 credit: Default::default(),
+                window: plan.window,
             },
         )
         .unwrap();

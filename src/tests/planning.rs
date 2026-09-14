@@ -92,6 +92,7 @@ fn catch_up_work(len: usize) -> (u64, usize) {
             actor_range_hints,
             genesis: None,
             credit: Default::default(),
+            window: crate::sync::ActorWindow::default(),
         };
         let page = responder
             .response_page(
@@ -178,6 +179,7 @@ fn pull_behind(source: &Oplog, peers: (PeerId, PeerId), topic_id: TopicId, genes
             actor_range_hints: plan.actor_range_hints,
             genesis: Some(genesis.id),
             credit: Default::default(),
+            window: plan.window,
         };
         let page = responder
             .response_page(

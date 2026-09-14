@@ -345,6 +345,7 @@ fn response_includes_closure() {
                 }],
                 genesis: None,
                 credit: Default::default(),
+                window: crate::sync::ActorWindow::default(),
             },
         )
         .unwrap();
@@ -987,6 +988,7 @@ fn clamps_oversized_hint() {
                 }],
                 genesis: None,
                 credit: Default::default(),
+                window: crate::sync::ActorWindow::default(),
             },
         )
         .unwrap();
@@ -1024,6 +1026,7 @@ fn ignores_reversed_hint() {
                 }],
                 genesis: None,
                 credit: Default::default(),
+                window: crate::sync::ActorWindow::default(),
             },
         )
         .unwrap();
@@ -1216,6 +1219,7 @@ fn unknown_want_serves_the_rest() {
         actor_range_hints: Vec::new(),
         genesis: None,
         credit: Default::default(),
+        window: crate::sync::ActorWindow::default(),
     };
 
     let data = engine
@@ -1407,6 +1411,7 @@ fn assert_repairs_hole<S: Corrupt>(storage: S, seed: u8, damage: Damage) {
                 actor_range_hints: plan.actor_range_hints,
                 genesis: None,
                 credit: Default::default(),
+                window: plan.window,
             },
         )
         .unwrap();
@@ -1504,6 +1509,7 @@ fn repair_refetches_dangling_dep() {
                 actor_range_hints: plan.actor_range_hints,
                 genesis: None,
                 credit: Default::default(),
+                window: plan.window,
             },
         )
         .unwrap();

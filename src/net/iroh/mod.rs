@@ -2001,6 +2001,7 @@ impl<S: Storage> SharedNet<S> {
                 actor_range_hints: Vec::new(),
                 genesis: None,
                 credit: crate::sync::SyncCredit::default(),
+                window: crate::sync::ActorWindow::default(),
             };
             let page = sync.response_in(read, remote_peer_id, &request, budget)?;
             leave = Some((page, position));
@@ -2106,6 +2107,7 @@ impl<S: Storage> SharedNet<S> {
             send: Vec::new(),
             need: BTreeSet::new(),
             actor_range_hints,
+            window: crate::sync::ActorWindow::default(),
         };
         let request = crate::sync::page_request(plan, Some(genesis));
         let credit_ops = request.credit.ops as usize;

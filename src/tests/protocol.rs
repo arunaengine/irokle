@@ -108,6 +108,7 @@ fn events_request(owner: &Irokle, topic_id: TopicId, credit: SyncCredit) -> Sync
         }],
         genesis: genesis_of(owner.storage(), &topic_id),
         credit,
+        window: crate::sync::ActorWindow::default(),
     }
 }
 
@@ -557,8 +558,8 @@ async fn lost_reply_retransmits() {
 /// A peer offering only the previous protocol cannot open a sync connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn old_protocol_refused() {
-    assert_eq!(crate::sync::SYNC_PROTOCOL, "irokle/sync/4");
-    assert_eq!(crate::net::IROKLE_SYNC_ALPN, b"irokle/sync/4");
+    assert_eq!(crate::sync::SYNC_PROTOCOL, "irokle/sync/5");
+    assert_eq!(crate::net::IROKLE_SYNC_ALPN, b"irokle/sync/5");
     let alice = peer(
         bind(None).await,
         net::IrohRuntimeConfig::default(),
@@ -566,14 +567,14 @@ async fn old_protocol_refused() {
     );
     let alice_addr = serve(&alice).await;
     let old = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-        .alpns(vec![b"irokle/sync/3".to_vec()])
+        .alpns(vec![b"irokle/sync/4".to_vec()])
         .bind()
         .await
         .unwrap();
 
     let connected = tokio::time::timeout(
         Duration::from_secs(30),
-        old.connect(alice_addr, b"irokle/sync/3"),
+        old.connect(alice_addr, b"irokle/sync/4"),
     )
     .await
     .expect("the handshake ends instead of hanging");
@@ -616,6 +617,7 @@ async fn serve_within(
             topic_id,
             more: false,
             missing: BTreeSet::new(),
+            positions: BTreeSet::new(),
         }),
     ]);
     let limits = StreamLimits {

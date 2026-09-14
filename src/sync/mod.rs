@@ -15,17 +15,19 @@ mod repair;
 mod types;
 
 pub use types::{
-    ActorRangeHint, PageBudget, SyncAck, SyncCredit, SyncData, SyncFailure, SyncFailureCode,
-    SyncFingerprint, SyncMessage, SyncOpen, SyncPage, SyncPlan, SyncReceipt, SyncReport,
-    SyncRequest, SyncSummary,
+    ActorFilter, ActorRangeHint, ActorWindow, PageBudget, SyncAck, SyncCredit, SyncData,
+    SyncFailure, SyncFailureCode, SyncFingerprint, SyncMessage, SyncOpen, SyncPage, SyncPlan,
+    SyncReceipt, SyncReport, SyncRequest, SyncSummary,
 };
 
 const SYNC_ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/2";
 
 /// Wire contract this build speaks. Version 3 added receive credits, page results
 /// and branch names; version 4 names missing records in page results and accepts
-/// zero-span position hints. Older peers are refused before any message.
-pub const SYNC_PROTOCOL: &str = "irokle/sync/4";
+/// zero-span position hints; version 5 bounds the actors a request describes by
+/// a window and names in page results the positions a page needed. Older peers
+/// are refused before any message.
+pub const SYNC_PROTOCOL: &str = "irokle/sync/5";
 
 /// Maximum number of sequences a single ActorRangeHint may span. Caps both the
 /// hint a peer can construct via `actor_ranges` and the work
@@ -33,6 +35,9 @@ pub const SYNC_PROTOCOL: &str = "irokle/sync/4";
 /// malicious peer cannot push us into walking unbounded sequence ranges.
 pub const MAX_ACTOR_RANGE_HINT_SPAN: u64 = 65_536;
 const MAX_REQUEST_ITEMS: usize = 65_536;
+/// Bytes of the filter of actors behind that a request leaves out; past it the
+/// request sends none and those actors stay unknown.
+pub const MAX_ACTOR_FILTER_BYTES: usize = 1024 * 1024;
 const MAX_PAGE_OPS: usize = 4096;
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 /// Actors one page plan keeps active range heads for; the rest wait for a free
@@ -56,6 +61,9 @@ pub struct PlannedPage {
     pub missing: BTreeSet<OpId>,
     /// An operation that alone exceeds the page's byte budget.
     pub too_large: Option<OpId>,
+    /// Actors the request did not describe whose positions the page needed,
+    /// at most [`MAX_PAGE_MISSING`]. Their dependents wait for a request naming them.
+    pub positions: BTreeSet<ActorId>,
 }
 
 #[derive(Clone)]
@@ -226,6 +234,7 @@ impl<S: Storage> SyncEngine<S> {
                 send: Vec::new(),
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
+                window: ActorWindow::default(),
             });
         };
         if !view.state.members.contains(&peer_id) {
@@ -236,6 +245,7 @@ impl<S: Storage> SyncEngine<S> {
                 send: Vec::new(),
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
+                window: ActorWindow::default(),
             });
         }
         if let Some(remote_event_type_id) = &remote.event_type_id
@@ -262,6 +272,7 @@ impl<S: Storage> SyncEngine<S> {
                 send: Vec::new(),
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
+                window: ActorWindow::default(),
             };
             *more = false;
             if remote_genesis < view.state.genesis {
@@ -310,6 +321,7 @@ impl<S: Storage> SyncEngine<S> {
                 send: Vec::new(),
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
+                window: ActorWindow::default(),
             });
         }
 
@@ -383,6 +395,7 @@ impl<S: Storage> SyncEngine<S> {
             send,
             need,
             actor_range_hints,
+            window: ActorWindow::default(),
         })
     }
 
@@ -596,6 +609,7 @@ impl<S: Storage> SyncEngine<S> {
             more: !repair.unsent.is_empty(),
             missing: repair.missing,
             too_large: repair.too_large,
+            positions: BTreeSet::new(),
         };
         if rest.ops == 0 || rest.bytes == 0 || page.too_large.is_some() {
             return Ok(page);
@@ -761,6 +775,7 @@ pub(crate) fn page_request(plan: SyncPlan, genesis: Option<OpId>) -> SyncRequest
         actor_range_hints: plan.actor_range_hints,
         genesis,
         credit,
+        window: plan.window,
     }
 }
 
