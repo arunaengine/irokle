@@ -458,3 +458,202 @@ impl<'de> Deserialize<'de> for ActorClock {
         Ok(clock)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The clock this type replaced, kept as the reference its behavior must match.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    struct Reference {
+        entries: BTreeMap<ActorId, u64>,
+    }
+
+    impl Reference {
+        fn observe(&mut self, actor: ActorId, seq: u64) {
+            let current = self.entries.entry(actor).or_default();
+            *current = (*current).max(seq);
+        }
+
+        fn set(&mut self, actor: ActorId, seq: u64) {
+            if seq == 0 {
+                self.entries.remove(&actor);
+            } else {
+                self.entries.insert(actor, seq);
+            }
+        }
+
+        fn merge(&mut self, other: &Self) {
+            for (actor, counter) in &other.entries {
+                self.observe(*actor, *counter);
+            }
+        }
+    }
+
+    /// A seeded generator, so every run draws the same operations.
+    struct Draw(u64);
+
+    impl Draw {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// Actor ids from a small pool that share long prefixes, so tries get
+        /// deep branches, splits inside compressed paths and collapses.
+        fn actor(&mut self) -> ActorId {
+            let mut bytes = [0xa5_u8; 32];
+            let pick = self.next();
+            let at = (pick % 32) as usize;
+            bytes[at] = (pick >> 8) as u8 % 4;
+            if pick >> 16 & 1 == 1 {
+                bytes[31] = (pick >> 24) as u8 % 3;
+            }
+            if pick >> 20 & 15 == 0 {
+                bytes = *blake3::hash(&(pick % 64).to_le_bytes()).as_bytes();
+            }
+            ActorId::from_bytes(bytes)
+        }
+    }
+
+    fn assert_same(clock: &ActorClock, reference: &Reference, encoded: bool) {
+        let entries = clock
+            .iter()
+            .map(|(actor, seq)| (*actor, *seq))
+            .collect::<Vec<_>>();
+        let expected = reference
+            .entries
+            .iter()
+            .map(|(actor, seq)| (*actor, *seq))
+            .collect::<Vec<_>>();
+        assert_eq!(entries, expected);
+        assert_eq!(clock.len(), expected.len());
+        assert_eq!(clock.is_empty(), expected.is_empty());
+        if !encoded {
+            return;
+        }
+        assert_eq!(
+            postcard::to_allocvec(clock).unwrap(),
+            postcard::to_allocvec(reference).unwrap()
+        );
+        assert_eq!(
+            format!("{clock:?}"),
+            format!("{reference:?}").replace("Reference", "ActorClock")
+        );
+        let decoded: ActorClock =
+            postcard::from_bytes(&postcard::to_allocvec(reference).unwrap()).unwrap();
+        assert_eq!(&decoded, clock);
+    }
+
+    /// Random operations on shared and unshared clocks match the map they
+    /// replaced: entries, zero positions, order, encoding, equality and every
+    /// derived answer, and a clone never sees a later change of its source.
+    #[test]
+    fn matches_reference() {
+        let mut draw = Draw(0x9e37_79b9_7f4a_7c15);
+        let mut clocks = vec![(ActorClock::new(), Reference::default()); 4];
+        for step in 0..20_000 {
+            let which = (draw.next() % 4) as usize;
+            let actor = draw.actor();
+            let seq = draw.next() % 5;
+            let before = clocks[which].clone();
+            match draw.next() % 6 {
+                0 => {
+                    let next = clocks[which].0.advance(actor);
+                    *clocks[which].1.entries.entry(actor).or_default() += 1;
+                    assert_eq!(next, clocks[which].1.entries[&actor]);
+                }
+                1 | 2 => {
+                    clocks[which].0.observe(actor, seq);
+                    clocks[which].1.observe(actor, seq);
+                }
+                3 => {
+                    clocks[which].0.set(actor, seq);
+                    clocks[which].1.set(actor, seq);
+                }
+                4 => {
+                    let other = clocks[(draw.next() % 4) as usize].clone();
+                    clocks[which].0.merge(&other.0);
+                    clocks[which].1.merge(&other.1);
+                }
+                _ => {
+                    let other = clocks[(draw.next() % 4) as usize].clone();
+                    clocks[which] = other;
+                }
+            }
+            let (clock, reference) = &clocks[which];
+            let encoded = step % 31 == 0;
+            assert_same(clock, reference, encoded);
+            assert_same(&before.0, &before.1, encoded);
+            assert_eq!(
+                clock.get(&actor),
+                reference.entries.get(&actor).copied().unwrap_or(0)
+            );
+            if step % 97 == 0 {
+                for (other, other_reference) in &clocks {
+                    assert_eq!(clock == other, reference == other_reference, "step {step}");
+                    let dominates = other_reference.entries.iter().all(|(actor, seq)| {
+                        reference.entries.get(actor).copied().unwrap_or(0) >= *seq
+                    });
+                    assert_eq!(clock.dominates(other), dominates);
+                    let intersection = reference
+                        .entries
+                        .iter()
+                        .filter_map(|(actor, seq)| {
+                            other_reference
+                                .entries
+                                .get(actor)
+                                .map(|held| (*actor, (*seq).min(*held)))
+                        })
+                        .collect();
+                    assert_same(
+                        &clock.intersect(other),
+                        &Reference {
+                            entries: intersection,
+                        },
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    /// A clock derived by one more position shares all but the path to it, and
+    /// merging a clock it already covers allocates nothing.
+    #[test]
+    fn derived_clocks_share() {
+        let actor =
+            |index: u32| ActorId::from_bytes(*blake3::hash(&index.to_le_bytes()).as_bytes());
+        let mut clock = ActorClock::new();
+        for index in 0..4096 {
+            clock.observe(actor(index), 1);
+        }
+        let mut derived = clock.clone();
+        derived.observe(actor(9999), 1);
+        let (Some(own), Some(theirs)) = (&clock.root, &derived.root) else {
+            panic!("both clocks hold entries");
+        };
+        let Node::Branch { children: own, .. } = &**own else {
+            panic!("a root of many entries is a branch");
+        };
+        let Node::Branch {
+            children: theirs, ..
+        } = &**theirs
+        else {
+            panic!("a root of many entries is a branch");
+        };
+        let shared = own
+            .iter()
+            .filter(|child| theirs.iter().any(|other| Arc::ptr_eq(child, other)))
+            .count();
+        assert_eq!(shared, own.len() - 1);
+        let mut merged = derived.clone();
+        merged.merge(&clock);
+        assert!(Arc::ptr_eq(
+            merged.root.as_ref().unwrap(),
+            derived.root.as_ref().unwrap()
+        ));
+    }
+}
