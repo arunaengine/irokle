@@ -11,11 +11,10 @@ use crate::{ActorId, Error, OpId, PeerId, Result, TopicId};
 
 use super::super::{
     AdmissionEffects, ProvisionalTopic, StagingLimits, StagingQuota, TopicState, ack_covers,
-    check_namespaces,
+    check_namespaces, merged_obligation,
 };
 use super::{
-    MemoryInner, MemoryStorage, memory_topic_state_locked, merged_obligation_locked,
-    put_obligation_locked,
+    MemoryInner, MemoryStorage, ObligationKind, memory_topic_state_locked, put_obligation_locked,
 };
 
 /// Registered provisional namespaces with their records. Lock order: this
@@ -226,32 +225,61 @@ impl MemoryStorage {
         if inner.topics.contains_key(&topic_id) {
             return Err(Error::AdmissionConflict);
         }
-        let Some((_, records)) = staging
+        if !staging
             .namespaces
             .get(&(provisional.source, topic_id))
-            .filter(|(current, _)| current.session == provisional.session)
-        else {
+            .is_some_and(|(current, _)| current.session == provisional.session)
+        {
             return Err(Error::StaleIncarnation);
-        };
-        let records = Arc::clone(records);
-        let staged = records.lock()?;
-        if memory_topic_state_locked(&staged, &topic_id).as_ref() != Some(expected) {
+        }
+        let records = staging
+            .namespaces
+            .iter()
+            .filter(|((_, topic), _)| *topic == topic_id)
+            .map(|(key, (_, records))| (*key, Arc::clone(records)))
+            .collect::<Vec<_>>();
+        let mut locked = records
+            .iter()
+            .map(|(_, records)| records.lock())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let position = records
+            .iter()
+            .position(|(key, _)| *key == (provisional.source, topic_id))
+            .ok_or(Error::StaleIncarnation)?;
+        let staged = &locked[position];
+        if memory_topic_state_locked(staged, &topic_id).as_ref() != Some(expected) {
             return Err(Error::AdmissionConflict);
         }
-        copy_topic_locked(&staged, &mut inner, &topic_id);
-        inner.topics.insert(topic_id, expected.clone());
+        let mut changes = BTreeMap::new();
         for obligation in effects.sync_obligations {
             let ack = inner.peer_acks.get(&(obligation.peer_id, topic_id));
             if obligation.is_empty() || ack_covers(ack, Some(expected.genesis), &obligation) {
                 continue;
             }
-            let merged = merged_obligation_locked(&inner, &obligation)?;
+            let kind = ObligationKind::of(&obligation);
+            let key = (obligation.peer_id, kind);
+            let existing = changes.get(&key).cloned().or_else(|| {
+                inner
+                    .obligations
+                    .get(&(topic_id, obligation.peer_id))
+                    .and_then(|records| records.get(&kind))
+                    .cloned()
+            });
+            let merged = merged_obligation(existing, &obligation)?;
+            changes.insert(key, merged);
+        }
+        copy_topic_locked(staged, &mut inner, &topic_id);
+        inner.topics.insert(topic_id, expected.clone());
+        for merged in changes.into_values() {
             put_obligation_locked(&mut inner, merged);
         }
-        drop(staged);
-        staging
-            .namespaces
-            .retain(|(_, staged_topic), _| *staged_topic != topic_id);
+        for records in &mut locked {
+            **records = MemoryInner::default();
+        }
+        drop(locked);
+        for (key, _) in records {
+            staging.namespaces.remove(&key);
+        }
         Ok(())
     }
 
@@ -264,6 +292,9 @@ impl MemoryStorage {
             .get(&key)
             .is_some_and(|(current, _)| current == provisional && !current.activating);
         if current {
+            if let Some((_, records)) = staging.namespaces.get(&key) {
+                *records.lock()? = MemoryInner::default();
+            }
             staging.namespaces.remove(&key);
         }
         Ok(current)

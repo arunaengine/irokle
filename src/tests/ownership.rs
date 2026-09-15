@@ -50,6 +50,148 @@ pub(super) fn bytes(ops: &[Op]) -> u64 {
         .sum()
 }
 
+fn owned_event(
+    previous: &Op,
+    signer: &impl Signer,
+    released: Arc<std::sync::atomic::AtomicBool>,
+) -> Op {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Payload(Vec<u8>, Arc<AtomicBool>);
+    impl AsRef<[u8]> for Payload {
+        fn as_ref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.1.store(true, Ordering::SeqCst);
+        }
+    }
+    let payload = bytes::Bytes::from_owner(Payload(
+        postcard::to_allocvec(&Note {
+            text: "owned".into(),
+        })
+        .unwrap(),
+        released,
+    ));
+    Op::sign(
+        OpBody {
+            topic_id: previous.signed.body.topic_id,
+            author: signer.peer_id(),
+            actor_id: previous.signed.body.actor_id,
+            actor_seq: previous.signed.body.actor_seq + 1,
+            actor_prev: Some(previous.id),
+            deps: [previous.id].into(),
+            generation: previous.signed.body.generation + 1,
+            payload: TopicPayload::Event(EventEnvelope::new::<Note>(payload)),
+        },
+        signer,
+    )
+    .unwrap()
+}
+
+#[test]
+fn stale_view_releases() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let released = Arc::new(AtomicBool::new(false));
+    let (source, topic, ops) = history(178, 0, 0);
+    let genesis = ops[0].clone();
+    let op = owned_event(&genesis, source.signer(), Arc::clone(&released));
+    let storage = MemoryStorage::new();
+    let provisional = storage
+        .open_provisional(source.peer_id(), topic, genesis.id, now())
+        .unwrap();
+    let view = storage.provisional_store(&provisional).unwrap().unwrap();
+    Oplog::with_storage(view.clone())
+        .receive_ops(vec![genesis, op])
+        .unwrap();
+    assert!(!released.load(Ordering::SeqCst));
+    let current = listed(&storage, &provisional).unwrap();
+    assert!(storage.discard_provisional(&current).unwrap());
+    assert!(
+        released.load(Ordering::SeqCst),
+        "stale capability retained payload storage"
+    );
+    assert!(matches!(view.stored_bytes(), Err(Error::StaleIncarnation)));
+}
+
+#[test]
+fn failed_activation_hidden() {
+    let (source, topic, ops) = history(179, 2, 32);
+    let storage = MemoryStorage::new();
+    let provisional = storage
+        .open_provisional(source.peer_id(), topic, ops[0].id, now())
+        .unwrap();
+    stage(&storage, &provisional, &ops).unwrap();
+    let current = listed(&storage, &provisional).unwrap();
+    let view = storage.provisional_store(&current).unwrap().unwrap();
+    let state = view.topic_state(&topic).unwrap().unwrap();
+    let ids = (0_u32..4098)
+        .map(|n| OpId::hash(n.to_le_bytes()))
+        .collect::<Vec<_>>();
+    let effects = AdmissionEffects {
+        sync_obligations: ids
+            .chunks(2049)
+            .map(|part| {
+                crate::storage::SyncObligation::repair(
+                    reader(),
+                    topic,
+                    part.iter().copied().collect(),
+                )
+            })
+            .collect(),
+    };
+    assert!(
+        storage
+            .activate_provisional(&current, &state, effects)
+            .is_err()
+    );
+    assert!(
+        storage.topic_state(&topic).unwrap().is_none(),
+        "failed activation published history"
+    );
+    assert!(storage.all_sync_obligations().unwrap().is_empty());
+    assert_eq!(
+        contents(&storage, &current).0,
+        ops.iter().map(|op| op.id).collect()
+    );
+}
+
+#[test]
+fn activation_releases_losers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (source, topic, common) = history(180, 0, 0);
+    let storage = MemoryStorage::new();
+    let mut staged = Vec::new();
+    for peer in [source.peer_id(), reader()] {
+        let released = Arc::new(AtomicBool::new(false));
+        let event = owned_event(
+            common.last().unwrap(),
+            source.signer(),
+            Arc::clone(&released),
+        );
+        let provisional = storage
+            .open_provisional(peer, topic, common[0].id, now())
+            .unwrap();
+        let view = storage.provisional_store(&provisional).unwrap().unwrap();
+        let mut ops = common.clone();
+        ops.push(event);
+        Oplog::with_storage(view.clone()).receive_ops(ops).unwrap();
+        staged.push((listed(&storage, &provisional).unwrap(), view, released));
+    }
+    let state = staged[0].1.topic_state(&topic).unwrap().unwrap();
+    storage
+        .activate_provisional(&staged[0].0, &state, AdmissionEffects::default())
+        .unwrap();
+    assert!(!staged[0].2.load(Ordering::SeqCst));
+    assert!(staged[1].2.load(Ordering::SeqCst));
+    for (_, view, _) in &staged {
+        assert!(matches!(view.stored_bytes(), Err(Error::StaleIncarnation)));
+    }
+    storage.reset_topic(&topic).unwrap();
+    assert!(staged[0].2.load(Ordering::SeqCst));
+}
+
 /// Admit `ops` into the namespace of `provisional` through a fresh view.
 pub(super) fn stage<S: Storage>(
     storage: &S,
