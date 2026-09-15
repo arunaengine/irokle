@@ -521,6 +521,9 @@ pub trait SnapshotRead {
 }
 
 pub trait Storage: Clone + Send + Sync + 'static {
+    #[cfg(test)]
+    fn sync_boundary(&self, _topic_id: TopicId, _boundary: &'static str) {}
+
     /// Run `read` over one snapshot: one lock or one read transaction, released
     /// when `read` returns. `read` must not call back into this store. Required
     /// rather than defaulted: separate live reads can mix two commits.
@@ -581,6 +584,22 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// stored source and charge. An op that is or waits on a rejected id of
     /// its topic is refused with [`crate::Error::RejectedOp`].
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()>;
+    /// Buffer under a captured genesis checked atomically with the write.
+    /// `None` keeps the unscoped contract; scoped writes require backend support.
+    fn put_pending_bound(
+        &self,
+        source_peer: PeerId,
+        op: Op,
+        meta: OpMeta,
+        genesis: Option<OpId>,
+    ) -> Result<()> {
+        if genesis.is_some() {
+            return Err(crate::Error::Storage(
+                "backend lacks scoped pending writes".into(),
+            ));
+        }
+        self.put_pending_op(source_peer, op, meta)
+    }
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>>;
     fn ready_pending_ops(&self) -> Result<Vec<(PeerId, Op)>> {
         self.ready_pending_after(None, usize::MAX)

@@ -263,6 +263,7 @@ pub struct Oplog<S = MemoryStorage> {
     // reintroduce a hole; scanning once per epoch keeps sync off a full scan.
     whole_topics: Arc<Mutex<BTreeMap<TopicId, (OpId, u64)>>>,
     membership_cache: Arc<Mutex<MembershipCache>>,
+    receive_genesis: Option<(TopicId, OpId)>,
 }
 
 impl Default for Oplog<MemoryStorage> {
@@ -283,10 +284,17 @@ impl<S: Storage> Oplog<S> {
             storage,
             whole_topics: Arc::new(Mutex::new(BTreeMap::new())),
             membership_cache: Arc::new(Mutex::new(MembershipCache::default())),
+            receive_genesis: None,
         }
     }
     pub fn storage(&self) -> &S {
         &self.storage
+    }
+
+    #[cfg(feature = "iroh")]
+    pub(crate) fn bound_genesis(mut self, topic: TopicId, genesis: OpId) -> Self {
+        self.receive_genesis = Some((topic, genesis));
+        self
     }
 
     /// An oplog over `storage` sharing this oplog's membership projections,
@@ -296,6 +304,7 @@ impl<S: Storage> Oplog<S> {
             storage,
             whole_topics: Arc::new(Mutex::new(BTreeMap::new())),
             membership_cache: Arc::clone(&self.membership_cache),
+            receive_genesis: self.receive_genesis,
         }
     }
 
@@ -923,6 +932,16 @@ impl<S: Storage> Oplog<S> {
         verified: &BTreeSet<crate::OpId>,
         effects: Option<ReceiveEffects<'_>>,
     ) -> Result<(BTreeSet<crate::OpId>, Option<TopicEviction>)> {
+        if let Some((topic, genesis)) = self.receive_genesis {
+            for op in ops
+                .iter()
+                .filter(|op| op.signed.body.topic_id == topic && is_structural_genesis(op))
+            {
+                if op.id != genesis {
+                    return Err(Error::StaleIncarnation);
+                }
+            }
+        }
         let has_genesis = ops.iter().any(is_structural_genesis);
         // Signatures are immutable, so each is checked once for the whole job
         // rather than again on every retry.
@@ -938,6 +957,17 @@ impl<S: Storage> Oplog<S> {
         let verified = &checked;
         for attempt in 0..MAX_ADMISSION_RETRIES {
             conflict_pause(attempt);
+            if let Some((topic, genesis)) = self.receive_genesis
+                && ops
+                    .first()
+                    .is_some_and(|op| op.signed.body.topic_id == topic)
+                && self
+                    .storage
+                    .topic_state(&topic)?
+                    .is_some_and(|state| state.genesis < genesis)
+            {
+                return Err(Error::StaleIncarnation);
+            }
             let (ops_to_admit, reset, rejected_genesis) = if has_genesis {
                 self.resolve_genesis_collision(ops.clone(), verified)?
             } else {
@@ -1135,6 +1165,20 @@ impl<S: Storage> Oplog<S> {
         };
         let mut heads = expected_heads.clone();
         let mut state = expected_state.clone();
+        if let Some((topic, genesis)) = self.receive_genesis
+            && topic == topic_id
+            && expected_state
+                .as_ref()
+                .map(|state| state.genesis)
+                .or_else(|| {
+                    ops.iter()
+                        .find(|op| is_structural_genesis(op))
+                        .map(|op| op.id)
+                })
+                != Some(genesis)
+        {
+            return Err(Error::StaleIncarnation);
+        }
         let mut topic_state_changed = false;
         let mut overlay_ops = BTreeMap::new();
         let mut overlay_meta = BTreeMap::new();
@@ -1440,10 +1484,13 @@ impl<S: Storage> Oplog<S> {
         // `entries`, so ordering after admission cannot spuriously reject it.
         for (op, missing_deps) in pending {
             let source_peer = source_peer.unwrap_or(op.signed.body.author);
-            let buffered = self.storage.put_pending_op(
+            let buffered = self.storage.put_pending_bound(
                 source_peer,
                 op.clone(),
                 pending_meta_for(&op, missing_deps),
+                self.receive_genesis
+                    .filter(|(topic, _)| *topic == topic_id)
+                    .map(|(_, genesis)| genesis),
             );
             // A descendant of a rejected op can never be admitted here.
             if let Err(Error::RejectedOp(rejected)) = &buffered {

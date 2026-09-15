@@ -802,6 +802,22 @@ impl<S: Storage> Irokle<S> {
         })
     }
 
+    #[cfg(feature = "iroh")]
+    pub(crate) fn receive_bound(
+        &self,
+        peer: PeerId,
+        data: SyncData,
+        genesis: Option<OpId>,
+    ) -> Result<ReceiveOutcome> {
+        let Some(genesis) = genesis else {
+            return self.receive_sync_outcome(peer, data);
+        };
+        let mut node = self.clone();
+        node.oplog = node.oplog.bound_genesis(data.topic_id, genesis);
+        node.sync = node.sync.bound_genesis(data.topic_id, genesis);
+        node.receive_sync_outcome(peer, data)
+    }
+
     pub fn receive_sync_data_as_local(
         &self,
         data: SyncData,

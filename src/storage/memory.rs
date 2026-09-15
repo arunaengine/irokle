@@ -339,6 +339,15 @@ impl Storage for MemoryStorage {
         Ok(peers)
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
+        self.put_pending_bound(source_peer, op, meta, None)
+    }
+    fn put_pending_bound(
+        &self,
+        source_peer: PeerId,
+        op: Op,
+        meta: OpMeta,
+        genesis: Option<OpId>,
+    ) -> Result<()> {
         let charge = pending_op_bytes(&op)? as u64;
         let topic_id = op.signed.body.topic_id;
         if meta.topic_id != topic_id || meta.id != op.id {
@@ -350,6 +359,9 @@ impl Storage for MemoryStorage {
             ));
         }
         let mut inner = self.lock()?;
+        if let Some(genesis) = genesis {
+            branch_matches(inner.topics.get(&topic_id), Some(genesis))?;
+        }
         // Only a completely stored op is already admitted; a half stored one
         // still has to buffer so its repair runs once its deps resolve.
         if dep_resolvable_locked(&inner, &op.id) {

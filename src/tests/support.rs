@@ -158,6 +158,7 @@ pub(crate) enum GatePoint {
     Admit(TopicId),
     /// A discard of a namespace of the topic, before it reaches the store.
     Discard(TopicId),
+    Sync(TopicId, &'static str),
 }
 
 impl Gate {
@@ -299,6 +300,7 @@ pub(crate) struct StaleReadStorage<S = MemoryStorage> {
     pub(crate) conflicts: Arc<std::sync::atomic::AtomicUsize>,
     /// Ops buffered as pending so far.
     pub(crate) pending_puts: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) sync_counts: Arc<std::sync::Mutex<std::collections::BTreeMap<&'static str, usize>>>,
 }
 
 impl<S: Storage> StaleReadStorage<S> {
@@ -319,6 +321,7 @@ impl<S: Storage> StaleReadStorage<S> {
             failed_activations: Arc::default(),
             conflicts: Arc::default(),
             pending_puts: Arc::default(),
+            sync_counts: Arc::default(),
         }
     }
 
@@ -453,6 +456,15 @@ impl<S: Storage> StaleReadStorage<S> {
 }
 
 impl<S: Storage> Storage for StaleReadStorage<S> {
+    fn sync_boundary(&self, topic_id: TopicId, boundary: &'static str) {
+        *self
+            .sync_counts
+            .lock()
+            .unwrap()
+            .entry(boundary)
+            .or_default() += 1;
+        self.gate_read(GatePoint::Sync(topic_id, boundary));
+    }
     fn read_snapshot<R>(
         &self,
         read: impl FnOnce(&dyn crate::storage::SnapshotRead) -> Result<R, Error>,
@@ -588,6 +600,18 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
         self.pending_puts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.put_pending_op(source_peer, op, meta)
+    }
+    fn put_pending_bound(
+        &self,
+        source_peer: PeerId,
+        op: Op,
+        meta: crate::storage::OpMeta,
+        genesis: Option<OpId>,
+    ) -> Result<(), Error> {
+        self.sync_boundary(meta.topic_id, "pending");
+        self.pending_puts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.put_pending_bound(source_peer, op, meta, genesis)
     }
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>, Error> {
         self.inner.pending_waiters(dep_id)
@@ -761,6 +785,7 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
         expected: &crate::storage::TopicState,
         effects: crate::storage::AdmissionEffects,
     ) -> Result<(), Error> {
+        self.sync_boundary(provisional.topic_id, "activation");
         if self
             .failed_activations
             .try_update(

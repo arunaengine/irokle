@@ -106,6 +106,12 @@ enum SendSet {
 }
 
 impl<S: Storage> SyncEngine<S> {
+    #[cfg(feature = "iroh")]
+    pub(crate) fn bound_genesis(mut self, topic: TopicId, genesis: OpId) -> Self {
+        self.oplog = self.oplog.bound_genesis(topic, genesis);
+        self
+    }
+
     pub fn new(oplog: Oplog<S>, peer_id: PeerId) -> Self {
         Self {
             oplog,

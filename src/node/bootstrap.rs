@@ -297,6 +297,16 @@ impl<S: Storage> Irokle<S> {
             Err(Error::AdmissionConflict)
                 if storage.topic_state(&provisional.topic_id)?.is_some() =>
             {
+                if let Some(current) = self
+                    .provisional_of(provisional.source, provisional.topic_id)?
+                    .filter(|current| {
+                        current.session == provisional.session
+                            && current.genesis == provisional.genesis
+                    })
+                    && !storage.discard_provisional(&current)?
+                {
+                    return Err(Error::AdmissionConflict);
+                }
                 Ok(Bootstrap::Active(BTreeSet::new()))
             }
             Err(error) => Err(error),

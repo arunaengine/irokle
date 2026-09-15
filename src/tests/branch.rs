@@ -71,6 +71,84 @@ pub(super) fn reset_to_new<S: Storage>(storage: &S, branches: &Branches) {
     assert_eq!(admitted.evictions.len(), 1, "the old branch was replaced");
 }
 
+#[cfg(feature = "iroh")]
+fn assert_bound_admission<S: Storage>(storage: S) {
+    for pending in [false, true] {
+        let branches = branches(if pending { 206 } else { 207 });
+        let topic = branches.topic_id;
+        let store = StaleReadStorage::new(storage.clone());
+        let log = Oplog::with_storage(store.clone());
+        log.receive_ops(vec![branches.old.0.clone()]).unwrap();
+        let node = Irokle::with_storage(
+            store.clone(),
+            NodeConfig {
+                signer: branches.member.clone(),
+                ..NodeConfig::default()
+            },
+        )
+        .unwrap();
+        let op = if pending {
+            old_followers(&branches).0
+        } else {
+            branches.old.1.clone()
+        };
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        store.arm_read(
+            if pending {
+                GatePoint::Sync(topic, "pending")
+            } else {
+                GatePoint::Admit(topic)
+            },
+            Arc::clone(&gate),
+        );
+        let received = thread::spawn({
+            let author = branches.author.peer_id();
+            let genesis = branches.old.0.id;
+            move || {
+                node.receive_bound(
+                    author,
+                    SyncData {
+                        topic_id: topic,
+                        ops: vec![op],
+                    },
+                    Some(genesis),
+                )
+            }
+        });
+        gate.wait_arrival();
+        assert!(gate.arrived() && !gate.has_left() && !received.is_finished());
+        reset_to_new(&store, &branches);
+        let before = store.topic_view(&topic, None).unwrap();
+        let obligations = store.all_sync_obligations().unwrap();
+        drop(release);
+        assert!(matches!(
+            received.join().unwrap(),
+            Err(Error::StaleIncarnation)
+        ));
+        assert_eq!(store.topic_view(&topic, None).unwrap(), before);
+        assert_eq!(store.all_sync_obligations().unwrap(), obligations);
+        assert!(store.pending_missing_deps(&topic).unwrap().is_empty());
+        assert_eq!(
+            store.list_op_ids(&topic).unwrap(),
+            [branches.new.0.id, branches.new.1.id].into()
+        );
+    }
+}
+
+#[cfg(feature = "iroh")]
+#[test]
+fn memory_bound_admission() {
+    assert_bound_admission(MemoryStorage::new());
+}
+
+#[cfg(all(feature = "iroh", feature = "fjall"))]
+#[test]
+fn fjall_bound_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_bound_admission(crate::storage::FjallStorage::open(directory.path()).unwrap());
+}
+
 /// An ack is built while a reset replaces the branch it started reading. It
 /// must not pair the old genesis with the new branch's clock, which would prove
 /// an old-branch position the member never held.

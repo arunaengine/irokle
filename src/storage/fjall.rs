@@ -1941,8 +1941,22 @@ impl Storage for FjallStorage {
         Ok(peers)
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
+        self.put_pending_bound(source_peer, op, meta, None)
+    }
+    fn put_pending_bound(
+        &self,
+        source_peer: PeerId,
+        op: Op,
+        meta: OpMeta,
+        genesis: Option<OpId>,
+    ) -> Result<()> {
         let charge = Self::pending_charge(&op, &meta)?;
         self.transaction_bulk(|tx| {
+            if let Some(genesis) = genesis {
+                let state: Option<TopicState> =
+                    Self::tx_get(tx, &self.records, Self::key_id(b"ts", &meta.topic_id))?;
+                branch_matches(state.as_ref(), Some(genesis))?;
+            }
             if let Some(fence) = &self.namespace
                 && Self::tx_pending_record(tx, &self.records, &op.id)?.is_none()
             {

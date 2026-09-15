@@ -2082,6 +2082,8 @@ impl<S: Storage> SharedNet<S> {
                 request.window.clone(),
                 summary.actor_clock.iter().count(),
             );
+            #[cfg(test)]
+            self.node.storage().sync_boundary(topic_id, "request");
             controls.push(SyncMessage::Request(request));
         }
         if let Some(local_summary) = local_summary.filter(|_| !terminal) {
@@ -2286,6 +2288,8 @@ impl<S: Storage> SharedNet<S> {
             summary.actor_clock.iter().count(),
         );
         let request = crate::sync::page_request(plan, Some(genesis));
+        #[cfg(test)]
+        self.node.storage().sync_boundary(topic_id, "request");
         let credit_ops = request.credit.ops as usize;
         Ok(Some(PlannedTopicSync {
             topic_id,
@@ -2714,6 +2718,10 @@ impl<S: Storage> SharedNet<S> {
                     summaries.insert(summary.topic_id, summary);
                 }
                 SyncMessage::Page(page) if group_topics.contains(&page.topic_id) => {
+                    #[cfg(test)]
+                    if received.contains(&page.topic_id) {
+                        self.node.storage().sync_boundary(page.topic_id, "page");
+                    }
                     if page.more {
                         more.insert(page.topic_id);
                     }
@@ -2736,7 +2744,13 @@ impl<S: Storage> SharedNet<S> {
                     let received = self
                         .node
                         .ensure_iroh_peer_whitelisted(remote_peer_id, &data)
-                        .and_then(|()| self.node.receive_sync_outcome(remote_peer_id, data));
+                        .and_then(|()| {
+                            self.node.receive_bound(
+                                remote_peer_id,
+                                data,
+                                geneses.get(&data_topic_id).copied().flatten(),
+                            )
+                        });
                     match received {
                         // A staged page of a pulled topic owes no ack; the next request continues it.
                         Ok(ReceiveOutcome::Staged(_)) => {}

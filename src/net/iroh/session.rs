@@ -335,6 +335,17 @@ impl SyncSession {
                         continue;
                     }
                 };
+                #[cfg(test)]
+                net.node.storage().sync_boundary(
+                    topic_id,
+                    if page.continued {
+                        "continuation"
+                    } else if page.ops.is_empty() {
+                        "positions"
+                    } else {
+                        "plan"
+                    },
+                );
                 if engine.is_some() && page.continued && page.positions.is_empty() {
                     self.requests.insert(topic_id, request);
                     self.requests.extend(pending);
@@ -416,6 +427,10 @@ impl SyncSession {
                 topic_id,
                 code: crate::sync::SyncFailureCode::Ack,
             }));
+        }
+        #[cfg(test)]
+        for ack in &bound {
+            net.node.storage().sync_boundary(ack.topic_id, "ack");
         }
         for (ack, result) in bound.iter().zip(net.node.apply_sync_acks(&bound)) {
             match result {
