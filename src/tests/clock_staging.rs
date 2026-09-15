@@ -28,6 +28,9 @@ fn assert_clocks(source: &Source<MemoryStorage>, store: &FjallStorage, ops: &[Op
         assert_eq!(store.get_op(&op.id).unwrap().as_ref(), Some(op));
         let expected = source.log.storage().get_meta(&op.id).unwrap().unwrap();
         let actual = store.get_meta(&op.id).unwrap().unwrap();
+        let (header, clock) = store.get_observation(&op.id).unwrap().unwrap();
+        assert_eq!(header, crate::storage::OpHeader::from(&expected));
+        assert_eq!(clock, expected.observed_clock);
         assert_eq!(actual, expected);
         assert_eq!(
             postcard::to_allocvec(&actual.observed_clock).unwrap(),
@@ -250,6 +253,7 @@ fn damaged_nodes_refused() {
         let provisional = storage.provisional_topics().unwrap().pop().unwrap();
         let view = storage.provisional_store(&provisional).unwrap().unwrap();
         assert!(view.get_meta(&ops.last().unwrap().id).is_err());
+        assert!(view.get_observation(&ops.last().unwrap().id).is_err());
         let state = view.topic_state(&topic).unwrap().unwrap();
         let result =
             storage.activate_provisional(&provisional, &state, AdmissionEffects::default());

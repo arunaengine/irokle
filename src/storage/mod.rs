@@ -501,6 +501,12 @@ pub trait SnapshotRead {
     fn get_header(&self, id: &OpId) -> Result<Option<OpHeader>> {
         Ok(self.get_position(id)?.as_ref().map(OpHeader::from))
     }
+    /// Header and observed clock without copying the dependency collection.
+    fn get_observation(&self, id: &OpId) -> Result<Option<(OpHeader, ActorClock)>> {
+        Ok(self
+            .get_meta(id)?
+            .map(|meta| (OpHeader::from(&meta), meta.observed_clock)))
+    }
     /// See [`Storage::dep_resolvable`].
     fn dep_resolvable(&self, id: &OpId) -> Result<bool>;
     /// See [`Storage::actor_range`].
@@ -525,6 +531,14 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()>;
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
+    /// Compact position fields from one read context.
+    fn get_header(&self, id: &OpId) -> Result<Option<OpHeader>> {
+        self.read_snapshot(|read| read.get_header(id))
+    }
+    /// Header and observed clock from one read context.
+    fn get_observation(&self, id: &OpId) -> Result<Option<(OpHeader, ActorClock)>> {
+        self.read_snapshot(|read| read.get_observation(id))
+    }
     /// The position of `id`, as [`Self::get_meta`] would give it. Backends
     /// override it to leave the observed clock unread.
     fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {

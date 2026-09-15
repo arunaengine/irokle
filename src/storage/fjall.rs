@@ -2284,18 +2284,18 @@ impl FjallStorage {
         Ok(())
     }
 
-    /// `stored` with its observed clock loaded from the nodes `records` holds.
-    fn loaded_meta(
+    fn loaded_clock(
         &self,
         tx: &impl fjall::Readable,
         records: &fjall::OptimisticTxKeyspace,
-        stored: StoredMeta,
-    ) -> Result<OpMeta> {
-        let observed_clock = match stored.observed_clock {
+        topic: &TopicId,
+        stored: StoredClock,
+    ) -> Result<ActorClock> {
+        let clock = match stored {
             StoredClock::Nodes(root) => {
                 let clock = ActorClock::load(&root, &self.clocks, |hash| {
                     Ok(
-                        fjall::Readable::get(tx, records, clock_node_key(&stored.topic_id, hash))?
+                        fjall::Readable::get(tx, records, clock_node_key(topic, hash))?
                             .map(|bytes| bytes.to_vec()),
                     )
                 })?;
@@ -2304,6 +2304,18 @@ impl FjallStorage {
             }
             StoredClock::Inline(clock) => clock,
         };
+        Ok(clock)
+    }
+
+    /// `stored` with its observed clock loaded from the nodes `records` holds.
+    fn loaded_meta(
+        &self,
+        tx: &impl fjall::Readable,
+        records: &fjall::OptimisticTxKeyspace,
+        stored: StoredMeta,
+    ) -> Result<OpMeta> {
+        let observed_clock =
+            self.loaded_clock(tx, records, &stored.topic_id, stored.observed_clock)?;
         Ok(OpMeta {
             id: stored.id,
             topic_id: stored.topic_id,
@@ -2397,23 +2409,40 @@ struct HeaderPrefix {
 }
 
 fn decode_header(bytes: &[u8]) -> Result<super::OpHeader> {
+    Ok(header_tail(bytes)?.0)
+}
+
+fn header_tail(bytes: &[u8]) -> Result<(super::OpHeader, &[u8])> {
     let (prefix, rest): (HeaderPrefix, _) = postcard::take_from_bytes(bytes)?;
-    let (count, rest): (usize, _) = postcard::take_from_bytes(rest)?;
+    let rest = skip_ids(rest)?;
+    let (generation, rest): (u64, _) = postcard::take_from_bytes(rest)?;
+    Ok((
+        super::OpHeader {
+            topic_id: prefix.topic_id,
+            actor_id: prefix.actor_id,
+            actor_seq: prefix.actor_seq,
+            actor_prev: prefix.actor_prev,
+            generation,
+        },
+        rest,
+    ))
+}
+
+fn skip_ids(bytes: &[u8]) -> Result<&[u8]> {
+    let (count, rest): (usize, _) = postcard::take_from_bytes(bytes)?;
     // Dependency IDs are fixed-width arrays in the existing metadata encoding.
     let offset = count
         .checked_mul(OpId::LEN)
         .ok_or_else(|| Error::Decode("dependency length overflow".into()))?;
-    let rest = rest
-        .get(offset..)
-        .ok_or_else(|| Error::Decode("truncated dependency IDs".into()))?;
-    let (generation, _): (u64, _) = postcard::take_from_bytes(rest)?;
-    Ok(super::OpHeader {
-        topic_id: prefix.topic_id,
-        actor_id: prefix.actor_id,
-        actor_seq: prefix.actor_seq,
-        actor_prev: prefix.actor_prev,
-        generation,
-    })
+    rest.get(offset..)
+        .ok_or_else(|| Error::Decode("truncated dependency IDs".into()))
+}
+
+fn clock_tail(bytes: &[u8]) -> Result<StoredClock> {
+    let (clock, rest): (StoredClock, _) = postcard::take_from_bytes(bytes)?;
+    let (_, rest): (bool, _) = postcard::take_from_bytes(rest)?;
+    skip_ids(rest)?;
+    Ok(clock)
 }
 
 #[cfg(feature = "fjall")]
@@ -2453,6 +2482,27 @@ impl FjallSnapshot<'_> {
 }
 
 impl SnapshotRead for FjallSnapshot<'_> {
+    fn get_observation(&self, id: &OpId) -> Result<Option<(super::OpHeader, ActorClock)>> {
+        self.store.counters.count_meta();
+        let Some(bytes) = fjall::Readable::get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(b"m", id),
+        )?
+        else {
+            return Ok(None);
+        };
+        let (header, tail) = header_tail(&bytes)?;
+        if !self.shown(&header.topic_id)? {
+            return Ok(None);
+        }
+        let clock = clock_tail(tail)?;
+        let clock =
+            self.store
+                .loaded_clock(&self.tx, &self.store.records, &header.topic_id, clock)?;
+        Ok(Some((header, clock)))
+    }
+
     fn get_header(&self, id: &OpId) -> Result<Option<super::OpHeader>> {
         self.store.counters.count_meta();
         let header = fjall::Readable::get(
@@ -2640,6 +2690,9 @@ mod tests {
                 missing_deps: BTreeSet::new(),
             };
             let bytes = postcard::to_allocvec(&meta).unwrap();
+            let (_, tail) = header_tail(&bytes).unwrap();
+            assert!(clock_tail(tail).is_ok());
+            assert!(clock_tail(&tail[..tail.len() - 1]).is_err());
             assert_eq!(
                 decode_header(&bytes).unwrap(),
                 super::super::OpHeader {

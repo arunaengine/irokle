@@ -1241,7 +1241,7 @@ impl<S: Storage> Oplog<S> {
                     match (body.actor_seq, body.actor_prev) {
                         (1, None) => {}
                         (2.., Some(prev)) if body.deps.contains(&prev) => {
-                            let prev_meta = self.meta_projected(&prev, &overlay_meta)?;
+                            let prev_meta = self.header_projected(&prev, &overlay_meta)?;
                             if prev_meta.topic_id != body.topic_id
                                 || prev_meta.actor_id != body.actor_id
                                 || checked_next(prev_meta.actor_seq)? != body.actor_seq
@@ -1253,7 +1253,7 @@ impl<S: Storage> Oplog<S> {
                     }
                     let mut generation = 0;
                     for id in &body.deps {
-                        let dep_meta = self.meta_projected(id, &overlay_meta)?;
+                        let dep_meta = self.header_projected(id, &overlay_meta)?;
                         if dep_meta.topic_id != body.topic_id {
                             return Err(Error::TopicMismatch);
                         }
@@ -1868,11 +1868,20 @@ impl<S: Storage> Oplog<S> {
         let body = &op.signed.body;
         let mut observed_clock = crate::ActorClock::new();
         for dep in &body.deps {
-            let meta = self.meta_projected(dep, overlay_meta)?;
+            let (meta, clock) = match overlay_meta.get(dep) {
+                Some(meta) => (
+                    crate::storage::OpHeader::from(meta),
+                    meta.observed_clock.clone(),
+                ),
+                None => self
+                    .storage
+                    .get_observation(dep)?
+                    .ok_or(Error::MissingDependency(*dep))?,
+            };
             if meta.topic_id != body.topic_id {
                 return Err(Error::TopicMismatch);
             }
-            observed_clock.merge(&meta.observed_clock);
+            observed_clock.merge(&clock);
             observed_clock.observe(meta.actor_id, meta.actor_seq);
         }
         Ok(OpMeta {
@@ -1888,6 +1897,20 @@ impl<S: Storage> Oplog<S> {
             ready: true,
             missing_deps: BTreeSet::new(),
         })
+    }
+
+    fn header_projected(
+        &self,
+        id: &OpId,
+        overlay_meta: &BTreeMap<OpId, OpMeta>,
+    ) -> Result<crate::storage::OpHeader> {
+        match overlay_meta.get(id) {
+            Some(meta) => Ok(crate::storage::OpHeader::from(meta)),
+            None => self
+                .storage
+                .get_header(id)?
+                .ok_or(Error::MissingDependency(*id)),
+        }
     }
 
     fn meta_projected<'a>(
@@ -1933,10 +1956,7 @@ impl<S: Storage> Oplog<S> {
             if overlay_ops.contains_key(dep) {
                 continue;
             }
-            if reset
-                || self.storage.get_op(dep)?.is_none()
-                || self.storage.get_position(dep)?.is_none()
-            {
+            if reset || !self.storage.dep_resolvable(dep)? {
                 missing.insert(*dep);
             }
         }
@@ -2015,7 +2035,7 @@ impl<S: Storage> Oplog<S> {
                 return Err(Error::ActorPrevMismatch);
             }
             if !missing_deps.contains(&prev) {
-                let prev_meta = self.meta_projected(&prev, overlay.meta)?;
+                let prev_meta = self.header_projected(&prev, overlay.meta)?;
                 if prev_meta.topic_id != body.topic_id || prev_meta.actor_id != body.actor_id {
                     return Err(Error::ActorPrevMismatch);
                 }
@@ -2053,7 +2073,7 @@ impl<S: Storage> Oplog<S> {
             if missing_deps.contains(dep) {
                 continue;
             }
-            let meta = self.meta_projected(dep, overlay.meta)?;
+            let meta = self.header_projected(dep, overlay.meta)?;
             if meta.topic_id != body.topic_id {
                 return Err(Error::TopicMismatch);
             }
@@ -2166,7 +2186,7 @@ impl<S: Storage> Oplog<S> {
         }
         let mut generation = 0;
         for id in &body.deps {
-            let meta = self.meta_projected(id, overlay.meta)?;
+            let meta = self.header_projected(id, overlay.meta)?;
             generation = generation.max(checked_next(meta.generation)?);
         }
         if body.generation != generation {
@@ -2282,14 +2302,14 @@ impl<S: Storage> Oplog<S> {
     ) -> Result<crate::ActorClock> {
         let mut observed_clock = crate::ActorClock::new();
         for id in deps {
-            let meta = self
+            let (meta, clock) = self
                 .storage
-                .get_meta(id)?
+                .get_observation(id)?
                 .ok_or(Error::MissingDependency(*id))?;
             if meta.topic_id != *topic_id {
                 return Err(Error::TopicMismatch);
             }
-            observed_clock.merge(&meta.observed_clock);
+            observed_clock.merge(&clock);
             observed_clock.observe(meta.actor_id, meta.actor_seq);
         }
 

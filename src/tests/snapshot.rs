@@ -29,6 +29,9 @@ fn assert_request_views<S: Storage>(storage: S) {
             for id in read.list_op_ids(&source.topic_id)? {
                 let position = read.get_position(&id)?.unwrap();
                 let header = read.get_header(&id)?.unwrap();
+                let (observed, clock) = read.get_observation(&id)?.unwrap();
+                assert_eq!(observed, header);
+                assert_eq!(clock, read.get_meta(&id)?.unwrap().observed_clock);
                 assert_eq!(
                     (
                         header.topic_id,
