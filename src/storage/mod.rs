@@ -128,6 +128,40 @@ pub struct OpPosition {
     pub generation: u64,
 }
 
+/// Position fields needed without materializing dependencies or an observed clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpHeader {
+    pub topic_id: TopicId,
+    pub actor_id: ActorId,
+    pub actor_seq: u64,
+    pub actor_prev: Option<OpId>,
+    pub generation: u64,
+}
+
+impl From<&OpMeta> for OpHeader {
+    fn from(meta: &OpMeta) -> Self {
+        Self {
+            topic_id: meta.topic_id,
+            actor_id: meta.actor_id,
+            actor_seq: meta.actor_seq,
+            actor_prev: meta.actor_prev,
+            generation: meta.generation,
+        }
+    }
+}
+
+impl From<&OpPosition> for OpHeader {
+    fn from(meta: &OpPosition) -> Self {
+        Self {
+            topic_id: meta.topic_id,
+            actor_id: meta.actor_id,
+            actor_seq: meta.actor_seq,
+            actor_prev: meta.actor_prev,
+            generation: meta.generation,
+        }
+    }
+}
+
 impl From<&OpMeta> for OpPosition {
     fn from(meta: &OpMeta) -> Self {
         Self {
@@ -462,6 +496,10 @@ pub trait SnapshotRead {
     /// override it to leave the observed clock unread.
     fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {
         Ok(self.get_meta(id)?.as_ref().map(OpPosition::from))
+    }
+    /// Position fields without dependency collections; see [`OpHeader`].
+    fn get_header(&self, id: &OpId) -> Result<Option<OpHeader>> {
+        Ok(self.get_position(id)?.as_ref().map(OpHeader::from))
     }
     /// See [`Storage::dep_resolvable`].
     fn dep_resolvable(&self, id: &OpId) -> Result<bool>;

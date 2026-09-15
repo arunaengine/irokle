@@ -796,6 +796,11 @@ struct MemorySnapshot<'a> {
 }
 
 impl SnapshotRead for MemorySnapshot<'_> {
+    fn get_header(&self, id: &OpId) -> Result<Option<super::OpHeader>> {
+        self.counters.count_meta();
+        Ok(self.inner.meta.get(id).map(super::OpHeader::from))
+    }
+
     fn request_view(
         &self,
         topic_id: &TopicId,

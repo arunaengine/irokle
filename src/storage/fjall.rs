@@ -2386,6 +2386,36 @@ struct MetaPrefix {
     generation: u64,
 }
 
+#[derive(Deserialize)]
+struct HeaderPrefix {
+    _id: OpId,
+    topic_id: TopicId,
+    _author: PeerId,
+    actor_id: ActorId,
+    actor_seq: u64,
+    actor_prev: Option<OpId>,
+}
+
+fn decode_header(bytes: &[u8]) -> Result<super::OpHeader> {
+    let (prefix, rest): (HeaderPrefix, _) = postcard::take_from_bytes(bytes)?;
+    let (count, rest): (usize, _) = postcard::take_from_bytes(rest)?;
+    // Dependency IDs are fixed-width arrays in the existing metadata encoding.
+    let offset = count
+        .checked_mul(OpId::LEN)
+        .ok_or_else(|| Error::Decode("dependency length overflow".into()))?;
+    let rest = rest
+        .get(offset..)
+        .ok_or_else(|| Error::Decode("truncated dependency IDs".into()))?;
+    let (generation, _): (u64, _) = postcard::take_from_bytes(rest)?;
+    Ok(super::OpHeader {
+        topic_id: prefix.topic_id,
+        actor_id: prefix.actor_id,
+        actor_seq: prefix.actor_seq,
+        actor_prev: prefix.actor_prev,
+        generation,
+    })
+}
+
 #[cfg(feature = "fjall")]
 impl From<MetaPrefix> for OpPosition {
     fn from(prefix: MetaPrefix) -> Self {
@@ -2423,6 +2453,21 @@ impl FjallSnapshot<'_> {
 }
 
 impl SnapshotRead for FjallSnapshot<'_> {
+    fn get_header(&self, id: &OpId) -> Result<Option<super::OpHeader>> {
+        self.store.counters.count_meta();
+        let header = fjall::Readable::get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(b"m", id),
+        )?
+        .map(|bytes| decode_header(&bytes))
+        .transpose()?;
+        match header {
+            Some(header) if self.shown(&header.topic_id)? => Ok(Some(header)),
+            _ => Ok(None),
+        }
+    }
+
     fn request_view(
         &self,
         topic_id: &TopicId,
@@ -2575,6 +2620,43 @@ fn clear_satisfied_tx(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn header_matches_fields() {
+        use super::*;
+        for count in [0, 1, 127, 128, 255, 256, 257, 65_537] {
+            let meta = StoredMeta {
+                id: OpId::hash(b"header"),
+                topic_id: TopicId::hash(b"topic"),
+                author: PeerId::hash(b"author"),
+                actor_id: ActorId::hash(b"actor"),
+                actor_seq: 777,
+                actor_prev: Some(OpId::hash(b"previous")),
+                deps: (0..count)
+                    .map(|n: u64| OpId::hash(n.to_le_bytes()))
+                    .collect(),
+                generation: 987_654,
+                observed_clock: StoredClock::Inline(ActorClock::new()),
+                ready: true,
+                missing_deps: BTreeSet::new(),
+            };
+            let bytes = postcard::to_allocvec(&meta).unwrap();
+            assert_eq!(
+                decode_header(&bytes).unwrap(),
+                super::super::OpHeader {
+                    topic_id: meta.topic_id,
+                    actor_id: meta.actor_id,
+                    actor_seq: meta.actor_seq,
+                    actor_prev: meta.actor_prev,
+                    generation: meta.generation,
+                }
+            );
+            let (_, rest): (HeaderPrefix, _) = postcard::take_from_bytes(&bytes).unwrap();
+            let (_, ids): (usize, _) = postcard::take_from_bytes(rest).unwrap();
+            let before_generation = bytes.len() - ids.len() + count as usize * OpId::LEN;
+            assert!(decode_header(&bytes[..before_generation]).is_err());
+        }
+    }
+
     use super::*;
 
     #[test]

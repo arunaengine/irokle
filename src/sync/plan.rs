@@ -382,7 +382,7 @@ impl Pager<'_> {
                 }
                 None => {
                     self.visit();
-                    self.read.get_position(dep)?.map(|dep_meta| {
+                    self.read.get_header(dep)?.map(|dep_meta| {
                         (dep_meta.actor_id, dep_meta.actor_seq, dep_meta.generation)
                     })
                 }
@@ -428,7 +428,7 @@ impl Pager<'_> {
             for dep in &meta.deps {
                 self.work.edges.fetch_add(1, Ordering::Relaxed);
                 self.visit();
-                let Some(dep_meta) = self.read.get_position(dep)? else {
+                let Some(dep_meta) = self.read.get_header(dep)? else {
                     continue;
                 };
                 if !self.scope.unknown(&dep_meta.actor_id)

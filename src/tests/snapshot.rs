@@ -26,6 +26,26 @@ fn assert_request_views<S: Storage>(storage: S) {
         .storage()
         .read_snapshot(|read| {
             let full = read.topic_view(&source.topic_id, None)?.unwrap();
+            for id in read.list_op_ids(&source.topic_id)? {
+                let position = read.get_position(&id)?.unwrap();
+                let header = read.get_header(&id)?.unwrap();
+                assert_eq!(
+                    (
+                        header.topic_id,
+                        header.actor_id,
+                        header.actor_seq,
+                        header.actor_prev,
+                        header.generation
+                    ),
+                    (
+                        position.topic_id,
+                        position.actor_id,
+                        position.actor_seq,
+                        position.actor_prev,
+                        position.generation
+                    )
+                );
+            }
             let projected = read
                 .request_view(&source.topic_id, &source.reader, &actors)?
                 .unwrap();
