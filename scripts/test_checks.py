@@ -2,6 +2,7 @@
 
 import csv
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -90,6 +91,35 @@ class Checks(unittest.TestCase):
         self.assertNotEqual(rows[0]["source_before"], rows[0]["source_after"])
         self.assertEqual(len(rows), 1)
 
+    def test_source_restored(self):
+        code = "from pathlib import Path; p=Path('source'); b=p.read_bytes(); p.write_text('change'); p.write_bytes(b)"
+        result, rows = self.run_cases([self.case("restored", code)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(rows[0]["source_before"], rows[0]["source_after"])
+        self.assertIn("source changed", rows[0]["reason"])
+
+    def test_prior_log_removed(self):
+        code = f"from pathlib import Path; Path({str(self.output / 'one.log')!r}).unlink()"
+        result, rows = self.run_cases([self.case("one", "pass"), self.case("two", code)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([r["exit"] for r in rows], ["0", "0"])
+        self.assertTrue(json.loads((self.output / "complete.json").read_text())["changed_artifacts"])
+
+    def test_matrix_failure(self):
+        cases = [self.case("early", "raise SystemExit(7)"), self.case("later", "pass")]
+        shim = self.base / "python3"
+        shim.write_text(f"#!{sys.executable}\nimport os,sys\n"
+                        "if any(arg.endswith('/matrix.py') for arg in sys.argv):\n"
+                        f"    print({json.dumps(cases)!r})\nelse:\n"
+                        f"    os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n")
+        shim.chmod(0o700)
+        result = subprocess.run(["bash", str(RUNNER.with_name("matrix.sh")), str(self.repo),
+                                 str(self.output), str(self.base / "matrix.json")],
+                                env={**os.environ, "PATH": f"{self.base}:{os.environ['PATH']}"},
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("later: passed", result.stdout)
+
     def test_duplicate_labels(self):
         result, rows = self.run_cases([self.case("same", "pass"), self.case("same", "pass")])
         self.assertNotEqual(result.returncode, 0)
@@ -113,6 +143,13 @@ class Checks(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertNotEqual(rows[0]["status"], "passed")
         self.assertEqual(json.loads((self.output / "complete.json").read_text())["status"], "incomplete")
+
+    def test_runner_killed(self):
+        code = "import os,signal; os.kill(os.getppid(), signal.SIGKILL)"
+        result, _ = self.run_cases([self.case("killed", code)])
+        self.assertEqual(result.returncode, -9)
+        self.assertFalse((self.output / "complete.json").exists())
+        self.assertEqual(json.loads((self.output / "state.json").read_text())["status"], "incomplete")
 
 
 if __name__ == "__main__":

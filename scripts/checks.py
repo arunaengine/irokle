@@ -28,9 +28,13 @@ def git(repo, *args):
 def identity(repo):
     paths = git(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
     digest = hashlib.sha256()
+    stats = hashlib.sha256()
     for name in sorted(set(paths.split(b"\0")) - {b""}):
         path = repo / os.fsdecode(name)
         digest.update(name + b"\0")
+        if path.exists() or path.is_symlink():
+            stat = path.lstat()
+            stats.update(name + str((stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns)).encode())
         if path.is_symlink():
             digest.update(b"link\0" + os.fsencode(os.readlink(path)))
         elif path.is_file():
@@ -45,6 +49,7 @@ def identity(repo):
         "head": git(repo, "rev-parse", "HEAD").decode().strip(),
         "tree": git(repo, "rev-parse", "HEAD^{tree}").decode().strip(),
         "source_sha256": digest.hexdigest(),
+        "stat_sha256": stats.hexdigest(),
         "status": git(repo, "status", "--porcelain=v1").decode(),
     }
 
@@ -117,6 +122,7 @@ def run(repo, output, cases):
     fields = ["label", "exit", "status", "seconds", "source_before", "source_after", "log", "reason"]
     failed = False
     completed = 0
+    artifacts = {}
     try:
         with (output / "CHECKS.csv").open("x", newline="") as table:
             writer = csv.DictWriter(table, fieldnames=fields)
@@ -132,7 +138,8 @@ def run(repo, output, cases):
                     if before != baseline:
                         raise RuntimeError("source changed before command")
                     with path.open("x") as log:
-                        log.write(json.dumps({"argv": case["argv"], "source": before}) + "\n")
+                        log.write(json.dumps({"argv": case["argv"], "source": before,
+                                              "started_utc": time.strftime("%FT%TZ", time.gmtime())}) + "\n")
                         log.flush()
                         process = subprocess.Popen(case["argv"], cwd=repo, stdout=log,
                                                    stderr=subprocess.STDOUT, start_new_session=True)
@@ -155,6 +162,9 @@ def run(repo, output, cases):
                     reason = reason or "source changed during command"
                 status = "failed" if reason else "passed"
                 failed |= bool(reason)
+                for artifact in [path, *(repo / p for p in case.get("required_logs", []))]:
+                    if artifact.is_file():
+                        artifacts[str(artifact)] = hashlib.sha256(artifact.read_bytes()).hexdigest()
                 writer.writerow(dict(label=label, exit=code, status=status,
                                      seconds=f"{time.monotonic() - started:.3f}",
                                      source_before=before["source_sha256"],
@@ -173,10 +183,14 @@ def run(repo, output, cases):
             signal.signal(signum, handler)
     after = identity(repo)
     save(output / "after.json", after)
+    changed = [path for path, digest in artifacts.items()
+               if not Path(path).is_file() or hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest]
     failed |= completed != len(cases) or after != baseline
+    failed |= bool(changed)
     status = "incomplete" if completed != len(cases) else "failed" if failed else "passed"
     save(output / "complete.json", {"status": status, "completed": completed,
-                                   "expected": len(cases), "signal": interrupted})
+                                   "expected": len(cases), "signal": interrupted,
+                                   "changed_artifacts": changed, "artifacts_sha256": artifacts})
     return (128 + interrupted) if interrupted else int(failed)
 
 
