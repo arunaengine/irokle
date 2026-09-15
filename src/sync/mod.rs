@@ -16,6 +16,7 @@ mod plan;
 mod records;
 mod repair;
 mod request;
+mod space;
 mod types;
 
 #[cfg(test)]

@@ -49,8 +49,16 @@ impl Continuation {
         Self {
             genesis: view.genesis,
             epoch: view.epoch,
-            window: request.window.clone(),
-            named: named(request).into_iter().collect(),
+            window: if summary.is_none() {
+                request.window.clone()
+            } else {
+                ActorWindow::default()
+            },
+            named: if summary.is_none() {
+                named(request).into_iter().collect()
+            } else {
+                Vec::new()
+            },
             peer: summary.map(|summary| peer_scope(summary, view.genesis).0),
             local,
             goal,
@@ -101,12 +109,12 @@ impl Continuation {
 
     /// A conservative estimate of the bytes this plan holds.
     pub(super) fn bytes(&self) -> usize {
-        let window = self
-            .window
-            .behind
-            .as_ref()
-            .map_or(0, |behind| behind.bits.len());
-        self.named.capacity() * size_of::<(ActorId, u64)>() + window + self.frontier.bytes()
+        let window = self.window.behind.as_ref().map_or(0, |behind| {
+            super::space::vector_bytes::<u8>(behind.bits.capacity())
+        });
+        super::space::vector_bytes::<(ActorId, u64)>(self.named.capacity())
+            + window
+            + self.frontier.bytes()
     }
 }
 
@@ -175,6 +183,9 @@ impl Continuations {
     #[cfg(feature = "iroh")]
     pub(super) fn release(&mut self, key: (PeerId, TopicId)) {
         self.entries.remove(&key);
+        if self.entries.is_empty() {
+            self.entries = BTreeMap::new();
+        }
     }
 
     pub(super) fn new(capacity: usize) -> Self {
@@ -209,6 +220,9 @@ impl Continuations {
         summary: Option<&SyncSummary>,
     ) -> Option<Continuation> {
         let kept = self.entries.remove(&key)?;
+        if self.entries.is_empty() {
+            self.entries = BTreeMap::new();
+        }
         kept.resumes(view, request, summary).then_some(kept)
     }
 
@@ -246,6 +260,11 @@ impl Continuations {
             .values()
             .map(Continuation::bytes)
             .sum::<usize>()
+            + if self.entries.is_empty() {
+                0
+            } else {
+                super::space::tree_bytes::<(PeerId, TopicId), Continuation>(self.entries.len())
+            }
             + self.clocks.load(Ordering::Acquire)
             + self.records.load(Ordering::Acquire)
     }

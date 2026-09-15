@@ -5,10 +5,39 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub use irokle::{Error, Result, ids};
+pub use irokle::{Error, Op, OpId, Result, TopicPayload, ids};
+
+const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
+
+mod storage {
+    pub use irokle::storage::SnapshotRead;
+}
+
+#[path = "../src/sync/records.rs"]
+mod records;
+
+mod tests {
+    pub mod support {
+        pub use bytes::Bytes;
+        pub use irokle::{
+            Ed25519Signer, Event, EventEnvelope, MemoryStorage, Signer, Storage, TopicGenesis,
+            TopicId, actor_id_for, oplog,
+        };
+        #[derive(serde::Serialize, serde::Deserialize)]
+        pub struct Note {
+            pub text: String,
+        }
+        impl Event for Note {
+            const TYPE_ID: &'static str = "test.note";
+        }
+    }
+}
 
 #[path = "../src/clock.rs"]
 mod clock;
+
+#[path = "../src/sync/space.rs"]
+mod space;
 
 struct Counting;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -191,5 +220,154 @@ fn shared_cache_bounds() {
             "allocator={allocated}, model={modeled}"
         );
         println!("cache actors={actors} allocator_bytes={allocated} modeled_bytes={modeled}");
+    }
+}
+
+#[test]
+#[ignore = "allocator measurement requires its own process and one test thread"]
+fn tree_allocation_bounds() {
+    check_tree(0_u64);
+    check_tree([0_u8; 128]);
+    check_tree([0_u8; 384]);
+}
+
+fn check_tree<V: Clone>(value: V) {
+    for entries in [1_u32, 4, 5, 6, 11, 12, 31, 32, 33, 256, 4096] {
+        let before = LIVE.load(Ordering::Relaxed);
+        let mut tree = std::collections::BTreeMap::new();
+        for n in 0..entries {
+            tree.insert(ids::ActorId::hash(n.to_le_bytes()), value.clone());
+        }
+        let allocated = LIVE.load(Ordering::Relaxed) - before;
+        let bound = space::tree_bytes::<ids::ActorId, V>(tree.len());
+        assert!(
+            allocated <= bound,
+            "retained tree allocation exceeds its charge"
+        );
+        while tree.len() > 1 {
+            tree.pop_first();
+        }
+        let shrunk = LIVE.load(Ordering::Relaxed) - before;
+        assert!(shrunk <= space::tree_bytes::<ids::ActorId, V>(tree.len()));
+        tree.pop_first();
+        let empty = LIVE.load(Ordering::Relaxed) - before;
+        assert!(empty <= space::tree_bytes::<ids::ActorId, V>(0));
+        println!(
+            "tree value_bytes={} entries={entries} allocator_bytes={allocated} bound={bound} shrunk_bytes={shrunk} empty_bytes={empty}",
+            size_of::<V>()
+        );
+    }
+}
+
+#[test]
+#[ignore = "allocator measurement requires its own process and one test thread"]
+fn vector_allocation_bounds() {
+    for entries in [1, 4, 5, 11, 12, 33, 4096] {
+        let before = LIVE.load(Ordering::Relaxed);
+        let mut values = std::collections::VecDeque::new();
+        for n in 0..entries {
+            values.push_back([n as u64; 12]);
+        }
+        let allocated = LIVE.load(Ordering::Relaxed) - before;
+        let bound = space::vector_bytes::<[u64; 12]>(values.capacity());
+        values.clear();
+        assert!(
+            allocated <= bound,
+            "{entries} entries allocated {allocated}, bound {bound}"
+        );
+        assert!(LIVE.load(Ordering::Relaxed) - before <= bound);
+        println!(
+            "deque entries={entries} capacity={} allocator_bytes={allocated} bound={bound}",
+            values.capacity()
+        );
+    }
+}
+
+#[test]
+#[ignore = "allocator measurement requires its own process and one test thread"]
+fn record_allocation_bounds() {
+    use irokle::{
+        Ed25519Signer, EventEnvelope, MemoryStorage, OpBody, Signer, Storage, TopicGenesis,
+        TopicId, actor_id_for, oplog,
+    };
+    assert_eq!(
+        irokle::sync::SyncCredit::default().bytes,
+        MAX_PAGE_BYTES as u64
+    );
+    for entries in [1, 128, 2048, 65_536] {
+        let store = MemoryStorage::new();
+        let log = oplog::Oplog::with_storage(store.clone());
+        let signer = Ed25519Signer::from_bytes(&[218; 32]);
+        let topic = TopicId::hash(b"record-allocation");
+        let actor = actor_id_for(topic, signer.peer_id());
+        let mut previous = log
+            .create_topic_genesis(
+                topic,
+                actor,
+                TopicGenesis::new("allocation", [signer.peer_id()]),
+                &signer,
+            )
+            .unwrap();
+        let mut deps = std::collections::BTreeSet::from([previous.id]);
+        for _ in 1..entries {
+            previous = log
+                .create_event_op(
+                    topic,
+                    actor,
+                    EventEnvelope {
+                        type_id: "allocation".into(),
+                        payload: bytes::Bytes::new(),
+                    },
+                    &signer,
+                )
+                .unwrap();
+            deps.insert(previous.id);
+        }
+        let join = Op::sign(
+            OpBody {
+                topic_id: topic,
+                author: signer.peer_id(),
+                actor_id: actor,
+                actor_seq: previous.signed.body.actor_seq + 1,
+                actor_prev: Some(previous.id),
+                deps,
+                generation: previous.signed.body.generation + 1,
+                payload: TopicPayload::Event(EventEnvelope {
+                    type_id: "allocation".into(),
+                    payload: bytes::Bytes::from_static(b"owned"),
+                }),
+            },
+            &signer,
+        )
+        .unwrap();
+        log.receive_ops(vec![join.clone()]).unwrap();
+        let pool = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut records = records::Records::new(std::sync::Arc::clone(&pool));
+        let before = LIVE.load(Ordering::Relaxed);
+        PEAK.store(before, Ordering::Relaxed);
+        let record = store
+            .read_snapshot(|read| records.take(read, &join.id))
+            .unwrap()
+            .unwrap();
+        records.keep(record);
+        assert!(records.contains(&join.id));
+        let allocated = LIVE.load(Ordering::Relaxed) - before;
+        let peak = PEAK.load(Ordering::Relaxed) - before;
+        let bound = pool.load(Ordering::Acquire) + 4096;
+        assert!(
+            allocated <= bound && peak <= bound,
+            "record: {allocated} retained, {peak} peak, {bound} bound"
+        );
+        let record = store
+            .read_snapshot(|read| records.take(read, &join.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.op, join);
+        drop(record);
+        drop(records);
+        assert_eq!(pool.load(Ordering::Acquire), 0);
+        println!(
+            "record dependencies={entries} allocator_bytes={allocated} peak_bytes={peak} bound={bound}"
+        );
     }
 }

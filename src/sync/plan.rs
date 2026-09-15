@@ -120,25 +120,27 @@ impl Frontier {
 
     /// A conservative estimate of the bytes the frontier holds.
     pub(super) fn bytes(&self) -> usize {
-        const ID: usize = 64;
-        let head = size_of::<RangeHead>() + ID;
+        use super::space::{tree_bytes, vector_bytes};
         let suspended = self
             .suspended
             .values()
-            .map(|waiting| ID + waiting.len() * (head + 8))
+            .map(|waiting| vector_bytes::<(u64, RangeHead)>(waiting.capacity()))
             .sum::<usize>();
-        self.active.capacity() * size_of::<RangeHead>()
+        vector_bytes::<RangeHead>(self.active.capacity())
             + self
                 .selecting
                 .as_ref()
-                .map_or(0, |heap| heap.capacity() * size_of::<RangeHead>())
+                .map_or(0, |heap| vector_bytes::<RangeHead>(heap.capacity()))
             + suspended
-            + (self.blocked.len() + self.missing.len()) * ID
+            + tree_bytes::<ActorId, Vec<(u64, RangeHead)>>(self.suspended.len())
+            + tree_bytes::<OpId, ()>(self.blocked.len())
+            + tree_bytes::<OpId, ()>(self.missing.len())
             + self.deferred.bytes()
-            + self.positions.len() * ID
-            + self.resumable.len() * head
-            + self.states.len() * (ID + size_of::<ActorState>())
-            + self.checked.len() * 128
+            + 32
+            + tree_bytes::<ActorId, u64>(self.positions.len())
+            + vector_bytes::<RangeHead>(self.resumable.capacity())
+            + tree_bytes::<ActorId, ActorState>(self.states.len())
+            + tree_bytes::<OpId, OpId>(self.checked.len())
             + 4096
     }
 }
