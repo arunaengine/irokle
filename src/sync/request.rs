@@ -34,6 +34,10 @@ impl Default for RequestKnowledge {
 }
 
 impl RequestKnowledge {
+    #[cfg(feature = "iroh")]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        super::space::vector_bytes::<ActorId>(self.positions.capacity())
+    }
     /// Knowledge keeping at most `capacity` needed positions.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {

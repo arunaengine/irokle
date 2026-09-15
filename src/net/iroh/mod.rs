@@ -65,6 +65,9 @@ const RESYNC_PROGRESS_TURN: Duration = Duration::ZERO;
 const MAX_SYNC_NOW_PAGES: usize = 64;
 /// Staging receipts remembered per peer and topic, oldest dropped first.
 const MAX_BOOTSTRAP_RECEIPTS: usize = 1024;
+const RECEIPT_LOG_BYTES: usize = 64 * 1024 * 1024;
+const REQUEST_LOG_BYTES: usize = 32 * 1024 * 1024;
+const LOG_INDEX_BYTES: usize = 256 * 1024;
 /// Storage jobs running at once for acks, fingerprints, summaries and status.
 const CONTROL_JOBS: usize = 4;
 /// Storage jobs running at once for admission and page planning.
@@ -104,23 +107,37 @@ impl Default for StreamLimits {
 struct ReceiptLog {
     clocks: BTreeMap<(PeerId, crate::TopicId), crate::sync::SyncReceipt>,
     order: std::collections::VecDeque<(PeerId, crate::TopicId)>,
+    bytes: usize,
 }
 
 impl ReceiptLog {
     fn record(&mut self, peer_id: PeerId, receipt: crate::sync::SyncReceipt) {
         let key = (peer_id, receipt.topic_id);
-        if self.clocks.insert(key, receipt).is_none() {
-            self.order.push_back(key);
-            if self.order.len() > MAX_BOOTSTRAP_RECEIPTS
-                && let Some(oldest) = self.order.pop_front()
-            {
-                self.clocks.remove(&oldest);
-            }
+        self.clear(&key);
+        let bytes = Self::charge(&receipt);
+        if bytes > RECEIPT_LOG_BYTES - LOG_INDEX_BYTES {
+            return;
         }
+        while self.bytes + bytes > RECEIPT_LOG_BYTES - LOG_INDEX_BYTES
+            || self.clocks.len() >= MAX_BOOTSTRAP_RECEIPTS
+        {
+            let Some(oldest) = self.order.front().copied() else {
+                break;
+            };
+            self.clear(&oldest);
+        }
+        self.clocks.insert(key, receipt);
+        self.order.push_back(key);
+        self.bytes += bytes;
+    }
+
+    fn charge(receipt: &crate::sync::SyncReceipt) -> usize {
+        crate::ActorClock::allocation_bound(receipt.clock.len()).saturating_add(2048)
     }
 
     fn clear(&mut self, key: &(PeerId, crate::TopicId)) {
-        if self.clocks.remove(key).is_some() {
+        if let Some(receipt) = self.clocks.remove(key) {
+            self.bytes -= Self::charge(&receipt);
             self.order.retain(|kept| kept != key);
         }
     }
@@ -133,6 +150,7 @@ impl ReceiptLog {
 struct RequestLog {
     entries: BTreeMap<(PeerId, crate::TopicId), RequestEntry>,
     order: std::collections::VecDeque<(PeerId, crate::TopicId)>,
+    bytes: usize,
 }
 
 struct RequestEntry {
@@ -146,6 +164,14 @@ struct RequestEntry {
 }
 
 impl RequestEntry {
+    fn bytes(&self) -> usize {
+        self.window
+            .behind
+            .as_ref()
+            .map_or(0, |filter| filter.bits.capacity() + 64 * 1024)
+            + self.knowledge.retained_bytes()
+            + 2048
+    }
     /// Whether a request on `genesis` and staging `session` continues this
     /// entry. The first staging session continues requests made before it.
     fn continues(&self, genesis: crate::OpId, session: Option<u64>) -> bool {
@@ -177,32 +203,38 @@ impl RequestLog {
         window: crate::sync::ActorWindow,
         actors: usize,
     ) {
-        if let Some(entry) = self
-            .entries
-            .get_mut(&key)
+        let knowledge = self
+            .remove(&key)
             .filter(|entry| entry.continues(genesis, session))
-        {
-            entry.session = session;
-            entry.window = window;
-            entry.actors = actors;
-            self.order.retain(|kept| *kept != key);
-            self.order.push_back(key);
-            return;
-        }
+            .map_or_else(Default::default, |entry| entry.knowledge);
         let entry = RequestEntry {
             genesis,
             session,
-            knowledge: Default::default(),
+            knowledge,
             window,
             actors,
         };
-        if self.entries.insert(key, entry).is_none() {
-            self.order.push_back(key);
-            if self.order.len() > MAX_BOOTSTRAP_RECEIPTS
-                && let Some(oldest) = self.order.pop_front()
-            {
-                self.entries.remove(&oldest);
-            }
+        self.bytes += entry.bytes();
+        self.entries.insert(key, entry);
+        self.order.push_back(key);
+        self.trim();
+    }
+
+    fn remove(&mut self, key: &(PeerId, crate::TopicId)) -> Option<RequestEntry> {
+        let entry = self.entries.remove(key)?;
+        self.bytes -= entry.bytes();
+        self.order.retain(|kept| kept != key);
+        Some(entry)
+    }
+
+    fn trim(&mut self) {
+        while self.bytes > REQUEST_LOG_BYTES - LOG_INDEX_BYTES
+            || self.entries.len() > MAX_BOOTSTRAP_RECEIPTS
+        {
+            let Some(oldest) = self.order.front().copied() else {
+                break;
+            };
+            self.remove(&oldest);
         }
     }
 
@@ -220,12 +252,15 @@ impl RequestLog {
             .get_mut(key)
             .filter(|entry| Some(entry.genesis) == genesis)
         {
+            let before = entry.bytes();
             entry.knowledge.settle(
                 &entry.window,
                 (&page.positions, page.continued),
                 (received, entry.actors),
             );
+            self.bytes = self.bytes - before + entry.bytes();
         }
+        self.trim();
     }
 
     fn revision(&self, key: &(PeerId, crate::TopicId), genesis: Option<crate::OpId>) -> u64 {
@@ -3856,6 +3891,112 @@ mod tests {
         }
         assert_eq!(log.knowledge(&key, genesis, None).positions(), 1);
         assert!(log.entries.len() <= MAX_BOOTSTRAP_RECEIPTS);
+    }
+
+    #[test]
+    fn hint_bytes_bound() {
+        let genesis = crate::OpId::hash(b"byte-bound");
+        let mut requests = RequestLog::default();
+        for index in 0..40_u8 {
+            let key = (peer(index), topic(1));
+            requests.sent(
+                key,
+                (genesis, None),
+                crate::sync::ActorWindow {
+                    after: None,
+                    through: Some(crate::ActorId::from_bytes([1; 32])),
+                    behind: Some(crate::sync::ActorFilter {
+                        bits: vec![255; crate::sync::MAX_ACTOR_FILTER_BYTES],
+                    }),
+                },
+                40,
+            );
+            requests.settle(
+                &key,
+                Some(genesis),
+                &crate::sync::SyncPage {
+                    topic_id: key.1,
+                    more: true,
+                    missing: Default::default(),
+                    positions: [crate::ActorId::from_bytes([index; 32])].into(),
+                    continued: false,
+                },
+                false,
+            );
+            assert!(requests.bytes + LOG_INDEX_BYTES <= REQUEST_LOG_BYTES);
+            assert_eq!(
+                requests.bytes,
+                requests
+                    .entries
+                    .values()
+                    .map(RequestEntry::bytes)
+                    .sum::<usize>()
+            );
+        }
+        assert!(requests.entries.len() < 40);
+        assert_eq!(
+            requests.knowledge(&(peer(0), topic(1)), genesis, None),
+            Default::default()
+        );
+        let key = (peer(39), topic(1));
+        assert_eq!(requests.knowledge(&key, genesis, None).positions(), 1);
+        let before = requests.bytes;
+        requests.sent(key, (genesis, None), Default::default(), 40);
+        assert!(requests.bytes < before);
+
+        let mut receipts = ReceiptLog::default();
+        for index in 0..8_u8 {
+            let mut clock = crate::ActorClock::new();
+            for actor in 0..65_536_u32 {
+                clock.observe(
+                    crate::ActorId::hash(
+                        [index]
+                            .into_iter()
+                            .chain(actor.to_le_bytes())
+                            .collect::<Vec<_>>(),
+                    ),
+                    1,
+                );
+            }
+            receipts.record(
+                peer(index),
+                crate::sync::SyncReceipt {
+                    topic_id: topic(1),
+                    genesis,
+                    session: u64::from(index),
+                    clock,
+                },
+            );
+            assert!(receipts.bytes + LOG_INDEX_BYTES <= RECEIPT_LOG_BYTES);
+            assert_eq!(
+                receipts.bytes,
+                receipts
+                    .clocks
+                    .values()
+                    .map(ReceiptLog::charge)
+                    .sum::<usize>()
+            );
+        }
+        assert!(receipts.clocks.len() < 8);
+        assert!(!receipts.clocks.contains_key(&(peer(0), topic(1))));
+        receipts.record(
+            peer(7),
+            crate::sync::SyncReceipt {
+                topic_id: topic(1),
+                genesis,
+                session: 9,
+                clock: Default::default(),
+            },
+        );
+        receipts.clear(&(peer(7), topic(1)));
+        assert_eq!(
+            receipts.bytes,
+            receipts
+                .clocks
+                .values()
+                .map(ReceiptLog::charge)
+                .sum::<usize>()
+        );
     }
 
     #[test]
