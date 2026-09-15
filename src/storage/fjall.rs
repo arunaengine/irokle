@@ -2258,6 +2258,26 @@ impl FjallStorage {
         Ok(())
     }
 
+    /// Validate a copied clock against this activation's persisted node view.
+    pub(super) fn validate_meta(
+        tx: &impl fjall::Readable,
+        records: &fjall::OptimisticTxKeyspace,
+        bytes: &[u8],
+        cache: &crate::clock::ClockCache,
+    ) -> Result<()> {
+        let stored: StoredMeta = postcard::from_bytes(bytes)?;
+        if let StoredClock::Nodes(root) = stored.observed_clock {
+            let clock = ActorClock::load(&root, cache, |hash| {
+                Ok(
+                    fjall::Readable::get(tx, records, clock_node_key(&stored.topic_id, hash))?
+                        .map(|bytes| bytes.to_vec()),
+                )
+            })?;
+            cache.keep(&clock);
+        }
+        Ok(())
+    }
+
     /// `stored` with its observed clock loaded from the nodes `records` holds.
     fn loaded_meta(
         &self,

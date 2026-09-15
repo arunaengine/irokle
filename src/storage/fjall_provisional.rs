@@ -556,6 +556,7 @@ impl FjallStorage {
     /// until the state record names the topic.
     fn copy_namespace(&self, provisional: &ProvisionalTopic, store: &Records) -> Result<()> {
         let topic_id = provisional.topic_id;
+        let clocks = crate::clock::ClockCache::default();
         let mut after: Option<Vec<u8>> = None;
         loop {
             self.hook(Hook::CopyChunk)?;
@@ -576,6 +577,9 @@ impl FjallStorage {
                     let (key, value) = item.into_inner()?;
                     seen += 1;
                     if copied_record(&key) {
+                        if key.len() == 1 + OpId::LEN && key.starts_with(b"m") {
+                            Self::validate_meta(tx, store, &value, &clocks)?;
+                        }
                         tx.insert(&self.records, key.to_vec(), value);
                     }
                     last = Some(key.to_vec());
