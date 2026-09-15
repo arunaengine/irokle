@@ -1017,4 +1017,79 @@ pub(super) mod fjall {
         assert_eq!(reopened.bytes, bytes(&other_ops));
         assert_bytes_exact(&storage);
     }
+
+    #[test]
+    fn clearing_conflict_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = StagingLimits {
+            namespaces: 2,
+            ..StagingLimits::MEMORY
+        };
+        let storage = FjallStorage::open(dir.path())
+            .unwrap()
+            .with_staging_limits(limits);
+        let (source, topic, ops) = history(163, 2, 32);
+        let (old, _) = staged(&storage, source.peer_id(), topic, &ops);
+        let charged = bytes(&ops);
+        storage.set_hook(|at| {
+            if at == Hook::DeleteChunk {
+                Err(Error::AdmissionConflict)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(
+            storage.discard_provisional(&old),
+            Err(Error::AdmissionConflict)
+        ));
+        let other = storage.clone();
+        let (source, topic, ops) = history(164, 2, 32);
+        let fresh = other
+            .open_provisional(source.peer_id(), topic, ops[0].id, now())
+            .unwrap();
+        stage(&other, &fresh, &ops).unwrap();
+        let slots = storage.slot_bytes().unwrap();
+        assert_eq!(slots.len(), 2);
+        assert!(slots.contains(&(true, charged, Some(charged))));
+        assert_retained(&storage, &limits);
+        assert!(storage.provisional_store(&old).unwrap().is_none());
+        storage.set_hook(|_| Ok(()));
+        let restarted = storage
+            .open_provisional(old.source, old.topic_id, old.genesis, now())
+            .unwrap();
+        assert_ne!(restarted.session, old.session);
+        assert!(
+            storage
+                .slot_bytes()
+                .unwrap()
+                .iter()
+                .all(|(clearing, _, _)| !clearing)
+        );
+        assert_eq!(contents(&other, &fresh).2, bytes(&ops));
+    }
+
+    #[test]
+    fn clearing_fault_global() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path()).unwrap();
+        let (source, topic, ops) = history(165, 2, 32);
+        let (old, _) = staged(&storage, source.peer_id(), topic, &ops);
+        storage.set_hook(|at| {
+            if at == Hook::DeleteChunk {
+                Err(Error::Fjall(::fjall::Error::Poisoned))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(storage.discard_provisional(&old).is_err());
+        let before = storage.slot_bytes().unwrap();
+        let (source, topic, ops) = history(166, 2, 32);
+        let refused = storage.open_provisional(source.peer_id(), topic, ops[0].id, now());
+        assert!(matches!(
+            refused,
+            Err(Error::Fjall(::fjall::Error::Poisoned))
+        ));
+        assert_eq!(storage.slot_bytes().unwrap(), before);
+        assert!(storage.provisional_topics().unwrap().is_empty());
+    }
 }

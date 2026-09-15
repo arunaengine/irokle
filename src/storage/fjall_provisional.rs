@@ -291,7 +291,10 @@ impl FjallStorage {
         now_ms: u64,
     ) -> Result<ProvisionalTopic> {
         self.main_store()?;
-        self.reclaim_slots()?;
+        match self.reclaim_slots() {
+            Ok(()) | Err(Error::AdmissionConflict) => {}
+            Err(error) => return Err(error),
+        }
         let limits = self.limits;
         self.transaction(|tx| {
             if fjall::Readable::contains_key(tx, &self.records, Self::key_id(b"ts", &topic_id))? {
