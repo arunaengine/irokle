@@ -137,6 +137,15 @@ impl Node {
 }
 
 impl Node {
+    #[cfg(feature = "fjall")]
+    fn bytes(&self) -> usize {
+        let children = match self {
+            Self::Leaf { .. } => 0,
+            Self::Branch { children, .. } => children.capacity() * size_of::<Arc<Node>>() + 16,
+        };
+        size_of::<Self>() + 2 * size_of::<usize>() + 16 + children
+    }
+
     fn key(&self) -> &ActorId {
         match self {
             Node::Leaf { actor, .. } => actor,
@@ -578,22 +587,44 @@ pub(crate) struct ClockCache {
 #[derive(Default)]
 struct CacheInner {
     nodes: HashMap<[u8; 32], Weak<Node>>,
-    latest: VecDeque<(Arc<Node>, usize)>,
+    latest: VecDeque<Arc<Node>>,
+    retained: HashMap<usize, CachedNode>,
     bytes: usize,
 }
 
 #[cfg(feature = "fjall")]
-/// Estimated bytes the latest clocks may hold, counting every entry.
+struct CachedNode {
+    references: usize,
+    root: bool,
+}
+
+#[cfg(feature = "fjall")]
+/// Modeled bytes of retained nodes and their ownership index.
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(feature = "fjall")]
-/// Estimated bytes one clock entry holds in its nodes.
-const ENTRY_BYTES: usize = 160;
+/// A single root's conservative node and ownership-index allowance per entry.
+const ENTRY_BYTES: usize = 512;
 #[cfg(feature = "fjall")]
 /// Node names the cache tracks before it drops those nothing holds.
 const CACHE_NODES: usize = 1 << 18;
 
 #[cfg(feature = "fjall")]
 impl ClockCache {
+    pub(crate) fn bytes(&self) -> usize {
+        let inner = self.lock();
+        let weak = inner
+            .nodes
+            .values()
+            .filter(|node| !inner.retained.contains_key(&(node.as_ptr() as usize)))
+            .count();
+        inner.root_bytes()
+            + table_bytes(&inner.nodes)
+            + weak * (size_of::<Node>() + 2 * size_of::<usize>() + 16)
+            + size_of::<Self>()
+            + 2 * size_of::<usize>()
+            + 16
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, CacheInner> {
         // Only a shortcut: a poisoned cache still names valid nodes.
         self.inner
@@ -612,15 +643,19 @@ impl ClockCache {
             return;
         }
         let mut inner = self.lock();
-        inner.remember(root);
-        inner.bytes += bytes;
-        inner.latest.push_back((Arc::clone(root), bytes));
-        while inner.bytes > CACHE_BYTES {
-            let Some((_, bytes)) = inner.latest.pop_front() else {
-                break;
-            };
-            inner.bytes -= bytes;
+        if inner
+            .retained
+            .get(&(Arc::as_ptr(root) as usize))
+            .is_some_and(|node| node.root)
+        {
+            return;
         }
+        inner.remember(root);
+        if let Some(node) = inner.retained.get_mut(&(Arc::as_ptr(root) as usize)) {
+            node.root = true;
+        }
+        inner.latest.push_back(Arc::clone(root));
+        inner.trim(CACHE_BYTES);
     }
 
     /// The node named `hash`: shared when something still holds it, otherwise
@@ -709,7 +744,29 @@ impl ClockCache {
 
 #[cfg(feature = "fjall")]
 impl CacheInner {
+    fn root_bytes(&self) -> usize {
+        self.bytes
+            + table_bytes(&self.retained)
+            + self.latest.capacity() * size_of::<Arc<Node>>()
+            + usize::from(self.latest.capacity() > 0) * 16
+    }
+
+    fn trim(&mut self, limit: usize) {
+        while self.root_bytes() > limit {
+            let Some(root) = self.latest.pop_front() else {
+                self.retained.shrink_to_fit();
+                self.latest.shrink_to_fit();
+                break;
+            };
+            self.release(&root);
+        }
+    }
+
     fn name(&mut self, hash: &[u8; 32], node: &Arc<Node>) {
+        if let Some(named) = self.nodes.get_mut(hash) {
+            *named = Arc::downgrade(node);
+            return;
+        }
         if self.nodes.len() >= CACHE_NODES {
             self.nodes.retain(|_, node| node.strong_count() > 0);
             if self.nodes.len() >= CACHE_NODES / 2 {
@@ -719,24 +776,58 @@ impl CacheInner {
         self.nodes.insert(*hash, Arc::downgrade(node));
     }
 
-    /// Name `node` and the nodes below it not named yet.
+    /// Count each retained parent edge and root, visiting a shared subtree once.
     fn remember(&mut self, node: &Arc<Node>) {
-        let mut stack = vec![Arc::clone(node)];
+        let mut stack = vec![node];
         while let Some(node) = stack.pop() {
-            let hash = node.hash();
-            if self
-                .nodes
-                .get(&hash)
-                .is_some_and(|held| held.strong_count() > 0)
-            {
+            let address = Arc::as_ptr(node) as usize;
+            if let Some(node) = self.retained.get_mut(&address) {
+                node.references += 1;
                 continue;
             }
-            self.name(&hash, &node);
-            if let Node::Branch { children, .. } = &*node {
-                stack.extend(children.iter().cloned());
+            self.retained.insert(
+                address,
+                CachedNode {
+                    references: 1,
+                    root: false,
+                },
+            );
+            self.bytes += node.bytes();
+            self.name(&node.hash(), node);
+            if let Node::Branch { children, .. } = &**node {
+                stack.extend(children);
             }
         }
     }
+
+    fn release(&mut self, node: &Arc<Node>) {
+        if let Some(node) = self.retained.get_mut(&(Arc::as_ptr(node) as usize)) {
+            node.root = false;
+        }
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            let address = Arc::as_ptr(node) as usize;
+            if let Some(node) = self.retained.get_mut(&address) {
+                node.references -= 1;
+                if node.references != 0 {
+                    continue;
+                }
+            }
+            self.retained.remove(&address);
+            self.bytes -= node.bytes();
+            if let Node::Branch { children, .. } = &**node {
+                stack.extend(children);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "fjall")]
+fn table_bytes<K, V>(table: &HashMap<K, V>) -> usize {
+    if table.capacity() == 0 {
+        return 0;
+    }
+    table.capacity().next_power_of_two() * (size_of::<(K, V)>() + 1) + 64
 }
 
 impl PartialEq for ActorClock {
@@ -963,6 +1054,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn cache_counts_shared() {
+        let cache = ClockCache::default();
+        let mut clock = ActorClock::new();
+        let mut roots = Vec::new();
+        for index in 0_u32..1024 {
+            clock.observe(
+                ActorId::from_bytes(*blake3::hash(&index.to_le_bytes()).as_bytes()),
+                1,
+            );
+            cache.keep(&clock);
+            roots.push(Arc::clone(clock.root.as_ref().unwrap()));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut bytes = 0;
+        let mut stack = roots.iter().collect::<Vec<_>>();
+        while let Some(node) = stack.pop() {
+            if !seen.insert(Arc::as_ptr(node)) {
+                continue;
+            }
+            bytes += size_of::<Node>() + 2 * size_of::<usize>() + 16;
+            if let Node::Branch { children, .. } = &**node {
+                bytes += children.capacity() * size_of::<Arc<Node>>() + 16;
+                stack.extend(children);
+            }
+        }
+        assert_eq!(
+            cache.lock().bytes,
+            bytes,
+            "charge each retained allocation once"
+        );
+        cache.keep(&clock);
+        assert_eq!(cache.lock().bytes, bytes);
+        cache.keep(&ActorClock {
+            root: Some(Arc::clone(&roots[0])),
+        });
+        assert_eq!(cache.lock().latest.len(), roots.len());
+        let duplicate = ActorClock {
+            root: clock.root.as_ref().map(|root| Arc::new((**root).clone())),
+        };
+        cache.keep(&duplicate);
+        assert_eq!(
+            cache.lock().bytes,
+            bytes + duplicate.root.as_ref().unwrap().bytes()
+        );
+        assert!(cache.bytes() > cache.lock().bytes);
+        {
+            let mut inner = cache.lock();
+            inner.trim(0);
+            assert_eq!(inner.bytes, 0);
+            assert_eq!(inner.root_bytes(), 0);
+            assert!(inner.retained.is_empty());
+        }
+        let loaded = ActorClock::load(&clock.root_hash().unwrap(), &cache, |_| {
+            panic!("external holders remain live")
+        })
+        .unwrap();
+        assert_eq!(loaded, clock);
     }
 
     #[cfg(feature = "fjall")]

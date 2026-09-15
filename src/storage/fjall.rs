@@ -289,6 +289,12 @@ impl FjallStorage {
         self.counters.snapshot()
     }
 
+    /// Modeled allocation bytes retained by this facade's shared clock cache,
+    /// including collection capacity and weak node names; shared nodes count once.
+    pub fn clock_cache_bytes(&self) -> usize {
+        self.clocks.bytes()
+    }
+
     /// Flush buffered transactions with the requested durability.
     pub fn persist(&self, persist_mode: fjall::PersistMode) -> Result<()> {
         self.db.persist(persist_mode)?;
