@@ -2538,11 +2538,12 @@ fn fjall_upgrades_schema_two() {
 #[cfg(feature = "fjall")]
 #[test]
 fn fjall_refuses_bad_schema() {
+    use fjall::Readable;
     let dir = tempfile::tempdir().unwrap();
     let peer = PeerId::hash(b"refuse-peer");
     let topic_id = TopicId::hash(b"refuse-topic");
     drop(crate_storage::FjallStorage::open(dir.path()).unwrap());
-    {
+    let unchanged = {
         let db = fjall::OptimisticTxDatabase::builder(dir.path())
             .open()
             .unwrap();
@@ -2562,7 +2563,14 @@ fn fjall_refuses_bad_schema() {
             vec![0xff; 3],
         );
         tx.commit().unwrap().unwrap();
-    }
+        db.read_tx()
+            .iter(&records)
+            .map(|entry| {
+                let (key, value) = entry.into_inner().unwrap();
+                (key.to_vec(), value.to_vec())
+            })
+            .collect::<Vec<_>>()
+    };
     assert!(crate_storage::FjallStorage::open(dir.path()).is_err());
     {
         let db = fjall::OptimisticTxDatabase::builder(dir.path())
@@ -2573,6 +2581,16 @@ fn fjall_refuses_bad_schema() {
             .unwrap();
         let version = records.get(b"sv").unwrap().unwrap();
         assert_eq!(postcard::from_bytes::<u32>(&version).unwrap(), 2);
+        assert_eq!(
+            db.read_tx()
+                .iter(&records)
+                .map(|entry| {
+                    let (key, value) = entry.into_inner().unwrap();
+                    (key.to_vec(), value.to_vec())
+                })
+                .collect::<Vec<_>>(),
+            unchanged
+        );
         let mut tx = db.write_tx().unwrap();
         tx.insert(
             &records,
@@ -2585,6 +2603,25 @@ fn fjall_refuses_bad_schema() {
         crate_storage::FjallStorage::open(dir.path()),
         Err(Error::Storage(message)) if message.contains("unsupported")
     ));
+    let db = fjall::OptimisticTxDatabase::builder(dir.path())
+        .open()
+        .unwrap();
+    let records = db
+        .keyspace("records", fjall::KeyspaceCreateOptions::default)
+        .unwrap();
+    let mut expected = unchanged;
+    let (_, version) = expected.iter_mut().find(|(key, _)| key == b"sv").unwrap();
+    *version = postcard::to_allocvec(&99u32).unwrap();
+    assert_eq!(
+        db.read_tx()
+            .iter(&records)
+            .map(|entry| {
+                let (key, value) = entry.into_inner().unwrap();
+                (key.to_vec(), value.to_vec())
+            })
+            .collect::<Vec<_>>(),
+        expected
+    );
 }
 fn assert_repair_limit<S: Storage>(storage: S) {
     let (source, topic, ops) = super::ownership::history(181, 0, 0);

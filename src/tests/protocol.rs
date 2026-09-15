@@ -571,6 +571,27 @@ async fn old_protocol_refused() {
         .bind()
         .await
         .unwrap();
+    let old_peer = PeerId::from_bytes(*old.id().as_bytes());
+    let topic = alice
+        .node
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [old_peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let event = topic
+        .publish(Note {
+            text: "still owed".into(),
+        })
+        .unwrap();
+    alice
+        .node
+        .put_sync_obligation(old_peer, topic.id(), [event.meta.op_id].into())
+        .unwrap();
+    let before = alice.node.sync_summary(topic.id()).unwrap();
+    let operations = alice.node.storage().list_op_ids(&topic.id()).unwrap();
+    let obligations = alice.node.storage().all_sync_obligations().unwrap();
+    assert!(!obligations.is_empty());
 
     let connected = tokio::time::timeout(
         Duration::from_secs(30),
@@ -579,6 +600,23 @@ async fn old_protocol_refused() {
     .await
     .expect("the handshake ends instead of hanging");
     assert!(connected.is_err());
+    assert_eq!(alice.node.sync_summary(topic.id()).unwrap(), before);
+    assert_eq!(
+        alice.node.storage().list_op_ids(&topic.id()).unwrap(),
+        operations
+    );
+    assert_eq!(
+        alice.node.storage().all_sync_obligations().unwrap(),
+        obligations
+    );
+    assert!(
+        alice
+            .node
+            .storage()
+            .peer_ack(&old_peer, &topic.id())
+            .unwrap()
+            .is_none()
+    );
     old.close().await;
     alice.net.shutdown().await;
 }
