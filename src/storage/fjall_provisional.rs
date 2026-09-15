@@ -560,6 +560,8 @@ impl FjallStorage {
         let mut after: Option<Vec<u8>> = None;
         loop {
             self.hook(Hook::CopyChunk)?;
+            // The claim freezes this namespace; validation needs no write-conflict reads.
+            let read = self.db.read_tx();
             let (seen, last) = self.transaction(|tx| {
                 Self::tx_claimed(tx, &self.records, &topic_id, provisional.session)?;
                 let mut seen = 0;
@@ -578,7 +580,7 @@ impl FjallStorage {
                     seen += 1;
                     if copied_record(&key) {
                         if key.len() == 1 + OpId::LEN && key.starts_with(b"m") {
-                            Self::validate_meta(tx, store, &value, &clocks)?;
+                            Self::validate_meta(&read, store, &value, &clocks)?;
                         }
                         tx.insert(&self.records, key.to_vec(), value);
                     }
