@@ -233,7 +233,10 @@ impl Pager<'_> {
                 break;
             }
             self.fill()?;
-            if self.selecting.is_some() || (self.exhausted() && self.active.is_empty()) {
+            if self.ended
+                || self.selecting.is_some()
+                || (self.exhausted() && self.active.is_empty())
+            {
                 self.ended = true;
                 break;
             }
@@ -396,6 +399,8 @@ impl Pager<'_> {
                     self.states.insert(head.1, ActorState::Active);
                     self.active.push(Reverse(head));
                 }
+                // Finish inventory before spending a fresh slice on its selected page.
+                self.ended = self.scanned > 0;
                 return Ok(());
             };
             self.scan();

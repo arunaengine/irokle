@@ -692,6 +692,41 @@ fn tip_work_scales() {
     }
 }
 
+#[test]
+fn inventory_fills_page() {
+    let source = joined_source(MemoryStorage::new(), 33, true);
+    let reader = Oplog::new();
+    reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+    let receiver = SyncEngine::new(reader.clone(), source.reader);
+    let responder = source
+        .engine
+        .clone()
+        .with_page_actors(4)
+        .with_page_visits(104, 16);
+    let summary = responder.summary(source.topic_id).unwrap();
+    let request = receiver.plan_request(source.reader, &summary).unwrap();
+    let held = receiver.summary(source.topic_id).unwrap();
+    let budget = PageBudget {
+        ops: 4,
+        bytes: 32 * 1024 * 1024,
+    };
+    for _ in 0..8 {
+        let page = responder
+            .response_with(source.reader, &request, budget, &held)
+            .unwrap();
+        if page.ops.is_empty() {
+            assert!(page.continued);
+            continue;
+        }
+        assert_eq!(page.ops.len(), 4, "inventory setup consumed the data slice");
+        let ids = page.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+        assert_eq!(reader.receive_ops(page.ops).unwrap(), ids);
+        assert_eq!(responder.page_work().kept_bytes, 0);
+        return;
+    }
+    panic!("inventory did not produce a page");
+}
+
 #[cfg(feature = "fjall")]
 #[test]
 fn fjall_prefixes_finish() {
