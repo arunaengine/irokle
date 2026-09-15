@@ -24,6 +24,7 @@ pub(super) const MAX_PAGE_VISITS: usize = 65_536;
 pub(crate) struct PageWork {
     visits: AtomicU64,
     actors: AtomicU64,
+    tips: AtomicU64,
     edges: AtomicU64,
     ended: AtomicU64,
     resumed: AtomicU64,
@@ -35,6 +36,7 @@ pub(crate) struct PageWork {
 pub(crate) struct PageWorkSnapshot {
     pub(crate) visits: u64,
     pub(crate) actors: u64,
+    pub(crate) tips: u64,
     pub(crate) edges: u64,
     pub(crate) ended: u64,
     pub(crate) resumed: u64,
@@ -42,6 +44,10 @@ pub(crate) struct PageWorkSnapshot {
 }
 
 impl PageWork {
+    pub(super) fn tip(&self) {
+        self.tips.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(super) fn resumed(&self) {
         self.resumed.fetch_add(1, Ordering::Relaxed);
     }
@@ -51,6 +57,7 @@ impl PageWork {
         PageWorkSnapshot {
             visits: self.visits.load(Ordering::Relaxed),
             actors: self.actors.load(Ordering::Relaxed),
+            tips: self.tips.load(Ordering::Relaxed),
             edges: self.edges.load(Ordering::Relaxed),
             ended: self.ended.load(Ordering::Relaxed),
             resumed: self.resumed.load(Ordering::Relaxed),
@@ -620,7 +627,8 @@ impl<S: Storage> SyncEngine<S> {
             visit_limit: self.page_visits,
             ended: false,
             active: BinaryHeap::new(),
-            selecting: (scope.named.len() > self.page_actors).then(BinaryHeap::new),
+            selecting: (scope.informed() && scope.named.len() > self.page_actors)
+                .then(BinaryHeap::new),
             remainder: false,
             deferred: ClockCursor::default(),
             suspended: BTreeMap::new(),

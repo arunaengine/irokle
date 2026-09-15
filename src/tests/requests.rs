@@ -670,6 +670,28 @@ fn held_inventory_skipped() {
     assert_eq!(source.engine.page_work().kept_bytes, 0);
 }
 
+#[test]
+fn tip_work_scales() {
+    for width in [128, 256, 257] {
+        let source = joined_source(MemoryStorage::new(), width, true);
+        let reader = Oplog::new();
+        reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+        let engine = SyncEngine::new(reader, source.reader);
+        let summary = source.engine.summary(source.topic_id).unwrap();
+        let request = engine.plan_request(source.reader, &summary).unwrap();
+        assert!(request.wants.is_empty());
+        assert_eq!(
+            request.actor_range_hints.len(),
+            summary.actor_clock.len() - 1
+        );
+        let tips = engine.page_work().tips;
+        assert!(
+            tips <= 2 * summary.actor_tips.len() as u64,
+            "{width} actors examined {tips} tips"
+        );
+    }
+}
+
 #[cfg(feature = "fjall")]
 #[test]
 fn fjall_prefixes_finish() {

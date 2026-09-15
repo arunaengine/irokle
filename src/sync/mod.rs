@@ -478,12 +478,15 @@ impl<S: Storage> SyncEngine<S> {
         // actor's ranges, over as many pages as the gap needs; only a head at or
         // behind the local position is a hole and stays an explicit want.
         if matches!(send_set, SendSet::Page(_)) {
-            need.retain(|id| {
-                !remote
-                    .actor_tips
-                    .iter()
-                    .any(|(actor_id, (seq, tip))| tip == id && view.clock.get(actor_id) < *seq)
-            });
+            for (actor_id, (seq, tip)) in &remote.actor_tips {
+                if need.is_empty() {
+                    break;
+                }
+                self.work.tip();
+                if view.clock.get(actor_id) < *seq {
+                    need.remove(tip);
+                }
+            }
         }
         // A request past the item limit is refused whole, so the wants are cut
         // to what one request may carry beside the positions a page asked for
