@@ -38,6 +38,8 @@ mod slices;
 mod snapshot;
 mod staging;
 mod storage;
+#[cfg(all(feature = "fjall", target_os = "linux", target_pointer_width = "64"))]
+mod storage_full;
 pub(crate) mod support;
 mod sync;
 mod tiebreak;

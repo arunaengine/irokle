@@ -297,7 +297,9 @@ impl FjallStorage {
 
     /// Flush buffered transactions with the requested durability.
     pub fn persist(&self, persist_mode: fjall::PersistMode) -> Result<()> {
-        self.db.persist(persist_mode)?;
+        self.db
+            .persist(persist_mode)
+            .map_err(Error::ReopenRequired)?;
         Ok(())
     }
 
@@ -760,7 +762,11 @@ impl FjallStorage {
     ) -> Result<R> {
         for _ in 0..64 {
             self.counters.count_attempt();
-            let mut tx = self.db.write_tx()?.durability(Some(self.persist_mode));
+            let mut tx = self
+                .db
+                .write_tx()
+                .map_err(Error::ReopenRequired)?
+                .durability(Some(self.persist_mode));
             let result = match &self.namespace {
                 Some(fence) => {
                     Self::tx_fence_write(&tx, fence)?;
@@ -771,7 +777,7 @@ impl FjallStorage {
                 }
                 None => f(&mut tx)?,
             };
-            match tx.commit()? {
+            match tx.commit().map_err(Error::ReopenRequired)? {
                 Ok(()) => return Ok(result),
                 Err(_) => continue,
             }
@@ -786,7 +792,11 @@ impl FjallStorage {
         f: impl FnOnce(&mut fjall::OptimisticWriteTx) -> Result<R>,
     ) -> Result<R> {
         self.counters.count_attempt();
-        let mut tx = self.db.write_tx()?.durability(Some(self.persist_mode));
+        let mut tx = self
+            .db
+            .write_tx()
+            .map_err(Error::ReopenRequired)?
+            .durability(Some(self.persist_mode));
         let result = match &self.namespace {
             Some(fence) => {
                 Self::tx_fence_write(&tx, fence)?;
@@ -799,7 +809,7 @@ impl FjallStorage {
         };
         #[cfg(test)]
         self.race_commit()?;
-        match tx.commit()? {
+        match tx.commit().map_err(Error::ReopenRequired)? {
             Ok(()) => Ok(result),
             Err(_) => Err(Error::AdmissionConflict),
         }

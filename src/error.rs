@@ -130,4 +130,9 @@ pub enum Error {
     #[cfg(feature = "fjall")]
     #[error("fjall error: {0}")]
     Fjall(#[from] fjall::Error),
+
+    /// A failed commit can appear after recovery; verify its outcome after reopening.
+    #[cfg(feature = "fjall")]
+    #[error("storage requires reopen and transaction outcome verification: {0}")]
+    ReopenRequired(#[source] fjall::Error),
 }
