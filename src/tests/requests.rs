@@ -442,6 +442,107 @@ fn chain_windows_saturated() {
     }
 }
 
+#[test]
+fn single_visit_chain() {
+    let mut previous = None;
+    for actors in [40, 80] {
+        let mut source = super::progress::reverse_chain(MemoryStorage::new(), actors);
+        source.engine = source.engine.with_page_visits(1, 16);
+        let reader = Oplog::new();
+        reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+        let paged = page_informed(&source, &reader, 3, 2, true);
+        assert!(
+            paged.complete,
+            "{} rounds sent {} operations",
+            paged.rounds, paged.sent
+        );
+        assert_eq!(paged.sent, actors);
+        let work = source.engine.page_work();
+        let total = work.visits + work.edges + work.actors;
+        println!(
+            "single_visit actors={actors} rounds={} planner_work={total}",
+            paged.rounds
+        );
+        if let Some(previous) = previous {
+            assert!(total <= 3 * previous);
+        }
+        previous = Some(total);
+    }
+}
+
+#[test]
+fn confirmed_frontier_only() {
+    let source = super::progress::reverse_chain(MemoryStorage::new(), 40);
+    let responder = source
+        .engine
+        .clone()
+        .with_request_items(3)
+        .with_page_visits(1, 16);
+    let reader = Oplog::new();
+    reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+    let receiver = SyncEngine::new(reader.clone(), source.reader).with_request_items(3);
+    let request = receiver
+        .plan_request(source.reader, &responder.summary(source.topic_id).unwrap())
+        .unwrap();
+    let budget = PageBudget::from_credit(request.credit);
+    let mut first = None;
+    for _ in 0..256 {
+        let held = receiver.summary(source.topic_id).unwrap();
+        let page = responder
+            .response_with(source.reader, &request, budget, &held)
+            .unwrap();
+        if page.ops.is_empty() {
+            assert!(page.continued);
+            continue;
+        }
+        if let Some(expected) = first {
+            assert_eq!(
+                page.ops[0].id, expected,
+                "an unconsumed page must be replayed"
+            );
+            reader.receive_ops(page.ops).unwrap();
+            break;
+        }
+        first = Some(page.ops[0].id);
+    }
+    assert_eq!(
+        reader
+            .storage()
+            .list_op_ids(&source.topic_id)
+            .unwrap()
+            .len(),
+        2
+    );
+    let held = receiver.summary(source.topic_id).unwrap();
+    let before = responder.page_work().resumed;
+    responder
+        .response_with(source.reader, &request, budget, &held)
+        .unwrap();
+    assert!(responder.page_work().resumed > before);
+    let mut staged = held.clone();
+    staged.genesis = None;
+    staged.actor_clock = ActorClock::new();
+    staged.staged = Some(crate::sync::SyncReceipt {
+        topic_id: source.topic_id,
+        genesis: source.genesis.id,
+        session: 7,
+        clock: held.actor_clock,
+    });
+    for session in [7, 8] {
+        staged.staged.as_mut().unwrap().session = session;
+        let before = responder.page_work().resumed;
+        let page = responder
+            .response_with(source.reader, &request, budget, &staged)
+            .unwrap();
+        assert!(page.continued && page.ops.is_empty());
+        assert_eq!(
+            responder.page_work().resumed,
+            before,
+            "a changed staging session cannot resume the old frontier"
+        );
+    }
+}
+
 /// Held older prefixes satisfy a join while its actors remain behind.
 #[test]
 fn fan_in_capacity() {

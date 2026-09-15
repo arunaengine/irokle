@@ -83,8 +83,7 @@ enum ActorState {
     Blocked,
 }
 
-/// Everything a page plan learned, kept when its slice ended before it could
-/// send anything, to go on from for the same request.
+/// Retained traversal state, with a separate reservation for operation records.
 pub(super) struct Frontier {
     active: BinaryHeap<Reverse<RangeHead>>,
     selecting: Option<BinaryHeap<RangeHead>>,

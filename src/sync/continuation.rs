@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Page plans kept across work slices. A plan that ends its slice before it can
-//! send anything keeps its frontier here, and the same peer's next request for
-//! the same positions goes on from it instead of walking the same prefix again.
+//! Captured goals retained across slices and confirmed data pages. A changed
+//! branch, staging session or unconfirmed prefix starts a fresh traversal.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
