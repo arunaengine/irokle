@@ -12,7 +12,7 @@ use crate::storage::RequestView;
 use crate::{ActorClock, ActorId, Error, OpId, PeerId, Result, TopicId};
 
 use super::plan::Frontier;
-use super::{ActorWindow, SyncRequest};
+use super::{ActorWindow, SyncRequest, SyncSummary};
 
 /// Plans one engine keeps at once.
 pub(crate) const MAX_CONTINUATIONS: usize = 16;
@@ -24,13 +24,13 @@ const CLOCK_POOL_BYTES: usize = 256 * 1024 * 1024;
 /// A kept plan nobody resumed for this long gives its place to a new one.
 const CONTINUATION_IDLE: Duration = Duration::from_secs(60);
 
-/// A kept plan: the frontier, the clocks it planned against, and the branch,
-/// window and named positions of the request it answers.
+/// A captured goal and its frontier, bound to branch and peer staging session.
 pub(super) struct Continuation {
     genesis: OpId,
     epoch: u64,
     window: ActorWindow,
     named: Vec<(ActorId, u64)>,
+    peer: Option<(bool, Option<u64>)>,
     pub(super) local: ActorClock,
     pub(super) goal: ActorClock,
     pub(super) frontier: Frontier,
@@ -45,12 +45,14 @@ impl Continuation {
         goal: ActorClock,
         frontier: Frontier,
         clocks: ClockClaim,
+        summary: Option<&SyncSummary>,
     ) -> Self {
         Self {
             genesis: view.genesis,
             epoch: view.epoch,
             window: request.window.clone(),
             named: named(request).into_iter().collect(),
+            peer: summary.map(|summary| peer_scope(summary, view.genesis).0),
             local,
             goal,
             frontier,
@@ -59,11 +61,29 @@ impl Continuation {
         }
     }
 
-    /// Whether `request` on `view` may go on from this plan: the same branch,
-    /// destructive epoch and window; every actor the plan's request named named
-    /// again at the same position; and any actor named since starting where the
-    /// plan takes the requester to be. Appends that grew the goal are later work.
-    fn resumes(&self, view: &RequestView, request: &SyncRequest) -> bool {
+    /// Resume only with the same branch/session and confirmed positions.
+    /// Without a full summary, require the original window and named positions.
+    fn resumes(
+        &self,
+        view: &RequestView,
+        request: &SyncRequest,
+        summary: Option<&SyncSummary>,
+    ) -> bool {
+        if self.genesis != view.genesis || self.epoch != view.epoch {
+            return false;
+        }
+        if let Some(peer) = self.peer {
+            return summary.is_some_and(|summary| {
+                let (current, clock) = peer_scope(summary, view.genesis);
+                let empty = ActorClock::new();
+                peer == current
+                    && clock.unwrap_or(&empty).dominates(self.frontier.clock())
+                    && request
+                        .actor_range_hints
+                        .iter()
+                        .all(|hint| hint.from_exclusive >= self.frontier.covered(&hint.actor_id))
+            });
+        }
         let named = named(request);
         self.genesis == view.genesis
             && self.epoch == view.epoch
@@ -99,7 +119,13 @@ pub(super) struct ClockClaim {
 
 impl ClockClaim {
     pub(super) fn grow(&mut self, entries: usize) -> Result<()> {
-        let bytes = ActorClock::allocation_bound(entries).saturating_mul(4);
+        self.grow_roots([entries; 4])
+    }
+
+    pub(super) fn grow_roots(&mut self, entries: [usize; 4]) -> Result<()> {
+        let bytes = entries.into_iter().fold(0_usize, |bytes, entries| {
+            bytes.saturating_add(ActorClock::allocation_bound(entries))
+        });
         if bytes > MAX_CLOCK_BYTES {
             return Err(Error::SyncCapacity(format!(
                 "captured clocks need {bytes} reserved bytes, limit {MAX_CLOCK_BYTES}"
@@ -128,6 +154,7 @@ pub(super) struct Continuations {
     entries: BTreeMap<(PeerId, TopicId), Continuation>,
     capacity: usize,
     clocks: Arc<AtomicUsize>,
+    records: Arc<AtomicUsize>,
 }
 
 impl Continuations {
@@ -141,6 +168,7 @@ impl Continuations {
             entries: BTreeMap::new(),
             capacity,
             clocks: Arc::default(),
+            records: Arc::default(),
         }
     }
 
@@ -153,6 +181,10 @@ impl Continuations {
         Ok(claim)
     }
 
+    pub(super) fn records(&self) -> super::records::Records {
+        super::records::Records::new(Arc::clone(&self.records))
+    }
+
     /// The plan kept for the requesting peer's topic, when `request` on `view`
     /// may go on from it. A kept plan the request does not continue is dropped.
     pub(super) fn take(
@@ -160,9 +192,10 @@ impl Continuations {
         key: (PeerId, TopicId),
         view: &RequestView,
         request: &SyncRequest,
+        summary: Option<&SyncSummary>,
     ) -> Option<Continuation> {
         let kept = self.entries.remove(&key)?;
-        kept.resumes(view, request).then_some(kept)
+        kept.resumes(view, request, summary).then_some(kept)
     }
 
     /// Keep `continuation` for `key`, making room from plans idle too long.
@@ -200,6 +233,7 @@ impl Continuations {
             .map(Continuation::bytes)
             .sum::<usize>()
             + self.clocks.load(Ordering::Acquire)
+            + self.records.load(Ordering::Acquire)
     }
 }
 
@@ -210,6 +244,20 @@ fn named(request: &SyncRequest) -> BTreeMap<ActorId, u64> {
         .iter()
         .map(|hint| (hint.actor_id, hint.from_exclusive))
         .collect()
+}
+
+fn peer_scope(summary: &SyncSummary, genesis: OpId) -> ((bool, Option<u64>), Option<&ActorClock>) {
+    if summary.genesis == Some(genesis) {
+        return ((true, None), Some(&summary.actor_clock));
+    }
+    match summary
+        .staged
+        .as_ref()
+        .filter(|staged| staged.genesis == genesis)
+    {
+        Some(staged) => ((false, Some(staged.session)), Some(&staged.clock)),
+        None => ((false, None), None),
+    }
 }
 
 #[cfg(test)]

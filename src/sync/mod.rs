@@ -13,6 +13,7 @@ use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, canon
 mod continuation;
 mod evidence;
 mod plan;
+mod records;
 mod repair;
 mod request;
 mod types;
@@ -51,7 +52,7 @@ const MAX_REQUEST_ITEMS: usize = 65_536;
 /// request sends none and those actors stay unknown.
 pub const MAX_ACTOR_FILTER_BYTES: usize = 1024 * 1024;
 const MAX_PAGE_OPS: usize = 4096;
-const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 /// Actors one page plan keeps active range heads for; the rest wait for a free
 /// slot in the same page or for a later page.
 const MAX_PAGE_ACTORS: usize = 4096;
@@ -760,14 +761,20 @@ impl<S: Storage> SyncEngine<S> {
         let key = (peer_id, request.topic_id);
         let continues = request.wants.is_empty();
         let mut kept = continues
-            .then(|| self.continuations().take(key, &view, request))
+            .then(|| self.continuations().take(key, &view, request, summary))
             .flatten();
         let local = &view.clock;
-        if let Some(kept) = &mut kept {
+        if summary.is_none()
+            && let Some(kept) = &mut kept
+        {
             kept.clocks.grow(local.len().max(kept.local.len()))?;
         }
-        let clocks = if kept.is_none() {
-            Some(self.continuations().reserve_clocks(local.len())?)
+        let mut clocks = if kept.is_none() {
+            Some(self.continuations().reserve_clocks(if summary.is_some() {
+                0
+            } else {
+                local.len()
+            })?)
         } else {
             None
         };
@@ -809,6 +816,28 @@ impl<S: Storage> SyncEngine<S> {
             None => None,
         };
         let scope = scope.with_held(held);
+        if summary.is_some() {
+            let covered = held.map_or(0, ActorClock::len).saturating_add(budget.ops);
+            match &mut kept {
+                Some(kept) => {
+                    kept.clocks
+                        .grow_roots([kept.local.len(), kept.goal.len(), covered, 0])?
+                }
+                None => clocks
+                    .as_mut()
+                    .ok_or_else(|| Error::Storage("missing clock reservation".into()))?
+                    .grow_roots([local.len(), goal.len(), covered, 0])?,
+            }
+        }
+        if summary.is_some() && kept.is_none() {
+            peer_clock = held.cloned().unwrap_or_default();
+            for hint in &request.actor_range_hints {
+                peer_clock.set(
+                    hint.actor_id,
+                    hint.from_exclusive.min(local.get(&hint.actor_id)),
+                );
+            }
+        }
         let repair = Self::plan_repair(
             read,
             &request.topic_id,
@@ -852,7 +881,7 @@ impl<S: Storage> SyncEngine<S> {
         // only its plans are kept.
         // Wants this page could not carry keep their dependents out of the
         // forward ranges, which still serve every independent actor.
-        let (planned, positions, frontier) = match kept {
+        let (mut planned, positions, mut frontier) = match kept {
             Some(kept) => {
                 self.work.resumed();
                 let clocks = (&kept.local, &kept.goal, kept.frontier);
@@ -878,6 +907,13 @@ impl<S: Storage> SyncEngine<S> {
                 (planned.0, planned.1, frontier)
             }
         };
+        if frontier
+            .as_ref()
+            .is_some_and(|(frontier, _, goal, _)| frontier.clock().dominates(goal))
+        {
+            frontier = None;
+            planned.more = false;
+        }
         if let Some((frontier, local, goal, clocks)) = frontier
             && page.ops.is_empty()
             && needed.is_empty()
@@ -887,13 +923,29 @@ impl<S: Storage> SyncEngine<S> {
             if !continues {
                 return Err(Error::Storage("sync page work exceeds its budget".into()));
             }
-            let continuation = Continuation::new((&view, request), local, goal, frontier, clocks);
+            let continuation =
+                Continuation::new((&view, request), local, goal, frontier, clocks, summary);
             self.continuations().keep(key, continuation)?;
-            page.continued = true;
+            page.continued = planned.ops.is_empty();
         }
         let forwarded = planned.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
         page.more = planned.more || !repair.unsent.is_subset(&forwarded);
         page.ops.extend(planned.ops);
+        if summary.is_some() {
+            let mut sent = BTreeMap::<ActorId, u64>::new();
+            for op in &page.ops {
+                let body = &op.signed.body;
+                sent.entry(body.actor_id)
+                    .and_modify(|seq| *seq = (*seq).max(body.actor_seq))
+                    .or_insert(body.actor_seq);
+            }
+            page.more |= request.actor_range_hints.iter().any(|hint| {
+                hint.to_inclusive.min(view.clock.get(&hint.actor_id))
+                    > hint
+                        .from_exclusive
+                        .max(sent.get(&hint.actor_id).copied().unwrap_or(0))
+            });
+        }
         page.missing.extend(planned.missing);
         for (actor_id, generation) in positions {
             request::need(&mut needed, actor_id, generation);

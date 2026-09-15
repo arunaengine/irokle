@@ -2569,6 +2569,24 @@ impl FjallSnapshot<'_> {
 }
 
 impl SnapshotRead for FjallSnapshot<'_> {
+    fn get_reserved_op(
+        &self,
+        id: &OpId,
+        reserve: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<Option<Op>> {
+        self.store.counters.count_op();
+        let Some(bytes) = fjall::Readable::get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(b"o", id),
+        )?
+        else {
+            return Ok(None);
+        };
+        reserve(bytes.len())?;
+        let op: Op = postcard::from_bytes(&bytes)?;
+        Ok(self.shown(&op.signed.body.topic_id)?.then_some(op))
+    }
     fn get_observation(&self, id: &OpId) -> Result<Option<(super::OpHeader, ActorClock)>> {
         self.store.counters.count_meta();
         let Some(bytes) = fjall::Readable::get(

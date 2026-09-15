@@ -808,6 +808,18 @@ struct MemorySnapshot<'a> {
 }
 
 impl SnapshotRead for MemorySnapshot<'_> {
+    fn get_reserved_op(
+        &self,
+        id: &OpId,
+        reserve: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<Option<Op>> {
+        self.counters.count_op();
+        let Some(op) = self.inner.ops.get(id) else {
+            return Ok(None);
+        };
+        reserve(postcard::experimental::serialized_size(op)?)?;
+        Ok(Some(op.clone()))
+    }
     fn get_observation(&self, id: &OpId) -> Result<Option<(super::OpHeader, ActorClock)>> {
         self.counters.count_meta();
         Ok(self

@@ -491,6 +491,15 @@ pub trait SnapshotRead {
         }))
     }
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
+    /// Reserve before cloning or decoding an operation. Backends may size it exactly.
+    fn get_reserved_op(
+        &self,
+        id: &OpId,
+        reserve: &mut dyn FnMut(usize) -> Result<()>,
+    ) -> Result<Option<Op>> {
+        reserve(crate::sync::MAX_PAGE_BYTES)?;
+        self.get_op(id)
+    }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
     /// The position of `id`, as [`Self::get_meta`] would give it. Backends
     /// override it to leave the observed clock unread.

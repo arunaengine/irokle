@@ -149,7 +149,7 @@ impl<'a> ActorScope<'a> {
     }
 
     pub(crate) fn unknown(&self, actor_id: &ActorId) -> bool {
-        !self.named.contains(actor_id) && (self.held.is_some() || !self.window.holds(actor_id))
+        self.held.is_none() && !self.named.contains(actor_id) && !self.window.holds(actor_id)
     }
 
     pub(crate) fn with_held(mut self, held: Option<&'a ActorClock>) -> Self {
@@ -162,7 +162,7 @@ impl<'a> ActorScope<'a> {
     }
 
     pub(crate) fn holds_prefix(&self, actor: &ActorId, seq: u64) -> bool {
-        self.unknown(actor) && self.held.is_some_and(|held| held.get(actor) >= seq)
+        !self.named.contains(actor) && self.held.is_some_and(|held| held.get(actor) >= seq)
     }
 }
 

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::clock::ClockCursor;
 use crate::storage::{SnapshotRead, Storage};
-use crate::{ActorClock, ActorId, Error, OpId, Result, TopicId};
+use crate::{ActorClock, ActorId, Error, Op, OpId, Result, TopicId};
 
 use super::request::need;
 use super::{
@@ -97,6 +97,8 @@ pub(super) struct Frontier {
     blocked: BTreeSet<OpId>,
     missing: BTreeSet<OpId>,
     positions: BTreeMap<ActorId, u64>,
+    checked: BTreeMap<OpId, OpId>,
+    records: super::records::Records,
 }
 
 impl Frontier {
@@ -129,11 +131,14 @@ impl Frontier {
             + self.positions.len() * ID
             + self.resumable.len() * head
             + self.states.len() * (ID + size_of::<ActorState>())
+            + self.checked.len() * 128
+            + 4096
     }
 }
 
 /// What an op still needs before it can be sent.
 enum Wait {
+    Yield,
     Ready,
     Blocked,
     Position(ActorId, u64),
@@ -178,6 +183,8 @@ struct Pager<'a> {
     /// Actors the request left unknown, with the lowest generation needing each.
     positions: BTreeMap<ActorId, u64>,
     more: bool,
+    checked: BTreeMap<OpId, OpId>,
+    records: super::records::Records,
 }
 
 impl Pager<'_> {
@@ -241,23 +248,33 @@ impl Pager<'_> {
                 break;
             };
             let (_, actor_id, seq, id, limit) = head;
-            self.visit();
-            let Some(op) = self.read.get_op(&id)? else {
+            if !self.records.contains(&id) {
+                self.visit();
+            }
+            let Some(record) = self.records.take(self.read, &id)? else {
                 self.missing.insert(id);
                 self.block(actor_id, id);
                 continue;
             };
-            match self.wait_for(&op.signed.body.deps)? {
+            match self.wait_for(&record.op)? {
+                Wait::Yield => {
+                    self.records.keep(record);
+                    self.active.push(Reverse(head));
+                    self.ended = true;
+                    break;
+                }
                 Wait::Ready => {}
                 Wait::Blocked => {
                     self.block(actor_id, id);
                     continue;
                 }
                 Wait::Position(dep_actor, dep_seq) => {
+                    self.records.keep(record);
                     self.suspend(head, dep_actor, dep_seq)?;
                     continue;
                 }
             }
+            let op = record.into_op();
             let size = postcard::experimental::serialized_size(&op)?;
             if size > MAX_PAGE_BYTES {
                 return Err(Error::Storage("operation exceeds sync page budget".into()));
@@ -266,6 +283,8 @@ impl Pager<'_> {
                 if ops.is_empty() && size > budget.bytes {
                     too_large = Some(id);
                 }
+                self.active.push(Reverse(head));
+                self.ended = true;
                 self.more = true;
                 break;
             }
@@ -291,7 +310,10 @@ impl Pager<'_> {
         while missing.len() > MAX_PAGE_MISSING {
             missing.pop_last();
         }
-        let frontier = (self.ended && ops.is_empty() && too_large.is_none()).then(|| {
+        let frontier = (self.ended
+            && (ops.is_empty() || (self.scope.informed() && !self.remainder))
+            && too_large.is_none())
+        .then(|| {
             self.work.ended.fetch_add(1, Ordering::Relaxed);
             Frontier {
                 active: self.active,
@@ -305,6 +327,8 @@ impl Pager<'_> {
                 blocked: self.blocked,
                 missing: self.missing,
                 positions: self.positions,
+                checked: self.checked,
+                records: self.records,
             }
         });
         let page = PlannedPage {
@@ -424,10 +448,20 @@ impl Pager<'_> {
     /// What `meta` still waits for: an unsent or blocked dependency, a missing
     /// record, positions of actors the request did not describe, all named at
     /// once, or a position of another actor the peer does not hold yet.
-    fn wait_for(&mut self, deps: &BTreeSet<OpId>) -> Result<Wait> {
+    fn wait_for(&mut self, op: &Op) -> Result<Wait> {
         let mut unknown = false;
         let mut waits = None;
-        for dep in deps {
+        let after = self.checked.get(&op.id).copied();
+        let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        for dep in op
+            .signed
+            .body
+            .deps
+            .range((start, std::ops::Bound::Unbounded))
+        {
+            if self.scope.informed() && self.exhausted() {
+                return Ok(Wait::Yield);
+            }
             self.work.edges.fetch_add(1, Ordering::Relaxed);
             if self.blocked.contains(dep) {
                 return Ok(Wait::Blocked);
@@ -445,6 +479,7 @@ impl Pager<'_> {
                 return Ok(Wait::Blocked);
             };
             if self.scope.holds_prefix(&dep_actor, dep_seq) {
+                self.checked.insert(op.id, *dep);
                 continue;
             }
             // Omitted from the request is not held: the requester names it next.
@@ -453,9 +488,15 @@ impl Pager<'_> {
                 self.unknown_ancestors(*dep)?;
                 unknown = true;
             } else if waits.is_none() && self.covered.get(&dep_actor) < dep_seq {
+                if self.scope.informed() {
+                    return Ok(Wait::Position(dep_actor, dep_seq));
+                }
                 waits = Some(Wait::Position(dep_actor, dep_seq));
+            } else if self.scope.informed() {
+                self.checked.insert(op.id, *dep);
             }
         }
+        self.checked.remove(&op.id);
         Ok(match (unknown, waits) {
             (true, _) => Wait::Blocked,
             (false, Some(waits)) => waits,
@@ -512,7 +553,9 @@ impl Pager<'_> {
             }
             Some(ActorState::Active | ActorState::Suspended) => {}
             Some(ActorState::Reached(limit)) => {
-                if limit >= dep_seq || dep_seq > self.local.get(&dep_actor) {
+                if limit >= dep_seq
+                    || (!self.scope.informed() && dep_seq > self.local.get(&dep_actor))
+                {
                     self.block(actor_id, id);
                     return Ok(());
                 }
@@ -558,7 +601,7 @@ impl Pager<'_> {
         let raised = waiting
             .iter()
             .map(|(needed, _)| *needed)
-            .filter(|needed| *needed > limit && *needed <= local_seq)
+            .filter(|needed| *needed > limit && (self.scope.informed() || *needed <= local_seq))
             .max();
         if let Some(raised) = raised {
             self.activate(actor_id, limit, raised)?;
@@ -573,6 +616,11 @@ impl Pager<'_> {
             } else {
                 self.block(head.1, head.3);
             }
+        }
+        if self.scope.informed()
+            && matches!(self.states.get(&actor_id), Some(ActorState::Reached(_)))
+        {
+            self.states.remove(&actor_id);
         }
         Ok(())
     }
@@ -641,6 +689,8 @@ impl<S: Storage> SyncEngine<S> {
             missing: BTreeSet::new(),
             positions: BTreeMap::new(),
             more: false,
+            checked: BTreeMap::new(),
+            records: self.continuations().records(),
         };
         pager.plan(budget, true)
     }
@@ -682,6 +732,8 @@ impl<S: Storage> SyncEngine<S> {
             missing: frontier.missing,
             positions: frontier.positions,
             more: false,
+            checked: frontier.checked,
+            records: frontier.records,
         };
         pager.plan(budget, false)
     }
