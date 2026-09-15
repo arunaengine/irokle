@@ -98,7 +98,7 @@ class Checks(unittest.TestCase):
         self.assertEqual(rows[0]["source_before"], rows[0]["source_after"])
         self.assertIn("source changed", rows[0]["reason"])
 
-    def test_prior_log_removed(self):
+    def test_prior_removal(self):
         code = f"from pathlib import Path; Path({str(self.output / 'one.log')!r}).unlink()"
         result, rows = self.run_cases([self.case("one", "pass"), self.case("two", code)])
         self.assertNotEqual(result.returncode, 0)
