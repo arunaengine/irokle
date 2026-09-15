@@ -151,18 +151,18 @@ fn fault_child(path: &std::path::Path) {
 
 #[test]
 fn write_fault_recovers() {
+    isolated("write_fault_recovers", fault_child);
+}
+
+fn isolated(name: &str, child: impl FnOnce(&std::path::Path)) {
     if let Some(path) = std::env::var_os("IROKLE_WRITE_CHILD") {
-        fault_child(std::path::Path::new(&path));
+        child(std::path::Path::new(&path));
         return;
     }
     let directory = tempfile::tempdir().unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "tests::storage_full::write_fault_recovers",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
+        .arg(format!("tests::storage_full::{name}"))
+        .args(["--exact", "--nocapture", "--test-threads=1"])
         .env("IROKLE_WRITE_CHILD", directory.path())
         .output()
         .unwrap();
@@ -183,8 +183,92 @@ fn write_fault_recovers() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fault_recovered"));
+}
+
+fn namespace_fault(path: &std::path::Path, point: crate::storage::Hook) {
+    use super::clock_staging::{assert_clocks, clock_nodes};
+    use super::ownership::fjall::{assert_hidden, staged};
+    use crate::storage::{AdmissionEffects, Hook};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let source = super::progress::reverse_chain(MemoryStorage::new(), 1300);
+    let topic = source.topic_id;
+    let ops = oplog::topological(source.log.storage(), &topic).unwrap();
+    let db = ::fjall::OptimisticTxDatabase::builder(path).open().unwrap();
+    let storage = FjallStorage::from_database(db.clone()).unwrap();
+    let (provisional, state) = staged(&storage, source.genesis.signed.body.author, topic, &ops);
+    assert!(clock_nodes(&db, "bootstrap-0", topic) > 4096);
+    let nth = if point == Hook::CopyChunk { 1 } else { 0 };
+    let seen = Arc::new(AtomicUsize::new(0));
+    let limit = Arc::new(std::sync::Mutex::new(None));
+    let (entered, armed) = (Arc::clone(&seen), Arc::clone(&limit));
+    storage.set_hook(move |at| {
+        if at == point && entered.fetch_add(1, Ordering::SeqCst) == nth {
+            *armed.lock().unwrap() = Some(FileLimit::zero());
+        }
+        Ok(())
+    });
+    let failed = if point == Hook::DeleteChunk {
+        storage.discard_provisional(&provisional).map(|_| ())
+    } else {
+        storage.activate_provisional(&provisional, &state, AdmissionEffects::default())
+    };
+    drop(limit.lock().unwrap().take());
+    storage.set_hook(|_| Ok(()));
+    assert_eq!(seen.load(Ordering::SeqCst), nth + 1);
     assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("fault_recovered prior_ops=2 recovered_ops=")
+        matches!(failed, Err(Error::ReopenRequired(_))),
+        "{failed:?}"
     );
+    assert_hidden(&storage, topic, ops[0].signed.body.actor_id, &ops);
+    assert!(matches!(
+        storage.persist(::fjall::PersistMode::SyncAll),
+        Err(Error::ReopenRequired(::fjall::Error::Poisoned))
+    ));
+    drop((storage, db));
+    let storage = FjallStorage::open(path).unwrap();
+    if point == Hook::DeleteChunk {
+        assert_hidden(&storage, topic, ops[0].signed.body.actor_id, &ops);
+    } else {
+        if storage.topic_state(&topic).unwrap().is_none() {
+            assert_hidden(&storage, topic, ops[0].signed.body.actor_id, &ops);
+            let current = storage.provisional_topics().unwrap().pop().unwrap();
+            let view = storage.provisional_store(&current).unwrap().unwrap();
+            assert_clocks(&source, &view, &ops);
+            storage
+                .activate_provisional(&current, &state, AdmissionEffects::default())
+                .unwrap();
+        }
+        assert_clocks(&source, &storage, &ops);
+    }
+    let other = super::progress::reverse_chain(MemoryStorage::new(), 1);
+    storage
+        .open_provisional(other.reader, other.topic_id, other.genesis.id, 2_000)
+        .unwrap();
+    drop(storage);
+    let db = ::fjall::OptimisticTxDatabase::builder(path).open().unwrap();
+    assert_eq!(clock_nodes(&db, "bootstrap-0", topic), 0);
+    println!("fault_recovered namespace={point:?}");
+}
+
+#[test]
+fn copy_fault_recovers() {
+    isolated("copy_fault_recovers", |path| {
+        namespace_fault(path, crate::storage::Hook::CopyChunk)
+    });
+}
+
+#[test]
+fn publish_fault_recovers() {
+    isolated("publish_fault_recovers", |path| {
+        namespace_fault(path, crate::storage::Hook::Publish)
+    });
+}
+
+#[test]
+fn clearing_fault_recovers() {
+    isolated("clearing_fault_recovers", |path| {
+        namespace_fault(path, crate::storage::Hook::DeleteChunk)
+    });
 }

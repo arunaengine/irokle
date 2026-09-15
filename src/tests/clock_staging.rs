@@ -7,7 +7,7 @@ use super::support::*;
 use crate::storage::{AdmissionEffects, FjallStorage, Hook};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn clock_nodes(db: &fjall::OptimisticTxDatabase, space: &str, topic: TopicId) -> usize {
+pub(super) fn clock_nodes(db: &fjall::OptimisticTxDatabase, space: &str, topic: TopicId) -> usize {
     let records = db
         .keyspace(space, fjall::KeyspaceCreateOptions::default)
         .unwrap();
@@ -15,7 +15,7 @@ fn clock_nodes(db: &fjall::OptimisticTxDatabase, space: &str, topic: TopicId) ->
     fjall::Readable::prefix(&db.read_tx(), &records, prefix).count()
 }
 
-fn assert_clocks(source: &Source<MemoryStorage>, store: &FjallStorage, ops: &[Op]) {
+pub(super) fn assert_clocks(source: &Source<MemoryStorage>, store: &FjallStorage, ops: &[Op]) {
     assert_eq!(
         store.topic_view(&source.topic_id, None).unwrap(),
         source
