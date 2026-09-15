@@ -2586,3 +2586,34 @@ fn fjall_refuses_bad_schema() {
         Err(Error::Storage(message)) if message.contains("unsupported")
     ));
 }
+fn assert_repair_limit<S: Storage>(storage: S) {
+    let (source, topic, ops) = super::ownership::history(181, 0, 0);
+    oplog::Oplog::with_storage(storage.clone())
+        .receive_ops(ops.clone())
+        .unwrap();
+    let ids = (0..=crate::storage::MAX_REPAIR_IDS)
+        .map(|n| OpId::hash(n.to_le_bytes()))
+        .collect();
+    let before = storage.all_sync_obligations().unwrap();
+    let result = storage.put_sync_obligation(
+        crate::storage::SyncObligation::repair(source.peer_id(), topic, ids),
+        Some(ops[0].id),
+    );
+    assert!(
+        result.is_err(),
+        "initial repair obligation exceeded its limit"
+    );
+    assert_eq!(storage.all_sync_obligations().unwrap(), before);
+}
+
+#[test]
+fn memory_repair_limit() {
+    assert_repair_limit(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_repair_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_repair_limit(crate::storage::FjallStorage::open(directory.path()).unwrap());
+}

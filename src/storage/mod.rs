@@ -1054,6 +1054,11 @@ pub(super) fn merged_obligation(
     existing: Option<SyncObligation>,
     incoming: &SyncObligation,
 ) -> Result<SyncObligation> {
+    if matches!(&incoming.target, ObligationTarget::Repair(ids) if ids.len() > MAX_REPAIR_IDS) {
+        return Err(crate::Error::Storage(
+            "repair obligation exceeds its id limit".into(),
+        ));
+    }
     let Some(mut merged) = existing else {
         return Ok(incoming.clone());
     };
