@@ -16,7 +16,7 @@ use super::{
 /// where the next actor window starts and the actors whose positions page
 /// results needed, newest first. A new branch or staging session starts over.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RequestKnowledge {
+pub struct RequestKnowledge {
     after: Option<ActorId>,
     positions: VecDeque<ActorId>,
     /// Positions kept at most; the oldest gives way to a newer one.
@@ -45,16 +45,9 @@ impl RequestKnowledge {
         }
     }
 
-    /// Fold the result of a page served for a request with `window` from a
-    /// peer whose clock names `actors` actors. A page the responder `continued`
-    /// wants the same request again. Positions a page names go first and keep
-    /// the window, so a dependency chain is followed from its deepest named
-    /// actor and kept positions a request could not name take turns; a page
-    /// naming none moves the window on. Without data, a result advances the
-    /// request only a bounded number of times in a row, so a request that
-    /// cannot describe what one operation needs ends instead of cycling.
-    #[cfg(any(feature = "iroh", test))]
-    pub(crate) fn settle(
+    /// Resume retained work, otherwise advance the window with needed prefixes
+    /// first. Empty responses have a finite allowance across attempts.
+    pub fn settle(
         &mut self,
         window: &ActorWindow,
         page: (&BTreeSet<ActorId>, bool),
@@ -76,7 +69,7 @@ impl RequestKnowledge {
                 self.positions.push_front(*actor_id);
             }
             self.positions.truncate(self.capacity);
-            self.after = window.after;
+            self.after = window.through;
             self.revision += u64::from(advancing);
             return;
         }
@@ -129,6 +122,7 @@ pub(crate) fn need(needed: &mut BTreeMap<ActorId, u64>, actor_id: ActorId, gener
 pub(crate) struct ActorScope<'a> {
     named: BTreeSet<ActorId>,
     window: &'a ActorWindow,
+    held: Option<&'a ActorClock>,
 }
 
 impl<'a> ActorScope<'a> {
@@ -136,6 +130,7 @@ impl<'a> ActorScope<'a> {
         Self {
             named: hints.iter().map(|hint| hint.actor_id).collect(),
             window,
+            held: None,
         }
     }
 
@@ -149,11 +144,21 @@ impl<'a> ActorScope<'a> {
         ActorScope {
             named: BTreeSet::new(),
             window: &WHOLE,
+            held: None,
         }
     }
 
     pub(crate) fn unknown(&self, actor_id: &ActorId) -> bool {
         !self.named.contains(actor_id) && !self.window.holds(actor_id)
+    }
+
+    pub(crate) fn with_held(mut self, held: Option<&'a ActorClock>) -> Self {
+        self.held = held;
+        self
+    }
+
+    pub(crate) fn holds_prefix(&self, actor: &ActorId, seq: u64) -> bool {
+        self.unknown(actor) && self.held.is_some_and(|held| held.get(actor) >= seq)
     }
 }
 
@@ -234,6 +239,19 @@ fn hint(
     }
 }
 
+fn prefix_hint(
+    local: &ActorClock,
+    remote: &ActorClock,
+    span: &mut u64,
+    actor_id: ActorId,
+) -> ActorRangeHint {
+    let mut hint = hint(local, remote, span, actor_id);
+    let next = hint.to_inclusive.min(hint.from_exclusive.saturating_add(1));
+    *span += hint.to_inclusive - next;
+    hint.to_inclusive = next;
+    hint
+}
+
 /// Hints for `named`, then a run of `behind` after `after` up to `items`
 /// hints, and the window over that run.
 fn window_ranges(
@@ -250,7 +268,7 @@ fn window_ranges(
         .collect::<BTreeSet<_>>();
     let mut hints = named
         .iter()
-        .map(|actor_id| hint(local, remote, &mut span, *actor_id))
+        .map(|actor_id| prefix_hint(local, remote, &mut span, *actor_id))
         .collect::<Vec<_>>();
     let mut after = after;
     let mut start = behind.partition_point(|actor_id| Some(*actor_id) <= after);
@@ -264,7 +282,7 @@ fn window_ranges(
             if hints.len() == items {
                 break;
             }
-            hints.push(hint(local, remote, &mut span, *actor_id));
+            hints.push(prefix_hint(local, remote, &mut span, *actor_id));
         }
         through = Some(*actor_id);
         end += 1;
@@ -395,7 +413,7 @@ mod tests {
         let asked = request_ranges(&local, &remote, 2, &knowledge);
         assert_described(&local, &remote, &asked);
         assert_eq!(asked.0[0].actor_id, actor(4));
-        assert_eq!(asked.1.after, None);
+        assert_eq!(asked.1.after, first.1.through);
         // Held and outside the filter, actor 9 needs no hint.
         assert!(asked.0.iter().all(|hint| hint.actor_id != actor(9)));
         knowledge.settle(&asked.1, (&[actor(4)].into(), false), (false, 5));
@@ -429,12 +447,12 @@ mod tests {
         let held = ActorId::from_bytes(colliding);
         let mut local = clock(&[]);
         local.observe(held, 3);
-        let mut remote = clock(&[(1, 1), (2, 1), (5, 1)]);
+        let mut remote = clock(&[(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]);
         remote.observe(held, 3);
         let mut knowledge = RequestKnowledge::default();
         let first = request_ranges(&local, &remote, 2, &knowledge);
         assert!(first.1.behind.as_ref().unwrap().contains(&held));
-        knowledge.settle(&first.1, (&[held].into(), false), (false, 4));
+        knowledge.settle(&first.1, (&[held].into(), false), (false, 6));
         let named = request_ranges(&local, &remote, 2, &knowledge);
         assert_described(&local, &remote, &named);
         let zero = named.0.iter().find(|hint| hint.actor_id == held).unwrap();

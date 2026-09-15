@@ -39,6 +39,16 @@ fn page_bounded<S: Storage>(
     items: usize,
     positions: usize,
 ) -> Paged {
+    page_informed(source, reader, items, positions, false)
+}
+
+fn page_informed<S: Storage, R: Storage>(
+    source: &Source<S>,
+    reader: &Oplog<R>,
+    items: usize,
+    positions: usize,
+    informed: bool,
+) -> Paged {
     let responder = source
         .engine
         .clone()
@@ -59,9 +69,13 @@ fn page_bounded<S: Storage>(
         assert!(request.actor_range_hints.len() + request.wants.len() <= items);
         assert!(rounds < 4096, "paging did not end");
         let budget = PageBudget::from_credit(request.credit);
-        let page = responder
-            .response_page(source.reader, &request, budget)
-            .unwrap();
+        let page = if informed {
+            let held = reader_engine.summary(source.topic_id).unwrap();
+            responder.response_with(source.reader, &request, budget, &held)
+        } else {
+            responder.response_page(source.reader, &request, budget)
+        }
+        .unwrap();
         assert!(page.positions.len() <= positions);
         let mut earlier = BTreeSet::new();
         for op in &page.ops {
@@ -120,6 +134,15 @@ fn page_bounded<S: Storage>(
 /// depends on, the genesis being index 0. Sequences, previous ops and
 /// generations follow from that order.
 fn graph_source<S: Storage>(storage: S, writers: usize, ops: &[(usize, &[usize])]) -> Source<S> {
+    graph_members(storage, writers, ops, true)
+}
+
+fn graph_members<S: Storage>(
+    storage: S,
+    writers: usize,
+    ops: &[(usize, &[usize])],
+    member: bool,
+) -> Source<S> {
     let owner = Ed25519Signer::from_bytes(&[232; 32]);
     let reader = Ed25519Signer::from_bytes(&[233; 32]).peer_id();
     let shape = postcard::to_allocvec(&(writers, ops)).unwrap();
@@ -136,7 +159,7 @@ fn graph_source<S: Storage>(storage: S, writers: usize, ops: &[(usize, &[usize])
         .iter()
         .chain([&owner])
         .map(Signer::peer_id)
-        .chain([reader])
+        .chain(member.then_some(reader))
         .collect::<BTreeSet<_>>();
     let genesis = Op::sign(
         OpBody {
@@ -197,6 +220,15 @@ fn graph_source<S: Storage>(storage: S, writers: usize, ops: &[(usize, &[usize])
     }
     let log = Oplog::with_storage(storage);
     log.receive_ops(signed).unwrap();
+    if !member {
+        log.create_control_op(
+            topic_id,
+            actor_id_for(topic_id, owner.peer_id()),
+            TopicControl::AddPeer { peer: reader },
+            &owner,
+        )
+        .unwrap();
+    }
     Source {
         engine: SyncEngine::new(log.clone(), owner.peer_id()),
         log,
@@ -405,10 +437,7 @@ fn chain_windows_saturated() {
     }
 }
 
-/// One op depending on three actors that stay behind until it is served
-/// needs all three described at once. Within that capacity paging completes;
-/// below it paging ends on a round without progress instead of cycling, and
-/// never serves an op before its dependency.
+/// Held older prefixes satisfy a join while its actors remain behind.
 #[test]
 fn fan_in_capacity() {
     // Writers 1 to 3 write roots; writer 0 joins them; each root writer then
@@ -436,10 +465,84 @@ fn fan_in_capacity() {
     assert!(paged.complete, "stalled after {} rounds", paged.rounds);
     assert_eq!(paged.sent, 4);
     let (source, reader) = open();
-    let paged = page_bounded(&source, &reader, 2, 1);
-    assert!(!paged.complete);
-    // Four actors: at most four times as many empty rounds, and a few more.
-    assert!(paged.rounds <= 4 * 5 + 64 + 2, "{} rounds", paged.rounds);
+    let paged = page_informed(&source, &reader, 2, 1, true);
+    assert!(paged.complete, "stalled after {} rounds", paged.rounds);
+    assert_eq!(paged.sent, 4);
+    assert!(paged.rounds <= 4, "{} rounds", paged.rounds);
+}
+
+fn joined_source<S: Storage>(storage: S, width: usize, member: bool) -> Source<S> {
+    let mut deps = vec![vec![0]; width];
+    deps.push((1..=width).collect());
+    deps.extend(vec![vec![width + 1]; width]);
+    let writers = (1..=width).chain([0]).chain(1..=width);
+    let ops = writers
+        .zip(deps.iter().map(Vec::as_slice))
+        .collect::<Vec<_>>();
+    graph_members(storage, width + 1, &ops, member)
+}
+
+#[test]
+fn prefixes_finish_joins() {
+    for width in [3, 128, 255, 256, 257, 512] {
+        for (items, positions) in [(2, 1), (3, 2)] {
+            let source = joined_source(MemoryStorage::new(), width, true);
+            let reader = Oplog::new();
+            reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+            let paged = page_informed(&source, &reader, items, positions, true);
+            assert!(
+                paged.complete,
+                "{width} actors stalled after {} rounds",
+                paged.rounds
+            );
+            assert_eq!(paged.sent, 2 * width + 1);
+            let work = source.engine.page_work();
+            eprintln!(
+                "join width={width} items={items} rounds={} edges={} visits={}",
+                paged.rounds, work.edges, work.visits
+            );
+            assert!(
+                work.edges <= 40 * width as u64,
+                "{width} actors visited {} edges",
+                work.edges
+            );
+        }
+    }
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_prefixes_finish() {
+    for width in [3, 257] {
+        let source_dir = tempfile::tempdir().unwrap();
+        let reader_dir = tempfile::tempdir().unwrap();
+        let source = joined_source(
+            crate::storage::FjallStorage::open(source_dir.path()).unwrap(),
+            width,
+            true,
+        );
+        let reader =
+            Oplog::with_storage(crate::storage::FjallStorage::open(reader_dir.path()).unwrap());
+        reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+        source
+            .engine
+            .put_obligation(
+                source.reader,
+                source.topic_id,
+                source.log.storage().list_op_ids(&source.topic_id).unwrap(),
+            )
+            .unwrap();
+        let paged = page_informed(&source, &reader, 2, 1, true);
+        assert!(paged.complete);
+        assert_eq!(paged.sent, 2 * width + 1);
+        assert!(
+            source
+                .log
+                .storage()
+                .has_sync_obligations(&source.reader, &source.topic_id)
+                .unwrap()
+        );
+    }
 }
 
 /// A responder refuses a request past its item limit, wants and hints together.
@@ -554,6 +657,33 @@ mod sessions {
             }
         }
         panic!("sync did not finish");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn joins_finish_sessions() {
+        for member in [true, false] {
+            let source = joined_source(MemoryStorage::new(), 3, member);
+            let (_, alice, addr) = capped(source.log.storage().clone(), 232, 2).await;
+            let store = MemoryStorage::new();
+            if member {
+                Oplog::with_storage(store.clone())
+                    .receive_ops(vec![source.genesis.clone()])
+                    .unwrap();
+            }
+            let (_, bob, _) = capped(store.clone(), 233, 2).await;
+            sync_through(&bob, addr, source.topic_id).await;
+            assert_eq!(
+                store.list_op_ids(&source.topic_id).unwrap(),
+                source.log.storage().list_op_ids(&source.topic_id).unwrap()
+            );
+            assert_eq!(
+                store.actor_clock(&source.topic_id).unwrap(),
+                source.log.storage().actor_clock(&source.topic_id).unwrap()
+            );
+            assert!(store.provisional_topics().unwrap().is_empty());
+            bob.shutdown().await;
+            alice.shutdown().await;
+        }
     }
 
     /// An ordinary sync through real sessions whose requests cannot name every

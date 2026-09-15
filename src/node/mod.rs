@@ -602,7 +602,7 @@ impl<S: Storage> Irokle<S> {
     /// A transport repeats request and page until the page reports no more:
     ///
     /// ```
-    /// use irokle::sync::{PageBudget, SyncCredit, SyncData};
+    /// use irokle::sync::{PageBudget, RequestKnowledge, SyncCredit, SyncData};
     /// use irokle::{Ed25519Signer, Irokle, Storage, TopicConfig};
     ///
     /// #[derive(Clone, irokle::Event, serde::Deserialize, serde::Serialize)]
@@ -623,16 +623,20 @@ impl<S: Storage> Irokle<S> {
     ///     topic.publish(Note(index))?;
     /// }
     /// let mut pages = 0;
+    /// let mut knowledge = RequestKnowledge::default();
     /// loop {
-    ///     let mut request = bob.plan_sync_request(alice.peer_id(), &alice.sync_summary(topic.id())?)?;
+    ///     let summary = alice.sync_summary(topic.id())?;
+    ///     let mut request = bob.plan_request_with(alice.peer_id(), &summary, &knowledge)?;
     ///     if request.wants.is_empty() && request.actor_range_hints.is_empty() {
     ///         break;
     ///     }
     ///     request.credit = SyncCredit { ops: 4, ..request.credit };
-    ///     let page = alice.response_page(bob.peer_id(), &request, PageBudget::from_credit(request.credit))?;
+    ///     let page = alice.response_with(bob.peer_id(), &request, PageBudget::from_credit(request.credit), &bob.sync_summary(topic.id())?)?;
     ///     assert!(page.ops.len() <= 4);
+    ///     let received = !page.ops.is_empty();
     ///     let data = SyncData { topic_id: topic.id(), ops: page.ops };
     ///     bob.receive_sync_outcome(alice.peer_id(), data)?;
+    ///     knowledge.settle(&request.window, (&page.positions, page.continued), (received, summary.actor_clock.iter().count()));
     ///     pages += 1;
     /// }
     /// assert_eq!(pages, 3);
@@ -649,12 +653,33 @@ impl<S: Storage> Irokle<S> {
         self.sync.response_page(peer_id, request, budget)
     }
 
+    /// Serve with the authenticated peer's current branch or staging summary.
+    pub fn response_with(
+        &self,
+        peer_id: PeerId,
+        request: &crate::sync::SyncRequest,
+        budget: crate::sync::PageBudget,
+        summary: &SyncSummary,
+    ) -> Result<crate::sync::PlannedPage> {
+        self.sync.response_with(peer_id, request, budget, summary)
+    }
+
     pub fn plan_sync_data(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncData> {
         self.sync.plan_data(peer_id, remote)
     }
 
     pub fn plan_sync_request(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncRequest> {
         self.sync.plan_request(peer_id, remote)
+    }
+
+    /// Continue one peer/topic/branch/session; reset knowledge when that scope changes.
+    pub fn plan_request_with(
+        &self,
+        peer_id: PeerId,
+        remote: &SyncSummary,
+        knowledge: &crate::sync::RequestKnowledge,
+    ) -> Result<SyncRequest> {
+        self.sync.plan_request_with(peer_id, remote, knowledge)
     }
 
     pub fn plan_sync_response_data(

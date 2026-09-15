@@ -50,6 +50,7 @@ impl<S: Storage> SyncEngine<S> {
                     break;
                 }
                 match read.get_position(dep)? {
+                    Some(meta) if scope.holds_prefix(&meta.actor_id, meta.actor_seq) => {}
                     // Every unknown actor of the want is named at once.
                     Some(meta) if scope.unknown(&meta.actor_id) => {
                         need(&mut page.positions, meta.actor_id, meta.generation);

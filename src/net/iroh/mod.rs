@@ -2297,6 +2297,21 @@ impl<S: Storage> SharedNet<S> {
             messages: vec![
                 SyncMessage::Open(self.node.sync_open(topic_id)),
                 SyncMessage::Request(request),
+                SyncMessage::Summary(SyncSummary {
+                    topic_id,
+                    event_type_id: None,
+                    genesis: None,
+                    fingerprint: [0; 32],
+                    heads: BTreeSet::new(),
+                    actor_clock: crate::ActorClock::new(),
+                    actor_tips: BTreeMap::new(),
+                    staged: session.map(|session| crate::sync::SyncReceipt {
+                        topic_id,
+                        genesis,
+                        session,
+                        clock: staged,
+                    }),
+                }),
             ],
             estimated_responses: 3 + credit_ops.div_ceil(MAX_SYNC_DATA_OPS_PER_MESSAGE),
         }))
@@ -2659,6 +2674,8 @@ impl<S: Storage> SharedNet<S> {
         let mut acks = Vec::new();
         let mut followups: BTreeMap<crate::TopicId, Vec<SyncMessage>> = BTreeMap::new();
         let mut pages = BTreeMap::new();
+        let mut requests = BTreeMap::new();
+        let mut summaries = BTreeMap::new();
         let mut outcomes = BTreeMap::new();
         let mut received = BTreeSet::new();
         for response in responses {
@@ -2689,7 +2706,9 @@ impl<S: Storage> SharedNet<S> {
                 SyncMessage::Failure(failure) if group_topics.contains(&failure.topic_id) => {
                     outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
                 }
-                SyncMessage::Summary(summary) if group_topics.contains(&summary.topic_id) => {}
+                SyncMessage::Summary(summary) if group_topics.contains(&summary.topic_id) => {
+                    summaries.insert(summary.topic_id, summary);
+                }
                 SyncMessage::Page(page) if group_topics.contains(&page.topic_id) => {
                     if page.more {
                         more.insert(page.topic_id);
@@ -2703,19 +2722,7 @@ impl<S: Storage> SharedNet<S> {
                     );
                 }
                 SyncMessage::Request(request) if group_topics.contains(&request.topic_id) => {
-                    let topic_id = request.topic_id;
-                    let budget = crate::sync::PageBudget::from_credit(request.credit);
-                    match self.node.response_page(remote_peer_id, &request, budget) {
-                        Ok(page) => {
-                            if page.more {
-                                more.insert(topic_id);
-                            }
-                            pages.insert(topic_id, page.ops);
-                        }
-                        Err(error) => {
-                            outcomes.insert(topic_id, Err(invalid_data(error)));
-                        }
-                    }
+                    requests.insert(request.topic_id, request);
                 }
                 SyncMessage::Data(data) if group_topics.contains(&data.topic_id) => {
                     let data_topic_id = data.topic_id;
@@ -2767,6 +2774,26 @@ impl<S: Storage> SharedNet<S> {
                         more,
                         unexpected: Some(error),
                     };
+                }
+            }
+        }
+        for (topic_id, request) in requests {
+            let budget = crate::sync::PageBudget::from_credit(request.credit);
+            let planned = match summaries.get(&topic_id) {
+                Some(summary) => self
+                    .node
+                    .response_with(remote_peer_id, &request, budget, summary),
+                None => self.node.response_page(remote_peer_id, &request, budget),
+            };
+            match planned {
+                Ok(page) => {
+                    if page.more {
+                        more.insert(topic_id);
+                    }
+                    pages.insert(topic_id, page.ops);
+                }
+                Err(error) => {
+                    outcomes.insert(topic_id, Err(invalid_data(error)));
                 }
             }
         }
@@ -3116,6 +3143,21 @@ impl<S: Storage> SharedNet<S> {
         Ok(targets)
     }
 
+    fn summary_reply(
+        &self,
+        peer_id: PeerId,
+        summary: &SyncSummary,
+    ) -> io::Result<Vec<SyncMessage>> {
+        let request = self
+            .node
+            .plan_sync_request(peer_id, summary)
+            .map_err(invalid_data)?;
+        if request.wants.is_empty() && request.actor_range_hints.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![SyncMessage::Request(request)])
+    }
+
     fn handle_message(
         &self,
         message: SyncMessage,
@@ -3221,16 +3263,7 @@ impl<S: Storage> SharedNet<S> {
                 let peer_id = remote_peer_id.ok_or_else(|| {
                     invalid_data("sync summary requires a preceding SyncOpen with peer_id")
                 })?;
-                // A summary only yields a request: data the peer lacks is served
-                // against its own request, so nothing is sent twice.
-                let request = self
-                    .node
-                    .plan_sync_request(peer_id, &summary)
-                    .map_err(invalid_data)?;
-                if request.wants.is_empty() && request.actor_range_hints.is_empty() {
-                    return Ok(Vec::new());
-                }
-                Ok(vec![SyncMessage::Request(request)])
+                self.summary_reply(peer_id, &summary)
             }
             SyncMessage::Request(_) => {
                 Err(invalid_data("sync request must be served by the session"))

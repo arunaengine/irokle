@@ -391,6 +391,9 @@ impl Pager<'_> {
                 self.missing.insert(*dep);
                 return Ok(Wait::Blocked);
             };
+            if self.scope.holds_prefix(&dep_actor, dep_seq) {
+                continue;
+            }
             // Omitted from the request is not held: the requester names it next.
             if self.scope.unknown(&dep_actor) {
                 need(&mut self.positions, dep_actor, dep_generation);
@@ -429,6 +432,9 @@ impl Pager<'_> {
                     continue;
                 };
                 if !self.scope.unknown(&dep_meta.actor_id)
+                    || self
+                        .scope
+                        .holds_prefix(&dep_meta.actor_id, dep_meta.actor_seq)
                     || self.positions.contains_key(&dep_meta.actor_id)
                 {
                     continue;

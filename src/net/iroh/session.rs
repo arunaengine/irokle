@@ -52,6 +52,7 @@ pub(super) struct SyncSession {
     receipts: BTreeMap<crate::TopicId, crate::sync::SyncReceipt>,
     /// Requests to serve once the whole stream is read, latest per topic.
     pub(super) requests: BTreeMap<crate::TopicId, crate::sync::SyncRequest>,
+    summaries: BTreeMap<crate::TopicId, crate::sync::SyncSummary>,
     /// Bytes every message kept above may hold, never decreased.
     retained: usize,
     pub(super) charge: Option<Charge>,
@@ -69,6 +70,7 @@ impl SyncSession {
             replies: BTreeMap::new(),
             receipts: BTreeMap::new(),
             requests: BTreeMap::new(),
+            summaries: BTreeMap::new(),
             retained: 0,
             charge: None,
         }
@@ -159,7 +161,10 @@ impl SyncSession {
             self.controls.push(failure);
             return Ok(());
         }
-        if matches!(message, SyncMessage::Ack(_) | SyncMessage::Request(_)) {
+        if matches!(
+            message,
+            SyncMessage::Ack(_) | SyncMessage::Request(_) | SyncMessage::Summary(_)
+        ) {
             self.retain(&message)?;
         }
 
@@ -183,7 +188,15 @@ impl SyncSession {
                 // other topics batched into the stream keep their replies.
                 // Framing and authentication failures above stay fatal.
                 let failure = per_topic_failure_scope(&message);
-                match net.handle_message(message, self.remote_peer_id) {
+                let replies = match message {
+                    SyncMessage::Summary(summary) => {
+                        let replies = net.summary_reply(self.authenticated_peer_id, &summary);
+                        self.summaries.insert(summary.topic_id, summary);
+                        replies
+                    }
+                    message => net.handle_message(message, self.remote_peer_id),
+                };
+                match replies {
                     Ok(responses) => {
                         for response in responses {
                             self.keep_reply(net, response)?;
@@ -296,7 +309,11 @@ impl SyncSession {
                 budget.bytes = budget
                     .bytes
                     .min(grant_left.saturating_sub(ops_bytes) / super::budget::DECODED_FACTOR);
-                let page = match net.node.response_page(peer_id, &request, budget) {
+                let planned = match self.summaries.get(&topic_id) {
+                    Some(summary) => net.node.response_with(peer_id, &request, budget, summary),
+                    None => net.node.response_page(peer_id, &request, budget),
+                };
+                let page = match planned {
                     Ok(page) => page,
                     Err(error) => {
                         tracing::warn!(%topic_id, %error, "failing one sync request");

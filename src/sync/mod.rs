@@ -23,7 +23,7 @@ use continuation::{Continuation, Continuations};
 #[cfg(test)]
 pub(crate) use plan::PageWorkSnapshot;
 use plan::{MAX_PAGE_VISITS, PageWork};
-pub(crate) use request::RequestKnowledge;
+pub use request::RequestKnowledge;
 use request::{ActorScope, request_ranges};
 pub use types::{
     ActorFilter, ActorRangeHint, ActorWindow, PageBudget, SyncAck, SyncCredit, SyncData,
@@ -602,8 +602,7 @@ impl<S: Storage> SyncEngine<S> {
 
     /// [`Self::plan_request`] continuing from what earlier page results left in
     /// `knowledge`.
-    #[cfg(test)]
-    pub(crate) fn plan_request_with(
+    pub fn plan_request_with(
         &self,
         peer_id: PeerId,
         remote: &SyncSummary,
@@ -665,6 +664,30 @@ impl<S: Storage> SyncEngine<S> {
         request: &SyncRequest,
         budget: PageBudget,
     ) -> Result<PlannedPage> {
+        self.response_known(read, peer_id, request, budget, None)
+    }
+
+    /// Serve using the authenticated peer's current summary, never as an ACK.
+    pub fn response_with(
+        &self,
+        peer_id: PeerId,
+        request: &SyncRequest,
+        budget: PageBudget,
+        summary: &SyncSummary,
+    ) -> Result<PlannedPage> {
+        self.oplog.storage().read_snapshot(|read| {
+            self.response_known(read, peer_id, request, budget, Some(summary))
+        })
+    }
+
+    fn response_known(
+        &self,
+        read: &dyn SnapshotRead,
+        peer_id: PeerId,
+        request: &SyncRequest,
+        budget: PageBudget,
+        summary: Option<&SyncSummary>,
+    ) -> Result<PlannedPage> {
         let empty = PlannedPage::default();
         let Some(view) = read.topic_view(&request.topic_id, None)? else {
             return Ok(empty);
@@ -710,7 +733,34 @@ impl<S: Storage> SyncEngine<S> {
                 goal.set(hint.actor_id, to);
             }
         }
-        let scope = ActorScope::new(&request.actor_range_hints, &request.window);
+        let absent = ActorClock::new();
+        if summary.is_some_and(|summary| {
+            summary
+                .staged
+                .as_ref()
+                .is_some_and(|staged| staged.topic_id != summary.topic_id)
+        }) {
+            return Err(Error::TopicMismatch);
+        }
+        let held = match summary {
+            Some(summary) if summary.topic_id != request.topic_id => {
+                return Err(Error::TopicMismatch);
+            }
+            Some(summary) if summary.genesis == Some(view.state.genesis) => {
+                Some(&summary.actor_clock)
+            }
+            Some(summary) => Some(
+                summary
+                    .staged
+                    .as_ref()
+                    .filter(|staged| {
+                        staged.topic_id == request.topic_id && staged.genesis == view.state.genesis
+                    })
+                    .map_or(&absent, |staged| &staged.clock),
+            ),
+            None => None,
+        };
+        let scope = ActorScope::new(&request.actor_range_hints, &request.window).with_held(held);
         let repair = Self::plan_repair(
             read,
             &request.topic_id,
