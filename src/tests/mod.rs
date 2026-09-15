@@ -48,4 +48,6 @@ mod tiebreak;
 #[cfg(feature = "fjall")]
 mod upgrade;
 #[cfg(feature = "iroh")]
+mod versions;
+#[cfg(feature = "iroh")]
 mod windows;
