@@ -254,6 +254,53 @@ fn slot(bitmap: u16, nibble: u8) -> usize {
     (bitmap & ((1_u16 << nibble) - 1)).count_ones() as usize
 }
 
+fn selected_node(
+    node: &Arc<Node>,
+    actors: &std::collections::BTreeSet<ActorId>,
+) -> Option<Arc<Node>> {
+    let Node::Branch {
+        level, children, ..
+    } = &**node
+    else {
+        return actors.contains(node.key()).then(|| Arc::clone(node));
+    };
+    let mut changed = None::<Vec<Arc<Node>>>;
+    for (index, child) in children.iter().enumerate() {
+        let selected = selected_node(child, actors);
+        if changed.is_none()
+            && selected
+                .as_ref()
+                .is_some_and(|selected| Arc::ptr_eq(selected, child))
+        {
+            continue;
+        }
+        let changed = changed.get_or_insert_with(|| {
+            let mut changed = Vec::with_capacity(children.len());
+            changed.extend(children[..index].iter().cloned());
+            changed
+        });
+        changed.extend(selected);
+    }
+    let Some(children) = changed else {
+        return Some(Arc::clone(node));
+    };
+    match children.len() {
+        0 => None,
+        1 => children.into_iter().next(),
+        _ => Some(Arc::new(Node::Branch {
+            level: *level,
+            bitmap: children
+                .iter()
+                .fold(0, |bits, child| bits | (1 << nibble(child.key(), *level))),
+            len: children.iter().map(|child| child.len()).sum(),
+            key: *children[0].key(),
+            children,
+            #[cfg(feature = "fjall")]
+            hash: OnceLock::new(),
+        })),
+    }
+}
+
 /// Set `actor` below `node` to `seq`, or remove it for `None`, copying shared
 /// nodes on the way. Returns false when the node became empty.
 fn set_node(node: &mut Arc<Node>, actor: &ActorId, seq: Option<u64>) -> bool {
@@ -556,6 +603,14 @@ impl ActorClock {
     }
 
     pub(crate) fn selected(&self, actors: &std::collections::BTreeSet<ActorId>) -> Self {
+        if actors.len().saturating_mul(2) >= self.len() {
+            return Self {
+                root: self
+                    .root
+                    .as_ref()
+                    .and_then(|node| selected_node(node, actors)),
+            };
+        }
         let mut clock = Self::new();
         for actor in actors {
             if let Some(seq) = self.entry(actor) {
@@ -1054,6 +1109,46 @@ mod tests {
         *damaged.last_mut().unwrap() = 0x80;
         let first = [ActorId::from_bytes([0; 32])].into();
         assert!(ActorClock::decode_selected(&damaged, &first).is_err());
+    }
+
+    #[test]
+    fn selected_shares() {
+        let mut clock = ActorClock::new();
+        for n in 0..1024_u32 {
+            clock.observe(ActorId::hash(n.to_le_bytes()), u64::from(n % 7));
+        }
+        let all = clock
+            .iter()
+            .map(|(actor, _)| *actor)
+            .collect::<std::collections::BTreeSet<_>>();
+        let same = clock.selected(&all);
+        assert!(Arc::ptr_eq(
+            clock.root.as_ref().unwrap(),
+            same.root.as_ref().unwrap()
+        ));
+        for stride in [1, 2, 3, 4, usize::MAX] {
+            let actors = all
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| index % stride != 0)
+                .map(|(_, actor)| *actor)
+                .chain([ActorId::hash(b"absent selection")])
+                .collect();
+            let selected = clock.selected(&actors);
+            let expected = Reference {
+                entries: clock
+                    .iter()
+                    .filter(|(actor, _)| actors.contains(actor))
+                    .map(|(actor, seq)| (*actor, *seq))
+                    .collect(),
+            };
+            assert_same(&selected, &expected, true);
+            let mut changed = clock.clone();
+            for actor in &actors {
+                changed.observe(*actor, 99);
+            }
+            assert_same(&selected, &expected, true);
+        }
     }
 
     use super::*;

@@ -65,6 +65,42 @@ fn captured_clock_bounds() {
 
 #[test]
 #[ignore = "allocator measurement requires its own process and one test thread"]
+fn selected_clock_bounds() {
+    for entries in [1024_u32, 2048, 65_536] {
+        let mut original = clock::ActorClock::new();
+        for n in 0..entries {
+            original.observe(ids::ActorId::hash(n.to_le_bytes()), 1);
+        }
+        let mut actors = original
+            .iter()
+            .map(|(actor, _)| *actor)
+            .collect::<std::collections::BTreeSet<_>>();
+        let removed = actors.pop_first().unwrap();
+        let before = LIVE.load(Ordering::Relaxed);
+        PEAK.store(before, Ordering::Relaxed);
+        let selected = original.selected(&actors);
+        let allocated = LIVE.load(Ordering::Relaxed) - before;
+        let peak = PEAK.load(Ordering::Relaxed) - before;
+        let bound = clock::ActorClock::allocation_bound(64);
+        assert_eq!(selected.len(), entries as usize - 1);
+        assert_eq!(selected.get(&removed), 0);
+        assert!(
+            selected
+                .iter()
+                .all(|(actor, seq)| original.get(actor) == *seq)
+        );
+        println!(
+            "selected entries={entries} allocator_bytes={allocated} peak_bytes={peak} bound={bound}"
+        );
+        assert!(
+            allocated <= bound && peak <= bound,
+            "unchanged trie subtrees were copied"
+        );
+    }
+}
+
+#[test]
+#[ignore = "allocator measurement requires its own process and one test thread"]
 fn decoded_clock_bounds() {
     use irokle::sync::{SyncMessage, SyncReceipt};
     for entries in [1024_u32, 2048, 65_536] {
