@@ -124,6 +124,19 @@ enum Encoded {
 const NODE_DOMAIN: &[u8] = b"irokle/clock-node/1";
 
 #[cfg(feature = "fjall")]
+pub(crate) struct ClockRecord<'a> {
+    node: &'a Node,
+    pub(crate) hash: [u8; 32],
+}
+
+#[cfg(feature = "fjall")]
+impl Serialize for ClockRecord<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.node.encoded().serialize(serializer)
+    }
+}
+
+#[cfg(feature = "fjall")]
 fn digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(NODE_DOMAIN);
@@ -616,24 +629,39 @@ impl ActorClock {
     /// The stored form of every node of this clock that `stored` does not
     /// report as held, by hash and parents first. The subtree of a held node
     /// is held too, so it is not visited.
+    #[cfg(test)]
     pub(crate) fn unstored_nodes(
         &self,
         mut stored: impl FnMut(&[u8; 32]) -> crate::Result<bool>,
     ) -> crate::Result<Vec<([u8; 32], Vec<u8>)>> {
         let mut out = Vec::new();
+        self.visit_nodes(|record| {
+            if stored(&record.hash)? {
+                return Ok(true);
+            }
+            out.push((record.hash, postcard::to_allocvec(&record)?));
+            Ok(false)
+        })?;
+        Ok(out)
+    }
+
+    /// Visit missing nodes without collecting their encoded bodies in memory.
+    pub(crate) fn visit_nodes(
+        &self,
+        mut visit: impl FnMut(ClockRecord<'_>) -> crate::Result<bool>,
+    ) -> crate::Result<()> {
         let mut stack = Vec::new();
         stack.extend(self.root.as_deref());
         while let Some(node) = stack.pop() {
             let hash = node.hash();
-            if stored(&hash)? {
+            if visit(ClockRecord { node, hash })? {
                 continue;
             }
-            out.push((hash, postcard::to_allocvec(&node.encoded())?));
             if let Node::Branch { children, .. } = node {
                 stack.extend(children.iter().map(|child| &**child));
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// The clock whose stored root node is `root`, reading nodes through

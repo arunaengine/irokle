@@ -83,6 +83,7 @@ fn fault_child(path: &std::path::Path) {
         "{failed:?}"
     );
     assert_eq!(storage.counters().transaction_attempts, attempts + 1);
+    assert!(storage.storage_usage().unwrap().requires_reopen);
     assert_eq!(storage.list_op_ids(&id).unwrap(), before);
     assert_eq!(storage.actor_clock(&id).unwrap(), clock);
     assert_eq!(
@@ -103,6 +104,7 @@ fn fault_child(path: &std::path::Path) {
     drop((topic, node, storage));
     let storage = FjallStorage::open(path).unwrap();
     let recovered = storage.list_op_ids(&id).unwrap();
+    assert!(!storage.storage_usage().unwrap().requires_reopen);
     assert_eq!(
         storage.sync_obligations(&peer, &id).unwrap(),
         vec![obligation.clone()]

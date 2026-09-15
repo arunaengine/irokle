@@ -40,6 +40,8 @@ mod staging;
 mod storage;
 #[cfg(all(feature = "fjall", target_os = "linux", target_pointer_width = "64"))]
 mod storage_full;
+#[cfg(feature = "fjall")]
+mod storage_pressure;
 pub(crate) mod support;
 mod sync;
 mod tiebreak;

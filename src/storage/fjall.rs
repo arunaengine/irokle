@@ -11,6 +11,7 @@ use crate::{
 };
 
 use super::fjall_provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
+use super::pressure::{Pressure, Transaction};
 use super::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
     ObligationTarget, OpMeta, OpPosition, PeerAck, ProvisionalTopic, SnapshotRead, StagingLimits,
@@ -27,6 +28,7 @@ pub struct FjallStorage {
     pub(super) db: fjall::OptimisticTxDatabase,
     pub(super) records: fjall::OptimisticTxKeyspace,
     persist_mode: fjall::PersistMode,
+    pressure: std::sync::Arc<Pressure>,
     pub(super) counters: std::sync::Arc<StorageCounters>,
     pub(super) limits: StagingLimits,
     /// The registry record a provisional namespace view stages under; `None`
@@ -196,8 +198,39 @@ impl FjallStorage {
         db: fjall::OptimisticTxDatabase,
         persist_mode: fjall::PersistMode,
     ) -> Result<Self> {
+        Self::from_database_policy(db, persist_mode, None)
+    }
+
+    /// Install pressure admission before creating or migrating Irokle records.
+    pub fn open_with_pressure(
+        path: impl AsRef<Path>,
+        pressure: super::StoragePressure,
+    ) -> Result<Self> {
+        let db = fjall::OptimisticTxDatabase::builder(path).open()?;
+        Self::from_database_policy(db, fjall::PersistMode::SyncAll, Some(pressure))
+    }
+
+    /// Use caller-managed database allocation with pressure admission during migration.
+    pub fn from_database_pressure(
+        db: fjall::OptimisticTxDatabase,
+        pressure: super::StoragePressure,
+    ) -> Result<Self> {
+        Self::from_database_policy(db, fjall::PersistMode::SyncAll, Some(pressure))
+    }
+
+    fn from_database_policy(
+        db: fjall::OptimisticTxDatabase,
+        persist_mode: fjall::PersistMode,
+        policy: Option<super::StoragePressure>,
+    ) -> Result<Self> {
+        let records = db.keyspace("records", fjall::KeyspaceCreateOptions::default)?;
+        let pressure = Pressure::shared(records.path())?;
+        if let Some(policy) = policy {
+            pressure.configure(policy)?;
+        }
         let storage = Self {
-            records: db.keyspace("records", fjall::KeyspaceCreateOptions::default)?,
+            records,
+            pressure,
             db,
             persist_mode,
             counters: Default::default(),
@@ -229,6 +262,7 @@ impl FjallStorage {
             db: self.db.clone(),
             records,
             persist_mode: self.persist_mode,
+            pressure: std::sync::Arc::clone(&self.pressure),
             counters: std::sync::Arc::clone(&self.counters),
             limits: self.limits,
             namespace: Some(fence),
@@ -297,9 +331,10 @@ impl FjallStorage {
 
     /// Flush buffered transactions with the requested durability.
     pub fn persist(&self, persist_mode: fjall::PersistMode) -> Result<()> {
-        self.db
-            .persist(persist_mode)
-            .map_err(Error::ReopenRequired)?;
+        self.db.persist(persist_mode).map_err(|error| {
+            self.pressure.uncertain();
+            Error::ReopenRequired(error)
+        })?;
         Ok(())
     }
 
@@ -435,7 +470,7 @@ impl FjallStorage {
                 ));
             }
             for (key, ack) in acks {
-                tx.remove(&self.records, key);
+                tx.remove(&self.records, key)?;
                 Self::tx_put(
                     tx,
                     &self.records,
@@ -474,7 +509,7 @@ impl FjallStorage {
                 obligations.insert(key, merged);
             }
             for key in legacy_keys {
-                tx.remove(&self.records, key);
+                tx.remove(&self.records, key)?;
             }
             for (key, obligation) in obligations {
                 Self::tx_put(tx, &self.records, key, &obligation)?;
@@ -494,7 +529,7 @@ impl FjallStorage {
                 *source_bytes.entry(source_peer).or_default() += bytes;
             }
             Self::tx_remove_prefix(tx, &self.records, PENDING_SOURCE_BYTES_PREFIX)?;
-            tx.remove(&self.records, PENDING_BYTES_KEY.to_vec());
+            tx.remove(&self.records, PENDING_BYTES_KEY)?;
             if total_bytes > 0 {
                 Self::tx_put(tx, &self.records, PENDING_BYTES_KEY, &total_bytes)?;
             }
@@ -595,7 +630,7 @@ impl FjallStorage {
 
     /// Charge every slot a schema 6 store left clearing with the bytes its
     /// keyspace still counts, which schema 6 no longer charged anywhere.
-    fn tx_charge_clearing(&self, tx: &mut fjall::OptimisticWriteTx) -> Result<()> {
+    fn tx_charge_clearing(&self, tx: &mut Transaction) -> Result<()> {
         use super::fjall_provisional::{ClearingCharge, SLOT, SlotRecord, clearing_key};
         let mut clearing = Vec::new();
         for item in fjall::Readable::prefix(tx, &self.records, SLOT) {
@@ -662,7 +697,7 @@ impl FjallStorage {
 
     /// Rewrite the next bounded run of legacy metadata records, or move the
     /// cursor to the next keyspace, or remove it. False once none is left.
-    fn tx_clock_migration_step(&self, tx: &mut fjall::OptimisticWriteTx) -> Result<bool> {
+    fn tx_clock_migration_step(&self, tx: &mut Transaction) -> Result<bool> {
         let Some(cursor) = Self::tx_get::<ClockMigration>(tx, &self.records, CLOCK_MIGRATION)?
         else {
             return Ok(false);
@@ -727,7 +762,7 @@ impl FjallStorage {
         };
         match next {
             Some(next) => Self::tx_put(tx, &self.records, CLOCK_MIGRATION, &next)?,
-            None => tx.remove(&self.records, CLOCK_MIGRATION),
+            None => tx.remove(&self.records, CLOCK_MIGRATION)?,
         }
         Ok(true)
     }
@@ -736,8 +771,11 @@ impl FjallStorage {
     #[cfg(test)]
     pub(crate) fn open_interrupted(path: impl AsRef<Path>, steps: usize) -> Result<()> {
         let db = fjall::OptimisticTxDatabase::builder(path.as_ref()).open()?;
+        let records = db.keyspace("records", fjall::KeyspaceCreateOptions::default)?;
+        let pressure = Pressure::shared(records.path())?;
         let storage = Self {
-            records: db.keyspace("records", fjall::KeyspaceCreateOptions::default)?,
+            records,
+            pressure,
             db,
             persist_mode: fjall::PersistMode::SyncAll,
             counters: Default::default(),
@@ -756,17 +794,56 @@ impl FjallStorage {
         Ok(self.get::<ClockMigration>(CLOCK_MIGRATION)?.is_some())
     }
 
-    pub(super) fn transaction<R>(
+    /// Set one shared policy for every facade of this database while writes are idle.
+    pub fn with_storage_pressure(self, policy: super::StoragePressure) -> Result<Self> {
+        self.pressure.configure(policy)?;
+        Ok(self)
+    }
+
+    /// Reservations and backend measurements, including hidden copies and journal data.
+    pub fn storage_usage(&self) -> Result<super::StorageUsage> {
+        let mut usage = self.pressure.usage()?;
+        usage.database_bytes = self.db.inner().disk_space()?;
+        usage.journal_bytes = self.db.inner().journal_disk_space()?;
+        usage.write_buffer_bytes = self.db.inner().write_buffer_size();
+        usage.clock_cache_bytes = self.clock_cache_bytes() as u64;
+        Ok(usage)
+    }
+
+    fn begin_write(&self, recovery: bool) -> Result<Transaction> {
+        let reservation = self.pressure.begin(recovery, || {
+            Ok((
+                self.db.inner().disk_space()?,
+                self.db.inner().write_buffer_size(),
+            ))
+        })?;
+        let inner = self
+            .db
+            .write_tx()
+            .map_err(Error::ReopenRequired)?
+            .durability(Some(self.persist_mode));
+        Ok(Transaction::new(inner, reservation))
+    }
+
+    pub(super) fn transaction<R>(&self, f: impl FnMut(&mut Transaction) -> Result<R>) -> Result<R> {
+        self.transaction_kind(true, f)
+    }
+
+    pub(super) fn transaction_bulk<R>(
         &self,
-        mut f: impl FnMut(&mut fjall::OptimisticWriteTx) -> Result<R>,
+        f: impl FnMut(&mut Transaction) -> Result<R>,
+    ) -> Result<R> {
+        self.transaction_kind(false, f)
+    }
+
+    fn transaction_kind<R>(
+        &self,
+        recovery: bool,
+        mut f: impl FnMut(&mut Transaction) -> Result<R>,
     ) -> Result<R> {
         for _ in 0..64 {
             self.counters.count_attempt();
-            let mut tx = self
-                .db
-                .write_tx()
-                .map_err(Error::ReopenRequired)?
-                .durability(Some(self.persist_mode));
+            let mut tx = self.begin_write(recovery)?;
             let result = match &self.namespace {
                 Some(fence) => {
                     Self::tx_fence_write(&tx, fence)?;
@@ -777,7 +854,7 @@ impl FjallStorage {
                 }
                 None => f(&mut tx)?,
             };
-            match tx.commit().map_err(Error::ReopenRequired)? {
+            match tx.commit()? {
                 Ok(()) => return Ok(result),
                 Err(_) => continue,
             }
@@ -787,16 +864,9 @@ impl FjallStorage {
 
     /// One attempt that reports a commit conflict as `AdmissionConflict`, for
     /// admission writes whose caller owns the whole retry budget.
-    fn transaction_once<R>(
-        &self,
-        f: impl FnOnce(&mut fjall::OptimisticWriteTx) -> Result<R>,
-    ) -> Result<R> {
+    fn transaction_once<R>(&self, f: impl FnOnce(&mut Transaction) -> Result<R>) -> Result<R> {
         self.counters.count_attempt();
-        let mut tx = self
-            .db
-            .write_tx()
-            .map_err(Error::ReopenRequired)?
-            .durability(Some(self.persist_mode));
+        let mut tx = self.begin_write(false)?;
         let result = match &self.namespace {
             Some(fence) => {
                 Self::tx_fence_write(&tx, fence)?;
@@ -809,7 +879,7 @@ impl FjallStorage {
         };
         #[cfg(test)]
         self.race_commit()?;
-        match tx.commit().map_err(Error::ReopenRequired)? {
+        match tx.commit()? {
             Ok(()) => Ok(result),
             Err(_) => Err(Error::AdmissionConflict),
         }
@@ -846,25 +916,16 @@ impl FjallStorage {
 
     fn put<T: Serialize>(&self, key: impl AsRef<[u8]>, value: &T) -> Result<()> {
         let key = key.as_ref().to_vec();
-        let value = postcard::to_allocvec(value)?;
-        self.transaction(|tx| {
-            tx.insert(&self.records, key.clone(), value.clone());
-            Ok(())
-        })
+        self.transaction(|tx| tx.put(&self.records, &key, value))
     }
 
     pub(super) fn tx_put<T: Serialize>(
-        tx: &mut fjall::OptimisticWriteTx,
+        tx: &mut Transaction,
         records: &fjall::OptimisticTxKeyspace,
         key: impl AsRef<[u8]>,
         value: &T,
     ) -> Result<()> {
-        tx.insert(
-            records,
-            key.as_ref().to_vec(),
-            postcard::to_allocvec(value)?,
-        );
-        Ok(())
+        tx.put(records, key, value)
     }
 
     pub(super) fn tx_get<T: for<'de> Deserialize<'de>>(
@@ -879,10 +940,7 @@ impl FjallStorage {
 
     /// Outstanding journal records, counted no further than the cap the caller
     /// compares against.
-    fn tx_eviction_count(
-        tx: &fjall::OptimisticWriteTx,
-        records: &fjall::OptimisticTxKeyspace,
-    ) -> usize {
+    fn tx_eviction_count(tx: &Transaction, records: &fjall::OptimisticTxKeyspace) -> usize {
         fjall::Readable::prefix(tx, records, EVICTION_PREFIX)
             .take(MAX_PENDING_EVICTIONS)
             .count()
@@ -911,7 +969,7 @@ impl FjallStorage {
 
     /// Delete every key under `prefix` and report how many there were.
     pub(super) fn tx_remove_prefix(
-        tx: &mut fjall::OptimisticWriteTx,
+        tx: &mut Transaction,
         records: &fjall::OptimisticTxKeyspace,
         prefix: &[u8],
     ) -> Result<usize> {
@@ -921,13 +979,13 @@ impl FjallStorage {
         }
         let removed = keys.len();
         for key in keys {
-            tx.remove(records, key);
+            tx.remove(records, key)?;
         }
         Ok(removed)
     }
 
     pub(super) fn tx_put_obligation(
-        tx: &mut fjall::OptimisticWriteTx,
+        tx: &mut Transaction,
         records: &fjall::OptimisticTxKeyspace,
         obligation: &SyncObligation,
     ) -> Result<()> {
@@ -958,7 +1016,7 @@ impl FjallStorage {
     /// outer result is a backend failure; the inner one is the per-ack verdict,
     /// which a batch records without abandoning the other acks.
     fn tx_ack_commit(
-        tx: &mut fjall::OptimisticWriteTx,
+        tx: &mut Transaction,
         records: &fjall::OptimisticTxKeyspace,
         ack: &PeerAck,
     ) -> Result<Result<AckCommit>> {
@@ -968,7 +1026,7 @@ impl FjallStorage {
     }
 
     fn tx_apply_peer_ack(
-        tx: &mut fjall::OptimisticWriteTx,
+        tx: &mut Transaction,
         records: &fjall::OptimisticTxKeyspace,
         ack: &PeerAck,
         commit: AckCommit,
@@ -1001,11 +1059,7 @@ impl FjallStorage {
         Ok(OpId::from_bytes(out))
     }
 
-    fn tx_admit_batch(
-        &self,
-        tx: &mut fjall::OptimisticWriteTx,
-        batch: &AdmittedBatch,
-    ) -> Result<()> {
+    fn tx_admit_batch(&self, tx: &mut Transaction, batch: &AdmittedBatch) -> Result<()> {
         validate_batch(batch)?;
         let AdmittedBatch {
             topic_id,
@@ -1279,8 +1333,8 @@ impl FjallStorage {
                     tx.remove(
                         &self.records,
                         [b"ss".as_slice(), topic_id.as_ref(), peer.as_ref()].concat(),
-                    );
-                    tx.remove(&self.records, Self::ack_key(&topic_id, peer));
+                    )?;
+                    tx.remove(&self.records, Self::ack_key(&topic_id, peer))?;
                 }
             }
             Ok(())
@@ -1292,7 +1346,7 @@ impl FjallStorage {
     #[cfg(test)]
     pub(crate) fn drop_op_record(&self, id: &OpId) {
         self.transaction(|tx| {
-            tx.remove(&self.records, Self::key_id(b"o", id));
+            tx.remove(&self.records, Self::key_id(b"o", id))?;
             Ok(())
         })
         .expect("fjall drop op record");
@@ -1302,7 +1356,7 @@ impl FjallStorage {
     #[cfg(test)]
     pub(crate) fn drop_meta_record(&self, id: &OpId) {
         self.transaction(|tx| {
-            tx.remove(&self.records, Self::key_id(b"m", id));
+            tx.remove(&self.records, Self::key_id(b"m", id))?;
             Ok(())
         })
         .expect("fjall drop meta record");
@@ -1479,11 +1533,7 @@ impl FjallStorage {
         Ok(state.map(|state| (meta, state.genesis)))
     }
 
-    fn tx_reset_topic(
-        &self,
-        tx: &mut fjall::OptimisticWriteTx,
-        topic_id: &TopicId,
-    ) -> Result<usize> {
+    fn tx_reset_topic(&self, tx: &mut Transaction, topic_id: &TopicId) -> Result<usize> {
         let epoch_key = Self::key_id(TOPIC_EPOCH_PREFIX, topic_id);
         let epoch: u64 = Self::tx_get(tx, &self.records, epoch_key.as_slice())?.unwrap_or_default();
         let next_epoch = epoch
@@ -1509,11 +1559,11 @@ impl FjallStorage {
                     tx.remove(
                         &self.records,
                         [b"ch".as_slice(), dep.as_ref(), op_id.as_ref()].concat(),
-                    );
+                    )?;
                 }
             }
-            tx.remove(&self.records, Self::key_id(b"o", op_id));
-            tx.remove(&self.records, Self::key_id(b"m", op_id));
+            tx.remove(&self.records, Self::key_id(b"o", op_id))?;
+            tx.remove(&self.records, Self::key_id(b"m", op_id))?;
             let ch_prefix = [b"ch".as_slice(), op_id.as_ref()].concat();
             let mut ch_keys = Vec::new();
             for item in fjall::Readable::prefix(tx, &self.records, ch_prefix) {
@@ -1521,12 +1571,12 @@ impl FjallStorage {
                 ch_keys.push(key.to_vec());
             }
             for key in ch_keys {
-                tx.remove(&self.records, key);
+                tx.remove(&self.records, key)?;
             }
             tx.remove(
                 &self.records,
                 [b"to".as_slice(), topic_id.as_ref(), op_id.as_ref()].concat(),
-            );
+            )?;
         }
         for prefix in [
             b"h".as_slice(),
@@ -1535,7 +1585,7 @@ impl FjallStorage {
             b"mg".as_slice(),
             b"ts".as_slice(),
         ] {
-            tx.remove(&self.records, Self::key_id(prefix, topic_id));
+            tx.remove(&self.records, Self::key_id(prefix, topic_id))?;
         }
         // Actor index/tip, sync status and clock nodes share a `<prefix><topic>` layout.
         for prefix in [
@@ -1551,7 +1601,7 @@ impl FjallStorage {
                 keys.push(key.to_vec());
             }
             for key in keys {
-                tx.remove(&self.records, key);
+                tx.remove(&self.records, key)?;
             }
         }
         // Acks and obligations key topic first, so both are prefix deletes.
@@ -1650,7 +1700,7 @@ impl Storage for FjallStorage {
             if Self::tx_get::<bool>(tx, &self.records, key.as_slice())?.is_none() {
                 return Ok(false);
             }
-            tx.remove(&self.records, key.clone());
+            tx.remove(&self.records, key.clone())?;
             Ok(true)
         })
     }
@@ -1666,7 +1716,7 @@ impl Storage for FjallStorage {
 
     fn clear_eviction(&self, key: &EvictionKey) -> Result<()> {
         self.transaction(|tx| {
-            tx.remove(&self.records, Self::key_id(EVICTION_PREFIX, key));
+            tx.remove(&self.records, Self::key_id(EVICTION_PREFIX, key))?;
             Ok(())
         })
     }
@@ -1892,7 +1942,7 @@ impl Storage for FjallStorage {
     }
     fn put_pending_op(&self, source_peer: PeerId, op: Op, meta: OpMeta) -> Result<()> {
         let charge = Self::pending_charge(&op, &meta)?;
-        self.transaction(|tx| {
+        self.transaction_bulk(|tx| {
             if let Some(fence) = &self.namespace
                 && Self::tx_pending_record(tx, &self.records, &op.id)?.is_none()
             {
@@ -2112,8 +2162,8 @@ impl Storage for FjallStorage {
             tx.remove(
                 &self.records,
                 [b"ss".as_slice(), topic_id.as_ref(), peer_id.as_ref()].concat(),
-            );
-            tx.remove(&self.records, Self::ack_key(topic_id, peer_id));
+            )?;
+            tx.remove(&self.records, Self::ack_key(topic_id, peer_id))?;
             Ok(cleared)
         })
     }
@@ -2199,6 +2249,21 @@ struct StoredMeta {
     missing_deps: BTreeSet<OpId>,
 }
 
+#[derive(Serialize)]
+struct MetaWrite<'a> {
+    id: OpId,
+    topic_id: TopicId,
+    author: PeerId,
+    actor_id: ActorId,
+    actor_seq: u64,
+    actor_prev: Option<OpId>,
+    deps: &'a BTreeSet<OpId>,
+    generation: u64,
+    observed_clock: StoredClock,
+    ready: bool,
+    missing_deps: &'a BTreeSet<OpId>,
+}
+
 #[cfg(feature = "fjall")]
 #[derive(Serialize, Deserialize)]
 enum StoredClock {
@@ -2236,39 +2301,37 @@ impl FjallStorage {
     /// `records` does not hold yet, in the same transaction.
     pub(super) fn tx_put_meta(
         &self,
-        tx: &mut fjall::OptimisticWriteTx,
+        tx: &mut Transaction,
         records: &fjall::OptimisticTxKeyspace,
         meta: &OpMeta,
     ) -> Result<()> {
         let observed_clock = match meta.observed_clock.root_hash() {
             Some(root) if meta.observed_clock.len() > INLINE_CLOCK_ENTRIES => {
-                let nodes = meta.observed_clock.unstored_nodes(|hash| {
-                    Ok(fjall::Readable::contains_key(
-                        tx,
-                        records,
-                        clock_node_key(&meta.topic_id, hash),
-                    )?)
+                meta.observed_clock.visit_nodes(|record| {
+                    let key = clock_node_key(&meta.topic_id, &record.hash);
+                    if fjall::Readable::contains_key(tx, records, &key)? {
+                        return Ok(true);
+                    }
+                    Self::tx_put(tx, records, key, &record)?;
+                    Ok(false)
                 })?;
-                for (hash, bytes) in nodes {
-                    tx.insert(records, clock_node_key(&meta.topic_id, &hash), bytes);
-                }
                 self.clocks.keep(&meta.observed_clock);
                 StoredClock::Nodes(root)
             }
             _ => StoredClock::Inline(meta.observed_clock.clone()),
         };
-        let stored = StoredMeta {
+        let stored = MetaWrite {
             id: meta.id,
             topic_id: meta.topic_id,
             author: meta.author,
             actor_id: meta.actor_id,
             actor_seq: meta.actor_seq,
             actor_prev: meta.actor_prev,
-            deps: meta.deps.clone(),
+            deps: &meta.deps,
             generation: meta.generation,
             observed_clock,
             ready: meta.ready,
-            missing_deps: meta.missing_deps.clone(),
+            missing_deps: &meta.missing_deps,
         };
         Self::tx_put(tx, records, Self::key_id(b"m", &meta.id), &stored)?;
         Ok(())
@@ -2645,7 +2708,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
 }
 
 fn clear_satisfied_tx(
-    tx: &mut fjall::OptimisticWriteTx,
+    tx: &mut Transaction,
     records: &fjall::OptimisticTxKeyspace,
     ack: &PeerAck,
 ) -> Result<usize> {
@@ -2670,7 +2733,7 @@ fn clear_satisfied_tx(
             Some(rest) if rest == obligation => {}
             Some(rest) => FjallStorage::tx_put(tx, records, key, &rest)?,
             None => {
-                tx.remove(records, key);
+                tx.remove(records, key)?;
                 cleared += 1;
             }
         }
@@ -2700,6 +2763,20 @@ mod tests {
                 missing_deps: BTreeSet::new(),
             };
             let bytes = postcard::to_allocvec(&meta).unwrap();
+            let borrowed = MetaWrite {
+                id: meta.id,
+                topic_id: meta.topic_id,
+                author: meta.author,
+                actor_id: meta.actor_id,
+                actor_seq: meta.actor_seq,
+                actor_prev: meta.actor_prev,
+                deps: &meta.deps,
+                generation: meta.generation,
+                observed_clock: StoredClock::Inline(ActorClock::new()),
+                ready: meta.ready,
+                missing_deps: &meta.missing_deps,
+            };
+            assert_eq!(postcard::to_allocvec(&borrowed).unwrap(), bytes);
             let (_, tail) = header_tail(&bytes).unwrap();
             assert!(clock_tail(tail).is_ok());
             assert!(clock_tail(&tail[..tail.len() - 1]).is_err());

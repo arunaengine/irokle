@@ -12,7 +12,7 @@ use super::{
     PendingRecord, PendingUsage, check_pending_quota, pending_op_bytes,
 };
 
-type Tx = fjall::OptimisticWriteTx;
+type Tx = super::pressure::Transaction;
 type Records = fjall::OptimisticTxKeyspace;
 
 /// Payload of a buffered op, `pp<op>`.
@@ -74,7 +74,7 @@ impl FjallStorage {
         usage: PendingUsage,
     ) -> Result<()> {
         if usage == PendingUsage::default() {
-            tx.remove(records, key);
+            tx.remove(records, key)?;
             Ok(())
         } else {
             Self::tx_put(tx, records, key, &usage)
@@ -95,7 +95,7 @@ impl FjallStorage {
             .checked_add_signed(delta)
             .ok_or_else(|| Error::Storage("pending waiter count does not match".into()))?;
         if next == 0 {
-            tx.remove(records, count_key);
+            tx.remove(records, count_key)?;
         } else {
             Self::tx_put(tx, records, count_key, &next)?;
         }
@@ -159,14 +159,14 @@ impl FjallStorage {
             )?;
         }
         for dep in previous.difference(&meta.missing_deps) {
-            tx.remove(records, key(&[WAITER, dep.as_ref(), op.id.as_ref()]));
+            tx.remove(records, key(&[WAITER, dep.as_ref(), op.id.as_ref()]))?;
             Self::tx_waiter_count(tx, records, dep, -1)?;
         }
         let ready_key = key(&[READY, op.id.as_ref()]);
         if meta.missing_deps.is_empty() {
             Self::tx_put(tx, records, ready_key, &())?;
         } else {
-            tx.remove(records, ready_key);
+            tx.remove(records, ready_key)?;
         }
         // A known op keeps its stored source and charge; only its waits move.
         let record = match existing {
@@ -217,16 +217,16 @@ impl FjallStorage {
         Self::tx_put_usage(tx, records, source_key, source)?;
         Self::tx_put_usage(tx, records, topic_key, topic)?;
         for dep in &record.missing {
-            tx.remove(records, key(&[WAITER, dep.as_ref(), op_id.as_ref()]));
+            tx.remove(records, key(&[WAITER, dep.as_ref(), op_id.as_ref()]))?;
             Self::tx_waiter_count(tx, records, dep, -1)?;
         }
         tx.remove(
             records,
             key(&[BY_TOPIC, record.topic_id.as_ref(), op_id.as_ref()]),
-        );
-        tx.remove(records, key(&[READY, op_id.as_ref()]));
-        tx.remove(records, key(&[RECORD, op_id.as_ref()]));
-        tx.remove(records, key(&[PAYLOAD, op_id.as_ref()]));
+        )?;
+        tx.remove(records, key(&[READY, op_id.as_ref()]))?;
+        tx.remove(records, key(&[RECORD, op_id.as_ref()]))?;
+        tx.remove(records, key(&[PAYLOAD, op_id.as_ref()]))?;
         Ok(())
     }
 
@@ -245,9 +245,9 @@ impl FjallStorage {
         if waiters.is_empty() {
             return Ok(());
         }
-        tx.remove(records, key(&[WAITER_COUNT, admitted.as_ref()]));
+        tx.remove(records, key(&[WAITER_COUNT, admitted.as_ref()]))?;
         for (waiter_key, waiter) in waiters {
-            tx.remove(records, waiter_key);
+            tx.remove(records, waiter_key)?;
             let Some(mut record) = Self::tx_pending_record(tx, records, &waiter)? else {
                 continue;
             };
@@ -317,9 +317,9 @@ impl FjallStorage {
                 tx.remove(
                     records,
                     key(&[REJECTED, topic_id.as_ref(), dropped.as_ref()]),
-                );
+                )?;
             }
-            tx.remove(records, order_key);
+            tx.remove(records, order_key)?;
             oldest += 1;
         }
         Self::tx_put(tx, records, range_key, &(oldest, next))?;
@@ -342,7 +342,7 @@ impl FjallStorage {
         for prefix in [REJECTED, REJECTED_ORDER] {
             Self::tx_remove_prefix(tx, records, &key(&[prefix, topic_id.as_ref()]))?;
         }
-        tx.remove(records, key(&[REJECTED_RANGE, topic_id.as_ref()]));
+        tx.remove(records, key(&[REJECTED_RANGE, topic_id.as_ref()]))?;
         Ok(())
     }
 

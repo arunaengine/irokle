@@ -104,6 +104,18 @@ pub enum Error {
     #[error("storage error: {0}")]
     Storage(String),
 
+    #[cfg(feature = "fjall")]
+    #[error("storage pressure: {0}")]
+    StoragePressure(String),
+
+    #[cfg(feature = "fjall")]
+    #[error("storage buffer requires {required} bytes, limit {limit}")]
+    StorageBuffer { required: u64, limit: u64 },
+
+    #[cfg(feature = "fjall")]
+    #[error("storage pressure probe failed: {0}")]
+    StorageProbe(#[source] std::io::Error),
+
     #[error("sync planning capacity exhausted: {0}")]
     SyncCapacity(String),
 

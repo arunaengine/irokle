@@ -26,7 +26,7 @@ use super::{
     ack_covers, check_namespaces,
 };
 
-type Tx = fjall::OptimisticWriteTx;
+type Tx = super::pressure::Transaction;
 type Records = fjall::OptimisticTxKeyspace;
 
 /// Namespace record, `bn<source><topic>`. No other key begins with `b`.
@@ -232,7 +232,7 @@ impl FjallStorage {
                         keys.push(item.key()?.to_vec());
                     }
                     for key in &keys {
-                        tx.remove(&store, key.clone());
+                        tx.remove(&store, key.clone())?;
                     }
                     Ok(Some(keys.len()))
                 })?;
@@ -248,8 +248,8 @@ impl FjallStorage {
             self.hook(Hook::ReleaseSlot)?;
             self.transaction(|tx| {
                 if clears(tx)? && fjall::Readable::iter(tx, &store).next().is_none() {
-                    tx.remove(&self.records, key.clone());
-                    tx.remove(&self.records, clearing_key(slot));
+                    tx.remove(&self.records, key.clone())?;
+                    tx.remove(&self.records, clearing_key(slot))?;
                 }
                 Ok(())
             })?;
@@ -426,7 +426,7 @@ impl FjallStorage {
         tx.remove(
             records,
             namespace_key(&provisional.source, &provisional.topic_id),
-        );
+        )?;
         Self::tx_put(
             tx,
             records,
@@ -565,7 +565,8 @@ impl FjallStorage {
             self.hook(Hook::CopyChunk)?;
             // The claim freezes this namespace; validation needs no write-conflict reads.
             let read = self.db.read_tx();
-            let (seen, last) = self.transaction(|tx| {
+            let (seen, last) = self.transaction_bulk(|tx| {
+                tx.activation();
                 Self::tx_claimed(tx, &self.records, &topic_id, provisional.session)?;
                 let mut seen = 0;
                 let mut last = None;
@@ -585,7 +586,7 @@ impl FjallStorage {
                         if key.len() == 1 + OpId::LEN && key.starts_with(b"m") {
                             Self::validate_meta(&read, store, &value, &clocks)?;
                         }
-                        tx.insert(&self.records, key.to_vec(), value);
+                        tx.insert(&self.records, &key, value)?;
                     }
                     last = Some(key.to_vec());
                 }
@@ -620,7 +621,7 @@ impl FjallStorage {
                 Self::tx_get(tx, store, Self::key_id(b"fp", &topic_id))?;
             let generation: u64 =
                 Self::tx_get(tx, store, Self::key_id(b"mg", &topic_id))?.unwrap_or_default();
-            tx.remove(&self.records, Self::key_id(ACTIVATING, &topic_id));
+            tx.remove(&self.records, Self::key_id(ACTIVATING, &topic_id))?;
             Self::tx_put(tx, &self.records, Self::key_id(b"ts", &topic_id), expected)?;
             Self::tx_put(tx, &self.records, Self::key_id(b"h", &topic_id), &heads)?;
             Self::tx_put(tx, &self.records, Self::key_id(b"ac", &topic_id), &clock)?;

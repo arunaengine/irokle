@@ -806,11 +806,15 @@ mod fjall_pending;
 #[cfg(feature = "fjall")]
 mod fjall_provisional;
 #[cfg(feature = "fjall")]
+mod pressure;
+#[cfg(feature = "fjall")]
 pub use fjall::FjallStorage;
 #[cfg(all(test, feature = "fjall"))]
 pub(crate) use fjall::Hook;
 #[cfg(all(test, feature = "fjall"))]
 pub(crate) use fjall::write_legacy_metas;
+#[cfg(feature = "fjall")]
+pub use pressure::{StorageDomain, StoragePressure, StorageUsage};
 
 pub(super) fn validate_batch(batch: &AdmittedBatch) -> Result<()> {
     for state in [&batch.expected_topic_state, &batch.topic_state]
