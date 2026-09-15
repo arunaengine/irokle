@@ -668,7 +668,12 @@ impl ClockCache {
                             .map(|child| 1_u16 << nibble(child.key(), level))
                             .fold(0, |bits, bit| bits | bit);
                         let total = children.iter().map(|child| child.len()).sum::<usize>();
-                        if digits != bitmap || total as u64 != len {
+                        if digits != bitmap
+                            || total as u64 != len
+                            || children.windows(2).any(|pair| {
+                                nibble(pair[0].key(), level) >= nibble(pair[1].key(), level)
+                            })
+                        {
                             return Err(corrupt());
                         }
                         Node::Branch {
@@ -957,6 +962,60 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn unordered_nodes_refused() {
+        let mut clock = ActorClock::new();
+        for n in [1, 2, 3] {
+            clock.observe(ActorId::from_bytes([n; 32]), u64::from(n));
+        }
+        let mut store = clock
+            .unstored_nodes(|_| Ok(false))
+            .unwrap()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let root = clock.root_hash().unwrap();
+        let Encoded::Branch {
+            level,
+            bitmap,
+            len,
+            key,
+            mut children,
+        } = postcard::from_bytes(&store[&root]).unwrap()
+        else {
+            panic!("branch required")
+        };
+        children.swap(0, 1);
+        let bytes = postcard::to_allocvec(&Encoded::Branch {
+            level,
+            bitmap,
+            len,
+            key,
+            children,
+        })
+        .unwrap();
+        let forged = digest(&bytes);
+        store.insert(forged, bytes);
+        for warm in [false, true] {
+            let cache = ClockCache::default();
+            if warm {
+                cache.keep(&clock);
+            }
+            let loaded = ActorClock::load(&forged, &cache, |hash| Ok(store.get(hash).cloned()));
+            assert!(
+                matches!(loaded, Err(crate::Error::Storage(_))),
+                "unordered children accepted: {loaded:?}"
+            );
+            let valid =
+                ActorClock::load(&root, &cache, |hash| Ok(store.get(hash).cloned())).unwrap();
+            assert_eq!(valid, clock);
+            assert_eq!(
+                postcard::to_allocvec(&valid).unwrap(),
+                postcard::to_allocvec(&clock).unwrap()
+            );
         }
     }
 
