@@ -19,6 +19,13 @@ pub enum Error {
     #[error("admission conflict")]
     AdmissionConflict,
 
+    #[error("memory {domain:?} reservation needs {required} bytes, limit {limit}")]
+    MemoryPressure {
+        domain: crate::storage::MemoryDomain,
+        required: u64,
+        limit: u64,
+    },
+
     #[error("invalid public key")]
     InvalidPublicKey,
 

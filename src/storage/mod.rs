@@ -831,7 +831,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
 }
 
 mod memory;
-pub use memory::MemoryStorage;
+pub use memory::{MemoryDomain, MemoryLimits, MemoryStorage, MemoryUsage};
 
 #[cfg(feature = "fjall")]
 mod fjall;

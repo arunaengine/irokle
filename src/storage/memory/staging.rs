@@ -160,9 +160,17 @@ impl MemoryStorage {
             revision: 0,
             bytes: 0,
         };
-        staging
-            .namespaces
-            .insert((source, topic_id), (provisional.clone(), Arc::default()));
+        let budget = Arc::clone(&self.lock()?.budget);
+        staging.namespaces.insert(
+            (source, topic_id),
+            (
+                provisional.clone(),
+                Arc::new(Mutex::new(MemoryInner {
+                    budget,
+                    ..Default::default()
+                })),
+            ),
+        );
         Ok(provisional)
     }
 
@@ -250,6 +258,14 @@ impl MemoryStorage {
         if memory_topic_state_locked(staged, &topic_id).as_ref() != Some(expected) {
             return Err(Error::AdmissionConflict);
         }
+        let copy_bytes = staged
+            .charges
+            .values()
+            .map(|charge| charge.operation.bytes + charge.metadata.bytes)
+            .sum();
+        let _copy = inner
+            .budget
+            .reserve(super::MemoryDomain::Activation, copy_bytes)?;
         let mut changes = BTreeMap::new();
         for obligation in effects.sync_obligations {
             let ack = inner.peer_acks.get(&(obligation.peer_id, topic_id));
@@ -274,7 +290,10 @@ impl MemoryStorage {
             put_obligation_locked(&mut inner, merged);
         }
         for records in &mut locked {
-            **records = MemoryInner::default();
+            **records = MemoryInner {
+                budget: Arc::clone(&records.budget),
+                ..Default::default()
+            };
         }
         drop(locked);
         for (key, _) in records {
@@ -293,7 +312,11 @@ impl MemoryStorage {
             .is_some_and(|(current, _)| current == provisional && !current.activating);
         if current {
             if let Some((_, records)) = staging.namespaces.get(&key) {
-                *records.lock()? = MemoryInner::default();
+                let mut records = records.lock()?;
+                *records = MemoryInner {
+                    budget: Arc::clone(&records.budget),
+                    ..Default::default()
+                };
             }
             staging.namespaces.remove(&key);
         }
@@ -306,6 +329,9 @@ fn copy_topic_locked(staged: &MemoryInner, inner: &mut MemoryInner, topic_id: &T
     let ids = staged.topic_ops.get(topic_id).cloned().unwrap_or_default();
     for id in &ids {
         if let (Some(op), Some(meta)) = (staged.ops.get(id), staged.meta.get(id)) {
+            if let Some(charge) = staged.charges.get(id) {
+                inner.charges.insert(*id, charge.clone());
+            }
             for dep in &meta.deps {
                 inner.children.entry(*dep).or_default().insert(*id);
             }

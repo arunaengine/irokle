@@ -87,8 +87,19 @@ fn captured_clock_bounds() {
         let allocated = LIVE.load(Ordering::Relaxed) - before;
         let reserved = 2 * clock::ActorClock::allocation_bound(entries as usize);
         assert!(allocated > 0 && allocated <= reserved);
+        let mut nodes = std::collections::BTreeMap::new();
+        for clock in &held {
+            clock
+                .visit_allocations(|node| {
+                    assert!(node.alive());
+                    Ok(nodes.insert(node.address, node).is_none())
+                })
+                .unwrap();
+        }
+        assert!(nodes.values().map(|node| node.bytes).sum::<usize>() <= reserved);
         println!("clocks entries={entries} allocator_bytes={allocated} reserved_bytes={reserved}");
         drop(held);
+        assert!(nodes.values().all(|node| !node.alive()));
     }
 }
 

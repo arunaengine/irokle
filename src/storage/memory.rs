@@ -20,9 +20,19 @@ use super::{
     topic_fingerprint_for, validate_batch, validate_heads,
 };
 
+mod budget;
 mod staging;
 
+pub use budget::{MemoryDomain, MemoryLimits, MemoryUsage};
+
+use budget::{Budget, Charge};
 use staging::Staging;
+
+#[derive(Clone)]
+struct RecordCharge {
+    operation: Arc<Charge>,
+    metadata: Arc<Charge>,
+}
 
 #[derive(Clone)]
 pub struct MemoryStorage {
@@ -49,6 +59,8 @@ impl Default for MemoryStorage {
 
 #[derive(Clone, Default)]
 struct MemoryInner {
+    budget: Arc<Budget>,
+    charges: BTreeMap<OpId, RecordCharge>,
     ops: BTreeMap<OpId, Op>,
     meta: BTreeMap<OpId, OpMeta>,
     topic_ops: BTreeMap<TopicId, BTreeSet<OpId>>,
@@ -98,6 +110,18 @@ impl MemoryStorage {
     pub fn with_staging_limits(mut self, limits: StagingLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    pub fn with_memory_limits(self, limits: MemoryLimits) -> Result<Self> {
+        self.main_store()?;
+        let budget = Arc::clone(&self.lock()?.budget);
+        budget.configure(limits)?;
+        Ok(self)
+    }
+
+    pub fn memory_usage(&self) -> Result<MemoryUsage> {
+        let budget = Arc::clone(&self.lock()?.budget);
+        Ok(budget.usage())
     }
 
     /// Work this store and its clones performed so far.
@@ -344,7 +368,7 @@ impl Storage for MemoryStorage {
     fn put_pending_bound(
         &self,
         source_peer: PeerId,
-        op: Op,
+        mut op: Op,
         meta: OpMeta,
         genesis: Option<OpId>,
     ) -> Result<()> {
@@ -425,6 +449,14 @@ impl Storage for MemoryStorage {
         }
 
         // A known op keeps its stored source and charge; only its waits move.
+        let reserved = match inner.charges.get(&op.id) {
+            Some(charge) => charge.clone(),
+            None => charge_record(&inner.budget, &op, &meta)?,
+        };
+        if let crate::TopicPayload::Event(event) = &mut op.signed.body.payload {
+            event.payload = bytes::Bytes::copy_from_slice(&event.payload);
+        }
+        inner.charges.insert(op.id, reserved);
         let previous = previous.unwrap_or_default();
         for dep in previous.difference(&meta.missing_deps) {
             unwait_locked(&mut inner, dep, &op.id);
@@ -722,6 +754,12 @@ impl Storage for MemoryStorage {
         // Stage both steps on a copy and swap only once the winner is admitted:
         // a rejected winner must leave the local chain exactly as it was, never
         // an empty topic with nothing installed in its place.
+        let copy_bytes = inner
+            .charges
+            .values()
+            .map(|charge| charge.operation.bytes + charge.metadata.bytes)
+            .sum();
+        let _copy = inner.budget.reserve(MemoryDomain::Recovery, copy_bytes)?;
         let mut staged = inner.clone();
         let removed = reset_topic_locked(&mut staged, topic_id)?;
         admit_batch_locked(&mut staged, batch, None)?;
@@ -1115,6 +1153,33 @@ fn admit_batch_locked(
     }
 
     ensure_deps_resolvable(&new_entries, |dep| Ok(dep_resolvable_locked(inner, dep)))?;
+    let previous = inner
+        .actor_clock
+        .get(&topic_id)
+        .cloned()
+        .unwrap_or_default();
+    let _workspace = inner.budget.reserve(
+        MemoryDomain::Workspace,
+        ActorClock::allocation_bound(
+            previous
+                .len()
+                .saturating_add(new_entries.len())
+                .saturating_add(64),
+        ) as u64,
+    )?;
+    let mut projected = previous.clone();
+    let mut nodes = inner.budget.nodes()?;
+    let mut charges = BTreeMap::new();
+    for (op, meta) in &new_entries {
+        projected.observe(meta.actor_id, meta.actor_seq);
+        nodes.add(&meta.observed_clock)?;
+        let charge = match inner.charges.get(&op.id) {
+            Some(charge) => charge.clone(),
+            None => charge_record(&inner.budget, op, meta)?,
+        };
+        charges.insert(op.id, charge);
+    }
+    nodes.add(&projected)?;
     if let Some(quota) = quota {
         let mut charge = 0;
         for (op, _) in &new_entries {
@@ -1126,7 +1191,12 @@ fn admit_batch_locked(
         inner.admitted_bytes += charge;
     }
 
-    for (op, meta) in new_entries {
+    nodes.commit();
+
+    for (mut op, meta) in new_entries {
+        if let crate::TopicPayload::Event(event) = &mut op.signed.body.payload {
+            event.payload = bytes::Bytes::copy_from_slice(&event.payload);
+        }
         inner
             .topic_ops
             .entry(meta.topic_id)
@@ -1151,11 +1221,6 @@ fn admit_batch_locked(
             }
         }
         inner
-            .actor_clock
-            .entry(meta.topic_id)
-            .or_default()
-            .observe(meta.actor_id, meta.actor_seq);
-        inner
             .max_generation
             .entry(meta.topic_id)
             .and_modify(|generation| *generation = (*generation).max(meta.generation))
@@ -1165,6 +1230,9 @@ fn admit_batch_locked(
         inner.meta.insert(op.id, meta);
         inner.ops.insert(op.id, op);
     }
+
+    inner.charges.extend(charges);
+    inner.actor_clock.insert(topic_id, projected);
 
     inner.heads.insert(topic_id, heads.clone());
     let clock = inner
@@ -1217,6 +1285,7 @@ fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> Result<usi
         }
         inner.ops.remove(op_id);
         inner.meta.remove(op_id);
+        inner.charges.remove(op_id);
         inner.children.remove(op_id);
     }
     inner.heads.remove(topic_id);
@@ -1239,6 +1308,22 @@ fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> Result<usi
         remove_pending_locked(inner, &op_id)?;
     }
     Ok(removed)
+}
+
+fn charge_record(budget: &Arc<Budget>, op: &Op, meta: &OpMeta) -> Result<RecordCharge> {
+    let encoded = pending_op_bytes(op)? as u64;
+    let peers = matches!(
+        op.signed.body.payload,
+        crate::TopicPayload::Genesis(_)
+            | crate::TopicPayload::Control(crate::TopicControl::SetReplicationPolicy { .. })
+    );
+    let metadata = (3 * size_of::<OpMeta>() + 4096) as u64
+        + (meta.deps.len() + meta.missing_deps.len()) as u64 * 768
+        + if peers { encoded.saturating_mul(3) } else { 0 };
+    Ok(RecordCharge {
+        operation: Arc::new(budget.reserve(MemoryDomain::Operations, encoded.saturating_mul(3))?),
+        metadata: Arc::new(budget.reserve(MemoryDomain::Metadata, metadata)?),
+    })
 }
 
 fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> Result<usize> {
@@ -1438,6 +1523,9 @@ fn remove_pending_locked(inner: &mut MemoryInner, op_id: &OpId) -> Result<()> {
     }
     inner.pending_ready.remove(op_id);
     inner.pending_ops.remove(op_id);
+    if !inner.ops.contains_key(op_id) && !inner.meta.contains_key(op_id) {
+        inner.charges.remove(op_id);
+    }
     Ok(())
 }
 

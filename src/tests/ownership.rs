@@ -97,6 +97,7 @@ fn stale_view_releases() {
     let (source, topic, ops) = history(178, 0, 0);
     let genesis = ops[0].clone();
     let op = owned_event(&genesis, source.signer(), Arc::clone(&released));
+    let (id, encoded) = (op.id, postcard::to_allocvec(&op).unwrap());
     let storage = MemoryStorage::new();
     let provisional = storage
         .open_provisional(source.peer_id(), topic, genesis.id, now())
@@ -105,7 +106,17 @@ fn stale_view_releases() {
     Oplog::with_storage(view.clone())
         .receive_ops(vec![genesis, op])
         .unwrap();
-    assert!(!released.load(Ordering::SeqCst));
+    assert!(
+        released.load(Ordering::SeqCst),
+        "storage must own the visible payload bytes"
+    );
+    let stored = view.get_op(&id).unwrap().unwrap();
+    assert_eq!(postcard::to_allocvec(&stored).unwrap(), encoded);
+    stored.validate().unwrap();
+    drop(stored);
+    assert!(
+        storage.memory_usage().unwrap().reserved[&crate::storage::MemoryDomain::Operations] > 0
+    );
     let current = listed(&storage, &provisional).unwrap();
     assert!(storage.discard_provisional(&current).unwrap());
     assert!(
@@ -113,6 +124,14 @@ fn stale_view_releases() {
         "stale capability retained payload storage"
     );
     assert!(matches!(view.stored_bytes(), Err(Error::StaleIncarnation)));
+    assert!(
+        storage
+            .memory_usage()
+            .unwrap()
+            .reserved
+            .values()
+            .all(|bytes| *bytes == 0)
+    );
 }
 
 #[test]
@@ -180,16 +199,31 @@ fn activation_releases_losers() {
         staged.push((listed(&storage, &provisional).unwrap(), view, released));
     }
     let state = staged[0].1.topic_state(&topic).unwrap().unwrap();
+    let before =
+        storage.memory_usage().unwrap().reserved[&crate::storage::MemoryDomain::Operations];
     storage
         .activate_provisional(&staged[0].0, &state, AdmissionEffects::default())
         .unwrap();
-    assert!(!staged[0].2.load(Ordering::SeqCst));
+    assert!(staged[0].2.load(Ordering::SeqCst));
     assert!(staged[1].2.load(Ordering::SeqCst));
+    assert_eq!(
+        2 * storage.memory_usage().unwrap().reserved[&crate::storage::MemoryDomain::Operations],
+        before
+    );
+    assert_eq!(storage.list_op_ids(&topic).unwrap().len(), common.len() + 1);
     for (_, view, _) in &staged {
         assert!(matches!(view.stored_bytes(), Err(Error::StaleIncarnation)));
     }
     storage.reset_topic(&topic).unwrap();
     assert!(staged[0].2.load(Ordering::SeqCst));
+    assert!(
+        storage
+            .memory_usage()
+            .unwrap()
+            .reserved
+            .values()
+            .all(|bytes| *bytes == 0)
+    );
 }
 
 /// Admit `ops` into the namespace of `provisional` through a fresh view.

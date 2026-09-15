@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[cfg(feature = "fjall")]
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 #[cfg(feature = "fjall")]
-use std::sync::{Mutex, OnceLock, Weak};
+use std::sync::{Mutex, OnceLock};
 
 /// Positions per actor. Clones share structure: entries live in a persistent
 /// trie over the nibbles of actor ids, so a clock derived from another by a
@@ -181,7 +181,6 @@ impl Node {
 }
 
 impl Node {
-    #[cfg(feature = "fjall")]
     fn bytes(&self) -> usize {
         let children = match self {
             Self::Leaf { .. } => 0,
@@ -202,6 +201,19 @@ impl Node {
             Node::Leaf { .. } => 1,
             Node::Branch { len, .. } => *len,
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ClockAllocation {
+    pub(crate) address: usize,
+    pub(crate) bytes: usize,
+    node: Weak<Node>,
+}
+
+impl ClockAllocation {
+    pub(crate) fn alive(&self) -> bool {
+        self.node.strong_count() > 0
     }
 }
 
@@ -514,6 +526,25 @@ fn lookup(mut node: &Node, actor: &ActorId) -> Option<u64> {
 }
 
 impl ActorClock {
+    pub(crate) fn visit_allocations(
+        &self,
+        mut visit: impl FnMut(ClockAllocation) -> crate::Result<bool>,
+    ) -> crate::Result<()> {
+        let mut stack = self.root.iter().collect::<Vec<_>>();
+        while let Some(node) = stack.pop() {
+            if !visit(ClockAllocation {
+                address: Arc::as_ptr(node) as usize,
+                bytes: node.bytes(),
+                node: Arc::downgrade(node),
+            })? {
+                continue;
+            }
+            if let Node::Branch { children, .. } = &**node {
+                stack.extend(children);
+            }
+        }
+        Ok(())
+    }
     pub fn new() -> Self {
         Self::default()
     }
