@@ -121,6 +121,18 @@ impl<S: Storage> SyncEngine<S> {
         }
     }
 
+    #[cfg(feature = "iroh")]
+    pub(crate) fn session_plan(&self) -> Self {
+        let mut engine = self.clone();
+        engine.continuations = Arc::new(Mutex::new(Continuations::new(1)));
+        engine
+    }
+
+    #[cfg(feature = "iroh")]
+    pub(crate) fn release_plan(&self, peer: PeerId, topic: TopicId) {
+        self.continuations().release((peer, topic));
+    }
+
     fn continuations(&self) -> MutexGuard<'_, Continuations> {
         // Kept plans are only a shortcut; a poisoned store still holds valid ones.
         self.continuations

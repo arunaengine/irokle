@@ -274,6 +274,142 @@ fn reset_drops_plan() {
 mod sessions {
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_sessions_finish() {
+        use crate::sync::SyncMessage;
+        use std::time::Duration;
+
+        let storage = MemoryStorage::new();
+        let source = reverse_chain(storage.clone(), 40);
+        let bind = |seed| {
+            iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                .secret_key(iroh::SecretKey::from_bytes(&seed))
+                .alpns(vec![net::IROKLE_SYNC_ALPN.to_vec()])
+                .bind()
+        };
+        let config = |endpoint: &iroh::Endpoint| NodeConfig {
+            signer: Ed25519Signer::from_iroh_secret_key(endpoint.secret_key()),
+            peer_whitelist: None,
+            ..NodeConfig::default()
+        };
+        let endpoint = bind([230; 32]).await.unwrap();
+        let alice = Irokle::with_storage(storage, config(&endpoint))
+            .unwrap()
+            .with_page_visits(VISITS);
+        let runtime = net::IrohRuntimeConfig {
+            sync_io_timeout: Duration::from_secs(300),
+            ..Default::default()
+        };
+        let server =
+            Arc::new(net::IrohNet::new_with_config(endpoint, alice.clone(), runtime).unwrap());
+        server.start_accept_loop().unwrap();
+        let address = super::super::iroh::ready_addr(server.endpoint()).await;
+        let held = server.hold_planners().await;
+        let summary = alice.sync_summary(source.topic_id).unwrap();
+        let mut clients = Vec::new();
+        let mut pulls = Vec::new();
+        for n in 0..32 {
+            let mut seed = [11; 32];
+            seed[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            let endpoint = bind(seed).await.unwrap();
+            let store = MemoryStorage::new();
+            Oplog::with_storage(store.clone())
+                .receive_ops(vec![source.genesis.clone()])
+                .unwrap();
+            let reader = Irokle::with_storage(store, config(&endpoint)).unwrap();
+            let request = reader.plan_sync_request(alice.peer_id(), &summary).unwrap();
+            let open = reader.sync_open(source.topic_id);
+            let client =
+                Arc::new(net::IrohNet::new_with_config(endpoint, reader, runtime).unwrap());
+            pulls.push(tokio::spawn({
+                let (client, address) = (Arc::clone(&client), address.clone());
+                async move {
+                    client
+                        .sync_with(
+                            address,
+                            &[SyncMessage::Open(open), SyncMessage::Request(request)],
+                        )
+                        .await
+                }
+            }));
+            clients.push(client);
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while server.plan_counts() != ((n + 1).min(16), n + 1) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(server.plan_counts(), ((n + 1).min(16), n + 1));
+        }
+        let probe = clients[0]
+            .sync_with(
+                address.clone(),
+                &[SyncMessage::Open(
+                    clients[0].node().sync_open(source.topic_id),
+                )],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !probe.is_empty(),
+            "control traffic stopped behind queued plans"
+        );
+        drop(held);
+        let mut completions = tokio::task::JoinSet::new();
+        for (client, pull) in clients.iter().zip(pulls) {
+            let replies = tokio::time::timeout(Duration::from_secs(300), pull)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            for reply in replies {
+                match reply {
+                    SyncMessage::Data(data) => {
+                        client
+                            .node()
+                            .receive_sync_data_from(alice.peer_id(), data)
+                            .unwrap();
+                    }
+                    SyncMessage::Failure(failure) => panic!("accepted plan refused: {failure:?}"),
+                    SyncMessage::Page(page) => assert!(!page.continued),
+                    _ => {}
+                }
+            }
+            assert!(
+                client
+                    .node()
+                    .storage()
+                    .list_op_ids(&source.topic_id)
+                    .unwrap()
+                    .len()
+                    > 1
+            );
+            let (client, address) = (Arc::clone(client), address.clone());
+            let topic = source.topic_id;
+            completions.spawn(async move { client.sync_now(address, topic).await });
+        }
+        while let Some(result) = completions.join_next().await {
+            result.unwrap().unwrap();
+        }
+        for client in &clients {
+            assert_eq!(
+                client
+                    .node()
+                    .storage()
+                    .list_op_ids(&source.topic_id)
+                    .unwrap(),
+                source.log.storage().list_op_ids(&source.topic_id).unwrap()
+            );
+        }
+        assert!(alice.sync_engine().page_work().resumed >= 32);
+        assert_eq!(server.plan_counts(), (0, 0));
+        for client in clients {
+            client.shutdown().await;
+        }
+        server.shutdown().await;
+    }
+
     /// A sync through real sessions whose responder ends every slice after a
     /// few reads still completes: kept plans count as progress.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

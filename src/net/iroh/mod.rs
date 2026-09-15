@@ -17,6 +17,7 @@ mod exchange;
 mod pool;
 mod runtime;
 mod scheduler;
+mod service;
 mod session;
 
 use budget::{ByteBudget, Charge, DATA_TAG, Pool};
@@ -265,6 +266,7 @@ pub struct SharedNet<S: Storage> {
     /// Outbound peer attempts, automatic batches and manual syncs alike.
     outbound: Arc<tokio::sync::Semaphore>,
     served: Arc<tokio::sync::Semaphore>,
+    plans: Arc<service::PlanQueue>,
     receipts: Mutex<ReceiptLog>,
     requests: Mutex<RequestLog>,
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -388,6 +390,7 @@ impl<S: Storage> IrohNet<S> {
                 budget: ByteBudget::new(MAX_INBOUND_FRAME_BYTES, budget::SESSION_POOL_BYTES),
                 outbound: Arc::new(tokio::sync::Semaphore::new(MAX_RESYNC_PEER_CONCURRENCY)),
                 served: Arc::new(tokio::sync::Semaphore::new(MAX_SERVED_STREAMS)),
+                plans: Arc::default(),
                 receipts: Mutex::default(),
                 requests: Mutex::default(),
                 shutdown,
@@ -524,6 +527,7 @@ impl<S: Storage> IrohNet<S> {
         self.shutdown.send_replace(true);
         // Waiting charges fail; held ones stay with their work until it ends.
         self.budget.close();
+        self.plans.close();
         self.endpoint().close().await;
         // Returns only once the loops and every task they spawned have ended.
         // Awaiting this from inside such a task would wait for itself.
@@ -2961,6 +2965,19 @@ impl<S: Storage> SharedNet<S> {
 }
 
 impl<S: Storage> IrohNet<S> {
+    #[cfg(test)]
+    pub(crate) fn plan_counts(&self) -> (usize, usize) {
+        self.plans.counts()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_planners(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.bulk_lane)
+            .acquire_many_owned(BULK_JOBS as u32)
+            .await
+            .unwrap()
+    }
+
     pub async fn accept_one(&self) -> io::Result<Option<iroh::EndpointId>> {
         let _task = self.tasks.enter()?;
         let Some(incoming) = self.endpoint().accept().await else {
@@ -3032,8 +3049,19 @@ impl<S: Storage> IrohNet<S> {
             } else {
                 Lane::Bulk
             };
+            let mut permit = if session.requests.is_empty() {
+                None
+            } else {
+                Some(
+                    self.plans
+                        .register(peer_id_from_endpoint_id(peer))?
+                        .enter()
+                        .await?,
+                )
+            };
+            let mut engine = self.node.sync_engine().session_plan();
             // Pages are granted before planning; this stream holds no data bytes now.
-            let grant = match session.pages_bound(self.limits) {
+            let mut grant = match session.pages_bound(self.limits) {
                 0 => None,
                 pages => {
                     let bytes = self.budget.output_bound(pages);
@@ -3044,18 +3072,44 @@ impl<S: Storage> IrohNet<S> {
                     )
                 }
             };
-            let (responses, held, grant) = self
-                .run_job(lane, move |shared| {
-                    let mut grant = grant;
-                    let granted = grant.as_ref().map_or(0, Charge::bytes);
-                    let responses = session.finish(shared, ByteBudget::page_bytes(granted));
-                    if let (Ok((_, used)), Some(grant)) = (&responses, &mut grant) {
-                        grant.shrink(granted - ByteBudget::page_bytes(granted) + used);
-                    }
-                    (responses, session.charge.take(), grant)
-                })
-                .await?;
-            let (responses, _) = responses?;
+            let mut responses = Vec::new();
+            let mut used = 0;
+            let mut remaining = self.limits;
+            loop {
+                let result;
+                (session, engine, permit, grant, result) = self
+                    .run_job(lane, move |shared| {
+                        let granted = grant.as_ref().map_or(0, Charge::bytes);
+                        let result = session.finish_slice(
+                            shared,
+                            ByteBudget::page_bytes(granted).saturating_sub(used),
+                            remaining,
+                            Some(&engine),
+                        );
+                        (session, engine, permit, grant, result)
+                    })
+                    .await?;
+                let (slice, bytes) = result?;
+                used += bytes;
+                remaining.messages = remaining.messages.saturating_sub(slice.len());
+                for message in &slice {
+                    remaining.bytes = remaining
+                        .bytes
+                        .saturating_sub(crate::net::framed_message_len(message)?);
+                }
+                responses.extend(slice);
+                if session.requests.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            if let Some(grant) = &mut grant {
+                let granted = grant.bytes();
+                grant.shrink(granted - ByteBudget::page_bytes(granted) + used);
+            }
+            drop((engine, permit));
+            let held = session.charge.take();
+            exchange::reply_fits(&responses, self.limits)?;
             // Retained messages stay charged until the reply carrying them is out.
             let budget = grant.is_none().then_some(&self.budget);
             write_sync_messages(&mut send, &responses, timeout, self.limits, budget).await?;

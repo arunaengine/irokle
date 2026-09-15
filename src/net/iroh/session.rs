@@ -249,6 +249,16 @@ impl SyncSession {
         net: &SharedNet<S>,
         granted: usize,
     ) -> io::Result<(Vec<SyncMessage>, usize)> {
+        self.finish_slice(net, granted, net.limits, None)
+    }
+
+    pub(super) fn finish_slice<S: Storage>(
+        &mut self,
+        net: &SharedNet<S>,
+        granted: usize,
+        limits: StreamLimits,
+        engine: Option<&crate::sync::SyncEngine<S>>,
+    ) -> io::Result<(Vec<SyncMessage>, usize)> {
         let mut responses = std::mem::take(&mut self.controls);
         responses.extend(self.apply_acks(net)?);
         responses.extend(
@@ -277,7 +287,6 @@ impl SyncSession {
             bytes += crate::net::framed_message_len(response)?;
         }
         let mut messages = responses.len() + requests.len();
-        let limits = net.limits;
         if bytes > limits.bytes || messages > limits.messages {
             return Err(invalid_data("sync reply controls exceed the stream budget"));
         }
@@ -293,7 +302,8 @@ impl SyncSession {
                 left = deferred.len();
                 queue = std::mem::take(&mut deferred);
             }
-            for (topic_id, request) in std::mem::take(&mut queue) {
+            let mut pending = std::mem::take(&mut queue).into_iter();
+            while let Some((topic_id, request)) = pending.next() {
                 let share_bytes = (limits.bytes - bytes) / left;
                 let share_messages = (limits.messages - messages) / left;
                 left -= 1;
@@ -309,11 +319,12 @@ impl SyncSession {
                 budget.bytes = budget
                     .bytes
                     .min(grant_left.saturating_sub(ops_bytes) / super::budget::DECODED_FACTOR);
+                let planner = engine.unwrap_or_else(|| net.node.sync_engine());
                 let planned = match self.summaries.get(&topic_id) {
-                    Some(summary) => net.node.response_with(peer_id, &request, budget, summary),
-                    None => net.node.response_page(peer_id, &request, budget),
+                    Some(summary) => planner.response_with(peer_id, &request, budget, summary),
+                    None => planner.response_page(peer_id, &request, budget),
                 };
-                let page = match planned {
+                let mut page = match planned {
                     Ok(page) => page,
                     Err(error) => {
                         tracing::warn!(%topic_id, %error, "failing one sync request");
@@ -324,6 +335,16 @@ impl SyncSession {
                         continue;
                     }
                 };
+                if engine.is_some() && page.continued && page.positions.is_empty() {
+                    self.requests.insert(topic_id, request);
+                    self.requests.extend(pending);
+                    self.requests.extend(deferred);
+                    return Ok((responses, held));
+                }
+                if let Some(engine) = engine {
+                    engine.release_plan(peer_id, topic_id);
+                    page.continued = false;
+                }
                 let data =
                     crate::net::sync_data_page(topic_id, page.ops, share_messages, share_bytes)?;
                 let more = page.more || data.cut;

@@ -92,6 +92,11 @@ pub(super) struct Continuations {
 }
 
 impl Continuations {
+    #[cfg(feature = "iroh")]
+    pub(super) fn release(&mut self, key: (PeerId, TopicId)) {
+        self.entries.remove(&key);
+    }
+
     pub(super) fn new(capacity: usize) -> Self {
         Self {
             entries: BTreeMap::new(),
