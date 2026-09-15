@@ -68,6 +68,17 @@ class Checks(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cardinality", rows[0]["reason"])
 
+    def test_zero_suite(self):
+        code = "print('test result: ok. 0 passed; 0 failed; 0 ignored;')"
+        result, rows = self.run_cases([self.case("zero", code)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no executed tests", rows[0]["reason"])
+
+    def test_mixed_suites(self):
+        code = "print('test result: ok. 0 passed; 0 failed; 0 ignored;\\ntest result: ok. 1 passed; 0 failed; 2 ignored;')"
+        result, _ = self.run_cases([self.case("mixed", code)])
+        self.assertEqual(result.returncode, 0)
+
     def test_exact_one(self):
         code = "print('test tests::wanted ... ok\\ntest result: ok. 1 passed; 0 failed; 0 ignored;')"
         result, _ = self.run_cases([self.case("one", code, tests=["tests::wanted"])])

@@ -87,12 +87,14 @@ def inspect_log(path, case):
     if not path.is_file() or path.stat().st_size == 0:
         return "missing or empty command log"
     text = path.read_text(errors="replace")
+    counts = re.findall(r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.MULTILINE)
     if "tests" in case:
         matches = re.findall(r"^test (\S+) \.\.\. ok$", text, re.MULTILINE)
-        counts = re.findall(r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.MULTILINE)
         wanted = sorted(case["tests"])
         if sorted(matches) != wanted or counts != [(str(len(wanted)), "0", "0")]:
             return f"exact test cardinality mismatch: expected {wanted}, got {matches}, summaries {counts}"
+    elif counts and not any(int(passed) for passed, _, _ in counts):
+        return "test command matched no executed tests"
     return ""
 
 
