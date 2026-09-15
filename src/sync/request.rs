@@ -157,6 +157,10 @@ impl<'a> ActorScope<'a> {
         self
     }
 
+    pub(crate) fn informed(&self) -> bool {
+        self.held.is_some()
+    }
+
     pub(crate) fn holds_prefix(&self, actor: &ActorId, seq: u64) -> bool {
         self.unknown(actor) && self.held.is_some_and(|held| held.get(actor) >= seq)
     }

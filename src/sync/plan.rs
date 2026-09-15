@@ -23,6 +23,7 @@ pub(super) const MAX_PAGE_VISITS: usize = 65_536;
 #[derive(Debug, Default)]
 pub(crate) struct PageWork {
     visits: AtomicU64,
+    actors: AtomicU64,
     edges: AtomicU64,
     ended: AtomicU64,
     resumed: AtomicU64,
@@ -33,6 +34,7 @@ pub(crate) struct PageWork {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PageWorkSnapshot {
     pub(crate) visits: u64,
+    pub(crate) actors: u64,
     pub(crate) edges: u64,
     pub(crate) ended: u64,
     pub(crate) resumed: u64,
@@ -48,6 +50,7 @@ impl PageWork {
     pub(super) fn snapshot(&self, kept_bytes: usize) -> PageWorkSnapshot {
         PageWorkSnapshot {
             visits: self.visits.load(Ordering::Relaxed),
+            actors: self.actors.load(Ordering::Relaxed),
             edges: self.edges.load(Ordering::Relaxed),
             ended: self.ended.load(Ordering::Relaxed),
             resumed: self.resumed.load(Ordering::Relaxed),
@@ -77,6 +80,8 @@ enum ActorState {
 /// send anything, to go on from for the same request.
 pub(super) struct Frontier {
     active: BinaryHeap<Reverse<RangeHead>>,
+    selecting: Option<BinaryHeap<RangeHead>>,
+    remainder: bool,
     deferred: ClockCursor,
     suspended: BTreeMap<ActorId, Vec<(u64, RangeHead)>>,
     resumable: VecDeque<RangeHead>,
@@ -88,6 +93,10 @@ pub(super) struct Frontier {
 }
 
 impl Frontier {
+    pub(super) fn clock(&self) -> &ActorClock {
+        &self.covered
+    }
+
     /// The position the plan takes the peer to hold of `actor_id`.
     pub(super) fn covered(&self, actor_id: &ActorId) -> u64 {
         self.covered.get(actor_id)
@@ -102,14 +111,17 @@ impl Frontier {
             .values()
             .map(|waiting| ID + waiting.len() * (head + 8))
             .sum::<usize>();
-        self.active.len() * head
+        self.active.capacity() * size_of::<RangeHead>()
+            + self
+                .selecting
+                .as_ref()
+                .map_or(0, |heap| heap.capacity() * size_of::<RangeHead>())
             + suspended
             + (self.blocked.len() + self.missing.len()) * ID
             + self.deferred.bytes()
             + self.positions.len() * ID
             + self.resumable.len() * head
             + self.states.len() * (ID + size_of::<ActorState>())
-            + self.covered.iter().count() * ID
     }
 }
 
@@ -140,9 +152,12 @@ struct Pager<'a> {
     work: &'a PageWork,
     /// Storage reads this slice made, and the most it may make.
     visits: usize,
+    scanned: usize,
     visit_limit: usize,
     ended: bool,
     active: BinaryHeap<Reverse<RangeHead>>,
+    selecting: Option<BinaryHeap<RangeHead>>,
+    remainder: bool,
     /// Actors behind the goal not activated yet, in clock order.
     deferred: ClockCursor,
     /// Suspended heads by the actor they wait for, with the position needed.
@@ -173,7 +188,7 @@ impl Pager<'_> {
     }
 
     fn exhausted(&self) -> bool {
-        self.visits >= self.visit_limit
+        self.visits + self.scanned >= self.visit_limit
     }
 
     /// Plan one slice. A fresh plan starts from the actors behind; a resumed one
@@ -194,7 +209,11 @@ impl Pager<'_> {
                 };
                 return Ok((page, BTreeMap::new(), None));
             }
-            self.deferred = self.local.cursor();
+            self.deferred = if !self.scope.informed() && !self.scope.named.is_empty() {
+                self.local.selected(&self.scope.named).cursor()
+            } else {
+                self.local.cursor()
+            };
         }
         let mut ops = Vec::new();
         let mut too_large = None;
@@ -207,6 +226,10 @@ impl Pager<'_> {
                 break;
             }
             self.fill()?;
+            if self.selecting.is_some() || (self.exhausted() && self.active.is_empty()) {
+                self.ended = true;
+                break;
+            }
             let Some(Reverse(head)) = self.active.pop() else {
                 break;
             };
@@ -251,6 +274,7 @@ impl Pager<'_> {
             }
         }
         let more = self.more
+            || self.remainder
             || self.ended
             || !self.active.is_empty()
             || !self.resumable.is_empty()
@@ -264,6 +288,8 @@ impl Pager<'_> {
             self.work.ended.fetch_add(1, Ordering::Relaxed);
             Frontier {
                 active: self.active,
+                selecting: self.selecting,
+                remainder: self.remainder,
                 deferred: self.deferred,
                 suspended: self.suspended,
                 resumable: self.resumable,
@@ -287,6 +313,12 @@ impl Pager<'_> {
 
     /// Fill free slots: resumed heads first, then deferred actors in order.
     fn fill(&mut self) -> Result<()> {
+        if let Some(selected) = self.selecting.take() {
+            self.select(selected)?;
+            if self.selecting.is_some() {
+                return Ok(());
+            }
+        }
         while self.active.len() < self.window && !self.exhausted() {
             if let Some(head) = self.resumable.pop_front() {
                 let (_, actor_id, _, _, _) = head;
@@ -297,6 +329,7 @@ impl Pager<'_> {
             let Some((actor_id, _)) = self.deferred.next() else {
                 return Ok(());
             };
+            self.scan();
             let limit = self.limit(&actor_id);
             if self.states.contains_key(&actor_id) || limit <= self.covered.get(&actor_id) {
                 continue;
@@ -310,6 +343,14 @@ impl Pager<'_> {
     /// `after < limit`. A gap in the index stops the actor and names the
     /// record the next indexed op follows.
     fn activate(&mut self, actor_id: ActorId, after: u64, limit: u64) -> Result<()> {
+        if let Some(head) = self.head(actor_id, after, limit)? {
+            self.active.push(Reverse(head));
+            self.states.insert(actor_id, ActorState::Active);
+        }
+        Ok(())
+    }
+
+    fn head(&mut self, actor_id: ActorId, after: u64, limit: u64) -> Result<Option<RangeHead>> {
         self.visit();
         let next = self
             .read
@@ -318,7 +359,7 @@ impl Pager<'_> {
         // The clock is ahead of the index, so no id names the lost position.
         let Some((seq, id)) = next else {
             self.stop(actor_id);
-            return Ok(());
+            return Ok(None);
         };
         self.visit();
         let meta = self.read.get_header(&id)?;
@@ -330,13 +371,44 @@ impl Pager<'_> {
                 }
             }
             self.stop(actor_id);
-            return Ok(());
+            return Ok(None);
         }
-        if let Some(meta) = meta {
-            self.active
-                .push(Reverse((meta.generation, actor_id, seq, id, limit)));
-            self.states.insert(actor_id, ActorState::Active);
+        Ok(meta.map(|meta| (meta.generation, actor_id, seq, id, limit)))
+    }
+
+    fn scan(&mut self) {
+        self.scanned += 1;
+        self.work.actors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Retain only the oldest heads while the bounded inventory cursor advances.
+    fn select(&mut self, mut selected: BinaryHeap<RangeHead>) -> Result<()> {
+        while !self.exhausted() {
+            let Some((actor, _)) = self.deferred.next() else {
+                for head in selected {
+                    self.states.insert(head.1, ActorState::Active);
+                    self.active.push(Reverse(head));
+                }
+                return Ok(());
+            };
+            self.scan();
+            let (after, limit) = (self.covered.get(&actor), self.limit(&actor));
+            if after >= limit {
+                continue;
+            }
+            if let Some(head) = self.head(actor, after, limit)? {
+                if selected.len() < self.window {
+                    selected.push(head);
+                } else {
+                    self.remainder = true;
+                    if selected.peek().is_some_and(|last| head < *last) {
+                        selected.pop();
+                        selected.push(head);
+                    }
+                }
+            }
         }
+        self.selecting = Some(selected);
         Ok(())
     }
 
@@ -544,9 +616,12 @@ impl<S: Storage> SyncEngine<S> {
             position_limit: self.page_positions,
             work: &self.work,
             visits: 0,
+            scanned: 0,
             visit_limit: self.page_visits,
             ended: false,
             active: BinaryHeap::new(),
+            selecting: (scope.named.len() > self.page_actors).then(BinaryHeap::new),
+            remainder: false,
             deferred: ClockCursor::default(),
             suspended: BTreeMap::new(),
             resumable: VecDeque::new(),
@@ -582,9 +657,12 @@ impl<S: Storage> SyncEngine<S> {
             position_limit: self.page_positions,
             work: &self.work,
             visits: 0,
+            scanned: 0,
             visit_limit: self.page_visits,
             ended: false,
             active: frontier.active,
+            selecting: frontier.selecting,
+            remainder: frontier.remainder,
             deferred: frontier.deferred,
             suspended: frontier.suspended,
             resumable: frontier.resumable,

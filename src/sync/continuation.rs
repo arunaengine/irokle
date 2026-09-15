@@ -4,6 +4,8 @@
 //! the same positions goes on from it instead of walking the same prefix again.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::storage::RequestView;
@@ -16,6 +18,9 @@ use super::{ActorWindow, SyncRequest};
 pub(crate) const MAX_CONTINUATIONS: usize = 16;
 /// Estimated bytes one kept plan may hold.
 pub(super) const MAX_CONTINUATION_BYTES: usize = 4 * 1024 * 1024;
+/// Reservations for captured immutable clocks, separate from traversal workspace.
+const MAX_CLOCK_BYTES: usize = 128 * 1024 * 1024;
+const CLOCK_POOL_BYTES: usize = 256 * 1024 * 1024;
 /// A kept plan nobody resumed for this long gives its place to a new one.
 const CONTINUATION_IDLE: Duration = Duration::from_secs(60);
 
@@ -25,10 +30,11 @@ pub(super) struct Continuation {
     genesis: OpId,
     epoch: u64,
     window: ActorWindow,
-    named: BTreeMap<ActorId, u64>,
+    named: Vec<(ActorId, u64)>,
     pub(super) local: ActorClock,
     pub(super) goal: ActorClock,
     pub(super) frontier: Frontier,
+    pub(super) clocks: ClockClaim,
     used: Instant,
 }
 
@@ -38,15 +44,17 @@ impl Continuation {
         local: ActorClock,
         goal: ActorClock,
         frontier: Frontier,
+        clocks: ClockClaim,
     ) -> Self {
         Self {
             genesis: view.genesis,
             epoch: view.epoch,
             window: request.window.clone(),
-            named: named(request),
+            named: named(request).into_iter().collect(),
             local,
             goal,
             frontier,
+            clocks,
             used: Instant::now(),
         }
     }
@@ -65,23 +73,53 @@ impl Continuation {
                 .iter()
                 .all(|(actor_id, from)| named.get(actor_id) == Some(from))
             && named.iter().all(|(actor_id, from)| {
-                self.named.contains_key(actor_id) || self.frontier.covered(actor_id) == *from
+                self.named
+                    .binary_search_by_key(actor_id, |(actor, _)| *actor)
+                    .is_ok()
+                    || self.frontier.covered(actor_id) == *from
             })
     }
 
     /// A conservative estimate of the bytes this plan holds.
     pub(super) fn bytes(&self) -> usize {
-        let clock = |clock: &ActorClock| clock.iter().count() * 48;
         let window = self
             .window
             .behind
             .as_ref()
             .map_or(0, |behind| behind.bits.len());
-        clock(&self.local)
-            + clock(&self.goal)
-            + self.named.len() * 48
-            + window
-            + self.frontier.bytes()
+        self.named.capacity() * size_of::<(ActorId, u64)>() + window + self.frontier.bytes()
+    }
+}
+
+/// A reservation follows the plan through a started job and any kept frontier.
+pub(super) struct ClockClaim {
+    pool: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl ClockClaim {
+    pub(super) fn grow(&mut self, entries: usize) -> Result<()> {
+        let bytes = ActorClock::allocation_bound(entries).saturating_mul(4);
+        if bytes > MAX_CLOCK_BYTES {
+            return Err(Error::SyncCapacity(format!(
+                "captured clocks need {bytes} reserved bytes, limit {MAX_CLOCK_BYTES}"
+            )));
+        }
+        let added = bytes.saturating_sub(self.bytes);
+        self.pool
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(added)
+                    .filter(|sum| *sum <= CLOCK_POOL_BYTES)
+            })
+            .map_err(|_| Error::SyncCapacity("captured clock pool is occupied".into()))?;
+        self.bytes += added;
+        Ok(())
+    }
+}
+
+impl Drop for ClockClaim {
+    fn drop(&mut self) {
+        self.pool.fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
@@ -89,6 +127,7 @@ impl Continuation {
 pub(super) struct Continuations {
     entries: BTreeMap<(PeerId, TopicId), Continuation>,
     capacity: usize,
+    clocks: Arc<AtomicUsize>,
 }
 
 impl Continuations {
@@ -101,7 +140,17 @@ impl Continuations {
         Self {
             entries: BTreeMap::new(),
             capacity,
+            clocks: Arc::default(),
         }
+    }
+
+    pub(super) fn reserve_clocks(&self, entries: usize) -> Result<ClockClaim> {
+        let mut claim = ClockClaim {
+            pool: Arc::clone(&self.clocks),
+            bytes: 0,
+        };
+        claim.grow(entries)?;
+        Ok(claim)
     }
 
     /// The plan kept for the requesting peer's topic, when `request` on `view`
@@ -146,7 +195,11 @@ impl Continuations {
     /// Estimated bytes all kept plans hold.
     #[cfg(test)]
     pub(super) fn bytes(&self) -> usize {
-        self.entries.values().map(Continuation::bytes).sum()
+        self.entries
+            .values()
+            .map(Continuation::bytes)
+            .sum::<usize>()
+            + self.clocks.load(Ordering::Acquire)
     }
 }
 
@@ -157,4 +210,35 @@ fn named(request: &SyncRequest) -> BTreeMap<ActorId, u64> {
         .iter()
         .map(|hint| (hint.actor_id, hint.from_exclusive))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_claims_release() {
+        let plans = Continuations::new(MAX_CONTINUATIONS);
+        let mut claims = Vec::new();
+        while let Ok(claim) = plans.reserve_clocks(65_536) {
+            claims.push(claim);
+            assert!(claims.len() < 16);
+        }
+        assert!(!claims.is_empty());
+        assert!(plans.clocks.load(Ordering::Acquire) <= CLOCK_POOL_BYTES);
+        let held = plans.clocks.load(Ordering::Acquire);
+        assert!(plans.reserve_clocks(usize::MAX).is_err());
+        assert_eq!(plans.clocks.load(Ordering::Acquire), held);
+        claims.pop();
+        claims.push(plans.reserve_clocks(65_536).unwrap());
+        drop(claims);
+        assert_eq!(plans.clocks.load(Ordering::Acquire), 0);
+        let panicked = std::panic::catch_unwind(|| {
+            let mut claim = plans.reserve_clocks(1).unwrap();
+            claim.grow(257).unwrap();
+            panic!("started job failed");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(plans.clocks.load(Ordering::Acquire), 0);
+    }
 }

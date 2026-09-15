@@ -43,6 +43,28 @@ static COUNTING: Counting = Counting;
 
 #[test]
 #[ignore = "allocator measurement requires its own process and one test thread"]
+fn captured_clock_bounds() {
+    for entries in [1024_u32, 2048, 65_536] {
+        let before = LIVE.load(Ordering::Relaxed);
+        let mut original = clock::ActorClock::new();
+        for n in 0..entries {
+            original.observe(ids::ActorId::hash(n.to_le_bytes()), 1);
+        }
+        let mut changed = original.clone();
+        for n in 0..entries {
+            changed.observe(ids::ActorId::hash(n.to_le_bytes()), 2);
+        }
+        let held = [original, changed];
+        let allocated = LIVE.load(Ordering::Relaxed) - before;
+        let reserved = 2 * clock::ActorClock::allocation_bound(entries as usize);
+        assert!(allocated > 0 && allocated <= reserved);
+        println!("clocks entries={entries} allocator_bytes={allocated} reserved_bytes={reserved}");
+        drop(held);
+    }
+}
+
+#[test]
+#[ignore = "allocator measurement requires its own process and one test thread"]
 fn shared_cache_bounds() {
     for actors in [1024_u32, 2048, 4096] {
         let before = LIVE.load(Ordering::Relaxed);

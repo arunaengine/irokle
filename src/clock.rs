@@ -536,6 +536,12 @@ impl ActorClock {
         self.root.as_deref().map_or(0, Node::len)
     }
 
+    /// Reserve for at most two nodes per entry and full child-vector capacity.
+    pub(crate) fn allocation_bound(entries: usize) -> usize {
+        let node = size_of::<Node>() + 2 * size_of::<usize>() + 16;
+        entries.saturating_mul(2 * node + 16 * size_of::<Arc<Node>>() + 16)
+    }
+
     pub(crate) fn selected(&self, actors: &std::collections::BTreeSet<ActorId>) -> Self {
         let mut clock = Self::new();
         for actor in actors {

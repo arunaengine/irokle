@@ -373,7 +373,19 @@ fn chain_windows_saturated() {
     let summary = responder.summary(source.topic_id).unwrap();
     while readers.iter().any(|reader| !reader.4) {
         rounds += 1;
-        assert!(rounds < 4096, "pulls did not finish");
+        assert!(
+            rounds < 4096,
+            "pulls did not finish: work={:?}, readers={:?}",
+            responder.page_work(),
+            readers
+                .iter()
+                .map(|(_, log, _, knowledge, done)| (
+                    log.storage().actor_clock(&source.topic_id).unwrap().len(),
+                    knowledge,
+                    done
+                ))
+                .collect::<Vec<_>>()
+        );
         for (peer, log, engine, knowledge, done) in &mut readers {
             if *done {
                 continue;
@@ -612,6 +624,50 @@ fn real_join_finishes() {
         work.visits,
         work.edges
     );
+}
+
+#[test]
+fn bounded_inventory_finishes() {
+    for width in [31, 32, 33, 255, 256, 257] {
+        let mut source = joined_source(MemoryStorage::new(), width, true);
+        source.engine = source
+            .engine
+            .clone()
+            .with_page_actors(2)
+            .with_page_visits(6, 16);
+        let reader = Oplog::new();
+        reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+        let paged = page_informed(&source, &reader, 3, 2, true);
+        assert!(paged.complete);
+        assert_eq!(paged.sent, 2 * width + 1);
+        let work = source.engine.page_work();
+        assert!(work.resumed > 0, "inventory did not span slices");
+        assert_eq!(work.kept_bytes, 0);
+        assert!(work.actors < 64 * width as u64, "{work:?}");
+    }
+}
+
+#[test]
+fn held_inventory_skipped() {
+    let mut source = joined_source(MemoryStorage::new(), 33, true);
+    source.engine = source.engine.clone().with_page_visits(6, 16);
+    let ops = oplog::topological(source.log.storage(), &source.topic_id).unwrap();
+    let last = ops
+        .iter()
+        .filter(|op| op.signed.body.generation == 3)
+        .max_by_key(|op| op.signed.body.actor_id)
+        .unwrap()
+        .id;
+    let reader = Oplog::new();
+    reader
+        .receive_ops(ops.into_iter().filter(|op| op.id != last).collect())
+        .unwrap();
+    let paged = page_bounded(&source, &reader, 3, 2);
+    assert!(paged.complete);
+    assert_eq!(paged.sent, 1);
+    assert_eq!(paged.empty, 0);
+    assert_eq!(source.engine.page_work().actors, 1);
+    assert_eq!(source.engine.page_work().kept_bytes, 0);
 }
 
 #[cfg(feature = "fjall")]

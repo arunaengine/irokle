@@ -748,13 +748,30 @@ impl<S: Storage> SyncEngine<S> {
                 ..PlannedPage::default()
             });
         }
+        let key = (peer_id, request.topic_id);
+        let continues = request.wants.is_empty();
+        let mut kept = continues
+            .then(|| self.continuations().take(key, &view, request))
+            .flatten();
         let local = &view.clock;
-        let mut peer_clock = local.clone();
-        let mut goal = local.clone();
-        for hint in &request.actor_range_hints {
-            if let Some((from, to)) = clamp_actor_range_hint(hint, local.get(&hint.actor_id)) {
-                peer_clock.set(hint.actor_id, from);
-                goal.set(hint.actor_id, to);
+        if let Some(kept) = &mut kept {
+            kept.clocks.grow(local.len().max(kept.local.len()))?;
+        }
+        let clocks = if kept.is_none() {
+            Some(self.continuations().reserve_clocks(local.len())?)
+        } else {
+            None
+        };
+        let (mut peer_clock, mut goal) = match &kept {
+            Some(kept) => (kept.frontier.clock().clone(), kept.goal.clone()),
+            None => (local.clone(), local.clone()),
+        };
+        if kept.is_none() {
+            for hint in &request.actor_range_hints {
+                if let Some((from, to)) = clamp_actor_range_hint(hint, local.get(&hint.actor_id)) {
+                    peer_clock.set(hint.actor_id, from);
+                    goal.set(hint.actor_id, to);
+                }
             }
         }
         let absent = ActorClock::new();
@@ -824,11 +841,6 @@ impl<S: Storage> SyncEngine<S> {
         }
         // Only a request without wants is repeated after an empty slice, so
         // only its plans are kept.
-        let key = (peer_id, request.topic_id);
-        let continues = request.wants.is_empty();
-        let kept = continues
-            .then(|| self.continuations().take(key, &view, request))
-            .flatten();
         // Wants this page could not carry keep their dependents out of the
         // forward ranges, which still serve every independent actor.
         let (planned, positions, frontier) = match kept {
@@ -837,7 +849,8 @@ impl<S: Storage> SyncEngine<S> {
                 let clocks = (&kept.local, &kept.goal, kept.frontier);
                 let (planned, positions, frontier) =
                     self.resume_page(read, &request.topic_id, clocks, &scope, rest)?;
-                let frontier = frontier.map(|frontier| (frontier, kept.local, kept.goal));
+                let frontier =
+                    frontier.map(|frontier| (frontier, kept.local, kept.goal, kept.clocks));
                 (planned, positions, frontier)
             }
             None => {
@@ -849,11 +862,14 @@ impl<S: Storage> SyncEngine<S> {
                     &repair.unsent,
                     rest,
                 )?;
-                let clocks = |frontier| (frontier, local.clone(), goal.clone());
-                (planned.0, planned.1, planned.2.map(clocks))
+                let frontier = planned
+                    .2
+                    .zip(clocks)
+                    .map(|(frontier, clocks)| (frontier, local.clone(), goal.clone(), clocks));
+                (planned.0, planned.1, frontier)
             }
         };
-        if let Some((frontier, local, goal)) = frontier
+        if let Some((frontier, local, goal, clocks)) = frontier
             && page.ops.is_empty()
             && needed.is_empty()
             && positions.is_empty()
@@ -862,7 +878,7 @@ impl<S: Storage> SyncEngine<S> {
             if !continues {
                 return Err(Error::Storage("sync page work exceeds its budget".into()));
             }
-            let continuation = Continuation::new((&view, request), local, goal, frontier);
+            let continuation = Continuation::new((&view, request), local, goal, frontier, clocks);
             self.continuations().keep(key, continuation)?;
             page.continued = true;
         }
