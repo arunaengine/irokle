@@ -808,6 +808,13 @@ struct MemorySnapshot<'a> {
 }
 
 impl SnapshotRead for MemorySnapshot<'_> {
+    fn actor_count(&self, topic_id: &TopicId) -> Result<usize> {
+        Ok(self
+            .inner
+            .actor_clock
+            .get(topic_id)
+            .map_or(0, ActorClock::len))
+    }
     fn get_reserved_op(
         &self,
         id: &OpId,

@@ -1627,6 +1627,7 @@ impl Storage for FjallStorage {
             tx: self.snapshot()?,
             store: self,
             shown: Default::default(),
+            counted: Default::default(),
         })
     }
     fn put_admitted_batch(&self, batch: AdmittedBatch) -> Result<()> {
@@ -2553,6 +2554,7 @@ struct FjallSnapshot<'a> {
     store: &'a FjallStorage,
     /// The last topic whose visibility this snapshot read.
     shown: std::cell::Cell<Option<(TopicId, bool)>>,
+    counted: std::cell::Cell<Option<(TopicId, usize)>>,
 }
 
 impl FjallSnapshot<'_> {
@@ -2569,6 +2571,26 @@ impl FjallSnapshot<'_> {
 }
 
 impl SnapshotRead for FjallSnapshot<'_> {
+    fn actor_count(&self, topic_id: &TopicId) -> Result<usize> {
+        if !self.shown(topic_id)? {
+            return Ok(0);
+        }
+        if let Some((topic, count)) = self.counted.get()
+            && topic == *topic_id
+        {
+            return Ok(count);
+        }
+        let count = fjall::Readable::get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(b"ac", topic_id),
+        )?
+        .map(|bytes| ActorClock::decode_counted(&bytes, &BTreeSet::new()).map(|(_, count)| count))
+        .transpose()?
+        .unwrap_or(0);
+        self.counted.set(Some((*topic_id, count)));
+        Ok(count)
+    }
     fn get_reserved_op(
         &self,
         id: &OpId,
@@ -2643,14 +2665,15 @@ impl SnapshotRead for FjallSnapshot<'_> {
             FjallStorage::key_id(TOPIC_EPOCH_PREFIX, topic_id),
         )?
         .unwrap_or_default();
-        let clock = fjall::Readable::get(
+        let (clock, count) = fjall::Readable::get(
             &self.tx,
             &self.store.records,
             FjallStorage::key_id(b"ac", topic_id),
         )?
-        .map(|bytes| ActorClock::decode_selected(&bytes, actors))
+        .map(|bytes| ActorClock::decode_counted(&bytes, actors))
         .transpose()?
         .unwrap_or_default();
+        self.counted.set(Some((*topic_id, count)));
         Ok(Some(super::RequestView {
             genesis: state.genesis,
             epoch,

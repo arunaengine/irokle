@@ -158,6 +158,21 @@ pub(super) struct Continuations {
 
 impl Continuations {
     #[cfg(feature = "iroh")]
+    pub(super) fn fork(&self) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            capacity: 1,
+            clocks: Arc::clone(&self.clocks),
+            records: Arc::clone(&self.records),
+        }
+    }
+
+    #[cfg(feature = "iroh")]
+    pub(super) fn idle(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(feature = "iroh")]
     pub(super) fn release(&mut self, key: (PeerId, TopicId)) {
         self.entries.remove(&key);
     }

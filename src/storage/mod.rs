@@ -470,6 +470,12 @@ pub struct RequestView {
 /// so a planner can authorize a peer, select positions and load records without
 /// mixing a state before and after a concurrent write.
 pub trait SnapshotRead {
+    /// Actor count of this snapshot's topic, used to reserve a finite goal's workspace.
+    fn actor_count(&self, topic_id: &TopicId) -> Result<usize> {
+        Ok(self
+            .topic_view(topic_id, None)?
+            .map_or(0, |view| view.clock.len()))
+    }
     /// See [`Storage::topic_view`].
     fn topic_view(&self, topic_id: &TopicId, peer_id: Option<&PeerId>)
     -> Result<Option<TopicView>>;

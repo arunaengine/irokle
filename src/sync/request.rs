@@ -164,6 +164,12 @@ impl<'a> ActorScope<'a> {
     pub(crate) fn holds_prefix(&self, actor: &ActorId, seq: u64) -> bool {
         !self.named.contains(actor) && self.held.is_some_and(|held| held.get(actor) >= seq)
     }
+
+    pub(crate) fn known_prefix(&self, actor: &ActorId) -> Option<u64> {
+        (!self.named.contains(actor))
+            .then(|| self.held.map(|held| held.get(actor)))
+            .flatten()
+    }
 }
 
 /// The ranges one request names in at most `items` hints and the window they

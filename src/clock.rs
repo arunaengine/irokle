@@ -620,14 +620,22 @@ impl ActorClock {
         clock
     }
 
-    #[cfg(feature = "fjall")]
+    #[cfg(all(feature = "fjall", test))]
     pub(crate) fn decode_selected(
         bytes: &[u8],
         actors: &std::collections::BTreeSet<ActorId>,
     ) -> crate::Result<Self> {
+        Self::decode_counted(bytes, actors).map(|(clock, _)| clock)
+    }
+
+    #[cfg(feature = "fjall")]
+    pub(crate) fn decode_counted(
+        bytes: &[u8],
+        actors: &std::collections::BTreeSet<ActorId>,
+    ) -> crate::Result<(Self, usize)> {
         struct Selected<'a>(&'a std::collections::BTreeSet<ActorId>);
         impl<'de> serde::de::Visitor<'de> for Selected<'_> {
-            type Value = ActorClock;
+            type Value = (ActorClock, usize);
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str("actor positions")
             }
@@ -636,7 +644,9 @@ impl ActorClock {
                 mut map: M,
             ) -> Result<Self::Value, M::Error> {
                 let mut selected = BTreeMap::new();
+                let mut count = 0;
                 while let Some((actor, seq)) = map.next_entry::<ActorId, u64>()? {
+                    count += 1;
                     if self.0.contains(&actor) {
                         selected.insert(actor, seq);
                     }
@@ -645,11 +655,17 @@ impl ActorClock {
                 for (actor, seq) in selected {
                     clock.put(actor, Some(seq));
                 }
-                Ok(clock)
+                Ok((clock, count))
             }
         }
         let mut decoder = postcard::Deserializer::from_bytes(bytes);
-        Ok(decoder.deserialize_map(Selected(actors))?)
+        let selected = decoder.deserialize_map(Selected(actors))?;
+        if !decoder.finalize()?.is_empty() {
+            return Err(crate::Error::Storage(
+                "trailing bytes in stored clock".into(),
+            ));
+        }
+        Ok(selected)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&ActorId, &u64)> {
@@ -1105,6 +1121,10 @@ mod tests {
         let selected = ActorClock::decode_selected(&bytes, &actors).unwrap();
         assert_eq!(selected, clock.selected(&actors));
         assert_eq!(selected.len(), 3, "zero positions remain encoded");
+        assert_eq!(ActorClock::decode_counted(&bytes, &actors).unwrap().1, 33);
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(ActorClock::decode_counted(&trailing, &actors).is_err());
         let mut damaged = bytes;
         *damaged.last_mut().unwrap() = 0x80;
         let first = [ActorId::from_bytes([0; 32])].into();

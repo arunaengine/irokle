@@ -131,8 +131,13 @@ impl<S: Storage> SyncEngine<S> {
     #[cfg(feature = "iroh")]
     pub(crate) fn session_plan(&self) -> Self {
         let mut engine = self.clone();
-        engine.continuations = Arc::new(Mutex::new(Continuations::new(1)));
+        engine.continuations = Arc::new(Mutex::new(self.continuations().fork()));
         engine
+    }
+
+    #[cfg(feature = "iroh")]
+    pub(crate) fn plan_idle(&self) -> bool {
+        self.continuations().idle()
     }
 
     #[cfg(feature = "iroh")]
@@ -764,6 +769,11 @@ impl<S: Storage> SyncEngine<S> {
             .then(|| self.continuations().take(key, &view, request, summary))
             .flatten();
         let local = &view.clock;
+        if summary.is_some()
+            && let Some(kept) = &mut kept
+        {
+            kept.frontier.confirm(request, local);
+        }
         if summary.is_none()
             && let Some(kept) = &mut kept
         {
@@ -816,21 +826,17 @@ impl<S: Storage> SyncEngine<S> {
             None => None,
         };
         let scope = scope.with_held(held);
-        if summary.is_some() {
-            let covered = held.map_or(0, ActorClock::len).saturating_add(budget.ops);
-            match &mut kept {
-                Some(kept) => {
-                    kept.clocks
-                        .grow_roots([kept.local.len(), kept.goal.len(), covered, 0])?
-                }
-                None => clocks
-                    .as_mut()
-                    .ok_or_else(|| Error::Storage("missing clock reservation".into()))?
-                    .grow_roots([local.len(), goal.len(), covered, 0])?,
-            }
+        if summary.is_some() && kept.is_none() {
+            let covered = read.actor_count(&request.topic_id)?;
+            clocks
+                .as_mut()
+                .ok_or_else(|| Error::Storage("missing clock reservation".into()))?
+                .grow_roots([local.len(), goal.len(), covered, 0])?;
         }
         if summary.is_some() && kept.is_none() {
-            peer_clock = held.cloned().unwrap_or_default();
+            peer_clock = held
+                .map(|held| held.selected(&scope.named))
+                .unwrap_or_default();
             for hint in &request.actor_range_hints {
                 peer_clock.set(
                     hint.actor_id,

@@ -101,6 +101,14 @@ pub(super) struct Frontier {
 }
 
 impl Frontier {
+    pub(super) fn confirm(&mut self, request: &super::SyncRequest, local: &ActorClock) {
+        for hint in &request.actor_range_hints {
+            let known = hint.from_exclusive.min(local.get(&hint.actor_id));
+            if known > 0 {
+                self.covered.observe(hint.actor_id, known);
+            }
+        }
+    }
     pub(super) fn clock(&self) -> &ActorClock {
         &self.covered
     }
@@ -234,7 +242,7 @@ impl Pager<'_> {
         loop {
             // A slice out of reads, or a resumed plan given no allowance, ends
             // here and keeps what it holds.
-            if budget.ops == 0 || budget.bytes == 0 || self.exhausted() {
+            if ops.len() >= budget.ops || bytes >= budget.bytes || self.exhausted() {
                 self.ended = true;
                 break;
             }
@@ -477,7 +485,13 @@ impl Pager<'_> {
                 self.missing.insert(*dep);
                 return Ok(Wait::Blocked);
             };
+            if let Some(known) = self.scope.known_prefix(&dep_actor)
+                && known > 0
+            {
+                self.covered.observe(dep_actor, known.min(dep_seq));
+            }
             if self.scope.holds_prefix(&dep_actor, dep_seq) {
+                self.covered.observe(dep_actor, dep_seq);
                 self.checked.insert(op.id, *dep);
                 continue;
             }
