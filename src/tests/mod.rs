@@ -45,6 +45,8 @@ mod storage_pressure;
 pub(crate) mod support;
 mod sync;
 mod tiebreak;
+#[cfg(feature = "iroh")]
+mod transitions;
 #[cfg(feature = "fjall")]
 mod upgrade;
 #[cfg(feature = "iroh")]

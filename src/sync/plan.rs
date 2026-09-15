@@ -233,10 +233,7 @@ impl Pager<'_> {
                 break;
             }
             self.fill()?;
-            if self.ended
-                || self.selecting.is_some()
-                || (self.exhausted() && self.active.is_empty())
-            {
+            if self.ended || self.selecting.is_some() || self.exhausted() {
                 self.ended = true;
                 break;
             }
