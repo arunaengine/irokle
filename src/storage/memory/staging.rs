@@ -14,7 +14,8 @@ use super::super::{
     check_namespaces, merged_obligation,
 };
 use super::{
-    MemoryInner, MemoryStorage, ObligationKind, memory_topic_state_locked, put_obligation_locked,
+    MemoryInner, MemoryStorage, MetadataPlan, ObligationKind, memory_topic_state_locked,
+    put_obligation_locked,
 };
 
 /// Registered provisional namespaces with their records. Lock order: this
@@ -149,6 +150,10 @@ impl MemoryStorage {
             .filter(|(peer, _)| *peer == source)
             .count();
         check_namespaces(&self.limits, staging.namespaces.len(), from_source)?;
+        let budget = Arc::clone(&self.lock()?.budget);
+        let namespace_charge = Some(Arc::new(
+            budget.reserve(super::MemoryDomain::Metadata, 4096)?,
+        ));
         staging.sessions += 1;
         let provisional = ProvisionalTopic {
             source,
@@ -160,13 +165,13 @@ impl MemoryStorage {
             revision: 0,
             bytes: 0,
         };
-        let budget = Arc::clone(&self.lock()?.budget);
         staging.namespaces.insert(
             (source, topic_id),
             (
                 provisional.clone(),
                 Arc::new(Mutex::new(MemoryInner {
                     budget,
+                    namespace_charge,
                     ..Default::default()
                 })),
             ),
@@ -262,7 +267,16 @@ impl MemoryStorage {
             .charges
             .values()
             .map(|charge| charge.operation.bytes + charge.metadata.bytes)
-            .sum();
+            .sum::<u64>()
+            + staged
+                .metadata
+                .values()
+                .map(|charge| charge.bytes)
+                .sum::<u64>()
+            + staged
+                .namespace_charge
+                .as_ref()
+                .map_or(0, |charge| charge.bytes);
         let _copy = inner
             .budget
             .reserve(super::MemoryDomain::Activation, copy_bytes)?;
@@ -284,6 +298,11 @@ impl MemoryStorage {
             let merged = merged_obligation(existing, &obligation)?;
             changes.insert(key, merged);
         }
+        let mut reservation = MetadataPlan::new(&inner)?;
+        for obligation in changes.values() {
+            reservation.obligation(&inner, obligation)?;
+        }
+        reservation.commit(&mut inner);
         copy_topic_locked(staged, &mut inner, &topic_id);
         inner.topics.insert(topic_id, expected.clone());
         for merged in changes.into_values() {
@@ -326,6 +345,10 @@ impl MemoryStorage {
 
 /// Copy every record of `topic_id` from a namespace store into `inner`.
 fn copy_topic_locked(staged: &MemoryInner, inner: &mut MemoryInner, topic_id: &TopicId) {
+    let key = super::MetadataKey::Topic(*topic_id);
+    if let Some(charge) = staged.metadata.get(&key) {
+        inner.metadata.insert(key, Arc::clone(charge));
+    }
     let ids = staged.topic_ops.get(topic_id).cloned().unwrap_or_default();
     for id in &ids {
         if let (Some(op), Some(meta)) = (staged.ops.get(id), staged.meta.get(id)) {

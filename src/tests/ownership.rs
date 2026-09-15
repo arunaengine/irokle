@@ -216,14 +216,12 @@ fn activation_releases_losers() {
     }
     storage.reset_topic(&topic).unwrap();
     assert!(staged[0].2.load(Ordering::SeqCst));
-    assert!(
-        storage
-            .memory_usage()
-            .unwrap()
-            .reserved
-            .values()
-            .all(|bytes| *bytes == 0)
+    let usage = storage.memory_usage().unwrap();
+    assert_eq!(
+        usage.reserved[&crate::storage::MemoryDomain::Metadata],
+        4096
     );
+    assert_eq!(usage.reserved.values().sum::<u64>(), 4096);
 }
 
 /// Admit `ops` into the namespace of `provisional` through a fresh view.

@@ -25,6 +25,7 @@ mod integrated;
 #[cfg(feature = "iroh")]
 mod iroh;
 mod membership;
+mod memory_pressure;
 mod ownership;
 mod pages;
 mod pending;

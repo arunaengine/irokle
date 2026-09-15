@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::{
@@ -21,11 +21,13 @@ use super::{
 };
 
 mod budget;
+mod metadata;
 mod staging;
 
 pub use budget::{MemoryDomain, MemoryLimits, MemoryUsage};
 
 use budget::{Budget, Charge};
+use metadata::{MetadataKey, MetadataPlan};
 use staging::Staging;
 
 #[derive(Clone)]
@@ -61,6 +63,8 @@ impl Default for MemoryStorage {
 struct MemoryInner {
     budget: Arc<Budget>,
     charges: BTreeMap<OpId, RecordCharge>,
+    metadata: BTreeMap<MetadataKey, Arc<Charge>>,
+    namespace_charge: Option<Arc<Charge>>,
     ops: BTreeMap<OpId, Op>,
     meta: BTreeMap<OpId, OpMeta>,
     topic_ops: BTreeMap<TopicId, BTreeSet<OpId>>,
@@ -81,7 +85,7 @@ struct MemoryInner {
     source_usage: BTreeMap<PeerId, PendingUsage>,
     topic_usage: BTreeMap<TopicId, PendingUsage>,
     rejected: BTreeMap<TopicId, RejectedIds>,
-    peer_acks: HashMap<(PeerId, TopicId), PeerAck>,
+    peer_acks: BTreeMap<(PeerId, TopicId), PeerAck>,
     /// Keyed topic first, so one topic's records are a range.
     obligations: BTreeMap<(TopicId, PeerId), BTreeMap<ObligationKind, SyncObligation>>,
     sync_statuses: BTreeMap<(TopicId, PeerId), SyncPeerStatus>,
@@ -551,6 +555,13 @@ impl Storage for MemoryStorage {
         };
         let mut subtree = waiter_closure_locked(&inner, op_id);
         subtree.insert(*op_id);
+        let mut reservation = MetadataPlan::new(&inner)?;
+        reservation.reserve(
+            &inner,
+            MetadataKey::Rejected(topic_id),
+            4096 + MAX_REJECTED_PER_TOPIC as u64 * 256,
+        )?;
+        reservation.commit(&mut inner);
         for id in &subtree {
             remove_pending_locked(&mut inner, id)?;
         }
@@ -587,6 +598,9 @@ impl Storage for MemoryStorage {
         let mut inner = self.lock()?;
         branch_matches(inner.topics.get(&obligation.topic_id), expected_genesis)?;
         let merged = merged_obligation_locked(&inner, &obligation)?;
+        let mut reservation = MetadataPlan::new(&inner)?;
+        reservation.obligation(&inner, &merged)?;
+        reservation.commit(&mut inner);
         put_obligation_locked(&mut inner, merged);
         Ok(())
     }
@@ -657,7 +671,11 @@ impl Storage for MemoryStorage {
     }
 
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()> {
-        self.lock()?
+        let mut inner = self.lock()?;
+        let mut reservation = MetadataPlan::new(&inner)?;
+        reservation.status(&inner, &status)?;
+        reservation.commit(&mut inner);
+        inner
             .sync_statuses
             .insert((status.topic_id, status.peer_id), status);
         Ok(())
@@ -678,6 +696,9 @@ impl Storage for MemoryStorage {
             .unwrap_or_else(|| new_peer_status(*peer_id, *topic_id));
         // A rejected update leaves no record behind for a peer that had none.
         if apply_status_update(&mut status, update) {
+            let mut reservation = MetadataPlan::new(&inner)?;
+            reservation.status(&inner, &status)?;
+            reservation.commit(&mut inner);
             inner.sync_statuses.insert(key, status.clone());
         }
         Ok(status)
@@ -715,6 +736,9 @@ impl Storage for MemoryStorage {
             .map_or(0, |records| records.len());
         inner.sync_statuses.remove(&(*topic_id, *peer_id));
         inner.peer_acks.remove(&(*peer_id, *topic_id));
+        inner
+            .metadata
+            .retain(|key, _| !key.peer(*topic_id, *peer_id));
         Ok(cleared)
     }
 
@@ -758,7 +782,12 @@ impl Storage for MemoryStorage {
             .charges
             .values()
             .map(|charge| charge.operation.bytes + charge.metadata.bytes)
-            .sum();
+            .sum::<u64>()
+            + inner
+                .metadata
+                .values()
+                .map(|charge| charge.bytes)
+                .sum::<u64>();
         let _copy = inner.budget.reserve(MemoryDomain::Recovery, copy_bytes)?;
         let mut staged = inner.clone();
         let removed = reset_topic_locked(&mut staged, topic_id)?;
@@ -771,14 +800,28 @@ impl Storage for MemoryStorage {
             {
                 return Err(Error::EvictionJournalFull);
             }
-            staged.evictions.insert(key, eviction.clone());
+            let mut reservation = MetadataPlan::new(&staged)?;
+            let bytes = postcard::experimental::serialized_size(eviction)? as u64;
+            reservation.reserve(&staged, MetadataKey::Eviction(key), 4096 + bytes * 3)?;
+            let mut eviction = eviction.clone();
+            for op in &mut eviction.evicted {
+                if let crate::TopicPayload::Event(event) = &mut op.payload {
+                    event.payload = bytes::Bytes::copy_from_slice(&event.payload);
+                }
+            }
+            reservation.commit(&mut staged);
+            staged.evictions.insert(key, eviction);
         }
         *inner = staged;
         Ok(removed)
     }
 
     fn seal_topic(&self, topic_id: &TopicId) -> Result<bool> {
-        Ok(self.lock()?.sealed_topics.insert(*topic_id))
+        let mut inner = self.lock()?;
+        let mut reservation = MetadataPlan::new(&inner)?;
+        reservation.reserve(&inner, MetadataKey::Topic(*topic_id), 4096)?;
+        reservation.commit(&mut inner);
+        Ok(inner.sealed_topics.insert(*topic_id))
     }
 
     fn unseal_topic(&self, topic_id: &TopicId) -> Result<bool> {
@@ -790,7 +833,9 @@ impl Storage for MemoryStorage {
     }
 
     fn clear_eviction(&self, key: &EvictionKey) -> Result<()> {
-        self.lock()?.evictions.remove(key);
+        let mut inner = self.lock()?;
+        inner.evictions.remove(key);
+        inner.metadata.remove(&MetadataKey::Eviction(*key));
         Ok(())
     }
 
@@ -1180,6 +1225,12 @@ fn admit_batch_locked(
         charges.insert(op.id, charge);
     }
     nodes.add(&projected)?;
+    let mut reservation = MetadataPlan::new(inner)?;
+    reservation.reserve(inner, MetadataKey::Topic(topic_id), 4096)?;
+    for obligation in effects.values() {
+        reservation.obligation(inner, obligation)?;
+    }
+    let fingerprint = topic_fingerprint_for(&heads, &projected)?;
     if let Some(quota) = quota {
         let mut charge = 0;
         for (op, _) in &new_entries {
@@ -1192,6 +1243,7 @@ fn admit_batch_locked(
     }
 
     nodes.commit();
+    reservation.commit(inner);
 
     for (mut op, meta) in new_entries {
         if let crate::TopicPayload::Event(event) = &mut op.signed.body.payload {
@@ -1235,14 +1287,7 @@ fn admit_batch_locked(
     inner.actor_clock.insert(topic_id, projected);
 
     inner.heads.insert(topic_id, heads.clone());
-    let clock = inner
-        .actor_clock
-        .get(&topic_id)
-        .cloned()
-        .unwrap_or_default();
-    inner
-        .topic_fingerprint
-        .insert(topic_id, topic_fingerprint_for(&heads, &clock)?);
+    inner.topic_fingerprint.insert(topic_id, fingerprint);
     if let Some(state) = topic_state {
         inner.topics.insert(state.topic_id, state);
     }
@@ -1253,11 +1298,15 @@ fn admit_batch_locked(
         inner.obligations.remove(&(topic_id, peer_id));
         inner.sync_statuses.remove(&(topic_id, peer_id));
         inner.peer_acks.remove(&(peer_id, topic_id));
+        inner.metadata.retain(|key, _| !key.peer(topic_id, peer_id));
     }
     Ok(())
 }
 
 fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> Result<usize> {
+    let mut reservation = MetadataPlan::new(inner)?;
+    reservation.reserve(inner, MetadataKey::Topic(*topic_id), 4096)?;
+    reservation.commit(inner);
     *inner.topic_epochs.entry(*topic_id).or_default() += 1;
     let op_ids = inner.topic_ops.remove(topic_id).unwrap_or_default();
     let removed = op_ids.len();
@@ -1299,6 +1348,7 @@ fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> Result<usi
     inner.obligations.retain(|(t, _), _| t != topic_id);
     inner.sync_statuses.retain(|(t, _), _| t != topic_id);
     inner.rejected.remove(topic_id);
+    inner.metadata.retain(|key, _| !key.reset(*topic_id));
     for op_id in inner
         .pending_by_topic
         .get(topic_id)
@@ -1329,22 +1379,60 @@ fn charge_record(budget: &Arc<Budget>, op: &Op, meta: &OpMeta) -> Result<RecordC
 fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> Result<usize> {
     let commit = ack_commit(inner.topics.get(&ack.topic_id), &ack)?;
     let key = (ack.peer_id, ack.topic_id);
+    let entries = ack.clock.len() + inner.peer_acks.get(&key).map_or(0, |old| old.clock.len());
+    let _workspace = inner.budget.reserve(
+        MemoryDomain::Workspace,
+        (2 * ActorClock::allocation_bound(entries) + ack.heads.len() * 256 + 4096) as u64,
+    )?;
     let effective_ack = match inner.peer_acks.get(&key) {
         Some(existing) if stored_ack_dominates(existing, &ack) => existing.clone(),
-        Some(existing) => {
-            let merged = merged_peer_ack(existing, &ack);
-            inner.peer_acks.insert(key, merged.clone());
-            merged
-        }
-        None => {
-            inner.peer_acks.insert(key, ack.clone());
-            ack
-        }
+        Some(existing) => merged_peer_ack(existing, &ack),
+        None => ack,
     };
-    if commit == AckCommit::Retain {
-        return Ok(0);
+    let mut reservation = MetadataPlan::new(inner)?;
+    reservation.ack(inner, &effective_ack)?;
+    let obligation_key = (effective_ack.topic_id, effective_ack.peer_id);
+    let mut settled = BTreeMap::new();
+    if commit != AckCommit::Retain
+        && let Some(records) = inner.obligations.get(&obligation_key)
+    {
+        for (kind, obligation) in records {
+            let rest = settled_obligation(obligation, &effective_ack, |id| {
+                Ok(inner.meta.get(id).map(OpPosition::from))
+            })?;
+            if let Some(rest) = &rest {
+                reservation.obligation(inner, rest)?;
+            }
+            settled.insert(*kind, rest);
+        }
     }
-    clear_satisfied_locked(inner, &effective_ack)
+    reservation.commit(inner);
+    inner.peer_acks.insert(key, effective_ack);
+    let mut cleared = 0;
+    for (kind, rest) in settled {
+        match rest {
+            Some(rest) => put_obligation_locked(inner, rest),
+            None => {
+                if let Some(records) = inner.obligations.get_mut(&obligation_key) {
+                    records.remove(&kind);
+                }
+                inner.metadata.remove(&MetadataKey::Obligation(
+                    obligation_key.0,
+                    obligation_key.1,
+                    kind,
+                ));
+                cleared += 1;
+            }
+        }
+    }
+    if inner
+        .obligations
+        .get(&obligation_key)
+        .is_some_and(BTreeMap::is_empty)
+    {
+        inner.obligations.remove(&obligation_key);
+    }
+    Ok(cleared)
 }
 
 /// Which of a peer's two records per topic an obligation belongs to.
@@ -1386,37 +1474,6 @@ fn put_obligation_locked(inner: &mut MemoryInner, obligation: SyncObligation) {
         .entry((obligation.topic_id, obligation.peer_id))
         .or_default()
         .insert(ObligationKind::of(&obligation), obligation);
-}
-
-fn clear_satisfied_locked(inner: &mut MemoryInner, ack: &PeerAck) -> Result<usize> {
-    let key = (ack.topic_id, ack.peer_id);
-    let Some(records) = inner.obligations.get(&key) else {
-        return Ok(0);
-    };
-    let mut settled = BTreeMap::new();
-    for (kind, obligation) in records {
-        let rest = settled_obligation(obligation, ack, |id| {
-            Ok(inner.meta.get(id).map(OpPosition::from))
-        })?;
-        settled.insert(*kind, rest);
-    }
-    let records = inner.obligations.entry(key).or_default();
-    let mut cleared = 0;
-    for (kind, rest) in settled {
-        match rest {
-            Some(rest) => {
-                records.insert(kind, rest);
-            }
-            None => {
-                records.remove(&kind);
-                cleared += 1;
-            }
-        }
-    }
-    if records.is_empty() {
-        inner.obligations.remove(&key);
-    }
-    Ok(cleared)
 }
 
 /// Metadata of a stored op and the genesis of the topic branch holding it.
