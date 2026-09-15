@@ -113,7 +113,7 @@ fn slice_kept_or_refused() {
         PageBudget::from_credit(request.credit),
     );
     assert!(
-        matches!(&refused, Err(Error::Storage(message)) if message.contains("work")),
+        matches!(&refused, Err(Error::SyncCapacity(_))),
         "{refused:?}"
     );
 }
@@ -159,7 +159,7 @@ fn plans_at_capacity() {
     }
     let refused = responder.response_page(peers[MAX_CONTINUATIONS], &request, budget);
     assert!(
-        matches!(&refused, Err(Error::Storage(message)) if message.contains("work")),
+        matches!(&refused, Err(Error::SyncCapacity(_))),
         "{refused:?}"
     );
     let small_reader = Oplog::new();

@@ -91,7 +91,7 @@ fn page_informed<S: Storage, R: Storage>(
         }
         if page.ops.is_empty() {
             assert!(
-                !page.positions.is_empty() || !page.missing.is_empty(),
+                page.continued || !page.positions.is_empty() || !page.missing.is_empty(),
                 "round {rounds} carried nothing and named no blocker"
             );
             empty += 1;
@@ -179,26 +179,19 @@ fn graph_members<S: Storage>(
     let mut last = vec![None::<usize>; writers];
     for (writer, deps) in ops {
         let signer = &signers[*writer];
+        let generation = deps
+            .iter()
+            .copied()
+            .chain(last[*writer])
+            .map(|index| signed[index].signed.body.generation + 1)
+            .max()
+            .unwrap_or(1);
         let mut deps = deps
             .iter()
             .map(|index| signed[*index].id)
             .collect::<BTreeSet<_>>();
         let prev = last[*writer].map(|index| signed[index].id);
         deps.extend(prev);
-        let generation = deps
-            .iter()
-            .map(|dep| {
-                signed
-                    .iter()
-                    .find(|op| op.id == *dep)
-                    .unwrap()
-                    .signed
-                    .body
-                    .generation
-                    + 1
-            })
-            .max()
-            .unwrap_or(1);
         let op = Op::sign(
             OpBody {
                 topic_id,
@@ -395,7 +388,7 @@ fn chain_windows_saturated() {
             let budget = PageBudget::from_credit(request.credit);
             let page = match responder.response_page(*peer, &request, budget) {
                 Ok(page) => page,
-                Err(Error::Storage(message)) if message.contains("work") => {
+                Err(Error::SyncCapacity(_)) => {
                     refused += 1;
                     continue;
                 }
@@ -482,6 +475,72 @@ fn joined_source<S: Storage>(storage: S, width: usize, member: bool) -> Source<S
     graph_members(storage, width + 1, &ops, member)
 }
 
+fn assert_batch_views<S: Storage>(storage: S, chunk: usize) {
+    let source = joined_source(MemoryStorage::new(), 33, false);
+    let ops = oplog::topological(source.log.storage(), &source.topic_id).unwrap();
+    let reader = Oplog::with_storage(storage);
+    let known = std::cell::RefCell::new(BTreeSet::new());
+    let effects =
+        |_, entries: &[(Op, crate::storage::OpMeta)], state: &crate::storage::TopicState| {
+            let mut known = known.borrow_mut();
+            known.extend(entries.iter().map(|(op, _)| op.id));
+            let referenced = ops
+                .iter()
+                .filter(|op| known.contains(&op.id))
+                .flat_map(|op| op.signed.body.deps.iter().copied())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                state.heads,
+                known.difference(&referenced).copied().collect()
+            );
+            Ok(crate::storage::AdmissionEffects::default())
+        };
+    for batch in ops.chunks(chunk) {
+        reader
+            .receive_ops_from_peer_preverified(
+                Some(source.genesis.signed.body.author),
+                batch.to_vec(),
+                &BTreeSet::new(),
+                Some(&effects),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        reader.storage().topic_view(&source.topic_id, None).unwrap(),
+        source
+            .log
+            .storage()
+            .topic_view(&source.topic_id, None)
+            .unwrap()
+    );
+    for op in ops {
+        assert_eq!(reader.storage().get_op(&op.id).unwrap(), Some(op.clone()));
+        assert_eq!(
+            reader.storage().get_meta(&op.id).unwrap(),
+            source.log.storage().get_meta(&op.id).unwrap()
+        );
+    }
+}
+
+#[test]
+fn memory_batch_views() {
+    for chunk in [1, 7, 128] {
+        assert_batch_views(MemoryStorage::new(), chunk);
+    }
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_batch_views() {
+    for chunk in [1, 7, 128] {
+        let directory = tempfile::tempdir().unwrap();
+        assert_batch_views(
+            crate::storage::FjallStorage::open(directory.path()).unwrap(),
+            chunk,
+        );
+    }
+}
+
 #[test]
 fn prefixes_finish_joins() {
     for width in [3, 128, 255, 256, 257, 512] {
@@ -508,6 +567,51 @@ fn prefixes_finish_joins() {
             );
         }
     }
+}
+
+#[test]
+#[ignore = "signed join beyond both real request and position limits, run explicitly"]
+fn real_join_finishes() {
+    const ITEMS: usize = 65_536;
+    const WIDTH: usize = ITEMS + MAX_PAGE_MISSING + 1;
+    let source = joined_source(MemoryStorage::new(), WIDTH, true);
+    let reader = Oplog::new();
+    reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+    let responder = &source.engine;
+    let receiver = SyncEngine::new(reader.clone(), source.reader);
+    let summary = responder.summary(source.topic_id).unwrap();
+    let request = receiver.plan_request(source.reader, &summary).unwrap();
+    assert_eq!(request.actor_range_hints.len(), ITEMS);
+    let held = reader.storage().actor_clock(&source.topic_id).unwrap();
+    let behind = summary
+        .actor_clock
+        .iter()
+        .filter(|(actor, seq)| **seq > held.get(actor))
+        .count();
+    assert!(behind - request.actor_range_hints.len() > MAX_PAGE_MISSING);
+    let encoded = postcard::to_allocvec(&request).unwrap();
+    let decoded: crate::sync::SyncRequest = postcard::from_bytes(&encoded).unwrap();
+    assert_eq!(decoded, request);
+    let paged = page_informed(&source, &reader, ITEMS, MAX_PAGE_MISSING, true);
+    assert!(paged.complete);
+    assert_eq!(paged.sent, 2 * WIDTH + 1);
+    assert_eq!(
+        reader.storage().list_op_ids(&source.topic_id).unwrap(),
+        source.log.storage().list_op_ids(&source.topic_id).unwrap()
+    );
+    let work = responder.page_work();
+    assert!(
+        work.edges < 128 * WIDTH as u64,
+        "{} repeated edges",
+        work.edges
+    );
+    eprintln!(
+        "real_join actors={WIDTH} behind={behind} request_bytes={} rounds={} visits={} edges={}",
+        encoded.len(),
+        paged.rounds,
+        work.visits,
+        work.edges
+    );
 }
 
 #[cfg(feature = "fjall")]

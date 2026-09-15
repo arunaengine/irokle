@@ -1318,14 +1318,17 @@ impl<S: Storage> Oplog<S> {
             }
             projection_tips = op.signed.body.deps.clone();
             let meta = self.meta_for_projected(&op, &overlay_meta)?;
-            heads = heads_after(&heads, &op);
+            for dep in &op.signed.body.deps {
+                heads.remove(dep);
+            }
+            heads.insert(op.id);
             match &op.signed.body.payload {
                 TopicPayload::Genesis(genesis) => {
                     state = Some(TopicState {
                         topic_id,
                         event_type_id: genesis.event_type_id.clone(),
                         genesis: op.id,
-                        heads: heads.clone(),
+                        heads: BTreeSet::new(),
                         members: genesis.initial_peers.clone(),
                         replication_policy: genesis.replication_policy.clone(),
                         membership_controls: BTreeMap::new(),
@@ -1333,14 +1336,9 @@ impl<S: Storage> Oplog<S> {
                     });
                     topic_state_changed = true;
                 }
-                TopicPayload::Event(_) => {
-                    if let Some(state) = state.as_mut() {
-                        state.heads = heads.clone();
-                    }
-                }
+                TopicPayload::Event(_) => {}
                 TopicPayload::Control(control) => {
                     let state = state.as_mut().ok_or(Error::TopicNotFound)?;
-                    state.heads = heads.clone();
                     apply_control_to_state(state, &op, control);
                     topic_state_changed = true;
                 }
@@ -1361,6 +1359,9 @@ impl<S: Storage> Oplog<S> {
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| Error::Storage("admitted op left the batch overlay".into()))?;
 
+        if let Some(state) = &mut state {
+            state.heads = heads.clone();
+        }
         // Effects commit with the entries under the same expected state, so a
         // reset cannot slip between the ops and the work they create.
         let effects = match (receive_effects, state.as_ref()) {
@@ -1889,16 +1890,19 @@ impl<S: Storage> Oplog<S> {
         })
     }
 
-    fn meta_projected(
+    fn meta_projected<'a>(
         &self,
         id: &crate::OpId,
-        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
-    ) -> Result<OpMeta> {
-        overlay_meta.get(id).cloned().map(Ok).unwrap_or_else(|| {
-            self.storage
+        overlay_meta: &'a BTreeMap<crate::OpId, OpMeta>,
+    ) -> Result<std::borrow::Cow<'a, OpMeta>> {
+        match overlay_meta.get(id) {
+            Some(meta) => Ok(std::borrow::Cow::Borrowed(meta)),
+            None => self
+                .storage
                 .get_meta(id)?
                 .ok_or(Error::MissingDependency(*id))
-        })
+                .map(std::borrow::Cow::Owned),
+        }
     }
 
     fn op_projected(

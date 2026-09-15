@@ -845,6 +845,8 @@ impl<S: Storage> SyncEngine<S> {
         };
         if let Some((frontier, local, goal)) = frontier
             && page.ops.is_empty()
+            && needed.is_empty()
+            && positions.is_empty()
         {
             // An empty slice that cannot be kept would repeat forever.
             if !continues {

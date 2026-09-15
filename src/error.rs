@@ -104,6 +104,9 @@ pub enum Error {
     #[error("storage error: {0}")]
     Storage(String),
 
+    #[error("sync planning capacity exhausted: {0}")]
+    SyncCapacity(String),
+
     /// The op, or a dependency it waits on, was rejected on this branch.
     #[error("op {0} was rejected on this branch")]
     RejectedOp(crate::ids::OpId),

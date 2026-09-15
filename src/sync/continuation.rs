@@ -125,14 +125,19 @@ impl Continuations {
         key: (PeerId, TopicId),
         continuation: Continuation,
     ) -> Result<()> {
-        let refuse = || Err(Error::Storage("sync page work exceeds its budget".into()));
-        if continuation.bytes() > MAX_CONTINUATION_BYTES {
-            return refuse();
+        let bytes = continuation.bytes();
+        if bytes > MAX_CONTINUATION_BYTES {
+            return Err(Error::SyncCapacity(format!(
+                "retained plan needs {bytes} bytes, limit {MAX_CONTINUATION_BYTES}"
+            )));
         }
         self.entries
             .retain(|_, kept| kept.used.elapsed() < CONTINUATION_IDLE);
         if !self.entries.contains_key(&key) && self.entries.len() >= self.capacity {
-            return refuse();
+            return Err(Error::SyncCapacity(format!(
+                "all {} retained plan slots are occupied",
+                self.capacity
+            )));
         }
         self.entries.insert(key, continuation);
         Ok(())
