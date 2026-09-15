@@ -122,6 +122,7 @@ async fn drain<S: Storage>(side: &Side<S>) {
     assert_eq!(owned.jobs, 0);
     assert!(owned.current.values().all(|bytes| *bytes == 0), "{owned:?}");
     assert_eq!(side.net.plan_counts(), (0, 0));
+    assert_eq!(side.net.retained_goals(), 0);
 }
 
 fn exact<S: Storage>(side: &Side<S>, expected: &[Op]) {

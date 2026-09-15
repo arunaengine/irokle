@@ -267,6 +267,7 @@ pub struct SharedNet<S: Storage> {
     outbound: Arc<tokio::sync::Semaphore>,
     served: Arc<tokio::sync::Semaphore>,
     plans: Arc<service::PlanQueue>,
+    goals: service::PlanStore<S>,
     receipts: Mutex<ReceiptLog>,
     requests: Mutex<RequestLog>,
     shutdown: tokio::sync::watch::Sender<bool>,
@@ -391,6 +392,7 @@ impl<S: Storage> IrohNet<S> {
                 outbound: Arc::new(tokio::sync::Semaphore::new(MAX_RESYNC_PEER_CONCURRENCY)),
                 served: Arc::new(tokio::sync::Semaphore::new(MAX_SERVED_STREAMS)),
                 plans: Arc::default(),
+                goals: service::PlanStore::default(),
                 receipts: Mutex::default(),
                 requests: Mutex::default(),
                 shutdown,
@@ -532,6 +534,7 @@ impl<S: Storage> IrohNet<S> {
         // Returns only once the loops and every task they spawned have ended.
         // Awaiting this from inside such a task would wait for itself.
         self.tasks.wait_idle().await;
+        self.goals.clear();
     }
 
     /// Like [`Self::shutdown`], but gives up waiting after `timeout` and
@@ -2985,6 +2988,11 @@ impl<S: Storage> IrohNet<S> {
     }
 
     #[cfg(test)]
+    pub(crate) fn retained_goals(&self) -> usize {
+        self.goals.len()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn hold_planners(&self) -> tokio::sync::OwnedSemaphorePermit {
         Arc::clone(&self.bulk_lane)
             .acquire_many_owned(BULK_JOBS as u32)
@@ -3073,7 +3081,6 @@ impl<S: Storage> IrohNet<S> {
                         .await?,
                 )
             };
-            let mut engine = self.node.sync_engine().session_plan();
             // Pages are granted before planning; this stream holds no data bytes now.
             let mut grant = match session.pages_bound(self.limits) {
                 0 => None,
@@ -3091,16 +3098,16 @@ impl<S: Storage> IrohNet<S> {
             let mut remaining = self.limits;
             loop {
                 let result;
-                (session, engine, permit, grant, result) = self
+                (session, permit, grant, result) = self
                     .run_job(lane, move |shared| {
                         let granted = grant.as_ref().map_or(0, Charge::bytes);
                         let result = session.finish_slice(
                             shared,
                             ByteBudget::page_bytes(granted).saturating_sub(used),
                             remaining,
-                            Some(&engine),
+                            true,
                         );
-                        (session, engine, permit, grant, result)
+                        (session, permit, grant, result)
                     })
                     .await?;
                 let (slice, bytes) = result?;
@@ -3121,7 +3128,7 @@ impl<S: Storage> IrohNet<S> {
                 let granted = grant.bytes();
                 grant.shrink(granted - ByteBudget::page_bytes(granted) + used);
             }
-            drop((engine, permit));
+            drop(permit);
             let held = session.charge.take();
             exchange::reply_fits(&responses, self.limits)?;
             // Retained messages stay charged until the reply carrying them is out.

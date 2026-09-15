@@ -249,7 +249,7 @@ impl SyncSession {
         net: &SharedNet<S>,
         granted: usize,
     ) -> io::Result<(Vec<SyncMessage>, usize)> {
-        self.finish_slice(net, granted, net.limits, None)
+        self.finish_slice(net, granted, net.limits, false)
     }
 
     pub(super) fn finish_slice<S: Storage>(
@@ -257,7 +257,7 @@ impl SyncSession {
         net: &SharedNet<S>,
         granted: usize,
         limits: StreamLimits,
-        engine: Option<&crate::sync::SyncEngine<S>>,
+        served: bool,
     ) -> io::Result<(Vec<SyncMessage>, usize)> {
         let mut responses = std::mem::take(&mut self.controls);
         responses.extend(self.apply_acks(net)?);
@@ -319,10 +319,16 @@ impl SyncSession {
                 budget.bytes = budget
                     .bytes
                     .min(grant_left.saturating_sub(ops_bytes) / super::budget::DECODED_FACTOR);
-                let planner = engine.unwrap_or_else(|| net.node.sync_engine());
-                let planned = match self.summaries.get(&topic_id) {
-                    Some(summary) => planner.response_with(peer_id, &request, budget, summary),
-                    None => planner.response_page(peer_id, &request, budget),
+                let plan =
+                    |planner: &crate::sync::SyncEngine<S>| match self.summaries.get(&topic_id) {
+                        Some(summary) => planner.response_with(peer_id, &request, budget, summary),
+                        None => planner.response_page(peer_id, &request, budget),
+                    };
+                let planned = if served {
+                    net.goals
+                        .with_plan((peer_id, topic_id), net.node.sync_engine(), plan)
+                } else {
+                    plan(net.node.sync_engine())
                 };
                 let mut page = match planned {
                     Ok(page) => page,
@@ -346,14 +352,13 @@ impl SyncSession {
                         "plan"
                     },
                 );
-                if engine.is_some() && page.continued && page.positions.is_empty() {
+                if served && page.continued && page.positions.is_empty() {
                     self.requests.insert(topic_id, request);
                     self.requests.extend(pending);
                     self.requests.extend(deferred);
                     return Ok((responses, held));
                 }
-                if let Some(engine) = engine {
-                    engine.release_plan(peer_id, topic_id);
+                if served {
                     page.continued = false;
                 }
                 let data =

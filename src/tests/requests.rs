@@ -588,6 +588,89 @@ fn joined_source<S: Storage>(storage: S, width: usize, member: bool) -> Source<S
     graph_members(storage, width + 1, &ops, member)
 }
 
+#[test]
+fn named_prefix_changes() {
+    let source = joined_source(MemoryStorage::new(), 3, true);
+    let ops = oplog::topological(source.log.storage(), &source.topic_id).unwrap();
+    let root = ops
+        .iter()
+        .filter(|op| op.signed.body.generation == 1)
+        .max_by_key(|op| op.id)
+        .unwrap();
+    let join = ops
+        .iter()
+        .find(|op| op.signed.body.generation == 2)
+        .unwrap();
+    let reader = Oplog::new();
+    reader
+        .receive_ops(vec![source.genesis.clone(), root.clone()])
+        .unwrap();
+    let receiver = SyncEngine::new(reader.clone(), source.reader);
+    let mut request = crate::sync::SyncRequest {
+        topic_id: source.topic_id,
+        known: Default::default(),
+        wants: Default::default(),
+        actor_range_hints: vec![crate::sync::ActorRangeHint {
+            actor_id: join.signed.body.actor_id,
+            from_exclusive: 0,
+            to_inclusive: 1,
+        }],
+        genesis: Some(source.genesis.id),
+        credit: crate::sync::SyncCredit {
+            ops: 1,
+            bytes: 32 * 1024 * 1024,
+        },
+        window: Default::default(),
+    };
+    for round in 0..16 {
+        if reader
+            .storage()
+            .list_op_ids(&source.topic_id)
+            .unwrap()
+            .len()
+            == 6
+        {
+            return;
+        }
+        let held = receiver.summary(source.topic_id).unwrap();
+        let page = source
+            .engine
+            .response_with(
+                source.reader,
+                &request,
+                PageBudget::from_credit(request.credit),
+                &held,
+            )
+            .unwrap();
+        for op in &page.ops {
+            assert!(
+                reader.storage().get_op(&op.id).unwrap().is_none(),
+                "repeated an already-held prefix"
+            );
+            assert!(
+                op.signed
+                    .body
+                    .deps
+                    .iter()
+                    .all(|dep| reader.storage().dep_resolvable(dep).unwrap())
+            );
+        }
+        reader.receive_ops(page.ops).unwrap();
+        if round == 0 {
+            request.actor_range_hints.push(crate::sync::ActorRangeHint {
+                actor_id: root.signed.body.actor_id,
+                from_exclusive: 1,
+                to_inclusive: 2,
+            });
+        }
+        let clock = reader.storage().actor_clock(&source.topic_id).unwrap();
+        for hint in &mut request.actor_range_hints {
+            hint.from_exclusive = clock.get(&hint.actor_id);
+        }
+    }
+    panic!("changed hint scope did not finish");
+}
+
 fn assert_batch_views<S: Storage>(storage: S, chunk: usize) {
     let source = joined_source(MemoryStorage::new(), 33, false);
     let ops = oplog::topological(source.log.storage(), &source.topic_id).unwrap();
@@ -1001,6 +1084,68 @@ mod sessions {
             assert!(store.provisional_topics().unwrap().is_empty());
             bob.shutdown().await;
             alice.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn network_work_scales() {
+        let mut previous = None;
+        for actors in [40, 80] {
+            let source = super::super::progress::reverse_chain(MemoryStorage::new(), actors);
+            let reader = MemoryStorage::new();
+            Oplog::with_storage(reader.clone())
+                .receive_ops(vec![source.genesis.clone()])
+                .unwrap();
+            let mut peers = Vec::new();
+            for (store, seed) in [(source.log.storage().clone(), 230), (reader.clone(), 231)] {
+                let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                    .secret_key(iroh::SecretKey::from_bytes(&[seed; 32]))
+                    .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+                    .bind()
+                    .await
+                    .unwrap();
+                let node = Irokle::with_storage(
+                    store,
+                    NodeConfig {
+                        signer: Ed25519Signer::from_bytes(&[seed; 32]),
+                        peer_whitelist: None,
+                        ..NodeConfig::default()
+                    },
+                )
+                .unwrap()
+                .with_request_items(3)
+                .with_page_visits(1);
+                let net = Arc::new(net::IrohNet::new(endpoint, node.clone()).unwrap());
+                net.start_accept_loop().unwrap();
+                let address = super::super::iroh::ready_addr(net.endpoint()).await;
+                peers.push((node, net, address));
+            }
+            sync_calls(&peers[1].1, peers[0].2.clone(), source.topic_id, 64).await;
+            let work = peers[0].0.sync_engine().page_work();
+            let total = work.visits + work.edges + work.actors;
+            println!("network_work actors={actors} planner_work={total}");
+            assert_eq!(
+                reader.list_op_ids(&source.topic_id).unwrap(),
+                source.log.storage().list_op_ids(&source.topic_id).unwrap()
+            );
+            assert_eq!(
+                reader.actor_clock(&source.topic_id).unwrap(),
+                source.log.storage().actor_clock(&source.topic_id).unwrap()
+            );
+            for (_, net, _) in &peers {
+                net.shutdown().await;
+                assert_eq!(net.owned_bytes().jobs, 0);
+                assert!(net.owned_bytes().current.values().all(|bytes| *bytes == 0));
+                assert_eq!(net.plan_counts(), (0, 0));
+                assert_eq!(net.retained_goals(), 0);
+            }
+            if let Some(previous) = previous {
+                assert!(
+                    total <= 3 * previous,
+                    "network transfers rebuilt completed planning work"
+                );
+            }
+            previous = Some(total);
         }
     }
 
