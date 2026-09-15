@@ -77,7 +77,7 @@ impl SyncSession {
     }
 
     fn retain(&mut self, message: &SyncMessage) -> io::Result<()> {
-        let held = ByteBudget::held_bound(crate::net::framed_message_len(message)?);
+        let held = crate::net::decoded_message_bound(message)?;
         self.retained = self.retained.saturating_add(held);
         Ok(())
     }

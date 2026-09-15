@@ -138,7 +138,7 @@ async fn held_results_charged() {
     assert!(held.len() >= 2, "{} responses", held.len());
     let decoded = held
         .iter()
-        .map(|message| ByteBudget::decoded_bound(framed_len(message) - 4, 0) as u64)
+        .map(|message| crate::net::decoded_message_bound(message).unwrap() as u64)
         .sum::<u64>();
     assert_eq!(net.owned_bytes().current[&OwnedClass::Results], decoded);
     let more = net.sync_with(bob_addr.clone(), &messages).await.unwrap();
@@ -207,7 +207,7 @@ async fn session_bytes_charged() {
     }
     let retained = messages[1..]
         .iter()
-        .map(|message| ByteBudget::held_bound(framed_len(message)))
+        .map(|message| crate::net::decoded_message_bound(message).unwrap())
         .sum::<usize>();
     let bob_addr = ready_addr(bob_net.endpoint()).await;
 

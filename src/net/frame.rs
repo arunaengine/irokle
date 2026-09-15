@@ -10,6 +10,52 @@ pub(super) const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 pub const MAX_SYNC_DATA_OPS_PER_MESSAGE: usize = 256;
 pub const IROKLE_SYNC_ALPN: &[u8] = crate::sync::SYNC_PROTOCOL.as_bytes();
 
+/// Conservative heap reservation for a message decoded from the wire.
+/// Shared allocations are reserved, not measured; caller-created backing slices
+/// and spare capacities outside the wire decoder are owned by the caller.
+pub fn decoded_message_bound(message: &SyncMessage) -> io::Result<usize> {
+    let bytes = postcard::experimental::serialized_size(message).map_err(invalid_data)?;
+    let ops = match message {
+        SyncMessage::Data(data) => data.ops.len(),
+        _ => 0,
+    };
+    let clock = |clock: &crate::ActorClock| crate::ActorClock::allocation_bound(clock.len());
+    let clocks = match message {
+        SyncMessage::Summary(summary) => clock(&summary.actor_clock).saturating_add(
+            summary
+                .staged
+                .as_ref()
+                .map_or(0, |receipt| clock(&receipt.clock)),
+        ),
+        SyncMessage::Ack(ack) => clock(&ack.clock),
+        SyncMessage::Receipt(receipt) => clock(&receipt.clock),
+        _ => 0,
+    };
+    Ok(bytes
+        .saturating_mul(3)
+        .saturating_add(ops.saturating_mul(size_of::<crate::Op>()))
+        .saturating_add(2 * size_of::<SyncMessage>())
+        .saturating_add(clocks))
+}
+
+/// Reservation while raw and decoded copies coexist. `tag` is the first wire byte.
+/// Includes temporary map/trie construction and cautious vector preallocation on
+/// malformed lengths, not only allocations left after successful decoding.
+pub fn frame_decode_bound(bytes: usize, tag: u8) -> usize {
+    let data = tag == 4;
+    let factor = if data { 3 } else { 18 };
+    let ops = if data {
+        MAX_SYNC_DATA_OPS_PER_MESSAGE
+    } else {
+        0
+    };
+    bytes
+        .saturating_mul(factor + 1)
+        .saturating_add(2 * 1024 * 1024)
+        .saturating_add(ops.saturating_mul(size_of::<crate::Op>()))
+        .saturating_add(2 * size_of::<SyncMessage>())
+}
+
 pub fn encode_sync_message(message: &SyncMessage) -> io::Result<Vec<u8>> {
     postcard::to_allocvec(message).map_err(invalid_data)
 }

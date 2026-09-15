@@ -3022,7 +3022,7 @@ impl<S: Storage> IrohNet<S> {
             while let Some((len, tag)) = read_frame_head(&mut recv, timeout).await? {
                 let frame_index = limits.observe_frame(len)?;
                 let data = tag == DATA_TAG;
-                let pool = ByteBudget::frame_pool(len, data);
+                let pool = ByteBudget::frame_pool(len, data || tag == 2 || tag == 8);
                 let bytes = ByteBudget::frame_charge(len, data);
                 let charge = self.budget.wait(pool, bytes, OwnedClass::Frames).await?;
                 let message = read_frame_body(&mut recv, len, tag, timeout, frame_index).await?;

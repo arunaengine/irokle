@@ -3,8 +3,8 @@
 //! moves with the data it covers and is released when that data is dropped.
 //!
 //! Wire lengths are measured exactly. Decoded sizes are conservative upper
-//! bounds: `DECODED_FACTOR` heap bytes per wire byte, plus the inline size of
-//! each decoded message and operation. None of them is measured memory.
+//! bounds include clock tries and temporary decoding allocations, plus inline
+//! message and operation storage. None of them is measured memory.
 //!
 //! A task never waits on a pool while it holds bytes of that pool, so charges
 //! cannot wait on each other. Growth that would need such a wait fails instead.
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::net::frame::{MAX_FRAME_LEN, MAX_SYNC_DATA_OPS_PER_MESSAGE};
+use crate::net::frame::MAX_FRAME_LEN;
 use crate::sync::{PageBudget, SyncCredit, SyncMessage};
 
 /// Frames up to this size of a kind other than data may use the control
@@ -88,7 +88,7 @@ pub(super) struct JobCount(Arc<ByteBudget>);
 
 impl ByteBudget {
     /// Pools of `data_bytes` for data and results and `session_bytes` for
-    /// sessions. The data pool always fits a largest frame and half of it a
+    /// sessions. The data pool always fits a largest data frame and half of it a
     /// largest page, so no single charge can wait forever.
     pub(super) fn new(data_bytes: usize, session_bytes: usize) -> Arc<Self> {
         let page = PageBudget::from_credit(SyncCredit::default());
@@ -110,12 +110,7 @@ impl ByteBudget {
     /// Bytes a frame of `len` wire bytes is charged while raw and decoded
     /// copies coexist. A data frame may decode the most operations allowed.
     pub(super) fn frame_charge(len: usize, data: bool) -> usize {
-        let ops = if data {
-            MAX_SYNC_DATA_OPS_PER_MESSAGE
-        } else {
-            0
-        };
-        len.saturating_add(Self::decoded_bound(len, ops))
+        crate::net::frame_decode_bound(len, if data { DATA_TAG } else { 0 })
     }
 
     /// Bytes a decoded message of `len` wire bytes and `ops` operations holds.
@@ -199,7 +194,7 @@ impl ByteBudget {
         let (semaphore, capacity) = self.semaphore(pool);
         if bytes > capacity {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+                io::ErrorKind::OutOfMemory,
                 "sync message exceeds the net's byte budget",
             ));
         }
@@ -330,6 +325,28 @@ mod tests {
         });
         let encoded = crate::net::encode_sync_message(&data).unwrap();
         assert_eq!(encoded[0], DATA_TAG);
+    }
+
+    #[test]
+    fn clock_bounds_cover() {
+        let mut clock = crate::ActorClock::new();
+        for n in 0_u32..65_536 {
+            clock.observe(crate::ActorId::hash(n.to_le_bytes()), 1);
+        }
+        let message = SyncMessage::Receipt(crate::sync::SyncReceipt {
+            topic_id: crate::TopicId::hash(b"budget"),
+            genesis: crate::OpId::hash(b"genesis"),
+            session: 1,
+            clock,
+        });
+        let encoded = crate::net::encode_sync_message(&message).unwrap();
+        assert_eq!(encoded[0], 8);
+        let held = crate::net::decoded_message_bound(&message).unwrap();
+        let frame = ByteBudget::frame_charge(encoded.len(), false);
+        assert!(frame >= held + encoded.len());
+        let budget = ByteBudget::new(256 * 1024 * 1024, SESSION_POOL_BYTES);
+        assert!(frame <= budget.capacity(Pool::Data));
+        assert!(held <= budget.capacity(Pool::Session));
     }
 
     #[test]

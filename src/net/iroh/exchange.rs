@@ -140,11 +140,11 @@ pub(super) async fn read_responses(
             Some(_) => budget.try_take(Pool::Results, bytes, OwnedClass::Results)?,
         };
         let message = read_frame_body(recv, len, tag, sync_io_timeout, frame_index).await?;
-        let ops = match &message {
-            SyncMessage::Data(data) => data.ops.len(),
-            _ => 0,
-        };
-        charge.shrink(ByteBudget::decoded_bound(len, ops));
+        let retained = crate::net::decoded_message_bound(&message)?;
+        if retained > charge.bytes() {
+            return Err(invalid_data("decoded message exceeded its reservation"));
+        }
+        charge.shrink(retained);
         match &mut held {
             Some(held) => held.merge(charge),
             None => held = Some(charge),
