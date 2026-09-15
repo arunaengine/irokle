@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::storage::TopicView;
+use crate::storage::RequestView;
 use crate::{ActorClock, ActorId, Error, OpId, PeerId, Result, TopicId};
 
 use super::plan::Frontier;
@@ -34,13 +34,13 @@ pub(super) struct Continuation {
 
 impl Continuation {
     pub(super) fn new(
-        (view, request): (&TopicView, &SyncRequest),
+        (view, request): (&RequestView, &SyncRequest),
         local: ActorClock,
         goal: ActorClock,
         frontier: Frontier,
     ) -> Self {
         Self {
-            genesis: view.state.genesis,
+            genesis: view.genesis,
             epoch: view.epoch,
             window: request.window.clone(),
             named: named(request),
@@ -55,9 +55,9 @@ impl Continuation {
     /// destructive epoch and window; every actor the plan's request named named
     /// again at the same position; and any actor named since starting where the
     /// plan takes the requester to be. Appends that grew the goal are later work.
-    fn resumes(&self, view: &TopicView, request: &SyncRequest) -> bool {
+    fn resumes(&self, view: &RequestView, request: &SyncRequest) -> bool {
         let named = named(request);
-        self.genesis == view.state.genesis
+        self.genesis == view.genesis
             && self.epoch == view.epoch
             && self.window == request.window
             && self
@@ -109,7 +109,7 @@ impl Continuations {
     pub(super) fn take(
         &mut self,
         key: (PeerId, TopicId),
-        view: &TopicView,
+        view: &RequestView,
         request: &SyncRequest,
     ) -> Option<Continuation> {
         let kept = self.entries.remove(&key)?;

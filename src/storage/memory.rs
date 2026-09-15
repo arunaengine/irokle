@@ -796,6 +796,34 @@ struct MemorySnapshot<'a> {
 }
 
 impl SnapshotRead for MemorySnapshot<'_> {
+    fn request_view(
+        &self,
+        topic_id: &TopicId,
+        peer_id: &PeerId,
+        actors: &BTreeSet<ActorId>,
+    ) -> Result<Option<super::RequestView>> {
+        let Some(state) = self.inner.topics.get(topic_id) else {
+            return Ok(None);
+        };
+        let clock = self
+            .inner
+            .actor_clock
+            .get(topic_id)
+            .map(|local| local.selected(actors))
+            .unwrap_or_default();
+        Ok(Some(super::RequestView {
+            genesis: state.genesis,
+            epoch: self
+                .inner
+                .topic_epochs
+                .get(topic_id)
+                .copied()
+                .unwrap_or_default(),
+            member: state.members.contains(peer_id),
+            clock,
+        }))
+    }
+
     fn topic_view(
         &self,
         topic_id: &TopicId,

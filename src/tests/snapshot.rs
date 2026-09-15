@@ -9,6 +9,119 @@ use super::support::*;
 use crate::oplog::Oplog;
 use crate::sync::{ActorRangeHint, PageBudget, SyncCredit, SyncEngine, SyncRequest, SyncSummary};
 
+fn assert_request_views<S: Storage>(storage: S) {
+    let source = super::progress::reverse_chain(storage, 40);
+    let actors = source
+        .log
+        .storage()
+        .actor_clock(&source.topic_id)
+        .unwrap()
+        .iter()
+        .take(3)
+        .map(|(actor, _)| *actor)
+        .chain([ActorId::from_bytes([0; 32])])
+        .collect();
+    source
+        .log
+        .storage()
+        .read_snapshot(|read| {
+            let full = read.topic_view(&source.topic_id, None)?.unwrap();
+            let projected = read
+                .request_view(&source.topic_id, &source.reader, &actors)?
+                .unwrap();
+            assert_eq!(projected.genesis, full.state.genesis);
+            assert_eq!(projected.epoch, full.epoch);
+            assert!(projected.member);
+            assert_eq!(
+                projected
+                    .clock
+                    .iter()
+                    .map(|(actor, seq)| (*actor, *seq))
+                    .collect::<Vec<_>>(),
+                full.clock
+                    .iter()
+                    .filter(|(actor, _)| actors.contains(actor))
+                    .map(|(actor, seq)| (*actor, *seq))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !read
+                    .request_view(&source.topic_id, &PeerId::from_bytes([0; 32]), &actors)?
+                    .unwrap()
+                    .member
+            );
+            assert!(
+                read.request_view(&TopicId::default(), &source.reader, &actors)?
+                    .is_none()
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn memory_request_views() {
+    assert_request_views(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_request_views() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_request_views(crate::FjallStorage::open(dir.path()).unwrap());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn request_snapshot_holds() {
+    let branch = branches(96);
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate::FjallStorage::open(dir.path()).unwrap();
+    Oplog::with_storage(storage.clone())
+        .receive_ops(vec![branch.old.0.clone(), branch.old.1.clone()])
+        .unwrap();
+    let (opened, ready) = std::sync::mpsc::channel();
+    let (changed, resume) = std::sync::mpsc::channel();
+    let reading = thread::spawn({
+        let storage = storage.clone();
+        let (topic, peer, actor) = (
+            branch.topic_id,
+            branch.member.peer_id(),
+            branch.old.1.signed.body.actor_id,
+        );
+        move || {
+            storage
+                .read_snapshot(|read| {
+                    let before = read.request_view(&topic, &peer, &[actor].into())?;
+                    opened.send(()).unwrap();
+                    resume
+                        .recv_timeout(std::time::Duration::from_secs(60))
+                        .unwrap();
+                    assert_eq!(read.request_view(&topic, &peer, &[actor].into())?, before);
+                    Ok(())
+                })
+                .unwrap()
+        }
+    });
+    ready
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap();
+    reset_to_new(&storage, &branch);
+    changed.send(()).unwrap();
+    reading.join().unwrap();
+    storage
+        .read_snapshot(|read| {
+            assert_eq!(
+                read.request_view(&branch.topic_id, &branch.member.peer_id(), &BTreeSet::new())?
+                    .unwrap()
+                    .genesis,
+                branch.new.0.id
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
 /// A summary of a reader that holds only the genesis of `topic_id`.
 fn genesis_summary<S: Storage>(storage: &S, topic_id: TopicId, owner: PeerId) -> SyncSummary {
     let genesis = genesis_of(storage, &topic_id).unwrap();

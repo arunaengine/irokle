@@ -505,6 +505,48 @@ impl ActorClock {
         self.root.as_deref().map_or(0, Node::len)
     }
 
+    pub(crate) fn selected(&self, actors: &std::collections::BTreeSet<ActorId>) -> Self {
+        let mut clock = Self::new();
+        for actor in actors {
+            if let Some(seq) = self.entry(actor) {
+                clock.put(*actor, Some(seq));
+            }
+        }
+        clock
+    }
+
+    #[cfg(feature = "fjall")]
+    pub(crate) fn decode_selected(
+        bytes: &[u8],
+        actors: &std::collections::BTreeSet<ActorId>,
+    ) -> crate::Result<Self> {
+        struct Selected<'a>(&'a std::collections::BTreeSet<ActorId>);
+        impl<'de> serde::de::Visitor<'de> for Selected<'_> {
+            type Value = ActorClock;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("actor positions")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut selected = BTreeMap::new();
+                while let Some((actor, seq)) = map.next_entry::<ActorId, u64>()? {
+                    if self.0.contains(&actor) {
+                        selected.insert(actor, seq);
+                    }
+                }
+                let mut clock = ActorClock::new();
+                for (actor, seq) in selected {
+                    clock.put(actor, Some(seq));
+                }
+                Ok(clock)
+            }
+        }
+        let mut decoder = postcard::Deserializer::from_bytes(bytes);
+        Ok(decoder.deserialize_map(Selected(actors))?)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&ActorId, &u64)> {
         let mut stack = Vec::new();
         stack.extend(self.root.as_deref());
@@ -897,6 +939,24 @@ impl<'de> Deserialize<'de> for ActorClock {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn selected_clock_matches() {
+        let mut clock = ActorClock::new();
+        for n in 0_u8..33 {
+            clock.observe(ActorId::from_bytes([n; 32]), u64::from(n));
+        }
+        let actors = [0, 4, 32, 99].map(|n| ActorId::from_bytes([n; 32])).into();
+        let bytes = postcard::to_allocvec(&clock).unwrap();
+        let selected = ActorClock::decode_selected(&bytes, &actors).unwrap();
+        assert_eq!(selected, clock.selected(&actors));
+        assert_eq!(selected.len(), 3, "zero positions remain encoded");
+        let mut damaged = bytes;
+        *damaged.last_mut().unwrap() = 0x80;
+        let first = [ActorId::from_bytes([0; 32])].into();
+        assert!(ActorClock::decode_selected(&damaged, &first).is_err());
+    }
+
     use super::*;
 
     /// The clock this type replaced, kept as the reference its behavior must match.

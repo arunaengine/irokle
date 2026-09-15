@@ -701,18 +701,6 @@ impl<S: Storage> SyncEngine<S> {
         summary: Option<&SyncSummary>,
     ) -> Result<PlannedPage> {
         let empty = PlannedPage::default();
-        let Some(view) = read.topic_view(&request.topic_id, None)? else {
-            return Ok(empty);
-        };
-        if !view.state.members.contains(&peer_id) {
-            return Ok(empty);
-        }
-        if request
-            .genesis
-            .is_some_and(|genesis| genesis != view.state.genesis)
-        {
-            return Err(Error::StaleIncarnation);
-        }
         let filter = request.window.behind.as_ref();
         if request
             .actor_range_hints
@@ -722,6 +710,30 @@ impl<S: Storage> SyncEngine<S> {
             || filter.is_some_and(|filter| filter.bits.len() > MAX_ACTOR_FILTER_BYTES)
         {
             return Err(Error::Storage("sync request exceeds work budget".into()));
+        }
+        let scope = ActorScope::new(&request.actor_range_hints, &request.window);
+        let view = if summary.is_some() {
+            read.request_view(&request.topic_id, &peer_id, &scope.named)?
+        } else {
+            read.topic_view(&request.topic_id, None)?
+                .map(|view| crate::storage::RequestView {
+                    genesis: view.state.genesis,
+                    epoch: view.epoch,
+                    member: view.state.members.contains(&peer_id),
+                    clock: view.clock,
+                })
+        };
+        let Some(view) = view else {
+            return Ok(empty);
+        };
+        if !view.member {
+            return Ok(empty);
+        }
+        if request
+            .genesis
+            .is_some_and(|genesis| genesis != view.genesis)
+        {
+            return Err(Error::StaleIncarnation);
         }
         let asks = !request.wants.is_empty() || !request.actor_range_hints.is_empty();
         // The requester's credit binds every caller, not only one transport.
@@ -758,21 +770,19 @@ impl<S: Storage> SyncEngine<S> {
             Some(summary) if summary.topic_id != request.topic_id => {
                 return Err(Error::TopicMismatch);
             }
-            Some(summary) if summary.genesis == Some(view.state.genesis) => {
-                Some(&summary.actor_clock)
-            }
+            Some(summary) if summary.genesis == Some(view.genesis) => Some(&summary.actor_clock),
             Some(summary) => Some(
                 summary
                     .staged
                     .as_ref()
                     .filter(|staged| {
-                        staged.topic_id == request.topic_id && staged.genesis == view.state.genesis
+                        staged.topic_id == request.topic_id && staged.genesis == view.genesis
                     })
                     .map_or(&absent, |staged| &staged.clock),
             ),
             None => None,
         };
-        let scope = ActorScope::new(&request.actor_range_hints, &request.window).with_held(held);
+        let scope = scope.with_held(held);
         let repair = Self::plan_repair(
             read,
             &request.topic_id,

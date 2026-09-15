@@ -423,6 +423,15 @@ pub struct SyncStatusUpdate {
     pub attempt: Option<(u64, u64)>,
 }
 
+/// Branch, authorization and selected positions from one snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestView {
+    pub genesis: OpId,
+    pub epoch: u64,
+    pub member: bool,
+    pub clock: ActorClock,
+}
+
 /// Reads of one coherent snapshot of a store. Every method sees the same commit,
 /// so a planner can authorize a peer, select positions and load records without
 /// mixing a state before and after a concurrent write.
@@ -430,6 +439,23 @@ pub trait SnapshotRead {
     /// See [`Storage::topic_view`].
     fn topic_view(&self, topic_id: &TopicId, peer_id: Option<&PeerId>)
     -> Result<Option<TopicView>>;
+    /// Branch, authorization and selected actor positions from this snapshot.
+    fn request_view(
+        &self,
+        topic_id: &TopicId,
+        peer_id: &PeerId,
+        actors: &BTreeSet<ActorId>,
+    ) -> Result<Option<RequestView>> {
+        Ok(self.topic_view(topic_id, None)?.map(|view| {
+            let clock = view.clock.selected(actors);
+            RequestView {
+                genesis: view.state.genesis,
+                epoch: view.epoch,
+                member: view.state.members.contains(peer_id),
+                clock,
+            }
+        }))
+    }
     fn get_op(&self, id: &OpId) -> Result<Option<Op>>;
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>>;
     /// The position of `id`, as [`Self::get_meta`] would give it. Backends

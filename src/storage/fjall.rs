@@ -2423,6 +2423,42 @@ impl FjallSnapshot<'_> {
 }
 
 impl SnapshotRead for FjallSnapshot<'_> {
+    fn request_view(
+        &self,
+        topic_id: &TopicId,
+        peer_id: &PeerId,
+        actors: &BTreeSet<ActorId>,
+    ) -> Result<Option<super::RequestView>> {
+        let state: Option<TopicState> = FjallStorage::tx_get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(b"ts", topic_id),
+        )?;
+        let Some(state) = state else {
+            return Ok(None);
+        };
+        let epoch = FjallStorage::tx_get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(TOPIC_EPOCH_PREFIX, topic_id),
+        )?
+        .unwrap_or_default();
+        let clock = fjall::Readable::get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(b"ac", topic_id),
+        )?
+        .map(|bytes| ActorClock::decode_selected(&bytes, actors))
+        .transpose()?
+        .unwrap_or_default();
+        Ok(Some(super::RequestView {
+            genesis: state.genesis,
+            epoch,
+            member: state.members.contains(peer_id),
+            clock,
+        }))
+    }
+
     fn topic_view(
         &self,
         topic_id: &TopicId,

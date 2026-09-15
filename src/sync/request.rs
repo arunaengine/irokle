@@ -120,7 +120,7 @@ pub(crate) fn need(needed: &mut BTreeMap<ActorId, u64>, actor_id: ActorId, gener
 /// its hint, an actor the window holds is held up to the responder's clock,
 /// and any other actor is unknown.
 pub(crate) struct ActorScope<'a> {
-    named: BTreeSet<ActorId>,
+    pub(super) named: BTreeSet<ActorId>,
     window: &'a ActorWindow,
     held: Option<&'a ActorClock>,
 }
@@ -149,7 +149,7 @@ impl<'a> ActorScope<'a> {
     }
 
     pub(crate) fn unknown(&self, actor_id: &ActorId) -> bool {
-        !self.named.contains(actor_id) && !self.window.holds(actor_id)
+        !self.named.contains(actor_id) && (self.held.is_some() || !self.window.holds(actor_id))
     }
 
     pub(crate) fn with_held(mut self, held: Option<&'a ActorClock>) -> Self {
