@@ -21,6 +21,37 @@ pub struct ActorClock {
     root: Option<Arc<Node>>,
 }
 
+/// An owned traversal of immutable nodes, resumable without retaining a read lock.
+#[derive(Default)]
+pub(crate) struct ClockCursor {
+    stack: Vec<Arc<Node>>,
+}
+
+impl ClockCursor {
+    pub(crate) fn bytes(&self) -> usize {
+        self.stack.capacity() * size_of::<Arc<Node>>()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
+}
+
+impl Iterator for ClockCursor {
+    type Item = (ActorId, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match &*self.stack.pop()? {
+                Node::Leaf { actor, seq, .. } => return Some((*actor, *seq)),
+                Node::Branch { children, .. } => {
+                    self.stack.extend(children.iter().rev().cloned());
+                }
+            }
+        }
+    }
+}
+
 enum Node {
     Leaf {
         actor: ActorId,
@@ -561,6 +592,12 @@ impl ActorClock {
             }
         })
     }
+
+    pub(crate) fn cursor(&self) -> ClockCursor {
+        ClockCursor {
+            stack: self.root.iter().cloned().collect(),
+        }
+    }
 }
 
 #[cfg(feature = "fjall")]
@@ -939,6 +976,34 @@ impl<'de> Deserialize<'de> for ActorClock {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cursor_keeps_snapshot() {
+        use super::*;
+        let mut clock = ActorClock::new();
+        for index in 0_u32..65_537 {
+            clock.observe(ActorId::hash(index.to_le_bytes()), u64::from(index));
+        }
+        let expected = clock
+            .iter()
+            .map(|(actor, seq)| (*actor, *seq))
+            .collect::<Vec<_>>();
+        let mut cursor = clock.cursor();
+        let mut actual = Vec::new();
+        for _ in 0..257 {
+            actual.push(cursor.next().unwrap());
+        }
+        clock.observe(ActorId::hash(b"later"), 9);
+        drop(clock);
+        while let Some(entry) = cursor.next() {
+            actual.push(entry);
+            // At most fifteen pending siblings at each of sixty-four levels.
+            assert!(cursor.bytes() <= 2048 * size_of::<Arc<Node>>());
+        }
+        assert_eq!(actual, expected);
+        assert!(cursor.is_empty());
+        assert_eq!(cursor.next(), None);
+    }
+
     #[cfg(feature = "fjall")]
     #[test]
     fn selected_clock_matches() {

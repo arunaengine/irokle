@@ -6,7 +6,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::storage::{OpPosition, SnapshotRead, Storage};
+use crate::clock::ClockCursor;
+use crate::storage::{SnapshotRead, Storage};
 use crate::{ActorClock, ActorId, Error, OpId, Result, TopicId};
 
 use super::request::need;
@@ -76,8 +77,7 @@ enum ActorState {
 /// send anything, to go on from for the same request.
 pub(super) struct Frontier {
     active: BinaryHeap<Reverse<RangeHead>>,
-    metas: BTreeMap<OpId, OpPosition>,
-    deferred: VecDeque<ActorId>,
+    deferred: ClockCursor,
     suspended: BTreeMap<ActorId, Vec<(u64, RangeHead)>>,
     resumable: VecDeque<RangeHead>,
     states: BTreeMap<ActorId, ActorState>,
@@ -97,20 +97,15 @@ impl Frontier {
     pub(super) fn bytes(&self) -> usize {
         const ID: usize = 64;
         let head = size_of::<RangeHead>() + ID;
-        let metas = self
-            .metas
-            .values()
-            .map(|meta| size_of::<OpPosition>() + ID + meta.deps.len() * ID)
-            .sum::<usize>();
         let suspended = self
             .suspended
             .values()
             .map(|waiting| ID + waiting.len() * (head + 8))
             .sum::<usize>();
         self.active.len() * head
-            + metas
             + suspended
-            + (self.deferred.len() + self.blocked.len() + self.missing.len()) * ID
+            + (self.blocked.len() + self.missing.len()) * ID
+            + self.deferred.bytes()
             + self.positions.len() * ID
             + self.resumable.len() * head
             + self.states.len() * (ID + size_of::<ActorState>())
@@ -148,9 +143,8 @@ struct Pager<'a> {
     visit_limit: usize,
     ended: bool,
     active: BinaryHeap<Reverse<RangeHead>>,
-    metas: BTreeMap<OpId, OpPosition>,
     /// Actors behind the goal not activated yet, in clock order.
-    deferred: VecDeque<ActorId>,
+    deferred: ClockCursor,
     /// Suspended heads by the actor they wait for, with the position needed.
     suspended: BTreeMap<ActorId, Vec<(u64, RangeHead)>>,
     /// Suspended heads whose position was sent, waiting for a free slot.
@@ -188,22 +182,19 @@ impl Pager<'_> {
     /// slice ended on its read budget before sending anything.
     fn plan(mut self, budget: PageBudget, fresh: bool) -> Result<PlannedSlice> {
         if fresh {
-            let behind = self
-                .local
-                .iter()
-                .filter(|(actor_id, _)| self.limit(actor_id) > self.covered.get(actor_id))
-                .map(|(actor_id, _)| *actor_id)
-                .collect::<VecDeque<_>>();
             // A zero allowance reads nothing; whether the goal holds more is
             // known from the clocks alone.
             if budget.ops == 0 || budget.bytes == 0 {
                 let page = PlannedPage {
-                    more: !behind.is_empty(),
+                    more: self
+                        .local
+                        .iter()
+                        .any(|(actor, _)| self.limit(actor) > self.covered.get(actor)),
                     ..PlannedPage::default()
                 };
                 return Ok((page, BTreeMap::new(), None));
             }
-            self.deferred = behind;
+            self.deferred = self.local.cursor();
         }
         let mut ops = Vec::new();
         let mut too_large = None;
@@ -220,8 +211,13 @@ impl Pager<'_> {
                 break;
             };
             let (_, actor_id, seq, id, limit) = head;
-            let meta = self.metas.remove(&id).ok_or(Error::MissingDependency(id))?;
-            match self.wait_for(&meta)? {
+            self.visit();
+            let Some(op) = self.read.get_op(&id)? else {
+                self.missing.insert(id);
+                self.block(actor_id, id);
+                continue;
+            };
+            match self.wait_for(&op.signed.body.deps)? {
                 Wait::Ready => {}
                 Wait::Blocked => {
                     self.block(actor_id, id);
@@ -232,12 +228,6 @@ impl Pager<'_> {
                     continue;
                 }
             }
-            self.visit();
-            let Some(op) = self.read.get_op(&id)? else {
-                self.missing.insert(id);
-                self.block(actor_id, id);
-                continue;
-            };
             let size = postcard::experimental::serialized_size(&op)?;
             if size > MAX_PAGE_BYTES {
                 return Err(Error::Storage("operation exceeds sync page budget".into()));
@@ -265,10 +255,7 @@ impl Pager<'_> {
             || !self.active.is_empty()
             || !self.resumable.is_empty()
             || self.suspended.values().any(|waiting| !waiting.is_empty())
-            || self
-                .deferred
-                .iter()
-                .any(|actor_id| !self.states.contains_key(actor_id));
+            || !self.deferred.is_empty();
         let (mut missing, positions) = (self.missing.clone(), self.positions.clone());
         while missing.len() > MAX_PAGE_MISSING {
             missing.pop_last();
@@ -277,7 +264,6 @@ impl Pager<'_> {
             self.work.ended.fetch_add(1, Ordering::Relaxed);
             Frontier {
                 active: self.active,
-                metas: self.metas,
                 deferred: self.deferred,
                 suspended: self.suspended,
                 resumable: self.resumable,
@@ -303,25 +289,18 @@ impl Pager<'_> {
     fn fill(&mut self) -> Result<()> {
         while self.active.len() < self.window && !self.exhausted() {
             if let Some(head) = self.resumable.pop_front() {
-                let (_, actor_id, _, id, _) = head;
-                self.visit();
-                let Some(meta) = self.read.get_position(&id)? else {
-                    self.missing.insert(id);
-                    self.block(actor_id, id);
-                    continue;
-                };
-                self.metas.insert(id, meta);
+                let (_, actor_id, _, _, _) = head;
                 self.active.push(Reverse(head));
                 self.states.insert(actor_id, ActorState::Active);
                 continue;
             }
-            let Some(actor_id) = self.deferred.pop_front() else {
+            let Some((actor_id, _)) = self.deferred.next() else {
                 return Ok(());
             };
-            if self.states.contains_key(&actor_id) {
+            let limit = self.limit(&actor_id);
+            if self.states.contains_key(&actor_id) || limit <= self.covered.get(&actor_id) {
                 continue;
             }
-            let limit = self.limit(&actor_id);
             self.activate(actor_id, self.covered.get(&actor_id), limit)?;
         }
         Ok(())
@@ -342,7 +321,7 @@ impl Pager<'_> {
             return Ok(());
         };
         self.visit();
-        let meta = self.read.get_position(&id)?;
+        let meta = self.read.get_header(&id)?;
         if seq != after + 1 || meta.is_none() {
             match meta.filter(|_| seq != after + 1) {
                 Some(meta) => self.missing.extend(meta.actor_prev),
@@ -356,7 +335,6 @@ impl Pager<'_> {
         if let Some(meta) = meta {
             self.active
                 .push(Reverse((meta.generation, actor_id, seq, id, limit)));
-            self.metas.insert(id, meta);
             self.states.insert(actor_id, ActorState::Active);
         }
         Ok(())
@@ -365,10 +343,10 @@ impl Pager<'_> {
     /// What `meta` still waits for: an unsent or blocked dependency, a missing
     /// record, positions of actors the request did not describe, all named at
     /// once, or a position of another actor the peer does not hold yet.
-    fn wait_for(&mut self, meta: &OpPosition) -> Result<Wait> {
+    fn wait_for(&mut self, deps: &BTreeSet<OpId>) -> Result<Wait> {
         let mut unknown = false;
         let mut waits = None;
-        for dep in &meta.deps {
+        for dep in deps {
             self.work.edges.fetch_add(1, Ordering::Relaxed);
             if self.blocked.contains(dep) {
                 return Ok(Wait::Blocked);
@@ -376,17 +354,11 @@ impl Pager<'_> {
             if self.sent.contains(dep) {
                 continue;
             }
-            let position = match self.metas.get(dep) {
-                Some(dep_meta) => {
-                    Some((dep_meta.actor_id, dep_meta.actor_seq, dep_meta.generation))
-                }
-                None => {
-                    self.visit();
-                    self.read.get_header(dep)?.map(|dep_meta| {
-                        (dep_meta.actor_id, dep_meta.actor_seq, dep_meta.generation)
-                    })
-                }
-            };
+            self.visit();
+            let position = self
+                .read
+                .get_header(dep)?
+                .map(|meta| (meta.actor_id, meta.actor_seq, meta.generation));
             let Some((dep_actor, dep_seq, dep_generation)) = position else {
                 self.missing.insert(*dep);
                 return Ok(Wait::Blocked);
@@ -575,8 +547,7 @@ impl<S: Storage> SyncEngine<S> {
             visit_limit: self.page_visits,
             ended: false,
             active: BinaryHeap::new(),
-            metas: BTreeMap::new(),
-            deferred: VecDeque::new(),
+            deferred: ClockCursor::default(),
             suspended: BTreeMap::new(),
             resumable: VecDeque::new(),
             states: BTreeMap::new(),
@@ -614,7 +585,6 @@ impl<S: Storage> SyncEngine<S> {
             visit_limit: self.page_visits,
             ended: false,
             active: frontier.active,
-            metas: frontier.metas,
             deferred: frontier.deferred,
             suspended: frontier.suspended,
             resumable: frontier.resumable,
