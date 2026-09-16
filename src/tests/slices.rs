@@ -280,7 +280,10 @@ mod sessions {
         use std::time::Duration;
 
         let storage = MemoryStorage::new();
-        let source = reverse_chain(storage.clone(), 40);
+        let sources = [
+            reverse_chain(storage.clone(), 40),
+            reverse_chain(storage.clone(), 41),
+        ];
         let bind = |seed| {
             iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
                 .secret_key(iroh::SecretKey::from_bytes(&seed))
@@ -305,10 +308,11 @@ mod sessions {
         server.start_accept_loop().unwrap();
         let address = super::super::iroh::ready_addr(server.endpoint()).await;
         let held = server.hold_planners().await;
-        let summary = alice.sync_summary(source.topic_id).unwrap();
         let mut clients = Vec::new();
         let mut pulls = Vec::new();
         for n in 0..32 {
+            let source = &sources[n % sources.len()];
+            let summary = alice.sync_summary(source.topic_id).unwrap();
             let mut seed = [11; 32];
             seed[..8].copy_from_slice(&(n as u64).to_le_bytes());
             let endpoint = bind(seed).await.unwrap();
@@ -332,7 +336,7 @@ mod sessions {
                         .await
                 }
             }));
-            clients.push(client);
+            clients.push((client, source.topic_id));
             tokio::time::timeout(Duration::from_secs(60), async {
                 while server.plan_counts() != ((n + 1).min(16), n + 1) {
                     tokio::task::yield_now().await;
@@ -343,10 +347,11 @@ mod sessions {
             assert_eq!(server.plan_counts(), ((n + 1).min(16), n + 1));
         }
         let probe = clients[0]
+            .0
             .sync_with(
                 address.clone(),
                 &[SyncMessage::Open(
-                    clients[0].node().sync_open(source.topic_id),
+                    clients[0].0.node().sync_open(clients[0].1),
                 )],
             )
             .await
@@ -357,7 +362,7 @@ mod sessions {
         );
         drop(held);
         let mut completions = tokio::task::JoinSet::new();
-        for (client, pull) in clients.iter().zip(pulls) {
+        for ((client, topic), pull) in clients.iter().zip(pulls) {
             let replies = tokio::time::timeout(Duration::from_secs(300), pull)
                 .await
                 .unwrap()
@@ -376,35 +381,23 @@ mod sessions {
                     _ => {}
                 }
             }
-            assert!(
-                client
-                    .node()
-                    .storage()
-                    .list_op_ids(&source.topic_id)
-                    .unwrap()
-                    .len()
-                    > 1
-            );
+            assert!(client.node().storage().list_op_ids(topic).unwrap().len() > 1);
             let (client, address) = (Arc::clone(client), address.clone());
-            let topic = source.topic_id;
+            let topic = *topic;
             completions.spawn(async move { client.sync_now(address, topic).await });
         }
         while let Some(result) = completions.join_next().await {
             result.unwrap().unwrap();
         }
-        for client in &clients {
+        for (client, topic) in &clients {
             assert_eq!(
-                client
-                    .node()
-                    .storage()
-                    .list_op_ids(&source.topic_id)
-                    .unwrap(),
-                source.log.storage().list_op_ids(&source.topic_id).unwrap()
+                client.node().storage().list_op_ids(topic).unwrap(),
+                alice.storage().list_op_ids(topic).unwrap()
             );
         }
         assert!(alice.sync_engine().page_work().resumed >= 32);
         assert_eq!(server.plan_counts(), (0, 0));
-        for client in clients {
+        for (client, _) in clients {
             client.shutdown().await;
         }
         server.shutdown().await;

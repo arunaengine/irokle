@@ -410,6 +410,128 @@ async fn memory_boundaries() {
     }
 }
 
+async fn append_case<S: Storage>(source: S, receiver: S, boundary: &'static str) {
+    let (mut history, _) = branches(false);
+    let topic = history[0].signed.body.topic_id;
+    let alice = side(source, [230; 32]).await;
+    let bob = side(receiver, [231; 32]).await;
+    install(&alice, &history);
+    install(&bob, &history[..1]);
+    let captured = alice.node.storage().actor_clock(&topic).unwrap();
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    let gated = if matches!(boundary, "continuation" | "plan") {
+        alice.node.storage()
+    } else {
+        bob.node.storage()
+    };
+    gated.arm_read_after(GatePoint::Sync(topic, boundary), 2, Arc::clone(&gate));
+    let pending = tokio::spawn({
+        let net = Arc::clone(&bob.net);
+        let address = alice.address.clone();
+        async move {
+            for attempt in 0..64 {
+                match net.sync_now(address.clone(), topic).await {
+                    Err(error)
+                        if attempt < 63 && error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    result => return result,
+                }
+            }
+            unreachable!()
+        }
+    });
+    wait_for(|| gate.arrived() || pending.is_finished()).await;
+    assert!(gate.arrived() && !pending.is_finished());
+    let resumed = alice.node.sync_engine().page_work().resumed;
+    let appended = oplog::Oplog::with_storage(alice.node.storage().clone())
+        .create_event_op(
+            topic,
+            actor_id_for(topic, alice.node.peer_id()),
+            EventEnvelope::encode_event(&Note {
+                text: "same branch append".into(),
+            })
+            .unwrap(),
+            alice.node.signer(),
+        )
+        .unwrap();
+    history.push(appended.clone());
+    alice
+        .node
+        .put_sync_obligation(bob.node.peer_id(), topic, [appended.id].into())
+        .unwrap();
+    assert_eq!(
+        alice
+            .node
+            .storage()
+            .topic_view(&topic, None)
+            .unwrap()
+            .unwrap()
+            .epoch,
+        0
+    );
+    drop(release);
+    pending.await.unwrap().unwrap();
+    assert!(
+        bob.node
+            .storage()
+            .actor_clock(&topic)
+            .unwrap()
+            .dominates(&captured)
+    );
+    assert!(alice.node.sync_engine().page_work().resumed > resumed);
+    if bob.node.storage().get_op(&appended.id).unwrap().is_none() {
+        assert!(
+            alice
+                .node
+                .storage()
+                .has_sync_obligations(&bob.node.peer_id(), &topic)
+                .unwrap()
+        );
+    }
+    for attempt in 0..64 {
+        match bob.net.sync_now(alice.address.clone(), topic).await {
+            Ok(()) => break,
+            Err(error) => assert!(
+                attempt < 63 && error.kind() == std::io::ErrorKind::WouldBlock,
+                "{error}"
+            ),
+        }
+    }
+    exact(&alice, &history);
+    exact(&bob, &history);
+    assert!(
+        !alice
+            .node
+            .storage()
+            .has_sync_obligations(&bob.node.peer_id(), &topic)
+            .unwrap()
+    );
+    drain(&bob).await;
+    drain(&alice).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_append_boundaries() {
+    for boundary in ["request", "continuation", "plan", "page"] {
+        append_case(MemoryStorage::new(), MemoryStorage::new(), boundary).await;
+    }
+}
+
+#[cfg(feature = "fjall")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fjall_append_boundaries() {
+    for boundary in ["request", "continuation", "plan", "page"] {
+        let source = tempfile::tempdir().unwrap();
+        let receiver = tempfile::tempdir().unwrap();
+        append_case(
+            crate::storage::FjallStorage::open(source.path()).unwrap(),
+            crate::storage::FjallStorage::open(receiver.path()).unwrap(),
+            boundary,
+        )
+        .await;
+    }
+}
+
 #[cfg(feature = "fjall")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fjall_boundaries() {
