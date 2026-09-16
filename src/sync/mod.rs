@@ -55,8 +55,7 @@ const MAX_REQUEST_ITEMS: usize = 65_536;
 /// request sends none and those actors stay unknown.
 pub const MAX_ACTOR_FILTER_BYTES: usize = 1024 * 1024;
 pub(crate) use self::{
-    MAX_ACTOR_FILTER_BYTES as MAX_FILTER_BYTES,
-    MAX_ACTOR_RANGE_HINT_SPAN as MAX_RANGE_SPAN,
+    MAX_ACTOR_FILTER_BYTES as MAX_FILTER_BYTES, MAX_ACTOR_RANGE_HINT_SPAN as MAX_RANGE_SPAN,
 };
 const MAX_PAGE_OPS: usize = 4096;
 pub(crate) const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
