@@ -224,18 +224,18 @@ impl FjallStorage {
             let mut chunk = CHUNK;
             let owned = loop {
                 self.hook(Hook::DeleteChunk)?;
+                let read = self.db.read_tx();
+                self.hook(Hook::ClearingRead)?;
                 let removed = self.transaction(|tx| {
                     if !clears(tx)? {
                         return Ok(None);
                     }
-                    let mut keys = Vec::new();
-                    for item in fjall::Readable::iter(tx, &store).take(chunk) {
-                        keys.push(item.key()?.to_vec());
+                    let mut removed = 0;
+                    for item in fjall::Readable::iter(&read, &store).take(chunk) {
+                        tx.remove(&store, item.key()?)?;
+                        removed += 1;
                     }
-                    for key in &keys {
-                        tx.remove(&store, key.clone())?;
-                    }
-                    Ok(Some(keys.len()))
+                    Ok(Some(removed))
                 });
                 let removed = match removed {
                     Err(Error::StorageBuffer { .. }) if chunk > 1 => {
@@ -574,6 +574,7 @@ impl FjallStorage {
             self.hook(Hook::CopyChunk)?;
             // The claim freezes this namespace; validation needs no write-conflict reads.
             let read = self.db.read_tx();
+            self.hook(Hook::CopyRead)?;
             let copied = self.transaction_bulk(|tx| {
                 tx.activation();
                 Self::tx_claimed(tx, &self.records, &topic_id, provisional.session)?;
@@ -583,7 +584,7 @@ impl FjallStorage {
                     .clone()
                     .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
                 for item in fjall::Readable::range::<Vec<u8>, _>(
-                    tx,
+                    &read,
                     store,
                     (start, std::ops::Bound::Unbounded),
                 )

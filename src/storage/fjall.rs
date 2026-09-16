@@ -51,10 +51,14 @@ pub(crate) enum Hook {
     Claimed,
     /// Before each bounded copy of an activation.
     CopyChunk,
+    /// After taking the frozen namespace's copy snapshot.
+    CopyRead,
     /// Before the transaction that publishes an activation.
     Publish,
     /// Before each bounded delete of a clearing slot.
     DeleteChunk,
+    /// After taking a clearing slot's bounded scan snapshot.
+    ClearingRead,
     /// Before a cleared slot is released.
     ReleaseSlot,
     /// Before a namespace view's write commits.

@@ -881,6 +881,15 @@ pub(super) mod fjall {
     /// pass's delete does nothing to the new session.
     #[test]
     fn fjall_stale_clearing() {
+        stale_clearing(Hook::DeleteChunk);
+    }
+
+    #[test]
+    fn snapshot_stale_clearing() {
+        stale_clearing(Hook::ClearingRead);
+    }
+
+    fn stale_clearing(boundary: Hook) {
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path()).unwrap();
         let (first_source, first_topic, first_ops) = history(151, 30, 64);
@@ -888,7 +897,7 @@ pub(super) mod fjall {
         let (first, _) = staged(&storage, first_source.peer_id(), first_topic, &first_ops);
         let gate = Arc::new(Gate::default());
         let release = gate.releaser();
-        pause_at(&storage, Hook::DeleteChunk, 0, &gate);
+        pause_at(&storage, boundary, 0, &gate);
         let late = thread::spawn({
             let storage = storage.clone();
             move || storage.discard_provisional(&first)
@@ -996,6 +1005,15 @@ pub(super) mod fjall {
     /// nothing when it resumes.
     #[test]
     fn fjall_late_copy() {
+        late_copy(Hook::CopyChunk);
+    }
+
+    #[test]
+    fn snapshot_late_copy() {
+        late_copy(Hook::CopyRead);
+    }
+
+    fn late_copy(boundary: Hook) {
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path()).unwrap();
         let other = storage.clone();
@@ -1008,7 +1026,7 @@ pub(super) mod fjall {
         storage.set_hook({
             let gate = Arc::clone(&gate);
             move |at| match at {
-                Hook::CopyChunk if copies.fetch_add(1, Ordering::SeqCst) == 0 => {
+                at if at == boundary && copies.fetch_add(1, Ordering::SeqCst) == 0 => {
                     gate.pass();
                     Ok(())
                 }
