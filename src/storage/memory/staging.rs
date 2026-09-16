@@ -280,6 +280,7 @@ impl MemoryStorage {
         let _copy = inner
             .budget
             .reserve(super::MemoryDomain::Activation, copy_bytes)?;
+        let _effects = super::metadata::merge_workspace(&inner, effects.sync_obligations.iter())?;
         let mut changes = BTreeMap::new();
         for obligation in effects.sync_obligations {
             let ack = inner.peer_acks.get(&(obligation.peer_id, topic_id));

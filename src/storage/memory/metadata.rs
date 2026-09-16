@@ -3,6 +3,29 @@
 use super::budget::NodePlan;
 use super::*;
 
+pub(super) fn obligation_bytes(obligation: &SyncObligation) -> u64 {
+    4096 + match &obligation.target {
+        ObligationTarget::Clock(clock) => ActorClock::allocation_bound(clock.len()) as u64,
+        ObligationTarget::Repair(ids) => ids.len() as u64 * 256,
+    }
+}
+
+pub(super) fn merge_workspace<'a>(
+    inner: &MemoryInner,
+    obligations: impl Iterator<Item = &'a SyncObligation>,
+) -> Result<Charge> {
+    let bytes = obligations.fold(0_u64, |bytes, incoming| {
+        let old = inner
+            .obligations
+            .get(&(incoming.topic_id, incoming.peer_id))
+            .and_then(|records| records.get(&ObligationKind::of(incoming)));
+        bytes
+            .saturating_add(obligation_bytes(incoming))
+            .saturating_add(old.map_or(0, obligation_bytes))
+    });
+    inner.budget.reserve(MemoryDomain::Workspace, bytes)
+}
+
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum MetadataKey {
     Topic(TopicId),

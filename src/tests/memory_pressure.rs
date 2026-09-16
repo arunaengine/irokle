@@ -156,3 +156,36 @@ fn refusal_allows_discard() {
         .unwrap();
     stage(&storage, &fresh, &ops[..2]).unwrap();
 }
+
+#[test]
+fn merge_reserves_first() {
+    let (source, topic, ops) = history(172, 2, 32);
+    let store = source.storage();
+    let before = store.all_sync_obligations().unwrap();
+    cap(
+        store,
+        MemoryLimits {
+            workspace_bytes: 0,
+            ..Default::default()
+        },
+    );
+    let obligation = SyncObligation::clock(
+        super::ownership::reader(),
+        topic,
+        store.actor_clock(&topic).unwrap(),
+    );
+    assert!(matches!(
+        store.put_sync_obligation(obligation, Some(ops[0].id)),
+        Err(Error::MemoryPressure {
+            domain: MemoryDomain::Workspace,
+            ..
+        })
+    ));
+    assert_eq!(store.all_sync_obligations().unwrap(), before);
+    assert_eq!(
+        store.memory_usage().unwrap().reserved[&MemoryDomain::Workspace],
+        0
+    );
+    assert_eq!(store.reset_topic(&topic).unwrap(), ops.len());
+    assert!(store.list_op_ids(&topic).unwrap().is_empty());
+}

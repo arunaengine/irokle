@@ -597,6 +597,7 @@ impl Storage for MemoryStorage {
     ) -> Result<()> {
         let mut inner = self.lock()?;
         branch_matches(inner.topics.get(&obligation.topic_id), expected_genesis)?;
+        let _workspace = metadata::merge_workspace(&inner, std::iter::once(&obligation))?;
         let merged = merged_obligation_locked(&inner, &obligation)?;
         let mut reservation = MetadataPlan::new(&inner)?;
         reservation.obligation(&inner, &merged)?;
@@ -689,6 +690,19 @@ impl Storage for MemoryStorage {
     ) -> Result<SyncPeerStatus> {
         let mut inner = self.lock()?;
         let key = (*topic_id, *peer_id);
+        let _workspace = inner.budget.reserve(
+            MemoryDomain::Workspace,
+            4096 + inner
+                .sync_statuses
+                .get(&key)
+                .and_then(|s| s.last_error.as_ref())
+                .map_or(0, String::len) as u64
+                + update
+                    .last_error
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    .map_or(0, String::len) as u64,
+        )?;
         let mut status = inner
             .sync_statuses
             .get(&key)
@@ -1092,6 +1106,7 @@ fn admit_batch_locked(
         .as_ref()
         .or(batch.expected_topic_state.as_ref())
         .map(|state| state.genesis);
+    let _effects = metadata::merge_workspace(inner, batch.effects.sync_obligations.iter())?;
     let mut effects = BTreeMap::new();
     for obligation in &batch.effects.sync_obligations {
         let ack = inner.peer_acks.get(&(obligation.peer_id, batch.topic_id));
@@ -1304,9 +1319,11 @@ fn admit_batch_locked(
 }
 
 fn reset_topic_locked(inner: &mut MemoryInner, topic_id: &TopicId) -> Result<usize> {
-    let mut reservation = MetadataPlan::new(inner)?;
-    reservation.reserve(inner, MetadataKey::Topic(*topic_id), 4096)?;
-    reservation.commit(inner);
+    let key = MetadataKey::Topic(*topic_id);
+    if !inner.metadata.contains_key(&key) {
+        let charge = inner.budget.reserve(MemoryDomain::Metadata, 4096)?;
+        inner.metadata.insert(key, Arc::new(charge));
+    }
     *inner.topic_epochs.entry(*topic_id).or_default() += 1;
     let op_ids = inner.topic_ops.remove(topic_id).unwrap_or_default();
     let removed = op_ids.len();
@@ -1380,9 +1397,19 @@ fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> Result<usize>
     let commit = ack_commit(inner.topics.get(&ack.topic_id), &ack)?;
     let key = (ack.peer_id, ack.topic_id);
     let entries = ack.clock.len() + inner.peer_acks.get(&key).map_or(0, |old| old.clock.len());
+    let outstanding = inner
+        .obligations
+        .get(&(ack.topic_id, ack.peer_id))
+        .map_or(0, |records| {
+            records
+                .values()
+                .map(metadata::obligation_bytes)
+                .sum::<u64>()
+        });
     let _workspace = inner.budget.reserve(
         MemoryDomain::Workspace,
-        (2 * ActorClock::allocation_bound(entries) + ack.heads.len() * 256 + 4096) as u64,
+        (2 * ActorClock::allocation_bound(entries) + ack.heads.len() * 256 + 4096) as u64
+            + outstanding,
     )?;
     let effective_ack = match inner.peer_acks.get(&key) {
         Some(existing) if stored_ack_dominates(existing, &ack) => existing.clone(),
