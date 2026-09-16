@@ -177,21 +177,6 @@ pub struct SyncStatusUpdate {
     pub attempt: Option<(u64, u64)>,
 }
 
-/// Branch, authorization and selected positions from one snapshot.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RequestView {
-    pub genesis: OpId,
-    pub epoch: u64,
-    pub member: bool,
-    pub clock: ActorClock,
-}
-
-/// Resume dependency reads within the same operation and branch snapshot.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DependencyCursor {
-    pub offset: usize,
-    pub after: Option<OpId>,
-}
 
 /// Reads of one coherent snapshot of a store. Every method sees the same commit,
 /// so a planner can authorize a peer, select positions and load records without
@@ -579,9 +564,14 @@ pub(super) use staging::{StagingQuota, check_namespaces};
 
 mod record;
 pub use record::{
-    AdmissionEffects, AdmittedBatch, ControlKey, CounterSnapshot, OpHeader, OpMeta, OpPosition,
-    StorageCounters, TopicState, TopicView,
+    AdmissionEffects, AdmittedBatch, ControlKey, CounterSnapshot, DependencyCursor, OpHeader,
+    OpMeta, OpPosition, RequestView, StorageCounters, TopicState, TopicView,
 };
+pub(super) use record::{
+    PendingRecord, PendingUsage, check_pending_quota, ensure_deps_resolvable, validate_batch,
+    validate_heads,
+};
+pub(crate) use record::pending_op_bytes;
 
 mod memory;
 pub use memory::{MemoryDomain, MemoryLimits, MemoryStorage, MemoryUsage};
@@ -599,136 +589,6 @@ pub(crate) use fjall::write_legacy_metas;
 #[cfg(feature = "fjall")]
 pub use pressure::{StorageDomain, StoragePressure, StorageUsage};
 
-pub(super) fn validate_batch(batch: &AdmittedBatch) -> Result<()> {
-    for state in [&batch.expected_topic_state, &batch.topic_state]
-        .into_iter()
-        .flatten()
-    {
-        if state.topic_id != batch.topic_id {
-            return Err(crate::Error::TopicMismatch);
-        }
-    }
-    if batch
-        .topic_state
-        .as_ref()
-        .is_some_and(|state| state.heads != batch.heads)
-    {
-        return Err(crate::Error::Storage(
-            "topic state frontier mismatch".into(),
-        ));
-    }
-    for (op, meta) in &batch.entries {
-        let body = &op.signed.body;
-        if body.topic_id != batch.topic_id || meta.topic_id != batch.topic_id {
-            return Err(crate::Error::TopicMismatch);
-        }
-        if meta.id != op.id
-            || meta.author != body.author
-            || meta.actor_id != body.actor_id
-            || meta.actor_seq != body.actor_seq
-            || meta.actor_prev != body.actor_prev
-            || meta.deps != body.deps
-            || meta.generation != body.generation
-            || !meta.ready
-            || !meta.missing_deps.is_empty()
-        {
-            return Err(crate::Error::Storage("operation metadata mismatch".into()));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn validate_heads(
-    batch: &AdmittedBatch,
-    mut accounted: impl FnMut(&OpMeta) -> Result<bool>,
-) -> Result<()> {
-    let mut heads = batch.expected_heads.clone();
-    let mut consumed = BTreeSet::new();
-    for (op, meta) in &batch.entries {
-        // Repairs and duplicates retain their existing position in the frontier.
-        if !accounted(meta)? {
-            heads.insert(op.id);
-            consumed.extend(op.signed.body.deps.iter().copied());
-        }
-    }
-    heads.retain(|id| !consumed.contains(id));
-    if heads != batch.heads {
-        return Err(crate::Error::Storage("admitted frontier mismatch".into()));
-    }
-    Ok(())
-}
-
-/// Serialized size charged against the pending byte budgets, counted without
-/// allocating the encoding. Backends store the charge and refund that value.
-pub(crate) fn pending_op_bytes(op: &Op) -> Result<usize> {
-    Ok(postcard::experimental::serialized_size(op)?)
-}
-
-/// Pending ops and serialized bytes one scope holds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct PendingUsage {
-    pub(super) ops: u64,
-    pub(super) bytes: u64,
-}
-
-impl PendingUsage {
-    pub(super) fn charged(self, bytes: u64) -> Self {
-        Self {
-            ops: self.ops + 1,
-            bytes: self.bytes + bytes,
-        }
-    }
-
-    /// Usage after refunding one op of `bytes`. Underflow means the counters
-    /// no longer describe the records, which is corruption, not a clean pool.
-    pub(super) fn refunded(self, bytes: u64) -> Result<Self> {
-        match (self.ops.checked_sub(1), self.bytes.checked_sub(bytes)) {
-            (Some(ops), Some(bytes)) => Ok(Self { ops, bytes }),
-            _ => Err(crate::Error::Storage(
-                "pending accounting does not match the buffered records".into(),
-            )),
-        }
-    }
-}
-
-/// A buffered op's description, stored apart from its payload.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct PendingRecord {
-    pub(super) source: PeerId,
-    pub(super) topic_id: TopicId,
-    pub(super) missing: BTreeSet<OpId>,
-    pub(super) charge: u64,
-}
-
-/// Refuse a new pending op of `charge` bytes that would push the total, its
-/// source or its topic past their limits.
-pub(super) fn check_pending_quota(
-    total: PendingUsage,
-    source: PendingUsage,
-    topic: PendingUsage,
-    charge: u64,
-) -> Result<()> {
-    let refuse = |message: &str| Err(crate::Error::Storage(message.into()));
-    if total.ops >= MAX_PENDING_OPS_TOTAL as u64 {
-        return refuse("pending op buffer is full");
-    }
-    if total.bytes + charge > MAX_PENDING_BYTES_TOTAL as u64 {
-        return refuse("pending byte budget is full");
-    }
-    if source.ops >= MAX_PENDING_OPS_PER_SOURCE as u64 {
-        return refuse("pending op source quota exceeded");
-    }
-    if source.bytes + charge > MAX_PENDING_BYTES_PER_SOURCE as u64 {
-        return refuse("pending byte quota exceeded for source");
-    }
-    if topic.ops >= MAX_PENDING_OPS_PER_TOPIC as u64 {
-        return refuse("pending op topic quota exceeded");
-    }
-    if topic.bytes + charge > MAX_PENDING_BYTES_PER_TOPIC as u64 {
-        return refuse("pending byte quota exceeded for topic");
-    }
-    Ok(())
-}
 
 
 
@@ -938,26 +798,6 @@ pub(super) fn new_peer_status(peer_id: PeerId, topic_id: TopicId) -> SyncPeerSta
     }
 }
 
-/// Reject a batch whose entry depends on an op that is not stored completely,
-/// checked against the same transaction that will write it. `stored_dep` must
-/// apply the [`Storage::dep_resolvable`] predicate inside that transaction.
-/// Enforcing this at the durability boundary is what keeps every admission path
-/// (batch admission, admission retry, genesis reset) from committing a dangling
-/// DAG edge.
-pub(super) fn ensure_deps_resolvable(
-    entries: &[(Op, OpMeta)],
-    mut stored_dep: impl FnMut(&OpId) -> Result<bool>,
-) -> Result<()> {
-    let batch = entries.iter().map(|(op, _)| op.id).collect::<BTreeSet<_>>();
-    for (_, meta) in entries {
-        for dep in &meta.deps {
-            if !batch.contains(dep) && !stored_dep(dep)? {
-                return Err(crate::Error::MissingDependency(*dep));
-            }
-        }
-    }
-    Ok(())
-}
 
 /// The eviction a reset must journal, with the key it takes. An eviction with
 /// no payloads leaves nothing to recover, so it takes no record and no
