@@ -163,6 +163,11 @@ fn memory_chain_bytes() {
 #[test]
 #[ignore = "measures stored bytes of large chains, run explicitly"]
 fn fjall_chain_bytes() {
+    let persist_mode = match std::env::var("IROKLE_BENCH_PERSIST").as_deref() {
+        Ok("buffer") => fjall::PersistMode::Buffer,
+        Ok("sync_all") | Err(std::env::VarError::NotPresent) => fjall::PersistMode::SyncAll,
+        _ => panic!("invalid measurement persist mode"),
+    };
     fn directory_bytes(path: &std::path::Path) -> u64 {
         std::fs::read_dir(path)
             .unwrap()
@@ -181,7 +186,10 @@ fn fjall_chain_bytes() {
         let (topic_id, ops) = reverse_chain(actors);
         let dir = tempfile::tempdir().unwrap();
         let started = std::time::Instant::now();
-        let log = admit(irokle::FjallStorage::open(dir.path()).unwrap(), &ops);
+        let log = admit(
+            irokle::FjallStorage::open_with_persist_mode(dir.path(), persist_mode).unwrap(),
+            &ops,
+        );
         let admit_ms = started.elapsed().as_millis();
         let entries = clock_entries(&log, &topic_id);
         drop(log);
@@ -206,7 +214,7 @@ fn fjall_chain_bytes() {
         let node_bytes = value_bytes(b"cn", 66);
         println!(
             "fjall actors={actors} directory_bytes={stored} meta_value_bytes={meta_bytes} \
-             clock_node_value_bytes={node_bytes} clock_entries={entries} admit_ms={admit_ms}"
+             clock_node_value_bytes={node_bytes} clock_entries={entries} admit_ms={admit_ms} durability={persist_mode:?}"
         );
     }
 }

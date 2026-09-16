@@ -16,6 +16,14 @@ use crate::{EvictionKey, SyncPeerStatus, TopicEviction, TopicInfo};
 
 const REPS: usize = 3;
 
+pub(super) fn persist_mode() -> fjall::PersistMode {
+    match std::env::var("IROKLE_BENCH_PERSIST").as_deref() {
+        Ok("buffer") => fjall::PersistMode::Buffer,
+        Ok("sync_all") | Err(std::env::VarError::NotPresent) => fjall::PersistMode::SyncAll,
+        _ => panic!("invalid measurement persist mode"),
+    }
+}
+
 /// Explicit facade walks, alongside the backend's native read counters.
 #[derive(Default)]
 struct Reads {
@@ -285,6 +293,11 @@ fn read_delta(before: [u64; 4], after: [u64; 4]) -> Vec<(&'static str, u64)> {
 }
 
 fn report(name: &str, params: &str, samples: Vec<Sample>) {
+    let params = if params.contains("backend=fjall") {
+        format!("{params} durability={:?}", persist_mode())
+    } else {
+        params.to_owned()
+    };
     for (rep, sample) in samples.iter().enumerate() {
         eprintln!(
             "bench_sample name={name} {params} rep={rep} ms={:.6}",
@@ -321,7 +334,9 @@ where
     let samples = (0..REPS)
         .map(|_| {
             let dir = tempfile::tempdir().unwrap();
-            fjall(Counting::new(FjallStorage::open(dir.path()).unwrap()))
+            fjall(Counting::new(
+                FjallStorage::open_with_persist_mode(dir.path(), persist_mode()).unwrap(),
+            ))
         })
         .collect();
     report(name, &format!("backend=fjall {params}"), samples);
@@ -661,7 +676,9 @@ fn steady_catch_up() {
     let samples = steady_page(Counting::new(MemoryStorage::new()));
     report("steady_page", &format!("backend=memory {params}"), samples);
     let dir = tempfile::tempdir().unwrap();
-    let samples = steady_page(Counting::new(FjallStorage::open(dir.path()).unwrap()));
+    let samples = steady_page(Counting::new(
+        FjallStorage::open_with_persist_mode(dir.path(), persist_mode()).unwrap(),
+    ));
     report("steady_page", &format!("backend=fjall {params}"), samples);
 }
 
@@ -727,7 +744,9 @@ fn membership_projection() {
     report("projection_cold", &format!("backend=memory {params}"), cold);
     report("projection_warm", &format!("backend=memory {params}"), warm);
     let dir = tempfile::tempdir().unwrap();
-    let (cold, warm) = projection(Counting::new(FjallStorage::open(dir.path()).unwrap()));
+    let (cold, warm) = projection(Counting::new(
+        FjallStorage::open_with_persist_mode(dir.path(), persist_mode()).unwrap(),
+    ));
     report("projection_cold", &format!("backend=fjall {params}"), cold);
     report("projection_warm", &format!("backend=fjall {params}"), warm);
 }
@@ -905,7 +924,12 @@ fn staged_history() {
     let fjall = (0..REPS)
         .map(|_| {
             let dir = tempfile::tempdir().unwrap();
-            staged_fragments(Counting::new(FjallStorage::open(dir.path()).unwrap()), len)
+            staged_fragments(
+                Counting::new(
+                    FjallStorage::open_with_persist_mode(dir.path(), persist_mode()).unwrap(),
+                ),
+                len,
+            )
         })
         .collect();
     run("fjall", fjall);

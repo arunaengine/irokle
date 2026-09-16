@@ -82,6 +82,11 @@ fn fixture(actors: usize, count: usize) -> (TopicId, Vec<Op>) {
 #[test]
 #[ignore = "paired release measurement, run explicitly"]
 fn activation_costs() {
+    let persist_mode = match std::env::var("IROKLE_BENCH_PERSIST").as_deref() {
+        Ok("buffer") => fjall::PersistMode::Buffer,
+        Ok("sync_all") | Err(std::env::VarError::NotPresent) => fjall::PersistMode::SyncAll,
+        _ => panic!("invalid measurement persist mode"),
+    };
     let actors = std::env::var("ACTIVATION_ACTORS").unwrap().parse().unwrap();
     let count = std::env::var("ACTIVATION_OPS").unwrap().parse().unwrap();
     let (topic, ops) = fixture(actors, count);
@@ -95,7 +100,7 @@ fn activation_costs() {
     let db = fjall::OptimisticTxDatabase::builder(dir.path())
         .open()
         .unwrap();
-    let storage = FjallStorage::from_database(db.clone()).unwrap();
+    let storage = FjallStorage::from_database_with_persist_mode(db.clone(), persist_mode).unwrap();
     let session = storage
         .open_provisional(ops[0].signed.body.author, topic, ops[0].id, 1000)
         .unwrap();
@@ -153,7 +158,7 @@ fn activation_costs() {
         );
     }
     println!(
-        "activation actors={actors} ops={count} fixture_blake3={fixture_hash} fixture_bytes={} node_records={nodes} elapsed_ns={} transaction_attempts={attempts} durability=SyncAll",
+        "activation actors={actors} ops={count} fixture_blake3={fixture_hash} fixture_bytes={} node_records={nodes} elapsed_ns={} transaction_attempts={attempts} durability={persist_mode:?}",
         encoded.len(),
         elapsed.as_nanos()
     );

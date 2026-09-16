@@ -37,7 +37,9 @@ impl Store for MemoryStorage {
 impl Store for FjallStorage {
     const NAME: &'static str = "fjall";
     fn builder(dir: &Path, name: &str) -> IrokleBuilder<Self> {
-        Irokle::builder().with_fjall_path(dir.join(name)).unwrap()
+        Irokle::builder()
+            .with_fjall_path_and_persist_mode(dir.join(name), super::bench::persist_mode())
+            .unwrap()
     }
     fn attempts(&self) -> Option<u64> {
         Some(self.counters().transaction_attempts)
@@ -52,6 +54,11 @@ struct Run {
 
 /// One line per workload: elapsed and every value as median and max.
 fn report(name: &str, params: &str, runs: Vec<Run>) {
+    let params = if params.contains("backend=fjall") {
+        format!("{params} durability={:?}", super::bench::persist_mode())
+    } else {
+        params.to_owned()
+    };
     for (rep, run) in runs.iter().enumerate() {
         eprintln!(
             "bench_sample name={name} {params} rep={rep} ms={:.6} completed={}",
@@ -715,7 +722,7 @@ async fn slow_control(ops: usize) -> Run {
         .build()
         .unwrap();
     let storage =
-        FjallStorage::open_with_persist_mode(dir.path().join("bob"), fjall::PersistMode::SyncAll)
+        FjallStorage::open_with_persist_mode(dir.path().join("bob"), super::bench::persist_mode())
             .unwrap();
     let bob = Irokle::builder()
         .with_storage(storage)
@@ -787,7 +794,7 @@ async fn slow_storage_control() {
     }
     report(
         "slow_control",
-        "backend=fjall persist=sync_all workers=1 push_ops=2048",
+        "backend=fjall workers=1 push_ops=2048",
         runs,
     );
 }
