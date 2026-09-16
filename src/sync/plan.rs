@@ -1625,3 +1625,239 @@ impl<S: Storage> SyncEngine<S> {
         Ok(page)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oplog::Oplog;
+    use crate::sync::{ActorRangeHint, SyncRequest};
+    use crate::tests::support::*;
+
+    fn wide_slices<S: Storage>(storage: S, unknown: bool) {
+        let owner = Ed25519Signer::from_bytes(&[201; 32]);
+        let peer = Ed25519Signer::from_bytes(&[202; 32]).peer_id();
+        let writers = (10..34)
+            .map(|seed| Ed25519Signer::from_bytes(&[seed; 32]))
+            .collect::<Vec<_>>();
+        let topic = TopicId::hash(b"wide-dependency-slices");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let log = Oplog::with_storage(storage);
+        let members = writers
+            .iter()
+            .map(Signer::peer_id)
+            .chain([owner.peer_id(), peer]);
+        let genesis = log
+            .create_topic_genesis(
+                topic,
+                actor,
+                TopicGenesis::new(Note::TYPE_ID, members),
+                &owner,
+            )
+            .unwrap();
+        let mut prefix = vec![genesis.clone()];
+        for writer in &writers {
+            let op = Op::sign(
+                OpBody {
+                    topic_id: topic,
+                    author: writer.peer_id(),
+                    actor_id: actor_id_for(topic, writer.peer_id()),
+                    actor_seq: 1,
+                    actor_prev: None,
+                    deps: [genesis.id].into(),
+                    generation: 1,
+                    payload: TopicPayload::Event(
+                        EventEnvelope::encode_event(&Note {
+                            text: "root".into(),
+                        })
+                        .unwrap(),
+                    ),
+                },
+                writer,
+            )
+            .unwrap();
+            log.receive_ops(vec![op.clone()]).unwrap();
+            prefix.push(op);
+        }
+        let join = log
+            .create_event_op(
+                topic,
+                actor,
+                EventEnvelope::encode_event(&Note {
+                    text: "join".into(),
+                })
+                .unwrap(),
+                &owner,
+            )
+            .unwrap();
+        assert!(join.signed.body.deps.len() > 4);
+        if unknown {
+            let writer = &writers[0];
+            let actor = actor_id_for(topic, writer.peer_id());
+            let tip = log
+                .create_event_op(
+                    topic,
+                    actor,
+                    EventEnvelope::encode_event(&Note { text: "tip".into() }).unwrap(),
+                    writer,
+                )
+                .unwrap();
+            let responder = SyncEngine::new(log, owner.peer_id())
+                .with_page_visits(4, 1)
+                .with_page_positions(2);
+            let receiver = Oplog::new();
+            receiver.receive_ops(prefix.clone()).unwrap();
+            let mut held = prefix.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+            let mut request = SyncRequest {
+                topic_id: topic,
+                known: BTreeSet::new(),
+                wants: BTreeSet::new(),
+                actor_range_hints: vec![ActorRangeHint {
+                    actor_id: actor,
+                    from_exclusive: 1,
+                    to_inclusive: 2,
+                }],
+                genesis: Some(genesis.id),
+                credit: Default::default(),
+                window: crate::sync::ActorWindow {
+                    after: Some(actor),
+                    through: Some(actor),
+                    behind: None,
+                },
+            };
+            let goal = responder.summary(topic).unwrap().actor_clock;
+            let mut complete = false;
+            for _ in 0..512 {
+                let before = responder.page_work();
+                let page = responder
+                    .response_page(
+                        peer,
+                        &request,
+                        PageBudget {
+                            ops: 1,
+                            bytes: MAX_PAGE_BYTES,
+                        },
+                    )
+                    .unwrap();
+                let after = responder.page_work();
+                assert!(after.visits - before.visits + after.actors - before.actors <= 4);
+                assert!(after.edges - before.edges <= 4);
+                assert!(page.positions.len() <= 2);
+                assert!(page.missing.is_empty());
+                assert!(!page.ops.is_empty() || page.continued || !page.positions.is_empty());
+                for op in &page.ops {
+                    assert!(op.signed.body.deps.is_subset(&held));
+                    assert!(held.insert(op.id));
+                }
+                receiver.receive_ops(page.ops).unwrap();
+                let clock = receiver.storage().actor_clock(&topic).unwrap();
+                for actor in page.positions {
+                    if !request
+                        .actor_range_hints
+                        .iter()
+                        .any(|hint| hint.actor_id == actor)
+                    {
+                        request.actor_range_hints.push(ActorRangeHint {
+                            actor_id: actor,
+                            from_exclusive: clock.get(&actor),
+                            to_inclusive: goal.get(&actor),
+                        });
+                    }
+                }
+                for hint in &mut request.actor_range_hints {
+                    hint.from_exclusive = clock.get(&hint.actor_id);
+                }
+                if !page.more {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete, "unknown ancestry failed to complete");
+            assert!(held.contains(&join.id) && held.contains(&tip.id));
+            assert_eq!(responder.page_work().kept_bytes, 0);
+            return;
+        }
+        for informed in [false, true] {
+            let responder = SyncEngine::new(log.clone(), owner.peer_id()).with_page_visits(4, 1);
+            let receiver = Oplog::new();
+            receiver.receive_ops(prefix.clone()).unwrap();
+            let held = SyncEngine::new(receiver.clone(), peer)
+                .summary(topic)
+                .unwrap();
+            let request = SyncRequest {
+                topic_id: topic,
+                known: BTreeSet::new(),
+                wants: BTreeSet::new(),
+                actor_range_hints: vec![ActorRangeHint {
+                    actor_id: actor,
+                    from_exclusive: 1,
+                    to_inclusive: 2,
+                }],
+                genesis: Some(genesis.id),
+                credit: Default::default(),
+                window: Default::default(),
+            };
+            let mut complete = false;
+            for _ in 0..32 {
+                let before = responder.page_work();
+                let budget = PageBudget {
+                    ops: 1,
+                    bytes: MAX_PAGE_BYTES,
+                };
+                let page = if informed {
+                    responder.response_with(peer, &request, budget, &held)
+                } else {
+                    responder.response_page(peer, &request, budget)
+                }
+                .unwrap();
+                let after = responder.page_work();
+                assert!(after.edges - before.edges <= 4);
+                assert!(after.visits - before.visits <= 4);
+                assert!(
+                    after.kept_bytes
+                        <= super::super::continuation::MAX_CONTINUATION_BYTES as u64 + 65536
+                );
+                if page.ops.is_empty() {
+                    assert!(page.more && page.continued);
+                    continue;
+                }
+                assert_eq!(page.ops, vec![join.clone()]);
+                assert!(!page.more && !page.continued);
+                receiver.receive_ops(page.ops).unwrap();
+                complete = true;
+                break;
+            }
+            assert!(complete);
+            assert!(responder.page_work().resumed > 0);
+        }
+    }
+
+    #[test]
+    fn memory_unknown_slices() {
+        wide_slices(MemoryStorage::new(), true);
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn fjall_unknown_slices() {
+        let directory = tempfile::tempdir().unwrap();
+        wide_slices(
+            crate::storage::FjallStorage::open(directory.path()).unwrap(),
+            true,
+        );
+    }
+
+    #[test]
+    fn memory_wide_slices() {
+        wide_slices(MemoryStorage::new(), false);
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn fjall_wide_slices() {
+        let directory = tempfile::tempdir().unwrap();
+        wide_slices(
+            crate::storage::FjallStorage::open(directory.path()).unwrap(),
+            false,
+        );
+    }
+}
