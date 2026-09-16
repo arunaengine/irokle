@@ -20,6 +20,9 @@ mod space;
 mod types;
 
 #[cfg(test)]
+mod page_tests;
+
+#[cfg(test)]
 pub(crate) use continuation::MAX_CONTINUATIONS;
 use continuation::{Continuation, Continuations};
 #[cfg(test)]
@@ -751,7 +754,6 @@ impl<S: Storage> SyncEngine<S> {
         {
             return Err(Error::StaleIncarnation);
         }
-        let asks = !request.wants.is_empty() || !request.actor_range_hints.is_empty();
         // The requester's credit binds every caller, not only one transport.
         let credit = PageBudget::from_credit(request.credit);
         let budget = PageBudget {
@@ -760,7 +762,7 @@ impl<S: Storage> SyncEngine<S> {
         };
         if budget.ops == 0 || budget.bytes == 0 {
             return Ok(PlannedPage {
-                more: asks,
+                more: !request.wants.is_empty() || forward_remaining(request, &view.clock, &[]),
                 ..PlannedPage::default()
             });
         }
@@ -881,6 +883,7 @@ impl<S: Storage> SyncEngine<S> {
         let named = request.actor_range_hints.len().saturating_sub(1).max(1);
         let position_limit = self.page_positions.min(named);
         if rest.ops == 0 || rest.bytes == 0 || page.too_large.is_some() {
+            page.more |= forward_remaining(request, local, &page.ops);
             page.positions = request::deepest(&needed, position_limit);
             return Ok(page);
         }
@@ -938,21 +941,7 @@ impl<S: Storage> SyncEngine<S> {
         let forwarded = planned.ops.iter().map(|op| op.id).collect::<BTreeSet<_>>();
         page.more = planned.more || !repair.unsent.is_subset(&forwarded);
         page.ops.extend(planned.ops);
-        if summary.is_some() {
-            let mut sent = BTreeMap::<ActorId, u64>::new();
-            for op in &page.ops {
-                let body = &op.signed.body;
-                sent.entry(body.actor_id)
-                    .and_modify(|seq| *seq = (*seq).max(body.actor_seq))
-                    .or_insert(body.actor_seq);
-            }
-            page.more |= request.actor_range_hints.iter().any(|hint| {
-                hint.to_inclusive.min(view.clock.get(&hint.actor_id))
-                    > hint
-                        .from_exclusive
-                        .max(sent.get(&hint.actor_id).copied().unwrap_or(0))
-            });
-        }
+        page.more |= forward_remaining(request, local, &page.ops);
         page.missing.extend(planned.missing);
         for (actor_id, generation) in positions {
             request::need(&mut needed, actor_id, generation);
@@ -1053,6 +1042,29 @@ impl<S: Storage> SyncEngine<S> {
             }),
         }
     }
+}
+
+fn forward_remaining(request: &SyncRequest, local: &ActorClock, ops: &[Op]) -> bool {
+    let mut sent = BTreeMap::<ActorId, u64>::new();
+    for hint in &request.actor_range_hints {
+        sent.entry(hint.actor_id)
+            .and_modify(|seq| *seq = (*seq).min(hint.from_exclusive))
+            .or_insert(hint.from_exclusive);
+    }
+    for op in ops {
+        let body = &op.signed.body;
+        if let Some(seq) = sent.get_mut(&body.actor_id)
+            && seq.checked_add(1) == Some(body.actor_seq)
+        {
+            *seq = body.actor_seq;
+        }
+    }
+    request.actor_range_hints.iter().any(|hint| {
+        hint.to_inclusive.min(local.get(&hint.actor_id))
+            > hint
+                .from_exclusive
+                .max(sent.get(&hint.actor_id).copied().unwrap_or(0))
+    })
 }
 
 /// The request for the ids and ranges of `plan`, on branch `genesis`, with a
