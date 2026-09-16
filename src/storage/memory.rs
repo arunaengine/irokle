@@ -457,9 +457,7 @@ impl Storage for MemoryStorage {
             Some(charge) => charge.clone(),
             None => charge_record(&inner.budget, &op, &meta)?,
         };
-        if let crate::TopicPayload::Event(event) = &mut op.signed.body.payload {
-            event.payload = bytes::Bytes::copy_from_slice(&event.payload);
-        }
+        own_payload(&mut op.signed.body.payload);
         inner.charges.insert(op.id, reserved);
         let previous = previous.unwrap_or_default();
         for dep in previous.difference(&meta.missing_deps) {
@@ -819,9 +817,7 @@ impl Storage for MemoryStorage {
             reservation.reserve(&staged, MetadataKey::Eviction(key), 4096 + bytes * 3)?;
             let mut eviction = eviction.clone();
             for op in &mut eviction.evicted {
-                if let crate::TopicPayload::Event(event) = &mut op.payload {
-                    event.payload = bytes::Bytes::copy_from_slice(&event.payload);
-                }
+                own_payload(&mut op.payload);
             }
             reservation.commit(&mut staged);
             staged.evictions.insert(key, eviction);
@@ -1261,9 +1257,7 @@ fn admit_batch_locked(
     reservation.commit(inner);
 
     for (mut op, meta) in new_entries {
-        if let crate::TopicPayload::Event(event) = &mut op.signed.body.payload {
-            event.payload = bytes::Bytes::copy_from_slice(&event.payload);
-        }
+        own_payload(&mut op.signed.body.payload);
         inner
             .topic_ops
             .entry(meta.topic_id)
@@ -1391,6 +1385,19 @@ fn charge_record(budget: &Arc<Budget>, op: &Op, meta: &OpMeta) -> Result<RecordC
         operation: Arc::new(budget.reserve(MemoryDomain::Operations, encoded.saturating_mul(3))?),
         metadata: Arc::new(budget.reserve(MemoryDomain::Metadata, metadata)?),
     })
+}
+
+fn own_payload(payload: &mut crate::TopicPayload) {
+    match payload {
+        crate::TopicPayload::Event(event) => {
+            event.payload = bytes::Bytes::copy_from_slice(&event.payload);
+            event.type_id = String::from(event.type_id.as_str());
+        }
+        crate::TopicPayload::Genesis(genesis) => {
+            genesis.event_type_id = String::from(genesis.event_type_id.as_str());
+        }
+        crate::TopicPayload::Control(_) => {}
+    }
 }
 
 fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> Result<usize> {
@@ -1622,5 +1629,66 @@ fn memory_topic_state_locked(inner: &MemoryInner, topic_id: &TopicId) -> Option<
 impl From<std::sync::PoisonError<std::sync::MutexGuard<'_, MemoryInner>>> for Error {
     fn from(_: std::sync::PoisonError<std::sync::MutexGuard<'_, MemoryInner>>) -> Self {
         Error::Storage("lock poisoned".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::support::*;
+
+    #[test]
+    fn bounded_string_ownership() {
+        let source = node(211);
+        let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
+        let record = topic
+            .publish(Note {
+                text: "bounded".into(),
+            })
+            .unwrap();
+        let expected = source
+            .storage()
+            .get_op(&record.meta.op_id)
+            .unwrap()
+            .unwrap();
+        for pending in [true, false] {
+            let mut op = expected.clone();
+            let TopicPayload::Event(event) = &mut op.signed.body.payload else {
+                unreachable!()
+            };
+            event.type_id.reserve(1024 * 1024);
+            op.validate().unwrap();
+            let store = MemoryStorage::new();
+            if pending {
+                let mut meta = source.storage().get_meta(&op.id).unwrap().unwrap();
+                meta.ready = false;
+                meta.missing_deps = meta.deps.clone();
+                store.put_pending_op(source.peer_id(), op, meta).unwrap();
+            } else {
+                let genesis = source
+                    .storage()
+                    .get_op(&expected.signed.body.actor_prev.unwrap())
+                    .unwrap()
+                    .unwrap();
+                oplog::Oplog::with_storage(store.clone())
+                    .receive_ops(vec![genesis, op])
+                    .unwrap();
+            }
+            let held = store.memory_usage().unwrap().reserved[&MemoryDomain::Operations];
+            let inner = store.lock().unwrap();
+            let op = if pending {
+                &inner.pending_ops[&expected.id]
+            } else {
+                &inner.ops[&expected.id]
+            };
+            let TopicPayload::Event(event) = &op.signed.body.payload else {
+                unreachable!()
+            };
+            assert!(
+                event.type_id.capacity() as u64 <= held,
+                "unbounded caller string retained"
+            );
+            assert_eq!(op, &expected);
+        }
     }
 }
