@@ -15,14 +15,17 @@ use crate::{
     TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
 };
 
-mod helpers;
+mod admission;
+mod genesis;
+mod membership;
 mod topology;
 
-use helpers::{
-    apply_control_to_state, checked_next, ensure_event_type, heads_after, is_local_admission_race,
-    is_permanent_rejection, materialize_topic_state, merge_states, next_actor_position,
-    pending_meta_for,
+use admission::{
+    checked_next, ensure_event_type, heads_after, is_admission_race, is_permanent_rejection,
+    next_actor_position, pending_meta_for,
 };
+pub(crate) use genesis::is_structural_genesis;
+use membership::{apply_control, materialize_topic_state, merge_states};
 pub(crate) use topology::topological_ids;
 use topology::topological_ops;
 pub(crate) use topology::{subset_in, topological_subset_entries};
@@ -177,14 +180,6 @@ fn conflict_pause(attempt: usize) {
     let ceiling = 200_u64 << (attempt - 4).min(5);
     let micros = u64::from_le_bytes(jitter) % ceiling;
     std::thread::sleep(std::time::Duration::from_micros(micros));
-}
-
-pub(crate) fn is_structural_genesis(op: &Op) -> bool {
-    let body = &op.signed.body;
-    matches!(body.payload, TopicPayload::Genesis(_))
-        && body.actor_seq == 1
-        && body.actor_prev.is_none()
-        && body.deps.is_empty()
 }
 
 fn without_descendants(ops: Vec<Op>, rejected: OpId) -> Vec<Op> {
@@ -612,7 +607,7 @@ impl<S: Storage> Oplog<S> {
                 &mut signed,
                 &effects,
             ) {
-                Err(err) if is_local_admission_race(&err) => continue,
+                Err(err) if is_admission_race(&err) => continue,
                 result => return result,
             }
         }
@@ -1383,7 +1378,7 @@ impl<S: Storage> Oplog<S> {
                 TopicPayload::Event(_) => {}
                 TopicPayload::Control(control) => {
                     let state = state.as_mut().ok_or(Error::TopicNotFound)?;
-                    apply_control_to_state(state, &op, control);
+                    apply_control(state, &op, control);
                     topic_state_changed = true;
                 }
             }
@@ -1563,7 +1558,7 @@ impl<S: Storage> Oplog<S> {
                 &mut signed,
                 &effects,
             ) {
-                Err(err) if is_local_admission_race(&err) => continue,
+                Err(err) if is_admission_race(&err) => continue,
                 result => return result,
             }
         }
@@ -2332,7 +2327,7 @@ impl<S: Storage> Oplog<S> {
                 TopicPayload::Event(_) => merge_states(&meta.deps, projections)?,
                 TopicPayload::Control(control) => {
                     let mut state = (*merge_states(&meta.deps, projections)?).clone();
-                    apply_control_to_state(&mut state, &op, control);
+                    apply_control(&mut state, &op, control);
                     Arc::new(state)
                 }
             };
@@ -2385,7 +2380,7 @@ impl<S: Storage> Oplog<S> {
             TopicPayload::Control(control) => {
                 let mut state = base_state.ok_or(Error::TopicNotFound)?;
                 state.heads = heads;
-                apply_control_to_state(&mut state, op, control);
+                apply_control(&mut state, op, control);
                 Ok(Some(state))
             }
         }
