@@ -129,10 +129,9 @@ fn page_informed<S: Storage, R: Storage>(
     }
 }
 
-/// A signed topic of `writers` writers sorted by actor key, whose ops after
-/// the genesis are `ops`: each names its writer and the indices of the ops it
-/// depends on, the genesis being index 0. Sequences, previous ops and
-/// generations follow from that order.
+/// A signed topic of `writers` writers sorted by actor key, with `ops` after genesis; each
+/// names its writer and dependency indices, with genesis at index 0. Sequences, previous ops,
+/// and generations follow that order.
 fn graph_source<S: Storage>(storage: S, writers: usize, ops: &[(usize, &[usize])]) -> Source<S> {
     graph_members(storage, writers, ops, true)
 }
@@ -277,10 +276,9 @@ fn memory_truncated_causal() {
     assert_truncated_causal(MemoryStorage::new);
 }
 
-/// A dependency chain or a branching graph through more unknown actors than
-/// one request names, and than a page result or the reader's knowledge keeps,
-/// still completes through successive requests: every page stays causal and
-/// the reader reaches the frontier, in rounds that grow with the actors.
+/// A chain or branching graph through more unknown actors than one request, page result, or
+/// reader knowledge can name still completes through successive requests: every page stays
+/// causal and the reader reaches the frontier in rounds that grow with actors.
 fn assert_beyond_windows<S: Storage>(open: impl Fn() -> S) {
     for (items, positions) in [(2, 1), (2, 2), (3, 1), (3, 2), (3, MAX_PAGE_MISSING)] {
         let chain = super::progress::reverse_chain(open(), 12);
@@ -336,11 +334,9 @@ fn fjall_beyond_windows() {
     });
 }
 
-/// A chain beyond the request and knowledge windows, planned in slices of a
-/// few reads with one place for kept plans, pulled by two readers at once. A
-/// reader refused for capacity asks again later, one reader reconnects midway
-/// and starts its knowledge over, and both still reach the frontier without an
-/// op before its dependency.
+/// A chain beyond request and knowledge windows is planned in small read slices with one
+/// kept plan and pulled by two readers. A capacity-refused reader retries, another reconnects
+/// midway, and both reach the frontier without sending an op before its dependency.
 #[test]
 fn chain_windows_saturated() {
     let source = super::progress::reverse_chain(MemoryStorage::new(), 40);
@@ -1181,10 +1177,9 @@ mod sessions {
         alice_net.shutdown().await;
     }
 
-    /// A behind-only bootstrap whose essential dependency lies beyond the item
-    /// window, served through small streams, after the staged session was
-    /// expired and restaged and the reader reconnected on a new endpoint:
-    /// staging buffers nothing and the topic activates with the whole history.
+    /// A behind-only bootstrap whose essential dependency lies beyond the item window uses small
+    /// streams after staging expiry and restaging, then reconnects: staging remains empty and
+    /// the topic activates with the whole history.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bootstrap_reconnect_reset() {
         let invited = Ed25519Signer::from_bytes(&[245; 32]).peer_id();
@@ -1272,11 +1267,9 @@ mod sessions {
         alice_net.shutdown().await;
     }
 
-    /// A pull of a topic the reader does not hold, invited last, through
-    /// requests that cannot name every actor: staging buffers nothing and the
-    /// topic activates with the whole history. Three items: before anything is
-    /// staged, a dependent needs the positions of the dependency's actor and of
-    /// the genesis actor beside its own.
+    /// A pull of a late-invited topic through requests that cannot name every actor leaves
+    /// staging empty and activates the whole history. With three items, a dependent needs
+    /// positions for its dependency actor and the genesis actor beside its own.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn truncated_bootstrap() {
         let invited = Ed25519Signer::from_bytes(&[244; 32]).peer_id();
@@ -1317,10 +1310,8 @@ mod sessions {
         alice_net.shutdown().await;
     }
 
-    /// A dependency chain through far more actors than a request names and
-    /// than a page result keeps, through real sessions with three-item
-    /// requests: an ordinary catch-up of a reader holding only the genesis,
-    /// and a bootstrap of a peer invited after the chain. Neither buffers an
+    /// A dependency chain beyond request and page windows uses real sessions with three-item
+    /// requests for ordinary catch-up from genesis and post-chain bootstrap. Neither buffers an
     /// op before its dependency, and both end with the whole history.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn chain_beyond_sessions() {

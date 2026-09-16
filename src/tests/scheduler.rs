@@ -142,16 +142,12 @@ fn status(node: &Irokle, peer_id: PeerId, topic_id: TopicId) -> crate::SyncPeerS
 /// until nothing is due. Returns the number of turns.
 async fn drain_due(net: &Arc<IrohNet>, cap: usize) -> usize {
     for turn in 0..cap {
-        let Some((peer_id, claims)) = net
-            .resync_scheduler
-            .due_targets(1, MAX_RESYNC_TOPICS)
-            .pop()
+        let Some((peer_id, claims)) = net.resync_scheduler.due_targets(1, MAX_RESYNC_TOPICS).pop()
         else {
             return turn;
         };
         let lease = net.resync_scheduler.lease(claims, BACKOFF);
-        net.sync_peer_batch(peer_id, lease, runtime())
-            .await;
+        net.sync_peer_batch(peer_id, lease, runtime()).await;
     }
     panic!("targets were still due after {cap} turns");
 }
@@ -293,8 +289,7 @@ async fn continuation_yields_turn() {
     scheduler.schedule_now(waiting, topic_id, false);
 
     let lease = scheduler.lease(claims, BACKOFF);
-    net.sync_peer_batch(bob_peer, lease, runtime())
-        .await;
+    net.sync_peer_batch(bob_peer, lease, runtime()).await;
     assert!(!clock(&bob, topic_id).dominates(&clock(&alice, topic_id)));
     assert_eq!(
         scheduler.target_state(bob_peer, topic_id),
@@ -428,10 +423,7 @@ async fn expiry_spares_settled() {
     };
     let batch = tokio::spawn({
         let net = Arc::clone(&net);
-        async move {
-            net.sync_peer_batch(bob_peer, lease, deadline)
-                .await
-        }
+        async move { net.sync_peer_batch(bob_peer, lease, deadline).await }
     });
     tokio::task::spawn_blocking({
         let gate = Arc::clone(&gate);
@@ -505,8 +497,7 @@ async fn failure_counted_once() {
             .unwrap();
         assert_eq!(claims.len(), topics);
         let lease = net.resync_scheduler.lease(claims, BACKOFF);
-        net.sync_peer_batch(down, lease, runtime())
-            .await;
+        net.sync_peer_batch(down, lease, runtime()).await;
         assert_eq!(
             alice.peer_health().failures(&down),
             round as u64 + 1,
@@ -533,11 +524,7 @@ async fn manual_keeps_claim() {
     publish(&alice, topic_id, 3, 1);
     let bob_peer = bob.peer_id();
     net.resync_scheduler.schedule_now(bob_peer, topic_id, false);
-    let (_, claims) = net
-        .resync_scheduler
-        .due_targets(1, 1)
-        .pop()
-        .unwrap();
+    let (_, claims) = net.resync_scheduler.due_targets(1, 1).pop().unwrap();
     let attempt = claims[0].attempt;
     let lease = net.resync_scheduler.lease(claims, Duration::ZERO);
 

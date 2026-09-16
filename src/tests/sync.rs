@@ -46,7 +46,7 @@ fn transfers_missing_ops() {
 }
 
 #[test]
-fn create_topic_with_event_replicates() {
+fn topic_event_replication() {
     let a = node(53);
     let b = node(54);
     let (topic, record) = a
@@ -355,7 +355,7 @@ fn response_includes_closure() {
 }
 
 #[test]
-fn accepts_out_of_order_batch() {
+fn unordered_batch_admitted() {
     let alice = node(40);
     let bob = node(41);
     let topic = alice
@@ -507,7 +507,7 @@ fn deterministic_overlap() {
 }
 
 #[test]
-fn receive_forwarding_obligates_other_selected_peers() {
+fn receive_forwarding_obligation() {
     let alice = node(90);
     let bob = node(91);
     let charlie = node(92);
@@ -700,7 +700,7 @@ fn scopes_accepted_ops() {
 }
 
 #[test]
-fn omits_non_member_ops() {
+fn omits_nonmember_ops() {
     let a = node(8);
     let topic = a.create_topic::<Note>(TopicConfig::default()).unwrap();
     topic
@@ -746,7 +746,7 @@ fn report_filters_obligations() {
 }
 
 #[test]
-fn rejects_other_topic_ops() {
+fn rejects_foreign_ops() {
     let alice = node(19);
     let bob = node(20);
     let topic_a = alice
@@ -831,7 +831,7 @@ fn exposes_sync_metadata() {
 }
 
 #[test]
-fn receive_schedules_forwarding_only_for_missing_selected_peers() {
+fn missing_peer_forwarding() {
     let alice = node(94);
     let bob = node(95);
     let charlie = node(96);
@@ -900,7 +900,7 @@ fn receive_schedules_forwarding_only_for_missing_selected_peers() {
 }
 
 #[test]
-fn failed_sync_result_keeps_obligation_pending_for_retry() {
+fn retry_keeps_obligation() {
     let alice = node(98);
     let bob = node(99);
     let topic = alice
@@ -973,7 +973,7 @@ fn clamps_oversized_hint() {
 
     // A peer-supplied hint covering the entire u64 range must not blow up
     // or iterate u64::MAX times; clamping is bounded by what we locally
-    // have and by MAX_ACTOR_RANGE_HINT_SPAN.
+    // have and by MAX_RANGE_SPAN.
     let response = alice
         .plan_sync_response_data(
             bob.peer_id(),
@@ -1034,13 +1034,11 @@ fn ignores_reversed_hint() {
 }
 
 #[test]
-fn unknown_topic_empty_plan() {
+fn unknown_topic_empty() {
     let alice = node(84);
     let unknown_topic = TopicId::hash(b"never-heard-of-this");
-    // A fabricated remote summary pointing at OpIds Alice doesn't have.
-    // The old code would surface remote.heads as `need`/`want`, letting a
-    // peer inject arbitrary OpIds into Alice's request set for a topic
-    // she cannot authenticate. The plan must now be empty.
+    // A fabricated summary points at OpIds Alice cannot authenticate.
+    // The plan must not expose those heads as `need` or `want`.
     let summary = crate_sync::SyncSummary {
         topic_id: unknown_topic,
         event_type_id: None,
@@ -1060,7 +1058,7 @@ fn unknown_topic_empty_plan() {
 }
 
 #[test]
-fn duplicate_sync_data_is_idempotent() {
+fn duplicate_sync_idempotent() {
     let alice = node(85);
     let bob = node(86);
     let topic = alice
@@ -1111,12 +1109,11 @@ fn duplicate_sync_data_is_idempotent() {
     );
 }
 
-/// Receive-side admission throughput for a backlog of unknown single-op
-/// topics, the hot path of a bulk drain. Wall time is dominated by op
-/// signature verification: each op must be verified exactly once even though
-/// the unknown-topic check and the real admission both inspect it.
+/// A backlog of unknown single-op topics exercises receive-side admission.
+/// Each op must be signature-verified once even though two admission paths inspect it.
+/// This protects the bulk-drain hot path.
 #[test]
-fn unknown_topic_backlog_admission_verifies_ops_once() {
+fn backlog_verify_once() {
     const TOPICS: usize = 1000;
     let alice = node(95);
     let bob = node(96);
@@ -1175,11 +1172,8 @@ fn stale_dedup_read() {
         .unwrap();
     assert_eq!(accepted.len(), 2);
 
-    // Simulate a concurrent admission racing the dedup check. The duplicate
-    // genesis models a mid-flight commit: its op record is not visible yet
-    // while its actor-index entry already is (fork-check duplicate path).
-    // The second op passes a stale `get_op` and a stale actor-index read and
-    // reaches the tip/seq check (seq-gap duplicate path).
+    // Simulate admission racing dedup: the genesis record is hidden while its actor index is visible.
+    // The second op hides both reads, exercising fork and sequence duplicate paths.
     storage.mid_commit_ops.lock().unwrap().insert(ops[0].id);
     storage.hidden_ops.lock().unwrap().insert(ops[1].id);
     storage.hidden_index.lock().unwrap().insert(ops[1].id);
@@ -1204,7 +1198,7 @@ fn stale_dedup_read() {
 }
 
 #[test]
-fn unknown_want_serves_the_rest() {
+fn unknown_want_remainder() {
     // A want we cannot resolve must not abort a whole batched exchange.
     let storage = MemoryStorage::new();
     let (_, topic_id, ops) = holed_store(&storage, 93, Damage::Meta);
@@ -1233,7 +1227,7 @@ fn unknown_want_serves_the_rest() {
 }
 
 #[test]
-fn dangling_dep_defers_dependents() {
+fn dangling_dep_deferred() {
     // The hole and the op standing on it are deferred; the genesis still ships.
     let storage = MemoryStorage::new();
     let (_, topic_id, ops) = holed_store(&storage, 94, Damage::Meta);
@@ -1449,7 +1443,7 @@ fn fjall_repairs_hole() {
 }
 
 #[test]
-fn repair_refetches_dangling_dep() {
+fn repair_dangling_dep() {
     // A store holding a hole must pull it from a peer over the ordinary
     // negotiate/request path and end up whole, even though its heads and clock
     // never revealed the gap.
@@ -1926,7 +1920,7 @@ fn refusal_keeps_health() {
 /// still visits the topics after it, and work owed for a healthy topic is still
 /// scheduled rather than being lost with the first failure.
 #[test]
-fn faulting_topic_spares_others() {
+fn faulting_topic_isolated() {
     let storage = StaleReadStorage::new(MemoryStorage::new());
     let alice = Irokle::with_storage(
         storage.clone(),

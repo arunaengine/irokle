@@ -426,7 +426,7 @@ fn fjall_direct_genesis() {
 /// Invitations beyond both old fixed caps (65,536 ops and 32 MiB per session),
 /// with non-inviting fragments crossing each, staged in frame-sized messages.
 /// Run explicitly: `cargo test --features fjall --lib invite_beyond_caps -- --ignored`.
-fn assert_invite_beyond_caps<S: Storage>(storage: S) {
+fn assert_invite_caps<S: Storage>(storage: S) {
     let source = node(148);
     let reader = reader_node(storage.clone(), 149);
     let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
@@ -480,9 +480,9 @@ fn assert_invite_beyond_caps<S: Storage>(storage: S) {
 #[cfg(feature = "fjall")]
 #[test]
 #[ignore = "stages about 40 MiB of signed history, run explicitly"]
-fn fjall_invite_beyond_caps() {
+fn fjall_invite_caps() {
     let dir = tempfile::tempdir().unwrap();
-    assert_invite_beyond_caps(
+    assert_invite_caps(
         crate::storage::FjallStorage::open_with_persist_mode(
             dir.path(),
             fjall::PersistMode::Buffer,
@@ -493,15 +493,15 @@ fn fjall_invite_beyond_caps() {
 
 #[test]
 #[ignore = "stages about 40 MiB of signed history, run explicitly"]
-fn memory_invite_beyond_caps() {
-    assert_invite_beyond_caps(MemoryStorage::new().with_staging_limits(
-        crate::storage::StagingLimits {
+fn memory_invite_caps() {
+    assert_invite_caps(
+        MemoryStorage::new().with_staging_limits(crate::storage::StagingLimits {
             total_bytes: 256 * 1024 * 1024,
             source_bytes: 256 * 1024 * 1024,
             namespace_bytes: 256 * 1024 * 1024,
             ..crate::storage::StagingLimits::MEMORY
-        },
-    ));
+        }),
+    );
 }
 
 /// Two nodes over Iroh: `source` serves streams, `reader` over `storage`
@@ -552,10 +552,9 @@ async fn pull_until_done<S: Storage>(
     panic!("the pull did not finish");
 }
 
-/// The reader staged 100 ops of one branch from the source, which then moved
-/// to a smaller genesis that invites the reader at op 2. Only the reader
-/// initiates: its pull replaces the staged branch instead of comparing the
-/// old staged positions with the new branch's shorter clock.
+/// The reader stages 100 ops before the source moves to a smaller genesis inviting it at op 2.
+/// Its pull replaces the staged branch instead of comparing old positions with the shorter clock.
+/// Only the reader initiates the replacement.
 #[cfg(feature = "iroh")]
 async fn assert_replaced_pull<S: Storage>(storage: S) {
     let (source, source_net, reader) = pull_pair(storage).await;

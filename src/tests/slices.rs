@@ -11,10 +11,9 @@ use crate::sync::{MAX_CONTINUATIONS, PageBudget, RequestKnowledge, SyncEngine};
 /// Storage reads one slice of the tests may make.
 const VISITS: usize = 12;
 
-/// Page a reader at the genesis through `source` with slices of [`VISITS`]
-/// reads. Every page carries data or a kept plan, no slice reads much past its
-/// budget, and the reader ends with the source's frontier. Returns the pages
-/// and how many of them only continued.
+/// Page a reader at genesis through `source` with [`VISITS`]-read slices. Each page carries
+/// data or a kept plan, stays within its work budget, and ends at the source frontier; returns
+/// page count and continuation-only count.
 fn page_slices<S: Storage>(source: &Source<S>) -> (usize, usize) {
     let responder = source.engine.clone().with_page_visits(VISITS, 4);
     let reader = Oplog::new();
@@ -105,7 +104,7 @@ fn fjall_slices_resume() {
 /// A slice that sent nothing and cannot keep its plan fails its request
 /// instead of reporting an empty page to be repeated forever.
 #[test]
-fn slice_kept_or_refused() {
+fn slice_kept_refused() {
     let mut source = reverse_chain(MemoryStorage::new(), 40);
     source.engine = source.engine.clone().with_page_actors(2);
     let responder = source.engine.clone().with_page_visits(VISITS, 0);
@@ -126,10 +125,9 @@ fn slice_kept_or_refused() {
     );
 }
 
-/// At the real capacity every peer below and at it keeps a plan of one deep
-/// topic; one more is refused with a capacity error instead of an empty page,
-/// while a request that needs no kept plan is still served. Once a kept plan
-/// completes, its place serves the refused peer.
+/// At capacity, peers below and at the limit keep one plan; one more is refused with a
+/// capacity error, while requests needing no kept plan still serve. When a plan completes,
+/// its place serves the refused peer.
 #[test]
 fn plans_at_capacity() {
     let storage = MemoryStorage::new();

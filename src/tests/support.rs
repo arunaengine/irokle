@@ -276,14 +276,9 @@ pub(crate) struct AckFault {
     pub(crate) error: Error,
 }
 
-/// Storage wrapper that simulates the stale reads of a concurrent admission:
-/// `get_op`/`actor_index` report "unknown" exactly once for ops in the
-/// one-shot sets, so a duplicate slips past the batch dedup check and reaches
-/// seq validation while the actor tip already covers it. Ops in
-/// `mid_commit_ops` stay invisible to `get_op` permanently, modelling a
-/// commit whose actor index/tip keys are visible before the op record. Writes
-/// for a topic in `failed_writes` are rejected, standing in for a storage fault
-/// that only affects one topic.
+/// Inject stale admission reads and topic-local write failures.
+/// One-shot hidden ops bypass deduplication; permanently hidden bodies model
+/// index visibility before payloads.
 #[derive(Clone)]
 pub(crate) struct StaleReadStorage<S = MemoryStorage> {
     pub(crate) op_reads: Arc<std::sync::atomic::AtomicUsize>,
