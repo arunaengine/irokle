@@ -5,15 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::{
+    MAX_PENDING_BYTES_PER_SOURCE as MAX_SOURCE_BYTES,
+    MAX_PENDING_BYTES_PER_TOPIC as MAX_TOPIC_BYTES, MAX_PENDING_BYTES_TOTAL as MAX_TOTAL_BYTES,
+    MAX_PENDING_OPS_PER_SOURCE as MAX_SOURCE_OPS, MAX_PENDING_OPS_PER_TOPIC as MAX_TOPIC_OPS,
+    MAX_PENDING_OPS_TOTAL as MAX_TOTAL_OPS, PeerAck, SyncObligation,
+};
 use crate::topic::ReplicationPolicy;
 use crate::{ActorClock, ActorId, Op, OpId, PeerId, Result, TopicId};
-use super::{
-    MAX_PENDING_BYTES_PER_SOURCE as MAX_SOURCE_BYTES, MAX_PENDING_BYTES_PER_TOPIC as MAX_TOPIC_BYTES,
-    MAX_PENDING_BYTES_TOTAL as MAX_TOTAL_BYTES, MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS,
-    MAX_PENDING_OPS_PER_SOURCE as MAX_SOURCE_OPS, MAX_PENDING_OPS_PER_TOPIC as MAX_TOPIC_OPS,
-    MAX_PENDING_OPS_TOTAL as MAX_TOTAL_OPS, MAX_PENDING_WAITERS_PER_DEP as MAX_WAITERS,
-    MAX_REJECTED_PER_TOPIC as MAX_REJECTED, PeerAck, SyncObligation,
-};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpMeta {
@@ -225,6 +224,15 @@ pub struct RequestView {
     pub epoch: u64,
     pub member: bool,
     pub clock: ActorClock,
+}
+
+/// Work admitted before snapshot preparation reads, membership scans and clock decoding.
+#[derive(Clone, Copy, Debug)]
+pub enum SnapshotCharge {
+    Read { bytes: usize },
+    Members(usize),
+    State { entries: usize, workspace: usize },
+    Clock { entries: usize, workspace: usize },
 }
 
 /// Resume dependency reads within the same operation and branch snapshot.

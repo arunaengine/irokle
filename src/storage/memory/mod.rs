@@ -11,14 +11,13 @@ use crate::{
 use super::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
     MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS, MAX_PENDING_WAITERS_PER_DEP as MAX_WAITERS,
-    MAX_REJECTED_PER_TOPIC as MAX_REJECTED,
-    ObligationTarget, OpMeta, OpPosition, PeerAck, PendingRecord, PendingUsage, ProvisionalTopic,
-    SnapshotRead, StagingLimits, StagingQuota, Storage, StorageCounters, SyncObligation,
-    SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers,
-    ack_reached_op, apply_status_update, branch_matches, check_pending_quota,
-    ensure_deps_resolvable, journalled_eviction, merged_obligation, merged_peer_ack,
-    new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
-    topic_fingerprint_for, validate_batch, validate_heads,
+    MAX_REJECTED_PER_TOPIC as MAX_REJECTED, ObligationTarget, OpMeta, OpPosition, PeerAck,
+    PendingRecord, PendingUsage, ProvisionalTopic, SnapshotRead, StagingLimits, StagingQuota,
+    Storage, StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState,
+    TopicView, ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches,
+    check_pending_quota, ensure_deps_resolvable, journalled_eviction, merged_obligation,
+    merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes, settled_obligation,
+    stored_ack_dominates, topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 mod budget;
@@ -424,10 +423,7 @@ impl Storage for MemoryStorage {
             let already = previous
                 .as_ref()
                 .is_some_and(|missing| missing.contains(dep));
-            if !already
-                && inner.pending_waiters.get(dep).map_or(0, BTreeSet::len)
-                    >= MAX_WAITERS
-            {
+            if !already && inner.pending_waiters.get(dep).map_or(0, BTreeSet::len) >= MAX_WAITERS {
                 return Err(Error::Storage("pending waiter quota exceeded".into()));
             }
         }
@@ -902,6 +898,52 @@ struct MemorySnapshot<'a> {
 }
 
 impl SnapshotRead for MemorySnapshot<'_> {
+    fn sync_identity(
+        &self,
+        topic: &TopicId,
+        peer: &PeerId,
+        reserve: &mut dyn FnMut(super::SnapshotCharge) -> Result<()>,
+    ) -> Result<Option<super::RequestView>> {
+        reserve(super::SnapshotCharge::Read { bytes: 0 })?;
+        self.counters.count_meta();
+        let Some(state) = self.inner.topics.get(topic) else {
+            return Ok(None);
+        };
+        reserve(super::SnapshotCharge::Members(1))?;
+        let member = state.members.contains(peer);
+        reserve(super::SnapshotCharge::Read { bytes: 0 })?;
+        let epoch = self
+            .inner
+            .topic_epochs
+            .get(topic)
+            .copied()
+            .unwrap_or_default();
+        Ok(Some(super::RequestView {
+            genesis: state.genesis,
+            epoch,
+            member,
+            clock: ActorClock::new(),
+        }))
+    }
+
+    fn sync_clock(
+        &self,
+        topic: &TopicId,
+        actors: Option<&BTreeSet<ActorId>>,
+        reserve: &mut dyn FnMut(super::SnapshotCharge) -> Result<()>,
+    ) -> Result<ActorClock> {
+        reserve(super::SnapshotCharge::Read { bytes: 0 })?;
+        self.counters.count_meta();
+        let Some(clock) = self.inner.actor_clock.get(topic) else {
+            return Ok(ActorClock::new());
+        };
+        reserve(super::SnapshotCharge::Clock {
+            entries: clock.len(),
+            workspace: actors.map_or(0, |actors| ActorClock::allocation_bound(actors.len())),
+        })?;
+        Ok(actors.map_or_else(|| clock.clone(), |actors| clock.selected(actors)))
+    }
+
     fn actor_count(&self, topic_id: &TopicId) -> Result<usize> {
         Ok(self
             .inner

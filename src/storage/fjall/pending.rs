@@ -6,12 +6,12 @@ use std::ops::Bound;
 
 use crate::{Error, Op, OpId, PeerId, Result, TopicId};
 
-use super::store::FjallStorage;
 use super::super::{
     MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS, MAX_PENDING_WAITERS_PER_DEP as MAX_WAITERS,
-    MAX_REJECTED_PER_TOPIC as MAX_REJECTED, OpMeta,
-    PendingRecord, PendingUsage, check_pending_quota, pending_op_bytes,
+    MAX_REJECTED_PER_TOPIC as MAX_REJECTED, OpMeta, PendingRecord, PendingUsage,
+    check_pending_quota, pending_op_bytes,
 };
+use super::store::FjallStorage;
 
 type Tx = super::super::pressure::Transaction;
 type Records = fjall::OptimisticTxKeyspace;

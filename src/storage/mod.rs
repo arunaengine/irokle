@@ -27,14 +27,34 @@ pub const MAX_REJECTED_PER_TOPIC: usize = 4096;
 /// not discard payloads while no other durable owner exists.
 pub const MAX_PENDING_EVICTIONS: usize = 1024;
 
-
-
-
-
 /// Reads of one coherent snapshot of a store. Every method sees the same commit,
 /// so a planner can authorize a peer, select positions and load records without
 /// mixing a state before and after a concurrent write.
 pub trait SnapshotRead {
+    /// Current branch and membership without loading a clock or unrelated topic indices.
+    fn sync_identity(
+        &self,
+        _topic: &TopicId,
+        _peer: &PeerId,
+        _reserve: &mut dyn FnMut(SnapshotCharge) -> Result<()>,
+    ) -> Result<Option<RequestView>> {
+        Err(crate::Error::SyncCapacity(
+            "backend must implement admitted sync authorization reads".into(),
+        ))
+    }
+
+    /// Capture a finite clock only after its read and allocation bounds are admitted.
+    fn sync_clock(
+        &self,
+        _topic: &TopicId,
+        _actors: Option<&BTreeSet<ActorId>>,
+        _reserve: &mut dyn FnMut(SnapshotCharge) -> Result<()>,
+    ) -> Result<ActorClock> {
+        Err(crate::Error::SyncCapacity(
+            "backend must implement admitted sync clock capture".into(),
+        ))
+    }
+
     /// Actor count of this snapshot's topic, used to reserve a finite goal's workspace.
     fn actor_count(&self, topic_id: &TopicId) -> Result<usize> {
         Ok(self
@@ -360,26 +380,26 @@ pub use staging::{
 pub(super) use staging::{StagingQuota, check_namespaces};
 
 mod evidence;
-pub use evidence::{
-    AttemptOutcome, MAX_REPAIR_IDS, ObligationTarget, PeerAck, SyncObligation, SyncPeerState,
-    SyncPeerStatus, SyncStateUpdate, SyncStatusUpdate,
-};
 pub(crate) use evidence::MAX_RECENT_ATTEMPTS;
 pub(super) use evidence::{
     AckCommit, ack_commit, ack_covers, ack_reached_op, apply_status_update, merged_obligation,
     merged_peer_ack, new_peer_status, settled_obligation, stored_ack_dominates,
 };
+pub use evidence::{
+    AttemptOutcome, MAX_REPAIR_IDS, ObligationTarget, PeerAck, SyncObligation, SyncPeerState,
+    SyncPeerStatus, SyncStateUpdate, SyncStatusUpdate,
+};
 
 mod record;
+pub(crate) use record::pending_op_bytes;
 pub use record::{
     AdmissionEffects, AdmittedBatch, ControlKey, CounterSnapshot, DependencyCursor, OpHeader,
-    OpMeta, OpPosition, RequestView, StorageCounters, TopicState, TopicView,
+    OpMeta, OpPosition, RequestView, SnapshotCharge, StorageCounters, TopicState, TopicView,
 };
 pub(super) use record::{
     PendingRecord, PendingUsage, check_pending_quota, ensure_deps_resolvable, validate_batch,
     validate_heads,
 };
-pub(crate) use record::pending_op_bytes;
 
 mod memory;
 pub use memory::{MemoryDomain, MemoryLimits, MemoryStorage, MemoryUsage};
@@ -396,9 +416,6 @@ pub(crate) use fjall::Hook;
 pub(crate) use fjall::write_legacy_metas;
 #[cfg(feature = "fjall")]
 pub use pressure::{StorageDomain, StoragePressure, StorageUsage};
-
-
-
 
 pub(crate) fn topic_fingerprint_for(
     heads: &BTreeSet<OpId>,

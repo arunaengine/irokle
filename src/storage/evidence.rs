@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorClock, OpId, PeerId, Result, TopicId};
 use super::{OpPosition, TopicState};
+use crate::{ActorClock, OpId, PeerId, Result, TopicId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerAck {
@@ -20,8 +20,6 @@ pub struct PeerAck {
     pub heads: BTreeSet<OpId>,
     pub clock: ActorClock,
 }
-
-
 
 /// Explicit repair ids one peer may owe for one topic.
 pub const MAX_REPAIR_IDS: usize = 4096;

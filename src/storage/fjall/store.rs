@@ -2623,6 +2623,30 @@ struct FjallSnapshot<'a> {
 }
 
 impl FjallSnapshot<'_> {
+    fn sync_record(
+        &self,
+        prefix: &[u8],
+        topic: &TopicId,
+        limit: usize,
+        reserve: &mut dyn FnMut(super::super::SnapshotCharge) -> Result<()>,
+    ) -> Result<Option<fjall::UserValue>> {
+        // Fjall may allocate an oversized raw value inside get; this envelope
+        // bounds admitted records and decoding, not that backend allocation.
+        reserve(super::super::SnapshotCharge::Read { bytes: limit })?;
+        self.store.counters.count_meta();
+        let value = fjall::Readable::get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(prefix, topic),
+        )?;
+        if value.as_ref().is_some_and(|value| value.len() > limit) {
+            return Err(Error::SyncCapacity(format!(
+                "stored sync record exceeds the supported {limit}-byte raw read envelope"
+            )));
+        }
+        Ok(value)
+    }
+
     fn shown(&self, topic_id: &TopicId) -> Result<bool> {
         if let Some((known, shown)) = self.shown.get()
             && known == *topic_id
@@ -2636,6 +2660,67 @@ impl FjallSnapshot<'_> {
 }
 
 impl SnapshotRead for FjallSnapshot<'_> {
+    fn sync_identity(
+        &self,
+        topic: &TopicId,
+        peer: &PeerId,
+        reserve: &mut dyn FnMut(super::super::SnapshotCharge) -> Result<()>,
+    ) -> Result<Option<super::super::RequestView>> {
+        let limit = (crate::sync::MAX_PAGE_BYTES - 1024) / 2;
+        let Some(bytes) = self.sync_record(b"ts", topic, limit, reserve)? else {
+            return Ok(None);
+        };
+        reserve(super::super::SnapshotCharge::State {
+            entries: bytes.len() / PeerId::LEN + 1,
+            workspace: bytes
+                .len()
+                .saturating_mul(16)
+                .saturating_add(size_of::<TopicState>()),
+        })?;
+        let state: TopicState = postcard::from_bytes(&bytes)?;
+        if state.topic_id != *topic {
+            return Err(Error::TopicMismatch);
+        }
+        let member = state.members.contains(peer);
+        let epoch = self
+            .sync_record(TOPIC_EPOCH_PREFIX, topic, 10, reserve)?
+            .map(|bytes| postcard::from_bytes(&bytes))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Some(super::super::RequestView {
+            genesis: state.genesis,
+            epoch,
+            member,
+            clock: ActorClock::new(),
+        }))
+    }
+
+    fn sync_clock(
+        &self,
+        topic: &TopicId,
+        actors: Option<&BTreeSet<ActorId>>,
+        reserve: &mut dyn FnMut(super::super::SnapshotCharge) -> Result<()>,
+    ) -> Result<ActorClock> {
+        let limit = (crate::sync::MAX_PAGE_BYTES - 1024) / 2;
+        let Some(bytes) = self.sync_record(b"ac", topic, limit, reserve)? else {
+            return Ok(ActorClock::new());
+        };
+        let (entries, rest): (usize, _) = postcard::take_from_bytes(&bytes)?;
+        if entries > rest.len() / (ActorId::LEN + 1) {
+            return Err(Error::Decode("truncated actor clock".into()));
+        }
+        let kept = actors.map_or(entries, |actors| actors.len().min(entries));
+        let workspace = ActorClock::allocation_bound(kept).saturating_add(
+            kept.saturating_mul(4 * size_of::<(ActorId, u64)>() + 128)
+                .saturating_add(256),
+        );
+        reserve(super::super::SnapshotCharge::Clock { entries, workspace })?;
+        match actors {
+            Some(actors) => ActorClock::decode_counted(&bytes, actors).map(|(clock, _)| clock),
+            None => postcard::from_bytes(&bytes).map_err(Error::from),
+        }
+    }
+
     fn actor_count(&self, topic_id: &TopicId) -> Result<usize> {
         if !self.shown(topic_id)? {
             return Ok(0);
@@ -2890,6 +2975,139 @@ fn clear_satisfied_tx(
 
 #[cfg(test)]
 mod tests {
+    fn replace_state(storage: &super::FjallStorage, topic: &crate::TopicId, bytes: &[u8]) {
+        let mut tx = storage.db.write_tx().unwrap();
+        tx.insert(
+            &storage.records,
+            super::FjallStorage::key_id(b"ts", topic),
+            bytes,
+        );
+        tx.commit().unwrap().unwrap();
+    }
+
+    #[test]
+    fn malformed_identity_rejected() {
+        use crate::Signer;
+        use crate::oplog::Oplog;
+        use crate::sync::{ActorRangeHint, PageBudget, SyncCredit, SyncEngine, SyncRequest};
+        use crate::tests::support::chain_source;
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(directory.path()).unwrap();
+        let peer = crate::Ed25519Signer::from_bytes(&[197; 32]).peer_id();
+        let (source, topic, ops) = chain_source(196, peer);
+        let log = Oplog::with_storage(storage.clone());
+        log.receive_ops(ops.clone()).unwrap();
+        let engine = SyncEngine::new(log, source.peer_id());
+        let summary = SyncEngine::new(Oplog::new(), peer).summary(topic).unwrap();
+        let credit = SyncCredit::default();
+        let budget = PageBudget::from_credit(credit);
+        let request = SyncRequest {
+            topic_id: topic,
+            genesis: Some(ops[0].id),
+            known: BTreeSet::new(),
+            wants: [ops[1].id].into(),
+            actor_range_hints: vec![ActorRangeHint {
+                actor_id: ops[0].signed.body.actor_id,
+                from_exclusive: 1,
+                to_inclusive: 3,
+            }],
+            credit,
+            window: Default::default(),
+        };
+        let bytes = postcard::to_allocvec(&storage.topic_state(&topic).unwrap().unwrap()).unwrap();
+        assert_eq!(bytes.last(), Some(&0));
+        let mut invalid_tag = bytes.clone();
+        *invalid_tag.last_mut().unwrap() = 2;
+        let mut trailing = bytes.clone();
+        trailing.push(99);
+        assert!(postcard::from_bytes::<TopicState>(&trailing).is_ok());
+        for damaged in [&bytes[..bytes.len() - 1], invalid_tag.as_slice()] {
+            replace_state(&storage, &topic, damaged);
+            for informed in [false, true] {
+                let result = if informed {
+                    engine.response_with(peer, &request, budget, &summary)
+                } else {
+                    engine.response_page(peer, &request, budget)
+                };
+                assert!(
+                    matches!(result, Err(Error::Encode(_) | Error::Decode(_))),
+                    "{result:?}"
+                );
+            }
+        }
+        for compatible in [&bytes, &trailing] {
+            replace_state(&storage, &topic, compatible);
+            assert!(
+                !engine
+                    .response_page(peer, &request, budget)
+                    .unwrap()
+                    .ops
+                    .is_empty()
+            );
+            assert!(
+                !engine
+                    .response_with(peer, &request, budget, &summary)
+                    .unwrap()
+                    .ops
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn large_identity_admitted() {
+        use crate::oplog::Oplog;
+        use crate::sync::{PageBudget, SyncCredit, SyncEngine, SyncRequest};
+        use crate::tests::support::Note;
+        use crate::{Event, Signer};
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(directory.path()).unwrap();
+        let signer = crate::Ed25519Signer::from_bytes(&[198; 32]);
+        let peer = crate::Ed25519Signer::from_bytes(&[199; 32]).peer_id();
+        let topic = TopicId::hash(b"large bounded identity");
+        let members = (0_u32..4096)
+            .map(|index| PeerId::hash(index.to_le_bytes()))
+            .chain([signer.peer_id(), peer]);
+        let log = Oplog::with_storage(storage.clone());
+        let genesis = log
+            .create_topic_genesis(
+                topic,
+                crate::actor_id_for(topic, signer.peer_id()),
+                crate::TopicGenesis::new(Note::TYPE_ID, members),
+                &signer,
+            )
+            .unwrap();
+        let engine = SyncEngine::new(log, signer.peer_id());
+        let credit = SyncCredit::default();
+        let request = SyncRequest {
+            topic_id: topic,
+            genesis: Some(genesis.id),
+            credit,
+            wants: [genesis.id].into(),
+            known: BTreeSet::new(),
+            actor_range_hints: Vec::new(),
+            window: Default::default(),
+        };
+        for informed in [false, true] {
+            let before = engine.page_work();
+            let budget = PageBudget::from_credit(credit);
+            let page = if informed {
+                let summary = SyncEngine::new(Oplog::new(), peer).summary(topic).unwrap();
+                engine.response_with(peer, &request, budget, &summary)
+            } else {
+                engine.response_page(peer, &request, budget)
+            }
+            .unwrap();
+            assert_eq!(page.ops, vec![genesis.clone()]);
+            assert!(!page.more);
+            let after = engine.page_work();
+            assert!(after.preparation > before.preparation);
+            assert!(after.captured - before.captured <= crate::sync::MAX_PAGE_BYTES as u64);
+        }
+    }
+
     #[test]
     fn dependency_corruption_refused() {
         use super::*;
