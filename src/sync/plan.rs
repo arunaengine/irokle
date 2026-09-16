@@ -972,6 +972,117 @@ impl Pager<'_> {
     /// What `meta` still waits for: an unsent or blocked dependency, a missing
     /// record, positions of actors the request did not describe, all named at
     /// once, or a position of another actor the peer does not hold yet.
+    fn observe(&mut self, actor: ActorId, seq: u64) {
+        if seq > self.covered.get(&actor) {
+            self.covered.observe(actor, seq);
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    fn position(&mut self, actor: ActorId, generation: u64) -> Result<bool> {
+        if !self.positions.contains_key(&actor) {
+            if self.positions.len() >= self.position_limit {
+                return Ok(false);
+            }
+            self.slice.reserve(256)?;
+        }
+        need(&mut self.positions, actor, generation);
+        Ok(true)
+    }
+
+    fn demand(&mut self, scan: &mut DependencyScan, meta: &OpHeader) -> Result<bool> {
+        if !scan.needed.contains_key(&meta.actor_id) {
+            if scan.needed.len() >= self.position_limit {
+                return Ok(false);
+            }
+            self.slice.reserve(256)?;
+        }
+        if !self.position(meta.actor_id, meta.generation)? {
+            return Ok(false);
+        }
+        scan.needed
+            .entry(meta.actor_id)
+            .and_modify(|needed| {
+                needed.0 = needed.0.max(meta.actor_seq);
+                needed.1 = needed.1.min(meta.generation);
+            })
+            .or_insert((meta.actor_seq, meta.generation));
+        Ok(true)
+    }
+
+    fn scan_ancestors(&mut self, scan: &mut DependencyScan) -> Result<bool> {
+        while let Some(mut frame) = scan.ancestry.pop() {
+            if !self.scope.unknown(&frame.actor)
+                && (self.scope.holds_prefix(&frame.actor, frame.seq)
+                    || self.covered.get(&frame.actor) >= frame.seq)
+            {
+                if !self.slice.actor() {
+                    scan.ancestry.push(frame);
+                    return Ok(false);
+                }
+                continue;
+            }
+            if frame.pending.is_none() {
+                if !self.visit() {
+                    scan.ancestry.push(frame);
+                    return Ok(false);
+                }
+                let next = self.read.dependency_ids(&frame.id, frame.cursor, 1)?;
+                let Some(mut next) = next else {
+                    self.slice.reserve(256)?;
+                    self.missing.insert(frame.id);
+                    continue;
+                };
+                let Some(id) = next.pop() else { continue };
+                frame.pending = Some(Dependency { id, header: None });
+            }
+            let Some(mut dependency) = frame.pending.take() else {
+                continue;
+            };
+            if dependency.header.is_none() {
+                if self.exhausted() || !self.slice.edge() || !self.visit() {
+                    frame.pending = Some(dependency);
+                    scan.ancestry.push(frame);
+                    return Ok(false);
+                }
+                dependency.header = self.read.get_header(&dependency.id)?;
+            }
+            let mut descend = false;
+            if let Some(meta) = &dependency.header
+                && self.scope.unknown(&meta.actor_id)
+                && scan
+                    .needed
+                    .get(&meta.actor_id)
+                    .is_none_or(|needed| needed.0 < meta.actor_seq)
+            {
+                if !self.demand(scan, meta)? {
+                    frame.pending = Some(dependency);
+                    scan.ancestry.push(frame);
+                    return Ok(false);
+                }
+                descend = true;
+            }
+            frame.cursor.offset = frame
+                .cursor
+                .offset
+                .checked_add(1)
+                .ok_or_else(|| Error::SyncCapacity("dependency cursor overflow".into()))?;
+            frame.cursor.after = Some(dependency.id);
+            scan.ancestry.push(frame);
+            if descend && let Some(meta) = dependency.header {
+                self.slice.reserve(2 * size_of::<Ancestor>())?;
+                scan.ancestry.push(Ancestor {
+                    id: dependency.id,
+                    actor: meta.actor_id,
+                    seq: meta.actor_seq,
+                    cursor: DependencyCursor::default(),
+                    pending: None,
+                });
+            }
+        }
+        Ok(true)
+    }
+
     fn wait_for(&mut self, op: &Op) -> Result<Wait> {
         let mut unknown = false;
         let mut waits = None;
