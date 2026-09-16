@@ -33,6 +33,7 @@ def cases():
                                    "--", "-D", "warnings"]),
         ])
     commands.extend((f"{name}-1.95", ["+1.95.0", *args]) for name, args in commands[:9])
+    commands.append(("contracts", ["test", "--locked", "--all-features", "--test", "contracts"]))
     result = [{"label": name,
                "argv": (["env", "RUSTDOCFLAGS=-D warnings"] if name.startswith("doc") else [])
                        + ["cargo", *args], "timeout": 7200}
@@ -47,6 +48,14 @@ def cases():
         result.append({"label": f"ignored-{name.split('::')[-1]}", "timeout": 7200,
                        "argv": ["cargo", "test", "--locked", "--all-features", "--lib", exact,
                                 "--", "--exact", "--ignored", "--test-threads=1"], "tests": [exact]})
+    for name in ("scan_allocation_bounds", "memory_store_bounds", "captured_clock_bounds",
+                 "selected_clock_bounds", "decoded_clock_bounds", "malformed_frame_bounds",
+                 "shared_cache_bounds", "tree_allocation_bounds", "vector_allocation_bounds",
+                 "record_allocation_bounds"):
+        result.append({"label": f"allocator-{name}", "timeout": 7200,
+                       "argv": ["cargo", "test", "--locked", "--all-features", "--test",
+                                "allocation_bounds", name, "--", "--exact", "--ignored",
+                                "--nocapture", "--test-threads=1"], "tests": [name]})
     result.append({"label": "runner-tests", "timeout": 120,
                    "argv": [sys.executable, "-B", "-m", "unittest", "discover", "-s", "scripts", "-v"]})
     return result
