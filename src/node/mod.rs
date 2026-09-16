@@ -45,7 +45,7 @@ fn is_unreachable(error: &std::io::Error) -> bool {
         std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
     )
 }
-const SYNC_PEER_SHARED_OVERLAP: usize = 2;
+const SHARED_OVERLAP: usize = 2;
 #[cfg(feature = "iroh")]
 const SYNC_TOPIC_CONCURRENCY: usize = 8;
 
@@ -164,10 +164,7 @@ impl<S: Storage> Irokle<S> {
         self.oplog.storage()
     }
 
-    /// Sync targets for `topic_id` under the topic's replication policy and
-    /// this node's runtime peer health. Every scheduling and eligibility path
-    /// reads the same view, so an alternate chosen because a preferred peer is
-    /// unreachable is not rejected elsewhere as an unselected target.
+    /// Select sync targets for `topic_id` from one replication-policy and peer-health view.
     pub(crate) fn sync_peers(&self, topic_id: TopicId, state: &TopicState) -> Vec<PeerId> {
         self.peer_health
             .with_view(|health| select_sync_targets(topic_id, self.peer_id(), state, health).peers)
@@ -281,14 +278,14 @@ impl<S: Storage> Irokle<S> {
         for peer in peers {
             while syncs.len() >= SYNC_TOPIC_CONCURRENCY {
                 if let Some(result) = syncs.join_next().await {
-                    record_sync_topic_join_result(result, &mut first_error);
+                    record_sync_join(result, &mut first_error);
                 }
             }
             let net = Arc::clone(net);
             syncs.spawn(async move { (peer, net.sync_peer_now(peer, topic_id).await) });
         }
         while let Some(result) = syncs.join_next().await {
-            record_sync_topic_join_result(result, &mut first_error);
+            record_sync_join(result, &mut first_error);
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -522,21 +519,14 @@ impl<S: Storage> Irokle<S> {
         self.oplog.recheck_topics()
     }
 
-    /// Discard ops of `topic_id` that no head reaches and rebuild the topic from
-    /// the ops that remain. A store damaged by the pre-`reset_topic_and_admit`
-    /// genesis reset can hold a descendant whose ancestry belongs to the
-    /// replaced chain; no peer can supply that ancestry under the current
-    /// genesis, so the topic stays unresolved until the descendant goes. The
-    /// returned payloads are the embedder's to re-emit.
+    /// Discard unreachable ops of `topic_id` and rebuild it from the remaining heads.
+    /// Replaced-genesis descendants stay unresolved; returned payloads belong to the embedder.
     pub fn quarantine_orphans(&self, topic_id: TopicId) -> Result<Option<TopicEviction>> {
         self.oplog.quarantine_orphans(&topic_id)
     }
 
-    /// Evictions this node recorded durably and no consumer has acknowledged
-    /// yet. Each was written in the same transaction that discarded the
-    /// payloads, so this is what a restart must drain before it can treat
-    /// eviction recovery as complete: an eviction delivered only through the
-    /// in-memory sink and lost to a crash is still here.
+    /// Return durable evictions awaiting acknowledgement. The transaction writes each record
+    /// with discarded payloads, so restart recovery survives a lost in-memory delivery.
     pub fn pending_evictions(&self) -> Result<Vec<TopicEviction>> {
         self.storage().pending_evictions()
     }
@@ -558,12 +548,8 @@ impl<S: Storage> Irokle<S> {
         self.storage().clear_eviction(key)
     }
 
-    /// Run [`Irokle::quarantine_orphans`] over every local topic. One topic that
-    /// cannot be quarantined, because it is sealed or its records are
-    /// unreadable, is a per-topic outcome: the remaining topics are still
-    /// visited and every eviction already committed is still returned, because
-    /// each was written in the transaction that discarded its payloads. Only a
-    /// failure to enumerate topics at all is reported as a global failure.
+    /// Quarantine orphaned ops in every local topic and return committed evictions.
+    /// Per-topic failures leave other topics running; only enumeration failure is global.
     pub fn quarantine_topics(&self) -> Result<Vec<TopicEviction>> {
         let mut quarantined = Vec::new();
         for info in self.list_topics()? {
@@ -597,53 +583,7 @@ impl<S: Storage> Irokle<S> {
         self.sync.negotiate_page(peer_id, remote, budget)
     }
 
-    /// One bounded page of `request`; see [`crate::sync::SyncEngine::response_page`].
-    ///
-    /// A transport repeats request and page until the page reports no more:
-    ///
-    /// ```
-    /// use irokle::sync::{PageBudget, RequestKnowledge, SyncCredit, SyncData};
-    /// use irokle::{Ed25519Signer, Irokle, Storage, TopicConfig};
-    ///
-    /// #[derive(Clone, irokle::Event, serde::Deserialize, serde::Serialize)]
-    /// #[irokle(type_id = "doc.note")]
-    /// struct Note(u32);
-    ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let alice = Irokle::builder().with_signer(Ed25519Signer::from_bytes(&[1; 32])).build()?;
-    /// let bob = Irokle::builder().with_signer(Ed25519Signer::from_bytes(&[2; 32])).build()?;
-    /// let topic = alice.create_topic::<Note>(TopicConfig {
-    ///     initial_peers: [bob.peer_id()].into(),
-    ///     ..TopicConfig::default()
-    /// })?;
-    /// // Bob holds the genesis first; pages then carry the events.
-    /// let genesis = alice.plan_sync_data(bob.peer_id(), &bob.sync_summary(topic.id())?)?;
-    /// bob.receive_sync_outcome(alice.peer_id(), genesis)?;
-    /// for index in 0..10 {
-    ///     topic.publish(Note(index))?;
-    /// }
-    /// let mut pages = 0;
-    /// let mut knowledge = RequestKnowledge::default();
-    /// loop {
-    ///     let summary = alice.sync_summary(topic.id())?;
-    ///     let mut request = bob.plan_request_with(alice.peer_id(), &summary, &knowledge)?;
-    ///     if request.wants.is_empty() && request.actor_range_hints.is_empty() {
-    ///         break;
-    ///     }
-    ///     request.credit = SyncCredit { ops: 4, ..request.credit };
-    ///     let page = alice.response_with(bob.peer_id(), &request, PageBudget::from_credit(request.credit), &bob.sync_summary(topic.id())?)?;
-    ///     assert!(page.ops.len() <= 4);
-    ///     let received = !page.ops.is_empty();
-    ///     let data = SyncData { topic_id: topic.id(), ops: page.ops };
-    ///     bob.receive_sync_outcome(alice.peer_id(), data)?;
-    ///     knowledge.settle(&request.window, (&page.positions, page.continued), (received, summary.actor_clock.iter().count()));
-    ///     pages += 1;
-    /// }
-    /// assert_eq!(pages, 3);
-    /// assert_eq!(bob.storage().actor_clock(&topic.id())?, alice.storage().actor_clock(&topic.id())?);
-    /// # Ok(())
-    /// # }
-    /// ```
+    #[doc = include_str!("response_page.md")]
     pub fn response_page(
         &self,
         peer_id: PeerId,
@@ -701,10 +641,8 @@ impl<S: Storage> Irokle<S> {
         self.receive_sync_data_from_evicting(source_peer_id, data)
     }
 
-    /// Alias for [`Self::receive_sync_data_from`] with an explicit name for
-    /// callers handling genesis tie-break evictions. The embedder consumes
-    /// evictions to re-emit discarded payloads under the winning genesis;
-    /// re-emission itself is out of scope for irokle.
+    /// Alias for [`Self::receive_sync_data_from`] that exposes genesis tie-break evictions.
+    /// The embedder re-emits discarded payloads under the winning genesis.
     pub fn receive_sync_data_from_evicting(
         &self,
         source_peer_id: PeerId,
@@ -899,7 +837,7 @@ impl<S: Storage> Irokle<S> {
     }
 
     #[cfg(feature = "iroh")]
-    pub(crate) fn ensure_iroh_peer_whitelisted(
+    pub(crate) fn ensure_peer_allowed(
         &self,
         source_peer_id: PeerId,
         data: &SyncData,
@@ -1439,7 +1377,7 @@ fn now_millis() -> Result<u64> {
 }
 
 #[cfg(feature = "iroh")]
-fn record_sync_topic_join_result(
+fn record_sync_join(
     result: std::result::Result<(PeerId, std::io::Result<()>), tokio::task::JoinError>,
     first_error: &mut Option<std::io::Error>,
 ) {

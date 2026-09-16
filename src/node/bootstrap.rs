@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Bootstrap of topics this node does not hold: each source stages its history
-//! in a provisional namespace, admitted by the normal oplog, and the namespace
-//! becomes the topic once that history makes this node and the source members.
+//! Bootstrap unknown topics through provisional storage and activate them once
+//! their staged history proves membership.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::oplog::is_structural_genesis;
 use crate::storage::{
-    AdmissionEffects, MAX_STAGED_IDLE_MS, ProvisionalTopic, StagedTopic, SyncObligation, TopicState,
+    AdmissionEffects, MAX_STAGED_IDLE_MS as STAGED_IDLE_MS, ProvisionalTopic, StagedTopic,
+    SyncObligation, TopicState,
 };
 use crate::sync::SyncData;
 use crate::{ActorClock, Error, OpId, PeerId, Result, Storage, TopicId, TopicPayload};
@@ -40,12 +40,8 @@ impl Bootstraps {
     }
 }
 
-/// Make room for `incoming` bytes of `current`: refuse them when they exceed
-/// the source quota or when discarding every less advanced staging of the same
-/// topic would still leave the total full, else discard those stagings, weakest
-/// first, until they fit. Stagings of one topic thus cannot block each other,
-/// and a fragment that cannot fit stages nothing. The store checks the limits
-/// again where the bytes commit, against usage this read may have missed.
+/// Refuse unless `incoming` fits after removing weaker same-topic stages; refusal evicts nothing.
+/// Remove those stages weakest first. The storage commit rechecks concurrent quota changes.
 fn make_room<S: Storage>(storage: &S, current: &ProvisionalTopic, incoming: u64) -> Result<()> {
     let limits = storage.staging_limits();
     let held = storage.provisional_topics()?;
@@ -116,10 +112,8 @@ fn reclaim_count(
 }
 
 impl<S: Storage> Irokle<S> {
-    /// Stage data for a topic this node does not hold in the namespace of its
-    /// source, and activate the namespace once its history makes this node and
-    /// the source members. A fragment of a smaller genesis replaces the
-    /// namespace; one of a larger genesis is refused as stale.
+    /// Stage an unknown topic until history proves membership of both source and this node.
+    /// Smaller genesis replaces staging; larger genesis is refused as stale.
     pub(super) fn bootstrap_unknown(
         &self,
         source: PeerId,
@@ -331,14 +325,14 @@ impl<S: Storage> Irokle<S> {
         }
     }
 
-    /// End namespaces with no touch for `MAX_STAGED_IDLE_MS`, unless
+    /// End namespaces with no touch for the staging idle limit, unless
     /// activating. Each ends only while it is exactly as this scan read it, so
     /// a write or touch in between keeps it.
     pub(crate) fn expire_bootstraps(&self, now_ms: u64) -> Result<()> {
         let storage = self.storage();
         for provisional in storage.provisional_topics()? {
             if !provisional.activating
-                && provisional.updated_ms < now_ms.saturating_sub(MAX_STAGED_IDLE_MS)
+                && provisional.updated_ms < now_ms.saturating_sub(STAGED_IDLE_MS)
             {
                 storage.discard_provisional(&provisional)?;
             }

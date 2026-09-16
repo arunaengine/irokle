@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 
 use crate::{PeerId, TopicId};
 
-use super::SYNC_PEER_SHARED_OVERLAP;
+use super::SHARED_OVERLAP;
 
 /// Consecutive failed attempts a peer may collect before selection passes it over.
 pub(crate) const PEER_FAILURE_LIMIT: u64 = 2;
@@ -148,10 +148,8 @@ struct CandidateOrder {
     probe: SmallVec<[PeerId; 16]>,
 }
 
-/// Sync targets for `local_peer` without attempt history. See
-/// [`select_sync_targets`] for the meaning of the policy fields. Production
-/// selection goes through [`super::Irokle::sync_peers`], which supplies the
-/// node's runtime health; this is the policy-only order tests compare against.
+/// Select sync targets for `local_peer` without attempt history; production
+/// selection adds runtime health through [`super::Irokle::sync_peers`].
 #[cfg(test)]
 pub(crate) fn select_sync_peers(
     topic_id: TopicId,
@@ -161,25 +159,7 @@ pub(crate) fn select_sync_peers(
     select_sync_targets(topic_id, local_peer, state, PeerHealth::empty()).peers
 }
 
-/// Sync targets for `local_peer` under the topic's replication policy and the
-/// caller's `health` view.
-///
-/// `max_sync_peers` is the whole fanout budget of one node, not a quota per
-/// class: preferred, ring and fallback slots are all taken out of it, so a
-/// budget of one means one target at a time, including while failing over.
-/// `selected_peers` is a policy restriction and not a hint. An empty set allows
-/// every current member; a non-empty set allows only its intersection with
-/// current membership. Every alternate stays inside that allowed scope, so a
-/// peer outside the policy or outside current membership is never selected, not
-/// even when all allowed peers are failing.
-///
-/// `health` carries failed attempt counts and the rotation epoch. A peer is
-/// passed over only once its count reaches the retry limit, so a short delay
-/// does not move targets. The epoch is injected instead of read from a clock so
-/// rotation is reproducible; callers advance it when a target has exhausted its
-/// retry budget. When the policy permits only peers past that budget, no
-/// selection can make progress: the result is reported as blocked and the
-/// allowed scope is never widened to compensate.
+#[doc = include_str!("peer_selection.md")]
 pub(crate) fn select_sync_targets(
     topic_id: TopicId,
     local_peer: PeerId,
@@ -209,7 +189,7 @@ pub(crate) fn select_sync_targets(
         } else {
             // Leave at least one slot for a ring neighbour instead of spending
             // the whole budget on the hubs every node prefers.
-            let preferred = SYNC_PEER_SHARED_OVERLAP.saturating_add(1).min(max - 1);
+            let preferred = SHARED_OVERLAP.saturating_add(1).min(max - 1);
             take_slots(&mut selected, &order.hubs, 0, preferred, health, false);
         }
         take_slots(&mut selected, &order.ring, rotation, max, health, false);

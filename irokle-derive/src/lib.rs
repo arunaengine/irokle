@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn infers_missing_type_id() {
+    fn infers_type_id() {
         let input = input(quote! { struct Chat; });
         let config = parse_config(&input).unwrap();
 
@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_type_id() {
+    fn rejects_empty_id() {
         let input = input(quote! {
             #[irokle(type_id = "")]
             struct Chat;
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_type_id() {
+    fn rejects_duplicate_id() {
         let input = input(quote! {
             #[irokle(type_id = "one", type_id = "two")]
             struct Chat;

@@ -2323,7 +2323,7 @@ impl<S: Storage> SharedNet<S> {
             ops: Vec::new(),
         };
         self.node
-            .ensure_iroh_peer_whitelisted(remote_peer_id, &probe)
+            .ensure_peer_allowed(remote_peer_id, &probe)
             .map_err(invalid_data)?;
         // Staging of another branch from this peer is continued only by a
         // smaller genesis, whose first fragment replaces it.
@@ -2862,7 +2862,7 @@ impl<S: Storage> SharedNet<S> {
                     }
                     let received = self
                         .node
-                        .ensure_iroh_peer_whitelisted(remote_peer_id, &data)
+                        .ensure_peer_allowed(remote_peer_id, &data)
                         .and_then(|()| {
                             self.node.receive_bound(
                                 remote_peer_id,
@@ -3465,7 +3465,7 @@ impl<S: Storage> SharedNet<S> {
                     invalid_data("sync data requires a preceding SyncOpen with peer_id")
                 })?;
                 self.node
-                    .ensure_iroh_peer_whitelisted(source_peer, &data)
+                    .ensure_peer_allowed(source_peer, &data)
                     .map_err(invalid_data)?;
                 let outcome = self
                     .node

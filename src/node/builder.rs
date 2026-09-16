@@ -166,9 +166,7 @@ impl<S: Storage> IrokleBuilder<S> {
     #[cfg(feature = "fjall")]
     /// Use Fjall storage with an explicit transaction persist mode.
     ///
-    /// The default `with_fjall_path` uses `SyncAll`. `Buffer` avoids a
-    /// foreground fsync per Irokle transaction when the caller has a separate
-    /// durability boundary.
+    /// `with_fjall_path` uses `SyncAll`; `Buffer` lets the caller set the durability boundary.
     pub fn with_fjall_path_and_persist_mode(
         self,
         path: impl AsRef<std::path::Path>,

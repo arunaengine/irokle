@@ -16,10 +16,9 @@ use std::sync::{Mutex, OnceLock};
 #[path = "clock_scan.rs"]
 pub(crate) mod scan;
 
-/// Positions per actor. Clones share structure: entries live in a persistent
-/// trie over the nibbles of actor ids, so a clock derived from another by a
-/// few changes copies only the paths to them. Iteration is in id order and
-/// the serialized form is a map of every entry, zero positions included.
+/// Actor positions in a persistent trie over actor-ID nibbles. Clones share nodes;
+/// updates copy only changed paths. Iteration is ID-ordered; serialization is a map
+/// of every entry, including zero positions.
 #[derive(Clone, Default)]
 pub struct ActorClock {
     root: Option<Arc<Node>>,
@@ -793,10 +792,8 @@ fn corrupt() -> crate::Error {
 }
 
 #[cfg(feature = "fjall")]
-/// Clock nodes loaded or stored recently, so loading a clock that shares most
-/// of its nodes with another reads only the rest. Nodes are held only while
-/// something else holds them, except those of the latest clocks, which are
-/// held within an estimate of their bytes.
+/// Reuse shared clock nodes without reading them again. Only the latest clocks
+/// retain nodes within an estimated byte limit; other cached nodes are weak references.
 #[derive(Default)]
 pub(crate) struct ClockCache {
     inner: Mutex<CacheInner>,
@@ -1485,7 +1482,7 @@ mod tests {
     /// its name, or that sits below a parent it does not belong to, is refused.
     #[cfg(feature = "fjall")]
     #[test]
-    fn stored_nodes_round_trip() {
+    fn nodes_round_trip() {
         let actor =
             |index: u32| ActorId::from_bytes(*blake3::hash(&index.to_le_bytes()).as_bytes());
         let mut store = std::collections::HashMap::new();
