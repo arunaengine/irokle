@@ -11,8 +11,8 @@ use crate::storage::{
     Storage, TopicState, TopicView,
 };
 use crate::{
-    ActorId, Error, EventEnvelope, EvictionKey, Op, OpBody, OpId, PeerId, Result, SignedOp, Signer,
-    TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
+    ActorId, Error, EvictionKey, Op, OpBody, OpId, PeerId, Result, SignedOp, TopicId, TopicPayload,
+    actor_id_for,
 };
 
 mod admission;
@@ -22,8 +22,7 @@ mod pending;
 mod topology;
 
 use admission::{
-    checked_next, ensure_event_type, heads_after, is_admission_race, is_permanent_rejection,
-    next_actor_position, pending_meta_for,
+    checked_next, ensure_event_type, heads_after, next_actor_position, pending_meta_for,
 };
 pub(crate) use genesis::is_structural_genesis;
 use membership::{apply_control, materialize_topic_state, merge_states};
@@ -1219,130 +1218,6 @@ impl<S: Storage> Oplog<S> {
         })
     }
 
-    fn validate_pending_op(
-        &self,
-        op: &Op,
-        missing_deps: &BTreeSet<crate::OpId>,
-        overlay: &BatchOverlay<'_>,
-        state: Option<&TopicState>,
-    ) -> Result<OpAdmission> {
-        let body = &op.signed.body;
-        if missing_deps.len() > MAX_PENDING_MISSING_DEPS {
-            return Err(Error::Storage(
-                "pending op has too many missing deps".into(),
-            ));
-        }
-        if body.actor_id != actor_id_for(body.topic_id, body.author) {
-            return Err(Error::ActorAuthorMismatch);
-        }
-        if body.actor_seq == 0 {
-            return Err(Error::ActorSeqGap {
-                expected: 1,
-                actual: 0,
-            });
-        }
-        if let Some(existing) = self.stored_actor_index(body, overlay.reset)?.or_else(|| {
-            overlay
-                .index
-                .get(&(body.topic_id, body.actor_id, body.actor_seq))
-                .copied()
-        }) {
-            if existing != op.id {
-                return Err(Error::ActorFork);
-            }
-            if self.is_admitted_duplicate(op)? {
-                return Ok(OpAdmission::Duplicate);
-            }
-        }
-        match &body.payload {
-            TopicPayload::Genesis(_) => {
-                if body.actor_seq != 1
-                    || body.actor_prev.is_some()
-                    || !body.deps.is_empty()
-                    || state.is_some()
-                {
-                    return Err(Error::InvalidGenesis);
-                }
-            }
-            TopicPayload::Event(envelope) => {
-                if body.deps.is_empty() || body.generation == 0 {
-                    return Err(Error::InvalidOpId);
-                }
-                // Latest membership says nothing about the op's causal frontier,
-                // which is unknown while a dependency is missing; the source's
-                // pending quota bounds what an unproven author can buffer.
-                if let Some(state) = state {
-                    ensure_event_type(&state.event_type_id, &envelope.type_id)?;
-                }
-            }
-            TopicPayload::Control(_) => {
-                if body.deps.is_empty() || body.generation == 0 {
-                    return Err(Error::InvalidOpId);
-                }
-            }
-        }
-        match (body.actor_seq, body.actor_prev) {
-            (1, Some(_)) => return Err(Error::ActorPrevMismatch),
-            (2.., None) => return Err(Error::ActorPrevMismatch),
-            _ => {}
-        }
-        if let Some(prev) = body.actor_prev {
-            if !body.deps.contains(&prev) {
-                return Err(Error::ActorPrevMismatch);
-            }
-            if !missing_deps.contains(&prev) {
-                let prev_meta = self.header_projected(&prev, overlay.meta)?;
-                if prev_meta.topic_id != body.topic_id || prev_meta.actor_id != body.actor_id {
-                    return Err(Error::ActorPrevMismatch);
-                }
-                if checked_next(prev_meta.actor_seq)? != body.actor_seq {
-                    return Err(Error::ActorSeqGap {
-                        expected: checked_next(prev_meta.actor_seq)?,
-                        actual: body.actor_seq,
-                    });
-                }
-            }
-        }
-        let expected = match overlay.tips.get(&(body.topic_id, body.actor_id)).copied() {
-            Some(tip) => Some(tip),
-            None => self.stored_actor_tip(body, overlay.reset)?,
-        };
-        if let Some((tip_seq, tip_id)) = expected {
-            let next_seq = checked_next(tip_seq)?;
-            if body.actor_seq <= tip_seq {
-                if self.is_admitted_duplicate(op)? {
-                    return Ok(OpAdmission::Duplicate);
-                }
-                return Err(Error::ActorSeqGap {
-                    expected: next_seq,
-                    actual: body.actor_seq,
-                });
-            }
-            if body.actor_prev == Some(tip_id) && body.actor_seq != next_seq {
-                return Err(Error::ActorSeqGap {
-                    expected: next_seq,
-                    actual: body.actor_seq,
-                });
-            }
-        }
-        for dep in &body.deps {
-            if missing_deps.contains(dep) {
-                continue;
-            }
-            let meta = self.header_projected(dep, overlay.meta)?;
-            if meta.topic_id != body.topic_id {
-                return Err(Error::TopicMismatch);
-            }
-            if meta.generation >= body.generation {
-                return Err(Error::GenerationMismatch {
-                    expected: checked_next(meta.generation)?,
-                    actual: body.generation,
-                });
-            }
-        }
-        Ok(OpAdmission::Admit)
-    }
-
     fn validate_op_projected(
         &self,
         op: &Op,
@@ -1480,31 +1355,6 @@ impl<S: Storage> Oplog<S> {
     /// repair, and calling it a duplicate is what left it broken forever.
     fn is_admitted_duplicate(&self, op: &Op) -> Result<bool> {
         self.storage.dep_resolvable(&op.id)
-    }
-
-    /// Classify what the store already holds for `op`. Both records present is
-    /// a duplicate; either record alone, or an actor slot or child edge naming
-    /// this exact id while the records are gone, is damage the local chain
-    /// already accounts for and must repair in place.
-    fn stored_op_state(&self, op: &Op) -> Result<StoredOp> {
-        let has_op = self.storage.get_op(&op.id)?.is_some();
-        let has_meta = self.storage.get_position(&op.id)?.is_some();
-        if has_op && has_meta {
-            return Ok(StoredOp::Complete);
-        }
-        if has_op || has_meta {
-            return Ok(StoredOp::Repair);
-        }
-        let body = &op.signed.body;
-        if self
-            .storage
-            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            == Some(op.id)
-            || !self.storage.children(&op.id)?.is_empty()
-        {
-            return Ok(StoredOp::Repair);
-        }
-        Ok(StoredOp::Absent)
     }
 
     fn project_membership(
