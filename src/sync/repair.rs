@@ -77,6 +77,183 @@ impl Repair {
         })
     }
 
+    pub(super) fn step(
+        &mut self,
+        view: RepairView<'_>,
+        budget: PageBudget,
+        position_limit: usize,
+        slice: &mut Slice,
+        records: &mut Records,
+    ) -> Result<RepairPage> {
+        let mut page = RepairPage::default();
+        if budget.ops == 0 || budget.bytes == 0 {
+            return Ok(page);
+        }
+        if !self.prepare(&view, slice)? {
+            page.continued = true;
+            return Ok(page);
+        }
+        let mut bytes = 0;
+        while page.ops.len() < budget.ops && bytes < budget.bytes {
+            let (generation, id) = match self.selected {
+                Some(root) => root,
+                None => {
+                    let start = self.after.map_or(Unbounded, Excluded);
+                    let Some(&root) = self.ordered.range((start, Unbounded)).next() else {
+                        self.after = None;
+                        break;
+                    };
+                    if !slice.actor() {
+                        page.continued = true;
+                        break;
+                    }
+                    self.selected = Some(root);
+                    root
+                }
+            };
+            if !self.remaining.contains(&id) {
+                self.advance(generation, id);
+                continue;
+            }
+            let mut scan = self.scans.get(&id).copied().unwrap_or_default();
+            if let Some((actor, seq, required)) = scan.waiting {
+                if !slice.actor() {
+                    page.continued = true;
+                    break;
+                }
+                if holds(&view, &actor, seq) {
+                    scan.waiting = None;
+                    self.save_scan(id, scan, slice)?;
+                } else {
+                    if view.scope.unknown(&actor)
+                        && !position(&mut page, actor, required, position_limit, slice)?
+                    {
+                        break;
+                    }
+                    self.advance(generation, id);
+                    continue;
+                }
+            }
+            if !records.contains(&id) && !slice.read() {
+                page.continued = true;
+                break;
+            }
+            let record = match records.take_slice(view.read, &id, slice) {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    self.mark_missing(id, slice)?;
+                    self.advance(generation, id);
+                    continue;
+                }
+                Err(LoadError::Yield) => {
+                    page.continued = true;
+                    break;
+                }
+                Err(LoadError::Failed(error)) => return Err(error),
+            };
+            let mut ready = true;
+            let start = scan.after.map_or(Unbounded, Excluded);
+            for dep in record.op.signed.body.deps.range((start, Unbounded)) {
+                if !slice.edge() {
+                    page.continued = true;
+                    ready = false;
+                    break;
+                }
+                if self.contains(dep) {
+                    ready = false;
+                    self.advance(generation, id);
+                    break;
+                }
+                if self.emitted.contains(dep) {
+                    scan.after = Some(*dep);
+                    continue;
+                }
+                if !slice.read() {
+                    page.continued = true;
+                    ready = false;
+                    break;
+                }
+                let Some(meta) = view.read.get_header(dep)? else {
+                    self.mark_missing(*dep, slice)?;
+                    ready = false;
+                    self.advance(generation, id);
+                    break;
+                };
+                if !holds(&view, &meta.actor_id, meta.actor_seq) {
+                    if view.scope.unknown(&meta.actor_id)
+                        && !position(
+                            &mut page,
+                            meta.actor_id,
+                            meta.generation,
+                            position_limit,
+                            slice,
+                        )?
+                    {
+                        ready = false;
+                        break;
+                    }
+                    scan.waiting = Some((meta.actor_id, meta.actor_seq, meta.generation));
+                    scan.after = Some(*dep);
+                    self.advance(generation, id);
+                    ready = false;
+                    break;
+                }
+                scan.after = Some(*dep);
+            }
+            if !ready {
+                self.save_scan(id, scan, slice)?;
+                records.keep(record);
+                if page.continued || self.after != Some((generation, id)) {
+                    break;
+                }
+                continue;
+            }
+            let size = postcard::experimental::serialized_size(&record.op)?;
+            if size > budget.bytes - bytes {
+                if page.ops.is_empty() {
+                    page.too_large = Some(id);
+                }
+                self.save_scan(id, scan, slice)?;
+                records.keep(record);
+                break;
+            }
+            reserve_set(&self.emitted, &id, slice)?;
+            self.emitted.insert(id);
+            self.remaining.remove(&id);
+            self.scans.remove(&id);
+            self.ordered.remove(&(generation, id));
+            self.advance(generation, id);
+            bytes += size;
+            // The destination slot and output credit exist before the cache lease ends.
+            page.ops.reserve(1);
+            page.ops.push(record.into_op());
+        }
+        if !self.missing.is_empty() {
+            slice.reserve(tree_bytes::<OpId, ()>(
+                self.missing.len().min(MAX_PAGE_MISSING),
+            ))?;
+            let start = self.missing_after.map_or(Unbounded, Excluded);
+            page.missing.extend(
+                self.missing
+                    .range((start, Unbounded))
+                    .take(MAX_PAGE_MISSING)
+                    .copied(),
+            );
+            self.missing_after = page.missing.last().copied();
+            if self.missing_after.is_some_and(|last| {
+                self.missing
+                    .range((Excluded(last), Unbounded))
+                    .next()
+                    .is_some()
+            }) {
+                page.continued = true;
+            } else {
+                self.missing_after = None;
+            }
+        }
+        Ok(page)
+    }
+
     fn advance(&mut self, generation: u64, id: OpId) {
         self.after = Some((generation, id));
         self.selected = None;
