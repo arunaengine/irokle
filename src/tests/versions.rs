@@ -255,7 +255,7 @@ async fn manual_pull(
         let mut request = engine.plan_request_with(peer, &remote, &knowledge).unwrap();
         if case != "reconnect" && round == 0 {
             let bytes = if case == "fallback" {
-                sync::MAX_ACTOR_FILTER_BYTES
+                sync::MAX_FILTER_BYTES
             } else {
                 1
             };

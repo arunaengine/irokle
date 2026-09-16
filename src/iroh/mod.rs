@@ -4176,7 +4176,7 @@ mod tests {
                     after: None,
                     through: Some(crate::ActorId::from_bytes([1; 32])),
                     behind: Some(crate::sync::ActorFilter {
-                        bits: vec![255; crate::sync::MAX_ACTOR_FILTER_BYTES],
+                        bits: vec![255; crate::sync::MAX_FILTER_BYTES],
                     }),
                 },
                 40,

@@ -181,14 +181,15 @@ impl Slice {
     pub(super) fn prepare_input(&mut self, units: usize, bytes: usize) -> Result<()> {
         let units = self.input_units.saturating_add(units);
         let bytes = self.prep_bytes.saturating_add(bytes);
-        let limit = 16 * super::MAX_REQUEST_ITEMS
-            + 8 * (super::MAX_PAGE_OPS + MAX_PAGE_MISSING);
+        let limit = 16 * super::MAX_REQUEST_ITEMS + 8 * (super::MAX_PAGE_OPS + MAX_PAGE_MISSING);
         if units > limit || bytes > 128 * 1024 * 1024 {
             return Err(Error::SyncCapacity(
                 "request input exceeds its work or memory limit; reduce wants, hints or filter bytes".into(),
             ));
         }
-        self.work.preparation.fetch_add((units - self.input_units) as u64, Ordering::Relaxed);
+        self.work
+            .preparation
+            .fetch_add((units - self.input_units) as u64, Ordering::Relaxed);
         self.input_units = units;
         self.prep_bytes = bytes;
         Ok(())
@@ -594,12 +595,9 @@ enum Wait {
     Position(ActorId, u64),
 }
 
-/// One bounded page plan over a snapshot. At most `window` actors are active.
-/// An op waiting for another actor's position is suspended outside that set
-/// and resumes once the position is sent, so waiters never fill the set and
-/// every actor behind gets a slot as others finish. A page that holds more
-/// but carries nothing names a missing record or an operation that is too
-/// large, so a caller never repeats an identical empty page silently.
+/// Bounded page plan over a snapshot with at most `window` active actors. Waiting heads stay
+/// suspended until positions are sent, so waiters do not fill the set; an empty page with more
+/// may retain a plan or report missing/oversized work. `continued` marks a retained no-data slice.
 struct Pager<'a> {
     revision: u64,
     repair: Option<super::repair::Repair>,
@@ -655,10 +653,9 @@ impl Pager<'_> {
         self.slice.exhausted()
     }
 
-    /// Plan one slice. A fresh plan starts from the actors behind; a resumed one
-    /// goes on from its frontier. Returns the actors whose positions the page
-    /// needed, by the lowest generation needing each, and the frontier when the
-    /// slice ended on its read budget before sending anything.
+    /// Plan one slice. A fresh plan starts from actors behind; a resumed plan continues from
+    /// its frontier. Return positions needed by the lowest generation and the frontier if the
+    /// slice reaches its read budget before sending anything.
     fn plan(mut self, budget: PageBudget, fresh: bool) -> Result<PlannedSlice> {
         if fresh {
             // A zero allowance reads nothing; whether the goal holds more is
@@ -1443,10 +1440,9 @@ impl Pager<'_> {
 }
 
 impl<S: Storage> SyncEngine<S> {
-    /// The next causal page for a peer at `peer`, merging forward actor ranges by
-    /// generation, so dependencies come first. Work grows with the page and the
-    /// actors behind, never with history the peer holds, and one slice reads at
-    /// most the engine's visit budget. See [`Pager`].
+    /// Next causal page for `peer`, merging forward ranges by generation so dependencies come
+    /// first. Work grows with the page and actors behind, not history the peer holds; one slice
+    /// reads at most the engine's visit budget. See [`Pager`].
     pub(super) fn plan_page(
         &self,
         read: &dyn SnapshotRead,

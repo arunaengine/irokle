@@ -8,8 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::{ActorClock, ActorId};
 
 use super::{
-    ActorFilter, ActorRangeHint, ActorWindow, MAX_ACTOR_FILTER_BYTES, MAX_ACTOR_RANGE_HINT_SPAN,
-    MAX_PAGE_MISSING,
+    ActorFilter, ActorRangeHint, ActorWindow, MAX_FILTER_BYTES, MAX_PAGE_MISSING, MAX_RANGE_SPAN,
 };
 
 /// What a requester carries between requests for one peer, topic and branch:
@@ -187,14 +186,9 @@ impl<'a> ActorScope<'a> {
     }
 }
 
-/// The ranges one request names in at most `items` hints and the window they
-/// describe. When every actor `remote` is ahead of `local` on fits, all are
-/// named and the window holds every actor. Otherwise the request first names
-/// the positions `knowledge` carries, newest first: actors behind, then held
-/// actors its window would not hold. Then it names a run of actors behind in
-/// id order after its cursor; the window covers that run and filters the
-/// actors behind it leaves out. Spans share [`MAX_ACTOR_RANGE_HINT_SPAN`]; an
-/// actor past it gets a zero-span hint.
+/// Build at most `items` hints and a window: name all fitting actors and hold them all; otherwise
+/// name `knowledge` positions newest first, then a run behind the cursor, holding it and filtering
+/// omitted actors. Spans share [`MAX_RANGE_SPAN`]; overflow actors get zero-span hints.
 pub(crate) fn request_ranges(
     local: &ActorClock,
     remote: &ActorClock,
@@ -207,7 +201,7 @@ pub(crate) fn request_ranges(
         .map(|(actor_id, _)| *actor_id)
         .collect::<Vec<_>>();
     if behind.len() <= items {
-        let mut span = MAX_ACTOR_RANGE_HINT_SPAN;
+        let mut span = MAX_RANGE_SPAN;
         let hints = behind
             .into_iter()
             .map(|actor_id| hint(local, remote, &mut span, actor_id))
@@ -220,7 +214,7 @@ pub(crate) fn request_ranges(
         let window = ActorWindow {
             after: empty,
             through: empty,
-            behind: ActorFilter::new(&behind, MAX_ACTOR_FILTER_BYTES),
+            behind: ActorFilter::new(&behind, MAX_FILTER_BYTES),
         };
         return (Vec::new(), window);
     }
@@ -286,7 +280,7 @@ fn window_ranges(
     after: Option<ActorId>,
     named: &[&ActorId],
 ) -> (Vec<ActorRangeHint>, ActorWindow) {
-    let mut span = MAX_ACTOR_RANGE_HINT_SPAN;
+    let mut span = MAX_RANGE_SPAN;
     let named = named
         .iter()
         .map(|actor_id| **actor_id)
@@ -330,23 +324,22 @@ fn window_ranges(
     (hints, window)
 }
 
-/// The filter of `omitted` that takes no actor of `remote` this node holds
-/// outside `window` as behind, grown from ten bits per actor within
-/// [`MAX_ACTOR_FILTER_BYTES`]. Past that, the largest filter keeps its few
-/// collisions, which a later request names like any needed position.
+/// Build a filter for omitted actors that excludes remote positions this node holds outside
+/// `window`, using ten bits per actor up to [`MAX_FILTER_BYTES`]. Beyond that, retain the
+/// largest filter; later requests name collisions as needed positions.
 fn exact_filter(
     remote: &ActorClock,
     local: &ActorClock,
     window: &ActorWindow,
     omitted: &[ActorId],
 ) -> Option<ActorFilter> {
-    let mut filter = ActorFilter::new(omitted, MAX_ACTOR_FILTER_BYTES)?;
+    let mut filter = ActorFilter::new(omitted, MAX_FILTER_BYTES)?;
     loop {
         let collides = remote.iter().any(|(actor_id, seq)| {
             *seq <= local.get(actor_id) && !window.contains(actor_id) && filter.contains(actor_id)
         });
         let bytes = filter.bits.len() * 2;
-        if !collides || bytes > MAX_ACTOR_FILTER_BYTES {
+        if !collides || bytes > MAX_FILTER_BYTES {
             return Some(filter);
         }
         filter = ActorFilter::sized(omitted, bytes);
@@ -554,7 +547,7 @@ mod tests {
                 after: Some(ActorId::from_bytes([0; 32])),
                 through: Some(ActorId::from_bytes([0xff; 32])),
                 behind: Some(ActorFilter {
-                    bits: vec![0xff; MAX_ACTOR_FILTER_BYTES],
+                    bits: vec![0xff; MAX_FILTER_BYTES],
                 }),
             },
         });
@@ -569,7 +562,7 @@ mod tests {
         let id =
             |index: u32| crate::ActorId::from_bytes(*blake3::hash(&index.to_le_bytes()).as_bytes());
         let held = (0..4096).map(id).collect::<Vec<_>>();
-        let filter = ActorFilter::new(&held, MAX_ACTOR_FILTER_BYTES).unwrap();
+        let filter = ActorFilter::new(&held, MAX_FILTER_BYTES).unwrap();
         assert!(held.iter().all(|actor_id| filter.contains(actor_id)));
         let collisions = (4096..8192)
             .filter(|index| filter.contains(&id(*index)))
@@ -579,10 +572,8 @@ mod tests {
         assert!(!ActorFilter::default().contains(&held[0]));
     }
 
-    /// At the real item limit the builder names no more than it may, whatever
-    /// the number of actors behind: one below and at the limit every actor is
-    /// named, one past it a window describes the rest. A page result naming
-    /// the most positions it may fits a small frame.
+    /// At the item limit, requests name every actor one below and at it; one past it uses a
+    /// window, and a page naming the maximum positions still fits a small frame.
     #[test]
     fn ranges_real_limit() {
         let items = super::super::MAX_REQUEST_ITEMS;

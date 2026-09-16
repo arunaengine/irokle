@@ -103,7 +103,9 @@ impl Records {
                 ));
             }
             if !slice.decode(bytes)? {
-                let marker = Arc::new(Error::SyncCapacity("slice decode allowance exhausted".into()));
+                let marker = Arc::new(Error::SyncCapacity(
+                    "slice decode allowance exhausted".into(),
+                ));
                 denied = Some(Arc::clone(&marker));
                 return Err(Error::Shared(marker));
             }
@@ -129,7 +131,9 @@ impl Records {
             Ok(op) => op,
             // Only our own admission refusal yields; backend errors retain their cause.
             Err(Error::Shared(source))
-                if denied.as_ref().is_some_and(|marker| Arc::ptr_eq(marker, &source)) =>
+                if denied
+                    .as_ref()
+                    .is_some_and(|marker| Arc::ptr_eq(marker, &source)) =>
             {
                 return Err(LoadError::Yield);
             }
@@ -141,9 +145,7 @@ impl Records {
         let mut claim = claim.ok_or_else(|| Error::Storage("operation was not reserved".into()))?;
         let actual = charge(postcard::experimental::serialized_size(&op).map_err(Error::from)?);
         if actual > claim.bytes {
-            return Err(Error::SyncCapacity(
-                "operation exceeded its reservation".into(),
-            ).into());
+            return Err(Error::SyncCapacity("operation exceeded its reservation".into()).into());
         }
         claim
             .pool
@@ -321,45 +323,54 @@ mod tests {
         let mut slice = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)
             .unwrap()
             .with_decode_limit(bytes);
-        store.read_snapshot(|read| {
-            let probe = DecodeProbe {
-                read,
-                decoded: Default::default(),
-                failure: Default::default(),
-            };
-            let record = records.take(&probe, &id, &mut slice).unwrap().unwrap();
-            assert_eq!(probe.decoded.get(), 1);
-            records.keep(record);
-            let cached = records.take(&probe, &id, &mut slice).unwrap().unwrap();
-            assert_eq!(probe.decoded.get(), 1, "cached records require no decode");
-            drop(cached);
-            assert_eq!(pool.bytes(), 0);
-            assert!(matches!(records.take(&probe, &id, &mut slice), Err(LoadError::Yield)));
-            assert_eq!(probe.decoded.get(), 1, "exhaustion must precede decoding");
-            assert_eq!(pool.bytes(), 0);
-            let mut resumed = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)?
-                .with_decode_limit(bytes);
-            let record = records.take(&probe, &id, &mut resumed).unwrap().unwrap();
-            assert_eq!(probe.decoded.get(), 2);
-            assert_eq!(record.op, op);
-            drop(record);
-            let mut small = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)?
-                .with_decode_limit(bytes - 1);
-            assert!(matches!(
-                records.take(&probe, &id, &mut small),
-                Err(LoadError::Failed(Error::SyncCapacity(_)))
-            ));
-            assert_eq!(probe.decoded.get(), 2);
-            let failure = Arc::new(Error::SyncCapacity("slice decode allowance exhausted".into()));
-            *probe.failure.borrow_mut() = Some(Error::Shared(Arc::clone(&failure)));
-            match records.take(&probe, &id, &mut slice) {
-                Err(LoadError::Failed(Error::Shared(source))) => assert!(Arc::ptr_eq(&source, &failure)),
-                _ => panic!("backend failure was mistaken for slice exhaustion"),
-            }
-            assert_eq!(probe.decoded.get(), 2);
-            assert_eq!(pool.bytes(), 0);
-            Ok(())
-        }).unwrap();
+        store
+            .read_snapshot(|read| {
+                let probe = DecodeProbe {
+                    read,
+                    decoded: Default::default(),
+                    failure: Default::default(),
+                };
+                let record = records.take(&probe, &id, &mut slice).unwrap().unwrap();
+                assert_eq!(probe.decoded.get(), 1);
+                records.keep(record);
+                let cached = records.take(&probe, &id, &mut slice).unwrap().unwrap();
+                assert_eq!(probe.decoded.get(), 1, "cached records require no decode");
+                drop(cached);
+                assert_eq!(pool.bytes(), 0);
+                assert!(matches!(
+                    records.take(&probe, &id, &mut slice),
+                    Err(LoadError::Yield)
+                ));
+                assert_eq!(probe.decoded.get(), 1, "exhaustion must precede decoding");
+                assert_eq!(pool.bytes(), 0);
+                let mut resumed = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)?
+                    .with_decode_limit(bytes);
+                let record = records.take(&probe, &id, &mut resumed).unwrap().unwrap();
+                assert_eq!(probe.decoded.get(), 2);
+                assert_eq!(record.op, op);
+                drop(record);
+                let mut small = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)?
+                    .with_decode_limit(bytes - 1);
+                assert!(matches!(
+                    records.take(&probe, &id, &mut small),
+                    Err(LoadError::Failed(Error::SyncCapacity(_)))
+                ));
+                assert_eq!(probe.decoded.get(), 2);
+                let failure = Arc::new(Error::SyncCapacity(
+                    "slice decode allowance exhausted".into(),
+                ));
+                *probe.failure.borrow_mut() = Some(Error::Shared(Arc::clone(&failure)));
+                match records.take(&probe, &id, &mut slice) {
+                    Err(LoadError::Failed(Error::Shared(source))) => {
+                        assert!(Arc::ptr_eq(&source, &failure))
+                    }
+                    _ => panic!("backend failure was mistaken for slice exhaustion"),
+                }
+                assert_eq!(probe.decoded.get(), 2);
+                assert_eq!(pool.bytes(), 0);
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(work.snapshot(0).decoded, (2 * bytes) as u64);
     }
 
@@ -381,13 +392,15 @@ mod tests {
         let original = store.get_op(&id).unwrap().unwrap();
         let pool = Arc::new(RecordPool::default());
         let mut records = Records::new(Arc::clone(&pool));
-        let record = store.read_snapshot(|read| read_record(&mut records, read, &id)).unwrap().unwrap();
+        let record = store
+            .read_snapshot(|read| read_record(&mut records, read, &id))
+            .unwrap()
+            .unwrap();
         assert!(pool.bytes() > 0);
         let output = record.into_op();
-        let (TopicPayload::Event(before), TopicPayload::Event(after)) = (
-            &original.signed.body.payload,
-            &output.signed.body.payload,
-        ) else {
+        let (TopicPayload::Event(before), TopicPayload::Event(after)) =
+            (&original.signed.body.payload, &output.signed.body.payload)
+        else {
             unreachable!()
         };
         assert_eq!(before.payload, after.payload);

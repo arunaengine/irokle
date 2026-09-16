@@ -39,25 +39,24 @@ pub use types::{
     SyncReceipt, SyncReport, SyncRequest, SyncSummary,
 };
 
-const SYNC_ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/2";
+const ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/2";
 
-/// Wire contract this build speaks. Version 3 added receive credits, page results
-/// and branch names; version 4 names missing records in page results and accepts
-/// zero-span position hints; version 5 bounds the actors a request describes by
-/// a window and names in page results the positions a page needed. Older peers
-/// are refused before any message.
+#[doc = include_str!("protocol.md")]
 pub const SYNC_PROTOCOL: &str = "irokle/sync/5";
 
-/// Maximum number of sequences a single ActorRangeHint may span. Caps both the
-/// hint a peer can construct via `actor_ranges` and the work
-/// `plan_response_data` is willing to do for a peer-supplied hint, so a
-/// malicious peer cannot push us into walking unbounded sequence ranges.
+/// Maximum sequences a single `ActorRangeHint` may span. Caps `actor_ranges` hints and
+/// `plan_response_data` work for peer input, so a malicious peer cannot make us walk
+/// unbounded sequence ranges.
 pub const MAX_ACTOR_RANGE_HINT_SPAN: u64 = 65_536;
 /// Wants and range hints one request may carry together.
 const MAX_REQUEST_ITEMS: usize = 65_536;
 /// Bytes of the filter of actors behind that a request leaves out; past it the
 /// request sends none and those actors stay unknown.
 pub const MAX_ACTOR_FILTER_BYTES: usize = 1024 * 1024;
+pub(crate) use self::{
+    MAX_ACTOR_FILTER_BYTES as MAX_FILTER_BYTES,
+    MAX_ACTOR_RANGE_HINT_SPAN as MAX_RANGE_SPAN,
+};
 const MAX_PAGE_OPS: usize = 4096;
 pub(crate) const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 /// Actors one page plan keeps active range heads for; the rest wait for a free
@@ -274,12 +273,9 @@ impl<S: Storage> SyncEngine<S> {
         })
     }
 
-    /// The digest a peer compares its own against. Stored heads and clock say
-    /// nothing about whether the records behind them exist, so the topic's
-    /// unresolved ids are folded in: a node holding a hole never looks equal to
-    /// a whole one, which is exactly what the matched-fingerprint fast path
-    /// assumes. Callers must still refuse that fast path while their own topic
-    /// is incomplete, since two identically damaged stores do match.
+    /// Digest heads, clock and unresolved IDs so incomplete and whole topics differ.
+    /// Identically damaged topics can still match, so callers must reject the
+    /// fingerprint fast path whenever their local topic is incomplete.
     pub(crate) fn digest_in(&self, read: &dyn SnapshotRead, view: &TopicView) -> Result<[u8; 32]> {
         let unresolved = self.oplog.unresolved_in(read, view)?;
         if unresolved.is_empty() {
@@ -304,10 +300,9 @@ impl<S: Storage> SyncEngine<S> {
         })
     }
 
-    /// Plan a causal push page within `budget` and the request for what the
-    /// peer holds beyond this node, and whether the push holds more. A zero
-    /// budget reads no operation; another genesis is planned as a branch,
-    /// never by comparing positions across branches.
+    /// Plan a causal push page within `budget` and a request for what the peer holds beyond
+    /// this node, plus whether the push holds more. Zero budget reads no operation; another
+    /// genesis is planned as a branch, never by comparing positions across branches.
     pub fn negotiate_page(
         &self,
         peer_id: PeerId,
@@ -372,12 +367,12 @@ impl<S: Storage> SyncEngine<S> {
                 window: ActorWindow::default(),
             });
         }
-        if let Some(remote_event_type_id) = &remote.event_type_id
-            && *remote_event_type_id != view.state.event_type_id
+        if let Some(remote_type_id) = &remote.event_type_id
+            && *remote_type_id != view.state.event_type_id
         {
             return Err(Error::EventTypeMismatch {
                 expected: view.state.event_type_id,
-                actual: remote_event_type_id.clone(),
+                actual: remote_type_id.clone(),
             });
         }
 
@@ -476,11 +471,9 @@ impl<S: Storage> SyncEngine<S> {
                 need.insert(*id);
             }
         }
-        // Anti-entropy: an id we reference but cannot resolve - a head the walk
-        // could not follow, an admitted record that is half stored, or a hole a
-        // buffered op waits on - is requested from this peer like any other
-        // missing op, so a store already holding a dangling edge heals over
-        // normal sync instead of deferring its dependents forever.
+        // Request every referenced but unresolved ID: dangling edges, partial records,
+        // and holes blocking buffered ops. Ordinary sync can then repair dependencies
+        // instead of deferring their dependents forever.
         let repair = dangling
             .into_iter()
             .chain(unresolved)
@@ -556,10 +549,9 @@ impl<S: Storage> SyncEngine<S> {
         })
     }
 
-    /// Walk local heads down to the frontier the remote already has, reporting
-    /// the common ancestors found there and every id the walk found stored
-    /// incompletely. The second set is what anti-entropy repair asks the peer
-    /// for; collecting it here costs no extra traversal.
+    /// Walk local heads to the remote frontier, reporting common ancestors and ids found
+    /// stored incompletely. The second set feeds anti-entropy repair; collecting it here costs
+    /// no extra traversal.
     fn survey_in(
         read: &dyn SnapshotRead,
         remote: &SyncSummary,
@@ -687,11 +679,9 @@ impl<S: Storage> SyncEngine<S> {
         })
     }
 
-    /// Serve one causal page of `request` within `budget` and the request's own
-    /// credit, whichever is smaller: its explicit wants, then its ranges,
-    /// refusing a request planned on another genesis. `more` says the requested
-    /// goal holds more; the requester asks again. The membership check and
-    /// every record come from one snapshot.
+    /// Serve one causal page of `request` within the smaller of `budget` and request credit:
+    /// explicit wants, then ranges, while refusing another genesis. `more` means the goal holds
+    /// more and the requester asks again; one snapshot supplies membership and every record.
     pub fn response_page(
         &self,
         peer_id: PeerId,
@@ -752,7 +742,7 @@ impl<S: Storage> SyncEngine<S> {
             .len()
             .saturating_add(request.wants.len())
             > self.request_items
-            || filter.is_some_and(|filter| filter.bits.len() > MAX_ACTOR_FILTER_BYTES)
+            || filter.is_some_and(|filter| filter.bits.len() > MAX_FILTER_BYTES)
         {
             return Err(Error::SyncCapacity(
                 "reduce the request's wants, actor hints or filter".into(),
@@ -844,7 +834,7 @@ impl<S: Storage> SyncEngine<S> {
         };
         if kept.is_none() {
             for hint in &request.actor_range_hints {
-                if let Some((from, to)) = clamp_actor_range_hint(hint, local.get(&hint.actor_id)) {
+                if let Some((from, to)) = clamp_actor_range(hint, local.get(&hint.actor_id)) {
                     peer_clock.set(hint.actor_id, from);
                     goal.set(hint.actor_id, to);
                 }
@@ -1206,18 +1196,16 @@ pub(crate) fn request_genesis(local: OpId, remote: Option<OpId>) -> OpId {
     remote.filter(|remote| *remote < local).unwrap_or(local)
 }
 
-/// Clamp a peer-supplied `ActorRangeHint` against our local knowledge so that
-/// `from_exclusive <= to_inclusive`, `to_inclusive <= local_seq` (we only walk
-/// sequences we actually have), and the resulting span never exceeds
-/// `MAX_ACTOR_RANGE_HINT_SPAN`. An empty or reversed range still names the
-/// peer's position. Returns `None` when the peer holds everything local.
-fn clamp_actor_range_hint(hint: &ActorRangeHint, local_seq: u64) -> Option<(u64, u64)> {
+/// Clamp a peer `ActorRangeHint`: `from_exclusive <= to_inclusive <= local_seq`, with
+/// span capped at `MAX_RANGE_SPAN`; empty or reversed ranges still name the peer's position.
+/// Return `None` when the peer holds everything local.
+fn clamp_actor_range(hint: &ActorRangeHint, local_seq: u64) -> Option<(u64, u64)> {
     if hint.from_exclusive >= local_seq {
         return None;
     }
     let upper = hint.to_inclusive.min(local_seq).max(hint.from_exclusive);
     let span = upper - hint.from_exclusive;
-    let span = span.min(MAX_ACTOR_RANGE_HINT_SPAN);
+    let span = span.min(MAX_RANGE_SPAN);
     let to_inclusive = hint.from_exclusive.checked_add(span)?;
     Some((hint.from_exclusive, to_inclusive))
 }

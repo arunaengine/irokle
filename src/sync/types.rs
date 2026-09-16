@@ -11,7 +11,7 @@ use crate::{
     ActorClock, ActorId, Error, Op, OpId, PeerId, Result, Signer, TopicId, canonical_bytes, verify,
 };
 
-use super::{MAX_PAGE_BYTES, MAX_PAGE_OPS, SYNC_ACK_SIGNING_DOMAIN};
+use super::{ACK_SIGNING_DOMAIN, MAX_PAGE_BYTES, MAX_PAGE_OPS};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncOpen {
@@ -51,18 +51,15 @@ pub struct ActorRangeHint {
     pub to_inclusive: u64,
 }
 
-/// The actors a request's hints describe completely. Every actor of the id
-/// interval from `after`, exclusive, to `through`, inclusive, that the
-/// requester is behind on is named by a hint; `None` leaves an end open. An
-/// unnamed actor inside the interval is held. An unnamed actor outside it is
-/// held when `behind` excludes it, and otherwise unknown: a responder never
-/// takes it as held. The default window holds every actor.
+/// Actors fully described by request hints. From `after` (exclusive) through `through`
+/// (inclusive), actors the requester is behind on are named and others held; outside, `behind`
+/// excludes held actors and leaves others unknown. `None` leaves an end open; default holds all.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActorWindow {
     pub after: Option<ActorId>,
     pub through: Option<ActorId>,
     /// The actors outside the interval the requester is behind on, when their
-    /// filter fits [`MAX_ACTOR_FILTER_BYTES`](super::MAX_ACTOR_FILTER_BYTES).
+    /// filter fits [`MAX_FILTER_BYTES`](super::MAX_FILTER_BYTES).
     pub behind: Option<ActorFilter>,
 }
 
@@ -194,10 +191,9 @@ pub struct SyncPage {
     pub continued: bool,
 }
 
-/// Staged progress of data for a topic the receiver does not hold yet. It is
-/// never an ack: it certifies nothing and clears no obligation. It names the
-/// branch and staging session it describes, so a receipt of a replaced or
-/// expired staging is not read as progress of the current one.
+/// Staged data progress for a topic the receiver does not hold, never an acknowledgement.
+/// It certifies no state and clears no obligation, and names its branch and staging session so
+/// replaced or expired receipts cannot count as current progress.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncReceipt {
     pub topic_id: TopicId,
@@ -237,10 +233,9 @@ pub struct SyncData {
 pub struct SyncAck {
     pub topic_id: TopicId,
     pub peer_id: PeerId,
-    /// Genesis of the incarnation this acknowledgement certifies. Signed, so a
-    /// proof cannot be moved to a branch that replaced the one it was made on.
-    /// `None` is an acknowledgement from a peer that predates this contract, or
-    /// one whose sender could not read a coherent view; it certifies nothing.
+    /// Genesis of the certified incarnation. Because this is signed, a proof cannot move to a
+    /// replaced branch. `None` is from a pre-contract peer or incoherent sender and certifies
+    /// nothing.
     #[serde(default)]
     pub genesis: Option<OpId>,
     pub accepted: BTreeSet<OpId>,
@@ -251,7 +246,7 @@ pub struct SyncAck {
 }
 
 #[derive(Serialize)]
-struct SyncAckToSign<'a> {
+struct AckPayload<'a> {
     topic_id: TopicId,
     peer_id: PeerId,
     genesis: &'a Option<OpId>,
@@ -276,8 +271,8 @@ impl SyncAck {
     }
 
     fn signing_bytes(&self) -> Result<Vec<u8>> {
-        let mut bytes = SYNC_ACK_SIGNING_DOMAIN.to_vec();
-        bytes.extend_from_slice(&canonical_bytes(&SyncAckToSign {
+        let mut bytes = ACK_SIGNING_DOMAIN.to_vec();
+        bytes.extend_from_slice(&canonical_bytes(&AckPayload {
             topic_id: self.topic_id,
             peer_id: self.peer_id,
             genesis: &self.genesis,

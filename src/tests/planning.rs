@@ -115,7 +115,7 @@ fn catch_up_work(len: usize) -> (u64, usize) {
 /// Doubling the history must not come close to quadrupling the work: a page
 /// plan reads forward from the peer's position instead of walking the prefix.
 #[test]
-fn catch_up_is_linear() {
+fn catchup_linear() {
     let (small, small_pages) = catch_up_work(8192);
     let (large, large_pages) = catch_up_work(16384);
     assert!(large_pages <= small_pages * 2 + 1);
@@ -215,8 +215,8 @@ fn pull_behind(source: &Oplog, peers: (PeerId, PeerId), topic_id: TopicId, genes
 /// reaches and then one past it: both finish by forward pages, never through
 /// a repair walk from the far tip.
 #[test]
-fn pull_crosses_hint_span() {
-    let span = crate::sync::MAX_ACTOR_RANGE_HINT_SPAN as usize;
+fn pull_hint_span() {
+    let span = crate::sync::MAX_RANGE_SPAN as usize;
     let (topic_id, signer, reader, ops) = signed_chain(9, span + 1);
     let source = Oplog::new();
     for batch in ops[..=span].chunks(4096) {
