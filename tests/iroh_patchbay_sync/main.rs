@@ -1,7 +1,5 @@
 #![cfg(all(feature = "iroh", target_os = "linux"))]
 
-use std::time::Duration;
-
 use irokle::{ReplicationPolicy, TopicConfig};
 
 mod patchbay;
@@ -44,7 +42,11 @@ async fn flaky_sync() -> TestResult<()> {
 
     env.impair_bob_link().await?;
     isolate(&env.bob_dev).await?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        sync(&env.alice_dev, &env.alice, &env.bob, topic_id)
+            .await
+            .is_err()
+    );
     env.impair_bob_link().await?;
 
     converge_pair(

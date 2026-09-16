@@ -1,27 +1,54 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::*;
+use crate::Signer;
+
+fn payload_message() -> SyncMessage {
+    let signer = crate::Ed25519Signer::from_bytes(&[214; 32]);
+    let topic_id = crate::TopicId::hash(b"leased-result");
+    let op = crate::Op::sign(
+        crate::OpBody {
+            topic_id,
+            author: signer.peer_id(),
+            actor_id: crate::actor_id_for(topic_id, signer.peer_id()),
+            actor_seq: 2,
+            actor_prev: None,
+            deps: Default::default(),
+            generation: 1,
+            payload: crate::TopicPayload::Event(crate::EventEnvelope {
+                type_id: "test.payload".into(),
+                payload: bytes::Bytes::from(vec![42; 1024]),
+            }),
+        },
+        &signer,
+    )
+    .unwrap();
+    SyncMessage::Data(crate::sync::SyncData {
+        topic_id,
+        ops: vec![op],
+    })
+}
+
+fn reservation() -> usize {
+    2 * crate::net::decoded_message_bound(&payload_message()).unwrap()
+}
 
 fn batch(budget: &Arc<ByteBudget>) -> SyncResponses {
-    let message = SyncMessage::Page(crate::sync::SyncPage {
-        topic_id: crate::TopicId::hash(b"leased-result"),
-        more: false,
-        missing: Default::default(),
-        positions: Default::default(),
-        continued: false,
-    });
     SyncResponses {
-        messages: vec![message.clone(), message],
+        messages: vec![payload_message(), payload_message()],
         charges: vec![
             budget
-                .try_take(Pool::Results, 4096, OwnedClass::Results)
+                .try_take(Pool::Results, reservation(), OwnedClass::Results)
                 .unwrap(),
         ],
     }
 }
 
 fn assert_held(budget: &Arc<ByteBudget>) {
-    assert_eq!(budget.owned().current[&OwnedClass::Results], 4096);
+    assert_eq!(
+        budget.owned().current[&OwnedClass::Results],
+        reservation() as u64
+    );
     assert!(
         budget
             .try_take(
@@ -49,7 +76,15 @@ fn collection_retains_bytes() {
     let item = items.pop().unwrap();
     drop(items);
     assert_held(&budget);
-    assert!(matches!(item.as_ref(), SyncMessage::Page(_)));
+    let SyncMessage::Data(data) = item.as_ref() else {
+        panic!("expected payload");
+    };
+    assert_eq!(data.ops.len(), 1);
+    data.ops[0].validate().unwrap();
+    let crate::TopicPayload::Event(event) = &data.ops[0].signed.body.payload else {
+        panic!("expected event");
+    };
+    assert_eq!(event.payload.as_ref(), &[42; 1024]);
     drop(item);
     assert_released(&budget);
 }
@@ -71,7 +106,7 @@ fn adapters_retain_bytes() {
     let budget = ByteBudget::new(0, 0);
     let items = batch(&budget)
         .into_iter()
-        .filter(|item| matches!(&**item, SyncMessage::Page(_)))
+        .filter(|item| matches!(&**item, SyncMessage::Data(_)))
         .take(1)
         .collect::<Vec<_>>();
     assert_eq!(items.len(), 1);
@@ -161,7 +196,10 @@ async fn cancelled_storage_retains() {
         .unwrap();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
-    assert_eq!(net.budget.owned().current[&OwnedClass::Session], 4096);
+    assert_eq!(
+        net.budget.owned().current[&OwnedClass::Session],
+        reservation() as u64
+    );
     let control = tokio::time::timeout(
         Duration::from_secs(60),
         net.run_job(super::super::Lane::Control, |_| 42),
@@ -170,7 +208,10 @@ async fn cancelled_storage_retains() {
     .unwrap()
     .unwrap();
     assert_eq!(control, 42);
-    assert_eq!(net.budget.owned().current[&OwnedClass::Session], 4096);
+    assert_eq!(
+        net.budget.owned().current[&OwnedClass::Session],
+        reservation() as u64
+    );
     release.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(60), completion)
         .await
@@ -185,10 +226,16 @@ fn transfer_preserves_ownership() {
     let budget = ByteBudget::new(0, 0);
     let (messages, lease) = batch(&budget).into_session(&budget).unwrap();
     assert_released(&budget);
-    assert_eq!(budget.owned().current[&OwnedClass::Session], 4096);
+    assert_eq!(
+        budget.owned().current[&OwnedClass::Session],
+        reservation() as u64
+    );
     let job = Arc::clone(&lease);
     drop(lease);
-    assert_eq!(budget.owned().current[&OwnedClass::Session], 4096);
+    assert_eq!(
+        budget.owned().current[&OwnedClass::Session],
+        reservation() as u64
+    );
     drop((messages, job));
     assert_eq!(budget.owned().current[&OwnedClass::Session], 0);
 }
@@ -204,6 +251,6 @@ fn transfer_full_fails() {
         )
         .unwrap();
     let error = batch(&budget).into_session(&budget).err().unwrap();
-    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
     assert_released(&budget);
 }

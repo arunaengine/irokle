@@ -367,20 +367,15 @@ async fn entry_points_admitted() {
         .collect::<Vec<_>>();
     tokio::time::timeout(Duration::from_secs(60), async {
         while MAX_SERVED_STREAMS - bob_net.served.available_permits() < MAX_RESYNC_PEERS
+            || net.outbound_sync_streams() < MAX_RESYNC_PEERS as u64
         {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("the streams never reached bob");
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
     assert_eq!(net.outbound.available_permits(), 0);
-    assert_eq!(
-        net.outbound_sync_streams(),
-        MAX_RESYNC_PEERS as u64
-    );
+    assert_eq!(net.outbound_sync_streams(), MAX_RESYNC_PEERS as u64);
 
     // An embedder's stream is refused, not queued, while served slots are full.
     let free = bob_net.served.available_permits() as u32;
@@ -402,20 +397,14 @@ async fn entry_points_admitted() {
             .unwrap()
             .unwrap();
     }
-    assert_eq!(
-        net.outbound_sync_streams(),
-        3 * MAX_RESYNC_PEERS as u64
-    );
+    assert_eq!(net.outbound_sync_streams(), 3 * MAX_RESYNC_PEERS as u64);
     let replies = bob_net.handle_messages(alice_id, messages).unwrap();
     assert!(!replies.is_empty());
     drop(replies);
     net.shutdown().await;
     bob_net.shutdown().await;
     assert_eq!(bob_net.served.available_permits(), MAX_SERVED_STREAMS);
-    assert_eq!(
-        net.outbound.available_permits(),
-        MAX_RESYNC_PEERS
-    );
+    assert_eq!(net.outbound.available_permits(), MAX_RESYNC_PEERS);
     assert_released(&net);
     assert_released(&bob_net);
 }

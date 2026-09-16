@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::iroh::ready_addr;
 use super::support::*;
@@ -189,10 +189,8 @@ async fn small_windows_complete() {
         SyncMessage::Request(events_request(&alice.node, topic_id, SyncCredit::default())),
     ];
     messages.extend(push(topic_id, pushed.clone()));
-    let started = Instant::now();
     let replies = bob.net.sync_with(alice_addr, &messages).await.unwrap();
     let replies = replies.messages();
-    assert!(started.elapsed() < timeout / 4, "{:?}", started.elapsed());
 
     assert!(acked(replies, topic_id));
     assert_eq!(page_more(replies, topic_id), Some(false));

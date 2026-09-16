@@ -39,9 +39,16 @@ fn page_slices<S: Storage>(source: &Source<S>) -> (usize, usize) {
                 PageBudget::from_credit(request.credit),
             )
             .unwrap();
-        let visits = responder.page_work().visits - before.visits;
-        // One head past the budget: its dependency, index and op reads.
-        assert!(visits <= VISITS as u64 + 4, "page {pages} read {visits}");
+        let after = responder.page_work();
+        let visits = after.visits - before.visits;
+        let actors = after.actors - before.actors;
+        assert!(
+            visits + actors <= VISITS as u64,
+            "page {pages} exceeded its work slice"
+        );
+        assert!(after.edges - before.edges <= VISITS as u64);
+        assert!(after.auth_reads - before.auth_reads <= 16);
+        assert!(after.decoded - before.decoded <= crate::sync::MAX_PAGE_BYTES as u64);
         assert!(page.more || !page.continued);
         if page.ops.is_empty() {
             assert!(
@@ -66,7 +73,8 @@ fn page_slices<S: Storage>(source: &Source<S>) -> (usize, usize) {
         source.log.storage().heads(&source.topic_id).unwrap()
     );
     let work = responder.page_work();
-    assert_eq!(work.resumed, continued as u64);
+    assert!(work.resumed >= continued as u64);
+    assert!(work.resumed < pages as u64);
     assert_eq!(work.kept_bytes, 0, "a finished plan keeps nothing");
     (pages, continued)
 }

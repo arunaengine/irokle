@@ -964,7 +964,10 @@ fn request_items_refused() {
             .clone()
             .with_request_items(3)
             .response_page(source.reader, &request, budget);
-    assert!(matches!(refused, Err(Error::Storage(_))), "{refused:?}");
+    assert!(
+        matches!(&refused, Err(Error::SyncCapacity(detail)) if !detail.is_empty()),
+        "{refused:?}"
+    );
     let served = source
         .engine
         .clone()
