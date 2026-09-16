@@ -3864,6 +3864,9 @@ fn exchange_state(result: std::result::Result<(), &io::Error>, advanced: bool) -
         .get_ref()
         .map(|source| source as &dyn std::error::Error);
     while let Some(cause) = source {
+        if cause.is::<RemoteFailure>() {
+            return ExchangeState::Retryable;
+        }
         if let Some(cause) = cause.downcast_ref::<crate::Error>() {
             match cause.cause() {
                 crate::Error::SyncCapacity(_)
@@ -3915,8 +3918,13 @@ fn copy_result(result: &io::Result<()>) -> io::Result<()> {
     result.as_ref().copied().map_err(clone_error)
 }
 
+/// The wire identifies the failed stage but cannot distinguish resource or backend causes.
+#[derive(Debug, thiserror::Error)]
+#[error("peer failed this topic at {0:?}")]
+struct RemoteFailure(crate::sync::SyncFailureCode);
+
 fn topic_failed(failure: &crate::sync::SyncFailure) -> io::Error {
-    invalid_data(format!("peer failed this topic at {:?}", failure.code))
+    invalid_data(RemoteFailure(failure.code))
 }
 
 fn timed_out(message: &'static str) -> io::Error {
@@ -3977,6 +3985,106 @@ mod tests {
         );
         assert_eq!(exchange_state(Ok(()), false), ExchangeState::Complete);
         assert_eq!(exchange_state(Ok(()), true), ExchangeState::Advancing);
+    }
+
+    #[test]
+    fn remote_failure_retries() {
+        for code in [
+            crate::sync::SyncFailureCode::Request,
+            crate::sync::SyncFailureCode::Ack,
+        ] {
+            let error = topic_failed(&crate::sync::SyncFailure {
+                topic_id: TopicId::hash(b"remote failure"),
+                code,
+            });
+            assert_eq!(exchange_state(Err(&error), false), ExchangeState::Retryable);
+            assert_eq!(
+                exchange_state(Err(&clone_error(&error)), false),
+                ExchangeState::Retryable
+            );
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn ack_failure_decisions() {
+        use crate::tests::support::{AckFault, Note, StaleReadStorage};
+        use crate::{Ed25519Signer, Signer, TopicConfig};
+        let storage = StaleReadStorage::new(MemoryStorage::new());
+        let node = Irokle::with_storage(
+            storage.clone(),
+            crate::NodeConfig {
+                signer: Ed25519Signer::from_bytes(&[221; 32]),
+                ..crate::NodeConfig::default()
+            },
+        )
+        .unwrap();
+        let signer = Ed25519Signer::from_bytes(&[222; 32]);
+        let peer = signer.peer_id();
+        let topic = node
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let record = topic
+            .publish(Note {
+                text: "retained".into(),
+            })
+            .unwrap();
+        node.put_sync_obligation(peer, topic.id(), [record.meta.op_id].into())
+            .unwrap();
+        let summary = node.sync_summary(topic.id()).unwrap();
+        let mut ack = crate::sync::SyncAck {
+            topic_id: topic.id(),
+            peer_id: peer,
+            genesis: summary.genesis,
+            accepted: summary.heads.clone(),
+            heads: summary.heads,
+            clock: summary.actor_clock,
+            signature: None,
+        };
+        ack.sign(&signer).unwrap();
+        let failures = [
+            (
+                crate::Error::SyncCapacity("credit unavailable".into()),
+                ExchangeState::Blocked,
+            ),
+            (
+                crate::Error::Storage("temporary backend failure".into()),
+                ExchangeState::Retryable,
+            ),
+        ];
+        #[cfg(feature = "fjall")]
+        let failures = failures.into_iter().chain([(
+            crate::Error::ReopenRequired(fjall::Error::Poisoned),
+            ExchangeState::Reconcile,
+        )]);
+        for (index, (error, expected)) in failures.into_iter().enumerate() {
+            *storage.ack_fault.lock().unwrap() = Some(AckFault {
+                committed: false,
+                error,
+            });
+            let error = node
+                .apply_sync_acks(std::slice::from_ref(&ack))
+                .pop()
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(error, crate::Error::Shared(_)));
+            let error = invalid_data(error);
+            assert_eq!(exchange_state(Err(&error), false), expected);
+            let copied = clone_error(&error);
+            drop(error);
+            assert_eq!(exchange_state(Err(&copied), false), expected);
+            assert_eq!(storage.ack_calls.load(Ordering::SeqCst), index + 1);
+            assert!(storage.peer_ack(&peer, &topic.id()).unwrap().is_none());
+            assert!(
+                !storage
+                    .sync_obligations(&peer, &topic.id())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[cfg(feature = "fjall")]

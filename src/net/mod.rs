@@ -154,9 +154,20 @@ pub fn _message_type_name(message: &SyncMessage) -> &'static str {
     }
 }
 
-#[derive(Clone, Debug, thiserror::Error)]
-#[error("{0}")]
-struct SharedError(#[source] std::sync::Arc<dyn std::error::Error + Send + Sync>);
+#[derive(Clone, Debug)]
+struct SharedError(std::sync::Arc<dyn std::error::Error + Send + Sync>);
+
+impl std::fmt::Display for SharedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.0.as_ref(), formatter)
+    }
+}
+
+impl std::error::Error for SharedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
 
 impl SharedError {
     fn new(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
