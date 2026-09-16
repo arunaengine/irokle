@@ -14,11 +14,14 @@ pub enum MemoryDomain {
     Workspace,
     Activation,
     Recovery,
+    Control,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryLimits {
+    /// Total retained allowance, including the portion reserved for control work.
     pub retained_bytes: u64,
+    pub control_bytes: u64,
     pub workspace_bytes: u64,
     pub activation_bytes: u64,
     pub recovery_bytes: u64,
@@ -28,6 +31,7 @@ impl Default for MemoryLimits {
     fn default() -> Self {
         Self {
             retained_bytes: 2 * 1024 * 1024 * 1024,
+            control_bytes: 128 * 1024 * 1024,
             workspace_bytes: 256 * 1024 * 1024,
             activation_bytes: 2 * 1024 * 1024 * 1024,
             recovery_bytes: 2 * 1024 * 1024 * 1024,
@@ -44,9 +48,9 @@ pub struct MemoryUsage {
 
 struct State {
     limits: MemoryLimits,
-    used: [u64; 6],
-    peak: [u64; 6],
-    nodes: BTreeMap<usize, ClockAllocation>,
+    used: [u64; 7],
+    peak: [u64; 7],
+    nodes: BTreeMap<usize, (ClockAllocation, MemoryDomain)>,
     cursor: Option<usize>,
 }
 
@@ -59,8 +63,8 @@ impl Default for Budget {
         Self {
             state: Mutex::new(State {
                 limits: Default::default(),
-                used: [0; 6],
-                peak: [0; 6],
+                used: [0; 7],
+                peak: [0; 7],
                 nodes: BTreeMap::new(),
                 cursor: None,
             }),
@@ -78,8 +82,11 @@ impl Budget {
     pub(super) fn configure(&self, limits: MemoryLimits) -> Result<()> {
         self.sweep(usize::MAX);
         let mut state = self.lock();
-        if state.used[..3].iter().sum::<u64>() > limits.retained_bytes
-            || state.used[3..].iter().any(|bytes| *bytes > 0)
+        if limits.control_bytes > limits.retained_bytes
+            || state.used[..3].iter().sum::<u64>()
+                > limits.retained_bytes.saturating_sub(limits.control_bytes)
+            || state.used[MemoryDomain::Control as usize] > limits.control_bytes
+            || state.used[3..6].iter().any(|bytes| *bytes > 0)
         {
             return Err(Error::Storage(
                 "memory limits cannot replace live reservations".into(),
@@ -115,6 +122,7 @@ impl Budget {
             MemoryDomain::Workspace,
             MemoryDomain::Activation,
             MemoryDomain::Recovery,
+            MemoryDomain::Control,
         ];
         MemoryUsage {
             reserved: domains.into_iter().zip(state.used).collect(),
@@ -139,20 +147,31 @@ impl Budget {
                 break;
             };
             state.cursor = Some(key);
-            if state.nodes.get(&key).is_some_and(|node| !node.alive())
-                && let Some(node) = state.nodes.remove(&key)
+            if state.nodes.get(&key).is_some_and(|(node, _)| !node.alive())
+                && let Some((node, domain)) = state.nodes.remove(&key)
             {
-                state.used[MemoryDomain::SharedNodes as usize] -= node.bytes as u64 + 128;
+                state.used[domain as usize] -= node.bytes as u64 + 128;
             }
         }
     }
 
     pub(super) fn nodes(self: &Arc<Self>) -> Result<NodePlan> {
+        self.nodes_in(MemoryDomain::SharedNodes)
+    }
+
+    pub(super) fn nodes_in(self: &Arc<Self>, domain: MemoryDomain) -> Result<NodePlan> {
         self.sweep(8);
         Ok(NodePlan {
             nodes: BTreeMap::new(),
-            retained: self.reserve(MemoryDomain::SharedNodes, 0)?,
-            workspace: self.reserve(MemoryDomain::Workspace, 4096)?,
+            retained: self.reserve(domain, 0)?,
+            workspace: self.reserve(
+                if domain == MemoryDomain::Control {
+                    domain
+                } else {
+                    MemoryDomain::Workspace
+                },
+                4096,
+            )?,
         })
     }
 }
@@ -170,11 +189,15 @@ impl Charge {
         let (held, limit) = match self.domain {
             MemoryDomain::Operations | MemoryDomain::Metadata | MemoryDomain::SharedNodes => (
                 state.used[..3].iter().sum::<u64>(),
-                state.limits.retained_bytes,
+                state
+                    .limits
+                    .retained_bytes
+                    .saturating_sub(state.limits.control_bytes),
             ),
             MemoryDomain::Workspace => (state.used[index], state.limits.workspace_bytes),
             MemoryDomain::Activation => (state.used[index], state.limits.activation_bytes),
             MemoryDomain::Recovery => (state.used[index], state.limits.recovery_bytes),
+            MemoryDomain::Control => (state.used[index], state.limits.control_bytes),
         };
         let required = held.checked_add(bytes).ok_or(Error::MemoryPressure {
             domain: self.domain,
@@ -227,7 +250,7 @@ impl NodePlan {
         for (address, node) in std::mem::take(&mut self.nodes) {
             if let std::collections::btree_map::Entry::Vacant(entry) = state.nodes.entry(address) {
                 self.retained.bytes -= node.bytes as u64 + 128;
-                entry.insert(node);
+                entry.insert((node, self.retained.domain));
             }
         }
     }

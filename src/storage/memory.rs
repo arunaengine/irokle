@@ -671,7 +671,7 @@ impl Storage for MemoryStorage {
 
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()> {
         let mut inner = self.lock()?;
-        let mut reservation = MetadataPlan::new(&inner)?;
+        let mut reservation = MetadataPlan::control(&inner)?;
         reservation.status(&inner, &status)?;
         reservation.commit(&mut inner);
         inner
@@ -689,7 +689,7 @@ impl Storage for MemoryStorage {
         let mut inner = self.lock()?;
         let key = (*topic_id, *peer_id);
         let _workspace = inner.budget.reserve(
-            MemoryDomain::Workspace,
+            MemoryDomain::Control,
             4096 + inner
                 .sync_statuses
                 .get(&key)
@@ -708,7 +708,7 @@ impl Storage for MemoryStorage {
             .unwrap_or_else(|| new_peer_status(*peer_id, *topic_id));
         // A rejected update leaves no record behind for a peer that had none.
         if apply_status_update(&mut status, update) {
-            let mut reservation = MetadataPlan::new(&inner)?;
+            let mut reservation = MetadataPlan::control(&inner)?;
             reservation.status(&inner, &status)?;
             reservation.commit(&mut inner);
             inner.sync_statuses.insert(key, status.clone());
@@ -1414,7 +1414,7 @@ fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> Result<usize>
                 .sum::<u64>()
         });
     let _workspace = inner.budget.reserve(
-        MemoryDomain::Workspace,
+        MemoryDomain::Control,
         (2 * ActorClock::allocation_bound(entries) + ack.heads.len() * 256 + 4096) as u64
             + outstanding,
     )?;
@@ -1423,7 +1423,7 @@ fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> Result<usize>
         Some(existing) => merged_peer_ack(existing, &ack),
         None => ack,
     };
-    let mut reservation = MetadataPlan::new(inner)?;
+    let mut reservation = MetadataPlan::control(inner)?;
     reservation.ack(inner, &effective_ack)?;
     let obligation_key = (effective_ack.topic_id, effective_ack.peer_id);
     let mut settled = BTreeMap::new();

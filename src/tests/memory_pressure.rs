@@ -19,6 +19,7 @@ fn metadata_refusal_atomic() {
         storage,
         MemoryLimits {
             retained_bytes: held,
+            control_bytes: 0,
             ..Default::default()
         },
     );
@@ -129,6 +130,7 @@ fn refusal_allows_discard() {
         &storage,
         MemoryLimits {
             retained_bytes: held,
+            control_bytes: 0,
             ..Default::default()
         },
     );
@@ -188,4 +190,50 @@ fn merge_reserves_first() {
     );
     assert_eq!(store.reset_topic(&topic).unwrap(), ops.len());
     assert!(store.list_op_ids(&topic).unwrap().is_empty());
+}
+
+#[test]
+fn bulk_leaves_control() {
+    let (source, topic, ops) = history(173, 2, 32);
+    let store = source.storage();
+    let used = store.memory_usage().unwrap().reserved.values().sum::<u64>();
+    cap(
+        store,
+        MemoryLimits {
+            retained_bytes: used + 65536,
+            control_bytes: 65536,
+            ..Default::default()
+        },
+    );
+    assert!(matches!(
+        source.open_topic::<Note>(topic).unwrap().publish(Note {
+            text: "bulk full".into()
+        }),
+        Err(Error::MemoryPressure { .. })
+    ));
+    assert_eq!(store.list_op_ids(&topic).unwrap().len(), ops.len());
+    let peer = super::ownership::reader();
+    let ack = PeerAck {
+        peer_id: peer,
+        topic_id: topic,
+        genesis: Some(ops[0].id),
+        heads: store.heads(&topic).unwrap(),
+        clock: postcard::from_bytes(
+            &postcard::to_allocvec(&store.actor_clock(&topic).unwrap()).unwrap(),
+        )
+        .unwrap(),
+    };
+    store.apply_peer_ack(ack).unwrap();
+    assert!(!store.has_sync_obligations(&peer, &topic).unwrap());
+    let usage = store.memory_usage().unwrap();
+    assert!(usage.reserved[&MemoryDomain::Control] > 0);
+    assert!(usage.reserved.values().sum::<u64>() <= used + 65536);
+    let held = store.peer_ack(&peer, &topic).unwrap().unwrap().clock;
+    store.reset_topic(&topic).unwrap();
+    assert!(store.memory_usage().unwrap().reserved[&MemoryDomain::Control] > 0);
+    drop(held);
+    assert_eq!(
+        store.memory_usage().unwrap().reserved[&MemoryDomain::Control],
+        0
+    );
 }

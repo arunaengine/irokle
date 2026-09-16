@@ -51,13 +51,27 @@ impl MetadataKey {
 pub(super) struct MetadataPlan {
     charges: BTreeMap<MetadataKey, Arc<Charge>>,
     nodes: NodePlan,
+    domain: MemoryDomain,
 }
 
 impl MetadataPlan {
     pub(super) fn new(inner: &MemoryInner) -> Result<Self> {
+        Self::build(inner, MemoryDomain::Metadata)
+    }
+
+    pub(super) fn control(inner: &MemoryInner) -> Result<Self> {
+        Self::build(inner, MemoryDomain::Control)
+    }
+
+    fn build(inner: &MemoryInner, domain: MemoryDomain) -> Result<Self> {
         Ok(Self {
             charges: BTreeMap::new(),
-            nodes: inner.budget.nodes()?,
+            nodes: inner.budget.nodes_in(if domain == MemoryDomain::Control {
+                domain
+            } else {
+                MemoryDomain::SharedNodes
+            })?,
+            domain,
         })
     }
 
@@ -69,7 +83,7 @@ impl MetadataPlan {
     ) -> Result<()> {
         let charge = match inner.metadata.get(&key) {
             Some(charge) if charge.bytes >= bytes => Arc::clone(charge),
-            _ => Arc::new(inner.budget.reserve(MemoryDomain::Metadata, bytes)?),
+            _ => Arc::new(inner.budget.reserve(self.domain, bytes)?),
         };
         self.charges.insert(key, charge);
         Ok(())
