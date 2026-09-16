@@ -197,10 +197,10 @@ impl ResyncScheduler {
         self.notify.notify_one();
     }
 
-    pub(super) fn due_targets_by_peer(
+    pub(super) fn due_targets(
         &self,
         max_peers: usize,
-        max_targets_per_peer: usize,
+        max_targets: usize,
     ) -> Vec<(PeerId, Vec<ResyncTarget>)> {
         let now = tokio::time::Instant::now();
         let mut targets = self.inner.lock().expect("resync scheduler lock poisoned");
@@ -217,7 +217,7 @@ impl ResyncScheduler {
         for (_, key) in ready {
             match due.get_mut(&key.peer_id) {
                 Some(keys) => {
-                    if keys.len() < max_targets_per_peer {
+                    if keys.len() < max_targets {
                         keys.push(key);
                     }
                 }
@@ -474,10 +474,8 @@ impl ResyncLease {
     }
 }
 
-/// One claim taken out of a lease, owned until a terminal transition consumes
-/// it. Dropping it first hands the claim back, so a panic or early return
-/// between taking a claim and recording its result cannot strand the target in
-/// flight forever.
+/// A lease claim stays owned until a terminal transition consumes it. Dropping
+/// it first returns the claim, so panic or early return cannot strand a target.
 pub(super) struct ClaimGuard {
     scheduler: ResyncScheduler,
     claim: Option<ResyncTarget>,

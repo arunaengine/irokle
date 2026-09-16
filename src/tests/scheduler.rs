@@ -144,13 +144,13 @@ async fn drain_due(net: &Arc<IrohNet>, cap: usize) -> usize {
     for turn in 0..cap {
         let Some((peer_id, claims)) = net
             .resync_scheduler
-            .due_targets_by_peer(1, MAX_TOPICS_PER_RESYNC_BATCH)
+            .due_targets(1, MAX_RESYNC_TOPICS)
             .pop()
         else {
             return turn;
         };
         let lease = net.resync_scheduler.lease(claims, BACKOFF);
-        net.sync_peer_batch_with_runtime(peer_id, lease, runtime())
+        net.sync_peer_batch(peer_id, lease, runtime())
             .await;
     }
     panic!("targets were still due after {cap} turns");
@@ -176,7 +176,7 @@ async fn paged_pull() -> Paged {
     };
     let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
     let topic_id = shared_topic(&alice, &bob);
-    publish(&bob, topic_id, MAX_SYNC_NOW_PAGES * 20, 1024);
+    publish(&bob, topic_id, MAX_NOW_PAGES * 20, 1024);
     let bob_addr = ready_addr(bob_net.endpoint()).await;
     Paged {
         alice,
@@ -210,7 +210,7 @@ async fn budget_schedules_continuation() {
         !pulled.dominates(&target),
         "the budget ended the pull early"
     );
-    assert!(covered(&pulled, &target) > MAX_SYNC_NOW_PAGES as u64);
+    assert!(covered(&pulled, &target) > MAX_NOW_PAGES as u64);
     assert_eq!(
         paged
             .net
@@ -243,7 +243,7 @@ async fn rearm_keeps_backoff() {
     let bob_peer = paged.bob.peer_id();
     let scheduler = &paged.net.resync_scheduler;
     scheduler.schedule_now(bob_peer, paged.topic_id, false);
-    let (_, mut claims) = scheduler.due_targets_by_peer(1, 1).pop().unwrap();
+    let (_, mut claims) = scheduler.due_targets(1, 1).pop().unwrap();
     scheduler.complete_failed(claims.remove(0), BACKOFF, Duration::from_secs(600));
 
     let result = paged
@@ -286,14 +286,14 @@ async fn continuation_yields_turn() {
     let bob_peer = bob.peer_id();
     let scheduler = &net.resync_scheduler;
     scheduler.schedule_now(bob_peer, topic_id, false);
-    let (_, claims) = scheduler.due_targets_by_peer(1, 1).pop().unwrap();
+    let (_, claims) = scheduler.due_targets(1, 1).pop().unwrap();
     let covered_work = claims[0].covered;
     // The smallest id also wins a tie on the due instant.
     let waiting = PeerId::from_bytes([0; 32]);
     scheduler.schedule_now(waiting, topic_id, false);
 
     let lease = scheduler.lease(claims, BACKOFF);
-    net.sync_peer_batch_with_runtime(bob_peer, lease, runtime())
+    net.sync_peer_batch(bob_peer, lease, runtime())
         .await;
     assert!(!clock(&bob, topic_id).dominates(&clock(&alice, topic_id)));
     assert_eq!(
@@ -310,9 +310,9 @@ async fn continuation_yields_turn() {
         covered_work,
         "the continuation bumped the work revision"
     );
-    let next = scheduler.due_targets_by_peer(1, 1).pop().unwrap();
+    let next = scheduler.due_targets(1, 1).pop().unwrap();
     assert_eq!(next.0, waiting, "the continuation jumped the queue");
-    let next = scheduler.due_targets_by_peer(1, 1).pop().unwrap();
+    let next = scheduler.due_targets(1, 1).pop().unwrap();
     assert_eq!(next.0, bob_peer, "the continuation must run next");
     drop(scheduler.lease(next.1, BACKOFF));
     net.shutdown().await;
@@ -413,7 +413,7 @@ async fn expiry_spares_settled() {
     let scheduler = &net.resync_scheduler;
     scheduler.schedule_now(bob_peer, first, false);
     scheduler.schedule_now(bob_peer, second, false);
-    let (_, claims) = scheduler.due_targets_by_peer(1, 8).pop().unwrap();
+    let (_, claims) = scheduler.due_targets(1, 8).pop().unwrap();
     assert_eq!(claims.len(), 2);
     let lease = scheduler.lease(claims, BACKOFF);
 
@@ -429,7 +429,7 @@ async fn expiry_spares_settled() {
     let batch = tokio::spawn({
         let net = Arc::clone(&net);
         async move {
-            net.sync_peer_batch_with_runtime(bob_peer, lease, deadline)
+            net.sync_peer_batch(bob_peer, lease, deadline)
                 .await
         }
     });
@@ -500,12 +500,12 @@ async fn failure_counted_once() {
         }
         let (_, claims) = net
             .resync_scheduler
-            .due_targets_by_peer(1, MAX_TOPICS_PER_RESYNC_BATCH)
+            .due_targets(1, MAX_RESYNC_TOPICS)
             .pop()
             .unwrap();
         assert_eq!(claims.len(), topics);
         let lease = net.resync_scheduler.lease(claims, BACKOFF);
-        net.sync_peer_batch_with_runtime(down, lease, runtime())
+        net.sync_peer_batch(down, lease, runtime())
             .await;
         assert_eq!(
             alice.peer_health().failures(&down),
@@ -535,7 +535,7 @@ async fn manual_keeps_claim() {
     net.resync_scheduler.schedule_now(bob_peer, topic_id, false);
     let (_, claims) = net
         .resync_scheduler
-        .due_targets_by_peer(1, 1)
+        .due_targets(1, 1)
         .pop()
         .unwrap();
     let attempt = claims[0].attempt;
@@ -708,7 +708,7 @@ async fn held_attempt_counts() {
         .id();
     let scheduler = &net.resync_scheduler;
     scheduler.schedule_now(peer, topic_id, false);
-    let (_, claims) = scheduler.due_targets_by_peer(1, 8).pop().unwrap();
+    let (_, claims) = scheduler.due_targets(1, 8).pop().unwrap();
     let mut lease = scheduler.lease(claims, BACKOFF);
     let key = ResyncTargetKey {
         peer_id: peer,
@@ -769,7 +769,7 @@ async fn held_attempt_counts() {
 /// pages held at once stay within two stream budgets instead of every topic's
 /// push page, and every topic still reaches the peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn planning_holds_one_group() {
+async fn planning_one_group() {
     let lookup = Lookup::new();
     let limits = StreamLimits {
         bytes: 256 * 1024,
@@ -827,7 +827,7 @@ async fn inbound_budget_holds() {
     // Enough data frames to fill bob's data pool, and one slot left for control.
     let charge = budget::ByteBudget::frame_charge(frame, true);
     let notes = bob_net.budget.capacity(budget::Pool::Data) / charge + 1;
-    assert!(notes < MAX_RESYNC_PEER_CONCURRENCY);
+    assert!(notes < MAX_RESYNC_PEERS);
     let topic = alice.open_topic::<Note>(topic_id).unwrap();
     for index in 0..notes {
         let text = format!("{index}{}", "x".repeat(frame));
@@ -950,12 +950,9 @@ async fn staging_server(
     (node, net)
 }
 
-/// A late invitation spanning many small pages is staged from two sources under
-/// a total staging budget that holds less than both complete histories. After
-/// part of it is staged the receiver restarts, an old receipt arrives late, and
-/// both sources send their final fragments at once: one activation makes the
-/// whole topic visible, the other source completes against it, and no staging
-/// is left behind.
+/// Two sources' invitation histories exceed the shared staging budget but each fits alone.
+/// After restart and a late receipt, both final fragments arrive together.
+/// One activation publishes the topic, the other source completes, and staging is empty.
 #[cfg(feature = "fjall")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn late_invite_restart() {

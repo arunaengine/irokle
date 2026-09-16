@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::sync::{SyncMessage, SyncSummary};
 use crate::{Irokle, MemoryStorage, PeerId, ReceiveOutcome, Storage, TopicEviction};
 
-use super::frame::MAX_SYNC_DATA_OPS_PER_MESSAGE;
+use super::frame::MAX_SYNC_DATA_OPS_PER_MESSAGE as MAX_DATA_OPS;
 use super::{_message_type_name, IROKLE_SYNC_ALPN, invalid_data};
 
 mod budget;
@@ -38,21 +38,20 @@ use session::SyncSession;
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 const EMPTY_RESYNC_SLEEP: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 const MAX_ACCEPT_CONNECTIONS: usize = 128;
-const MAX_ACCEPT_CONNECTIONS_PER_PEER: usize = 4;
-/// Handshakes the accept loop carries at once, before any identity is known.
-/// Completing them one at a time let a single slow peer hold off every other
-/// inbound connection for a whole connect timeout. A per-peer limit cannot
-/// apply yet, so this global bound is what keeps pre-authentication work finite.
+const MAX_PEER_CONNECTIONS: usize = 4;
+/// Pre-authentication work is globally bounded because peer identity is
+/// unavailable; this prevents one slow peer from delaying every inbound
+/// connection.
 const MAX_PENDING_HANDSHAKES: usize = 32;
-const MAX_RESYNC_PEER_CONCURRENCY: usize = 8;
-const MAX_TOPICS_PER_RESYNC_BATCH: usize = 1024;
-const MAX_SYNC_MESSAGES_PER_STREAM: usize = 4096;
+const MAX_RESYNC_PEERS: usize = 8;
+const MAX_RESYNC_TOPICS: usize = 1024;
+const MAX_STREAM_MESSAGES: usize = 4096;
 // Keep batched streams at half the per-stream message cap so the responder's
 // reply (which can echo up to two messages per topic) stays under its own cap.
-const MAX_BATCH_STREAM_MESSAGES: usize = MAX_SYNC_MESSAGES_PER_STREAM / 2;
-const MAX_SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
+const MAX_BATCH_MESSAGES: usize = MAX_STREAM_MESSAGES / 2;
+const MAX_STREAM_BYTES: usize = 256 * 1024 * 1024;
 /// Bytes of the data pool, and of the result pool, of a net.
-const MAX_INBOUND_FRAME_BYTES: usize = 256 * 1024 * 1024;
+const MAX_INBOUND_BYTES: usize = 256 * 1024 * 1024;
 /// Streams all served connections and embedders may handle at once.
 const MAX_SERVED_STREAMS: usize = 1024;
 /// Delay before a topic that advanced but still owes work is served again. It
@@ -62,7 +61,7 @@ const RESYNC_PROGRESS_TURN: Duration = Duration::ZERO;
 /// Pages one `sync_now` call will fetch while each is really advancing, before
 /// it reports what it reached. Bounds the caller's wait instead of paging on
 /// until the peer stops publishing.
-const MAX_SYNC_NOW_PAGES: usize = 64;
+const MAX_NOW_PAGES: usize = 64;
 /// Staging receipts remembered per peer and topic, oldest dropped first.
 const MAX_BOOTSTRAP_RECEIPTS: usize = 1024;
 const RECEIPT_LOG_BYTES: usize = 64 * 1024 * 1024;
@@ -90,10 +89,10 @@ pub(crate) struct StreamLimits {
 impl Default for StreamLimits {
     fn default() -> Self {
         Self {
-            bytes: MAX_SYNC_STREAM_BYTES,
-            messages: MAX_SYNC_MESSAGES_PER_STREAM,
-            batch_messages: MAX_BATCH_STREAM_MESSAGES,
-            inbound_bytes: MAX_INBOUND_FRAME_BYTES,
+            bytes: MAX_STREAM_BYTES,
+            messages: MAX_STREAM_MESSAGES,
+            batch_messages: MAX_BATCH_MESSAGES,
+            inbound_bytes: MAX_INBOUND_BYTES,
             session_bytes: budget::SESSION_POOL_BYTES,
         }
     }
@@ -341,10 +340,8 @@ pub struct SharedNet<S: Storage> {
     bulk_lane: Arc<tokio::sync::Semaphore>,
     /// Durable epoch of this net's start; attempts are `(epoch, sequence)`.
     attempt_epoch: u64,
-    // Optional sink for genesis tie-break evictions produced while admitting
-    // remote sync data. The embedder consumes these to re-emit the discarded
-    // payloads under the winning genesis; when unset they are recovered from
-    // the eviction journal instead.
+    // Optional sink for remote genesis evictions; the journal remains the
+    // recovery path when no sink is configured.
     eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
     /// Most framed bytes of planned topic messages held at once.
     #[cfg(test)]
@@ -417,12 +414,7 @@ impl<S: Storage> IrohNet<S> {
         Self::new_with_alpns_config_and_sink(endpoint, node, alpns, runtime, None)
     }
 
-    /// Like [`Self::new_with_alpns_and_config`], but also wires an optional
-    /// eviction sink. When set, every [`TopicEviction`] produced while admitting
-    /// remote sync data (genesis tie-break resolution) is forwarded to the sink
-    /// so the embedder can re-emit the discarded payloads under the winning
-    /// genesis. The sink only makes recovery prompt: with or without it, the
-    /// payloads are journalled and drained through [`Irokle::pending_evictions`].
+    #[doc = include_str!("eviction_sink.md")]
     pub fn new_with_alpns_config_and_sink(
         endpoint: iroh::Endpoint,
         node: Irokle<S>,
@@ -430,7 +422,7 @@ impl<S: Storage> IrohNet<S> {
         runtime: IrohRuntimeConfig,
         eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
     ) -> io::Result<Self> {
-        let endpoint_peer = peer_id_from_endpoint_id(endpoint.id());
+        let endpoint_peer = peer_from_endpoint(endpoint.id());
         if endpoint_peer != node.peer_id() {
             return Err(invalid_data("iroh endpoint id does not match node signer"));
         }
@@ -453,8 +445,8 @@ impl<S: Storage> IrohNet<S> {
                 runtime,
                 resync_scheduler: ResyncScheduler::default(),
                 limits: StreamLimits::default(),
-                budget: ByteBudget::new(MAX_INBOUND_FRAME_BYTES, budget::SESSION_POOL_BYTES),
-                outbound: Arc::new(tokio::sync::Semaphore::new(MAX_RESYNC_PEER_CONCURRENCY)),
+                budget: ByteBudget::new(MAX_INBOUND_BYTES, budget::SESSION_POOL_BYTES),
+                outbound: Arc::new(tokio::sync::Semaphore::new(MAX_RESYNC_PEERS)),
                 served: Arc::new(tokio::sync::Semaphore::new(MAX_SERVED_STREAMS)),
                 plans: Arc::default(),
                 goals: service::PlanStore::default(),
@@ -484,10 +476,8 @@ impl<S: Storage> IrohNet<S> {
         self
     }
 
-    /// Run storage work on a blocking thread in `lane`. The permit and the
-    /// task guard move into the job, so both are held until the job really
-    /// ends, even when the awaiting caller is cancelled first. The guard leaves
-    /// with the result, so a result no one awaits is dropped before it.
+    /// Run storage work in a blocking lane; its permit and guard survive caller cancellation.
+    /// The result carries the guard, so unawaited data drops before completion ownership ends.
     async fn run_job<T, F>(&self, lane: Lane, job: F) -> io::Result<T>
     where
         T: Send + 'static,
@@ -535,10 +525,8 @@ impl<S: Storage> IrohNet<S> {
 }
 
 impl<S: Storage> SharedNet<S> {
-    /// Forwards evictions to the configured sink as the fast path. The sink is
-    /// an optimization, not the handoff: every payload is already journalled by
-    /// the transaction that discarded it, so an undelivered eviction stays
-    /// recoverable through [`Irokle::pending_evictions`].
+    /// Forwards evictions to the optional sink. Journaled payloads remain
+    /// recoverable when the sink is absent or delivery fails.
     fn forward_evictions(&self, evictions: Vec<TopicEviction>) {
         if evictions.is_empty() {
             return;
@@ -586,10 +574,7 @@ impl<S: Storage> IrohNet<S> {
     }
 
     pub async fn shutdown(&self) {
-        // `send` reports failure and leaves the stored value alone when no
-        // receiver exists, which loses the intent entirely if shutdown runs
-        // before any loop subscribes. `send_replace` always stores it, so a
-        // loop started afterwards still sees the terminal state.
+        // Store shutdown even without a receiver; send alone would lose it.
         // Sealed first: no caller can register work the drain below would miss.
         self.tasks.close();
         self.shutdown.send_replace(true);
@@ -619,8 +604,7 @@ impl<S: Storage> IrohNet<S> {
     }
 
     pub async fn sync_peer_now(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<()> {
-        self.sync_now(peer_id_to_endpoint_addr(peer_id)?, topic_id)
-            .await
+        self.sync_now(endpoint_addr(peer_id)?, topic_id).await
     }
 }
 
@@ -656,7 +640,7 @@ impl<S: Storage> SharedNet<S> {
         }
         for topic_id in self
             .resync_scheduler
-            .peer_topics(peer_id, MAX_TOPICS_PER_RESYNC_BATCH)
+            .peer_topics(peer_id, MAX_RESYNC_TOPICS)
         {
             if let Err(error) = self.schedule_topic_recheck(topic_id) {
                 tracing::warn!(%peer_id, %topic_id, %error, "failed to recheck topic after a health change");
@@ -668,7 +652,7 @@ impl<S: Storage> SharedNet<S> {
     /// Outbound sync dials separately because reverse stream support is not guaranteed.
     pub fn register_connection(&self, connection: iroh::endpoint::Connection) -> io::Result<()> {
         let _task = self.tasks.enter()?;
-        self.note_peer_reachable(peer_id_from_endpoint_id(connection.remote_id()));
+        self.note_peer_reachable(peer_from_endpoint(connection.remote_id()));
         Ok(())
     }
 
@@ -779,7 +763,7 @@ impl<S: Storage> IrohNet<S> {
                                 // limit is applied here rather than on accept.
                                 let peer = connection.remote_id();
                                 let peer_count = peer_connections.entry(peer).or_default();
-                                if *peer_count >= MAX_ACCEPT_CONNECTIONS_PER_PEER {
+                                if *peer_count >= MAX_PEER_CONNECTIONS {
                                     tracing::warn!(
                                         %peer,
                                         "rejecting excess inbound iroh connection"
@@ -927,7 +911,7 @@ impl<S: Storage> IrohNet<S> {
                 let next_due = net
                     .upgrade()
                     .map(|current| {
-                        let busy = MAX_RESYNC_PEER_CONCURRENCY
+                        let busy = MAX_RESYNC_PEERS
                             .saturating_sub(current.outbound.available_permits())
                             .max(syncs.len());
                         next_resync_wake(&current.resync_scheduler, busy)
@@ -946,7 +930,7 @@ impl<S: Storage> IrohNet<S> {
                     _ = &mut full_sweep, if sweeps.is_empty() && (sweep_pending || !runtime.full_sweep_interval.is_zero()) => {
                         match net.upgrade() {
                             Some(current) => {
-                                sweeps.spawn(async move { current.schedule_full_sweep_resync().await });
+                                sweeps.spawn(async move { current.schedule_sweep().await });
                             }
                             None => break,
                         }
@@ -968,7 +952,7 @@ impl<S: Storage> IrohNet<S> {
                         } else {
                             sweep_backoff = runtime.resync_initial_backoff.max(Duration::from_millis(1));
                             if startup {
-                                next_full_sweep_deadline(runtime.full_sweep_interval, runtime.full_sweep_time_of_day)
+                                next_sweep_deadline(runtime.full_sweep_interval, runtime.full_sweep_time_of_day)
                             } else {
                                 tokio::time::Instant::now() + runtime.full_sweep_interval
                             }
@@ -1063,7 +1047,7 @@ impl<S: Storage> SharedNet<S> {
         }
     }
 
-    fn should_attempt_resync_target(&self, target: ResyncTarget) -> io::Result<bool> {
+    fn should_attempt(&self, target: ResyncTarget) -> io::Result<bool> {
         if target.force.is_some() {
             return self.target_is_selected(target.key.peer_id, target.key.topic_id);
         }
@@ -1196,7 +1180,7 @@ impl<S: Storage> SharedNet<S> {
 
 impl<S: Storage> IrohNet<S> {
     async fn schedule_startup_resync(self: &Arc<Self>) -> io::Result<usize> {
-        self.schedule_full_sweep_resync().await
+        self.schedule_sweep().await
     }
 }
 
@@ -1219,7 +1203,7 @@ impl<S: Storage> SharedNet<S> {
 }
 
 impl<S: Storage> IrohNet<S> {
-    async fn schedule_full_sweep_resync(self: &Arc<Self>) -> io::Result<usize> {
+    async fn schedule_sweep(self: &Arc<Self>) -> io::Result<usize> {
         // Durable work is scheduled before maintenance starts, and maintenance
         // runs as its own job, so no topic it visits can delay that work.
         let scheduled = self
@@ -1230,7 +1214,7 @@ impl<S: Storage> IrohNet<S> {
                     tracing::warn!(%error, "sweep could not refresh topic caches");
                 }
                 let mut scheduled = shared.schedule_persisted_obligations()?;
-                for (peer_id, topic_id) in shared.full_sweep_resync_targets()? {
+                for (peer_id, topic_id) in shared.sweep_targets()? {
                     shared
                         .resync_scheduler
                         .schedule_now(peer_id, topic_id, true);
@@ -1403,11 +1387,7 @@ impl<S: Storage> IrohNet<S> {
             .unwrap_or(Ok(()))
     }
 
-    /// Manually syncs `topic_ids` with one peer through the same batched page
-    /// exchange the resync loop uses, paging each topic while it advances up to
-    /// a page budget. Per topic: `Ok` when its goal completed, `WouldBlock`
-    /// when it advanced but the budget ran out and the rest is scheduled, and
-    /// the error of an exchange that failed or made no progress.
+    #[doc = include_str!("sync_topics.md")]
     pub async fn sync_topics_now(
         &self,
         peer: iroh::EndpointAddr,
@@ -1435,7 +1415,7 @@ impl<S: Storage> IrohNet<S> {
         };
         let attempt_id = next_attempt_id();
         let attempt = self.attempt_identity(attempt_id);
-        let remote_peer_id = peer_id_from_endpoint_id(peer.id);
+        let remote_peer_id = peer_from_endpoint(peer.id);
         let live = attempt_id.map(|attempt_id| {
             self.resync_scheduler.begin_attempts(
                 topic_ids.iter().map(|topic_id| ResyncTargetKey {
@@ -1456,7 +1436,7 @@ impl<S: Storage> IrohNet<S> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        for _ in 0..MAX_SYNC_NOW_PAGES {
+        for _ in 0..MAX_NOW_PAGES {
             if paging.is_empty() {
                 break;
             }
@@ -1530,7 +1510,7 @@ impl<S: Storage> IrohNet<S> {
 
     /// Services a peer's due resync targets as multi-topic batches over the
     /// pooled connection, recording per-topic results.
-    async fn sync_peer_batch_with_runtime(
+    async fn sync_peer_batch(
         &self,
         peer_id: PeerId,
         mut lease: ResyncLease,
@@ -1548,7 +1528,7 @@ impl<S: Storage> IrohNet<S> {
                 .map(|target| (target.key.topic_id, Err(clone_error(error)), false))
                 .collect::<Vec<_>>()
         };
-        let addr = match peer_id_to_endpoint_addr(peer_id) {
+        let addr = match endpoint_addr(peer_id) {
             Ok(addr) => addr,
             Err(error) => {
                 self.publish_results(peer_id, fail_all(&error), &mut lease, runtime)
@@ -1563,7 +1543,7 @@ impl<S: Storage> IrohNet<S> {
                     .into_iter()
                     .map(|target| {
                         let topic_id = target.key.topic_id;
-                        let decision = shared.should_attempt_resync_target(target);
+                        let decision = shared.should_attempt(target);
                         if matches!(decision, Ok(false))
                             && let Err(error) = shared.gc_stale_obligations(peer_id, topic_id)
                         {
@@ -1597,7 +1577,7 @@ impl<S: Storage> IrohNet<S> {
         }
         self.publish_results(peer_id, failed, &mut lease, runtime)
             .await;
-        for chunk in topics.chunks(MAX_TOPICS_PER_RESYNC_BATCH) {
+        for chunk in topics.chunks(MAX_RESYNC_TOPICS) {
             if tokio::time::timeout_at(
                 deadline,
                 self.sync_topic_chunk(addr.clone(), chunk, &mut lease, runtime),
@@ -1670,7 +1650,7 @@ impl<S: Storage> IrohNet<S> {
         lease: &mut ResyncLease,
         runtime: IrohRuntimeConfig,
     ) {
-        let remote_peer_id = peer_id_from_endpoint_id(peer.id);
+        let remote_peer_id = peer_from_endpoint(peer.id);
         let endpoint_id = peer.id;
         let outcomes = self
             .run_topic_batch(peer, topic_ids, Some((lease, runtime)))
@@ -1780,17 +1760,15 @@ impl<S: Storage> IrohNet<S> {
         }
     }
 
-    /// Syncs every topic in `topic_ids` with one peer using batched streams:
-    /// one fingerprint round trip for the whole batch, then data/request and
-    /// ack round trips that carry only the diverged topics. Returns an outcome
-    /// per topic.
+    /// Syncs topic_ids through batched fingerprint, data/request and ACK
+    /// exchanges, returning one outcome per topic.
     async fn run_topic_batch(
         &self,
         peer: iroh::EndpointAddr,
         topic_ids: &[crate::TopicId],
         mut settle: Option<(&mut ResyncLease, IrohRuntimeConfig)>,
     ) -> BatchOutcomes {
-        let remote_peer_id = peer_id_from_endpoint_id(peer.id);
+        let remote_peer_id = peer_from_endpoint(peer.id);
         let mut outcomes = BTreeMap::new();
         let mut advanced = BTreeSet::new();
         let mut settled = BTreeSet::new();
@@ -1983,7 +1961,7 @@ impl<S: Storage> IrohNet<S> {
             if group.is_empty() {
                 continue;
             }
-            self.run_topic_batch_exchange(
+            self.run_batch_exchange(
                 peer.clone(),
                 remote_peer_id,
                 group,
@@ -2209,7 +2187,7 @@ impl<S: Storage> SharedNet<S> {
         // A summary for the open, one ack for the pushed data, the peer's own
         // request, and at most one page of data frames plus its page result.
         let estimated_responses = 3 + if wants {
-            credit_ops.div_ceil(MAX_SYNC_DATA_OPS_PER_MESSAGE) + 1
+            credit_ops.div_ceil(MAX_DATA_OPS) + 1
         } else {
             0
         };
@@ -2420,7 +2398,7 @@ impl<S: Storage> SharedNet<S> {
                     }),
                 }),
             ],
-            estimated_responses: 3 + credit_ops.div_ceil(MAX_SYNC_DATA_OPS_PER_MESSAGE),
+            estimated_responses: 3 + credit_ops.div_ceil(MAX_DATA_OPS),
         }))
     }
 
@@ -2443,7 +2421,7 @@ impl<S: Storage> SharedNet<S> {
 }
 
 impl<S: Storage> IrohNet<S> {
-    async fn run_topic_batch_exchange(
+    async fn run_batch_exchange(
         &self,
         peer: iroh::EndpointAddr,
         remote_peer_id: PeerId,
@@ -3192,7 +3170,7 @@ impl<S: Storage> IrohNet<S> {
             } else {
                 Some(
                     self.plans
-                        .register(peer_id_from_endpoint_id(peer))?
+                        .register(peer_from_endpoint(peer))?
                         .enter()
                         .await?,
                 )
@@ -3296,7 +3274,7 @@ impl<S: Storage> SharedNet<S> {
         Ok(SyncResponses { messages, charges })
     }
 
-    fn full_sweep_resync_targets(&self) -> io::Result<BTreeSet<(PeerId, crate::TopicId)>> {
+    fn sweep_targets(&self) -> io::Result<BTreeSet<(PeerId, crate::TopicId)>> {
         let mut targets = BTreeSet::new();
         for topic in self.node.storage().list_topics().map_err(invalid_data)? {
             let state = match self.node.storage().topic_state(&topic.topic_id) {
@@ -3366,7 +3344,7 @@ impl<S: Storage> SharedNet<S> {
                     .storage()
                     .read_snapshot(|read| {
                         if let Some(view) = read.topic_view(&open.topic_id, None)?
-                            && !peer_may_open_topic(&view.state, peer_id)
+                            && !may_open_topic(&view.state, peer_id)
                         {
                             return Ok(None);
                         }
@@ -3409,7 +3387,7 @@ impl<S: Storage> SharedNet<S> {
                         let Some(view) = read.topic_view(&topic_id, None)? else {
                             return Ok(None);
                         };
-                        if !peer_may_open_topic(&view.state, peer_id) {
+                        if !may_open_topic(&view.state, peer_id) {
                             return Ok(None);
                         }
                         let local = sync.digest_in(read, &view)?;
@@ -3649,7 +3627,7 @@ impl Drop for OutboundSlot {
 /// dispatch, so no due deadline is armed and an expired one cannot spin.
 fn next_resync_wake(scheduler: &ResyncScheduler, in_flight: usize) -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
-    if in_flight >= MAX_RESYNC_PEER_CONCURRENCY {
+    if in_flight >= MAX_RESYNC_PEERS {
         return now + EMPTY_RESYNC_SLEEP;
     }
     scheduler.next_due().unwrap_or(now + EMPTY_RESYNC_SLEEP)
@@ -3672,7 +3650,7 @@ fn dispatch_due_resyncs<S: Storage>(
     // Slots are taken before targets are claimed, so manual syncs holding
     // slots leave nothing claimed that cannot run.
     let mut slots = Vec::new();
-    while slots.len() < MAX_RESYNC_PEER_CONCURRENCY.saturating_sub(syncs.len()) {
+    while slots.len() < MAX_RESYNC_PEERS.saturating_sub(syncs.len()) {
         match Arc::clone(&current.outbound).try_acquire_owned() {
             Ok(slot) => slots.push(slot),
             Err(_) => break,
@@ -3683,7 +3661,7 @@ fn dispatch_due_resyncs<S: Storage>(
     }
     let due = current
         .resync_scheduler
-        .due_targets_by_peer(slots.len(), MAX_TOPICS_PER_RESYNC_BATCH);
+        .due_targets(slots.len(), MAX_RESYNC_TOPICS);
     for ((peer_id, targets), slot) in due.into_iter().zip(slots) {
         // The lease owns the claims before the task is spawned, so an abort
         // releases them instead of wedging the targets in flight.
@@ -3695,22 +3673,20 @@ fn dispatch_due_resyncs<S: Storage>(
         syncs.spawn(async move {
             let _task = task;
             let _slot = slot;
-            peer_net
-                .sync_peer_batch_with_runtime(peer_id, lease, runtime)
-                .await;
+            peer_net.sync_peer_batch(peer_id, lease, runtime).await;
         });
     }
     true
 }
 
-fn next_full_sweep_deadline(interval: Duration, time_of_day: Duration) -> tokio::time::Instant {
+fn next_sweep_deadline(interval: Duration, time_of_day: Duration) -> tokio::time::Instant {
     if interval.is_zero() {
         return tokio::time::Instant::now() + EMPTY_RESYNC_SLEEP;
     }
-    tokio::time::Instant::now() + initial_full_sweep_delay(interval, time_of_day)
+    tokio::time::Instant::now() + initial_sweep_delay(interval, time_of_day)
 }
 
-fn initial_full_sweep_delay(interval: Duration, time_of_day: Duration) -> Duration {
+fn initial_sweep_delay(interval: Duration, time_of_day: Duration) -> Duration {
     if interval < Duration::from_secs(SECONDS_PER_DAY) {
         return interval;
     }
@@ -3728,7 +3704,7 @@ fn initial_full_sweep_delay(interval: Duration, time_of_day: Duration) -> Durati
     Duration::from_secs(delay_secs)
 }
 
-fn peer_may_open_topic(state: &crate::storage::TopicState, peer_id: PeerId) -> bool {
+fn may_open_topic(state: &crate::storage::TopicState, peer_id: PeerId) -> bool {
     state.members.contains(&peer_id)
         || state
             .membership_controls
@@ -3785,7 +3761,7 @@ async fn handle_connection<S: Storage>(
                         tracing::warn!(%peer, %error, "failed to handle iroh sync stream");
                     } else if let Err(error) = current
                         .run_job(Lane::Control, move |shared| {
-                            shared.note_peer_reachable(peer_id_from_endpoint_id(peer));
+                            shared.note_peer_reachable(peer_from_endpoint(peer));
                         })
                         .await
                     {
@@ -3806,11 +3782,11 @@ impl<S: Storage> Drop for IrohNet<S> {
     }
 }
 
-fn peer_id_from_endpoint_id(peer: iroh::EndpointId) -> PeerId {
+fn peer_from_endpoint(peer: iroh::EndpointId) -> PeerId {
     PeerId::from_bytes(*peer.as_bytes())
 }
 
-fn peer_id_to_endpoint_addr(peer_id: PeerId) -> io::Result<iroh::EndpointAddr> {
+fn endpoint_addr(peer_id: PeerId) -> io::Result<iroh::EndpointAddr> {
     Ok(iroh::EndpointAddr::from(
         iroh::EndpointId::from_bytes(peer_id.as_bytes()).map_err(invalid_data)?,
     ))
@@ -4163,7 +4139,7 @@ mod tests {
     /// An entry a node keeps requesting with stays while more entries than the
     /// log holds come and go around it.
     #[test]
-    fn requests_stay_in_use() {
+    fn requests_remain_used() {
         let genesis = crate::OpId::hash(b"branch");
         let key = (peer(1), topic(1));
         let page = crate::sync::SyncPage {
@@ -4299,7 +4275,7 @@ mod tests {
         scheduler.schedule_now(peer(1), topic(2), false);
         scheduler.schedule_now(peer(1), topic(2), false);
 
-        let due = scheduler.due_targets_by_peer(8, 8);
+        let due = scheduler.due_targets(8, 8);
 
         assert_eq!(due.len(), 1);
         let (peer_id, targets) = &due[0];
@@ -4311,14 +4287,14 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_groups_due_targets_by_peer() {
+    fn groups_due_targets() {
         let scheduler = ResyncScheduler::default();
         scheduler.schedule_now(peer(1), topic(1), false);
         scheduler.schedule_now(peer(1), topic(2), false);
         scheduler.schedule_now(peer(1), topic(3), false);
         scheduler.schedule_now(peer(2), topic(1), false);
 
-        let due = scheduler.due_targets_by_peer(8, 2);
+        let due = scheduler.due_targets(8, 2);
 
         assert_eq!(due.len(), 2);
         let (first_peer, first_targets) = &due[0];
@@ -4330,16 +4306,16 @@ mod tests {
 
         // Targets handed out stay in flight until completed, and a peer taking
         // its turn is not given a second one.
-        assert!(scheduler.due_targets_by_peer(8, 8).is_empty());
+        assert!(scheduler.due_targets(8, 8).is_empty());
     }
 
     #[test]
-    fn scheduler_uses_capped_failure_backoff() {
+    fn capped_failure_backoff() {
         let scheduler = ResyncScheduler::default();
         let peer_id = peer(3);
         let topic_id = topic(4);
         scheduler.schedule_now(peer_id, topic_id, false);
-        let mut due = scheduler.due_targets_by_peer(8, 8);
+        let mut due = scheduler.due_targets(8, 8);
         assert_eq!(due.len(), 1);
 
         scheduler.complete_failed(
@@ -4356,7 +4332,7 @@ mod tests {
         for _ in 0..16 {
             // Each failure needs its own claim: a completion must own one.
             scheduler.schedule_now(peer_id, topic_id, true);
-            let mut due = scheduler.due_targets_by_peer(8, 8);
+            let mut due = scheduler.due_targets(8, 8);
             assert_eq!(due.len(), 1);
             scheduler.complete_failed(
                 due.remove(0).1[0],
@@ -4373,7 +4349,7 @@ mod tests {
 
     /// A claim for the single due target of one peer.
     fn one_claim(scheduler: &ResyncScheduler) -> ResyncTarget {
-        let mut due = scheduler.due_targets_by_peer(8, 8);
+        let mut due = scheduler.due_targets(8, 8);
         assert_eq!(due.len(), 1);
         let targets = due.remove(0).1;
         assert_eq!(targets.len(), 1);
@@ -4419,7 +4395,7 @@ mod tests {
         let scheduler = ResyncScheduler::default();
         scheduler.schedule_now(peer(73), topic(74), false);
         scheduler.schedule_now(peer(73), topic(75), false);
-        let mut due = scheduler.due_targets_by_peer(8, 8);
+        let mut due = scheduler.due_targets(8, 8);
         let claims = due.remove(0).1;
         assert_eq!(claims.len(), 2);
         let mut lease = scheduler.lease(claims, BACKOFF);
@@ -4442,24 +4418,17 @@ mod tests {
     /// A peer waiting behind a full set of slots is served as soon as one
     /// frees, and peers still taking a turn are never claimed twice.
     #[test]
-    fn free_slot_serves_waiter() {
+    fn slot_serves_waiter() {
         let scheduler = ResyncScheduler::default();
-        let waiting = MAX_RESYNC_PEER_CONCURRENCY + 1;
+        let waiting = MAX_RESYNC_PEERS + 1;
         for index in 0..waiting {
             scheduler.schedule_now(peer(50 + index as u8), topic(60), false);
         }
 
-        let first =
-            scheduler.due_targets_by_peer(MAX_RESYNC_PEER_CONCURRENCY, MAX_TOPICS_PER_RESYNC_BATCH);
-        assert_eq!(
-            first.len(),
-            MAX_RESYNC_PEER_CONCURRENCY,
-            "every slot is filled"
-        );
+        let first = scheduler.due_targets(MAX_RESYNC_PEERS, MAX_RESYNC_TOPICS);
+        assert_eq!(first.len(), MAX_RESYNC_PEERS, "every slot is filled");
         assert!(
-            scheduler
-                .due_targets_by_peer(0, MAX_TOPICS_PER_RESYNC_BATCH)
-                .is_empty(),
+            scheduler.due_targets(0, MAX_RESYNC_TOPICS).is_empty(),
             "no slot is free, so nothing more is claimed"
         );
 
@@ -4468,7 +4437,7 @@ mod tests {
         for claim in claims {
             scheduler.complete_clean(claim);
         }
-        let next = scheduler.due_targets_by_peer(1, MAX_TOPICS_PER_RESYNC_BATCH);
+        let next = scheduler.due_targets(1, MAX_RESYNC_TOPICS);
         assert_eq!(next.len(), 1, "the freed slot is refilled at once");
         assert_ne!(
             next[0].0, done_peer,
@@ -4476,7 +4445,7 @@ mod tests {
         );
         assert_eq!(
             next[0].0,
-            peer(50 + MAX_RESYNC_PEER_CONCURRENCY as u8),
+            peer(50 + MAX_RESYNC_PEERS as u8),
             "the peer that was waiting is the one served"
         );
     }
@@ -4522,7 +4491,7 @@ mod tests {
         let topic = node
             .create_topic::<Ping>(crate::TopicConfig::default())
             .unwrap();
-        for _ in 0..(3 * MAX_SYNC_DATA_OPS_PER_MESSAGE) {
+        for _ in 0..(3 * MAX_DATA_OPS) {
             topic.publish(Ping).unwrap();
         }
         let ops = crate::oplog::topological(node.storage(), &topic.id()).unwrap();
@@ -4553,7 +4522,7 @@ mod tests {
         let scheduler = ResyncScheduler::default();
         scheduler.schedule_now(peer(31), topic(32), false);
         scheduler.schedule_now(peer(31), topic(33), false);
-        let mut due = scheduler.due_targets_by_peer(8, 8);
+        let mut due = scheduler.due_targets(8, 8);
         assert_eq!(due.len(), 1);
         let claims = due.remove(0).1;
         assert_eq!(claims.len(), 2);
@@ -4659,7 +4628,7 @@ mod tests {
         scheduler.complete_clean(stale);
         scheduler.complete_failed(stale, Duration::from_secs(1), Duration::from_secs(600));
 
-        assert!(scheduler.due_targets_by_peer(8, 8).is_empty());
+        assert!(scheduler.due_targets(8, 8).is_empty());
         assert!(scheduler.next_due().is_none());
         let (active, failures, force) = scheduler.target_state(peer(9), topic(10)).unwrap();
         assert_eq!(active, Some(live.attempt));
@@ -4689,7 +4658,7 @@ mod tests {
         let scheduler = ResyncScheduler::default();
         scheduler.schedule_now(peer(15), topic(1), false);
         scheduler.schedule_now(peer(15), topic(2), false);
-        let mut due = scheduler.due_targets_by_peer(8, 8);
+        let mut due = scheduler.due_targets(8, 8);
         assert_eq!(due.len(), 1);
         let mut lease = scheduler.lease(due.remove(0).1, Duration::ZERO);
         let done = lease
@@ -4808,7 +4777,7 @@ mod tests {
         .expect("the bulk lane never filled");
 
         let open = vec![SyncMessage::Open(remote.sync_open(topic_id))];
-        let endpoint = peer_id_to_endpoint_addr(remote.peer_id()).unwrap().id;
+        let endpoint = endpoint_addr(remote.peer_id()).unwrap().id;
         let replies = tokio::time::timeout(
             Duration::from_secs(60),
             net.run_job(Lane::Control, move |shared| {
@@ -5135,7 +5104,7 @@ mod tests {
         let mut syncs = tokio::task::JoinSet::new();
 
         let held = Arc::clone(&net.outbound)
-            .acquire_many_owned(MAX_RESYNC_PEER_CONCURRENCY as u32)
+            .acquire_many_owned(MAX_RESYNC_PEERS as u32)
             .await
             .unwrap();
         let manual = tokio::spawn({
@@ -5152,21 +5121,18 @@ mod tests {
 
         drop(held);
         tokio::time::timeout(Duration::from_secs(60), async {
-            while net.outbound.available_permits() == MAX_RESYNC_PEER_CONCURRENCY {
+            while net.outbound.available_permits() == MAX_RESYNC_PEERS {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("the manual sync never took a slot");
         assert!(dispatch_due_resyncs(&weak, &mut syncs, runtime));
-        assert!(syncs.len() < MAX_RESYNC_PEER_CONCURRENCY);
+        assert!(syncs.len() < MAX_RESYNC_PEERS);
         let _ = manual.await.unwrap();
         syncs.abort_all();
         while syncs.join_next().await.is_some() {}
-        assert_eq!(
-            net.outbound.available_permits(),
-            MAX_RESYNC_PEER_CONCURRENCY
-        );
+        assert_eq!(net.outbound.available_permits(), MAX_RESYNC_PEERS);
         net.shutdown().await;
     }
 
@@ -5260,8 +5226,8 @@ mod tests {
         let scheduler = ResyncScheduler::default();
         scheduler.schedule_now(peer(24), topic(1), false);
 
-        let armed = next_resync_wake(&scheduler, MAX_RESYNC_PEER_CONCURRENCY - 1);
-        let parked = next_resync_wake(&scheduler, MAX_RESYNC_PEER_CONCURRENCY);
+        let armed = next_resync_wake(&scheduler, MAX_RESYNC_PEERS - 1);
+        let parked = next_resync_wake(&scheduler, MAX_RESYNC_PEERS);
 
         assert!(armed <= tokio::time::Instant::now());
         assert!(parked > tokio::time::Instant::now() + Duration::from_secs(60));
@@ -5353,7 +5319,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(net.resync_scheduler.due_targets_by_peer(8, 8).is_empty());
+        assert!(net.resync_scheduler.due_targets(8, 8).is_empty());
         assert_eq!(
             net.resync_scheduler.target_state(bob.peer_id(), topic.id()),
             Some((Some(claim.attempt), 1, claim.force))
@@ -5371,7 +5337,7 @@ mod tests {
     /// Evidence migrated without a branch certifies nothing, so a clock it
     /// carries must not mark the target as synchronized.
     #[tokio::test]
-    async fn legacy_ack_needs_sync() {
+    async fn legacy_ack_sync() {
         let net = test_net().await;
         let peer_id = peer(90);
         let topic = net
@@ -5399,14 +5365,14 @@ mod tests {
     async fn notify_keeps_permit() {
         let scheduler = ResyncScheduler::default();
         let notify = scheduler.notifier();
-        assert!(scheduler.due_targets_by_peer(8, 8).is_empty());
+        assert!(scheduler.due_targets(8, 8).is_empty());
 
         scheduler.schedule_now(peer(11), topic(12), false);
         tokio::time::timeout(Duration::from_secs(60), notify.notified())
             .await
             .expect("a schedule after an empty scan must leave a wake permit");
 
-        assert_eq!(scheduler.due_targets_by_peer(8, 8).len(), 1);
+        assert_eq!(scheduler.due_targets(8, 8).len(), 1);
     }
 
     /// Shutdown while the accept loop sits at its connection cap also ends
@@ -5517,7 +5483,7 @@ mod tests {
     /// started: the job stays owned, shutdown reports it until it ends, and
     /// the target is not left owned by the aborted batch.
     #[tokio::test]
-    async fn parent_abort_owns_child() {
+    async fn abort_keeps_child() {
         use crate::tests::support::{Gate, GatePoint, Note, node};
 
         let (net, storage) = stale_net().await;
@@ -5629,7 +5595,7 @@ mod tests {
         let refused = |error: io::Error| error.kind() == io::ErrorKind::NotConnected;
         assert!(net.spawn_resync_loop(BACKOFF).is_err_and(refused));
         assert!(net.spawn_accept_loop().is_err_and(refused));
-        let addr = peer_id_to_endpoint_addr(remote).unwrap();
+        let addr = endpoint_addr(remote).unwrap();
         assert!(
             net.sync_now(addr.clone(), topic_id)
                 .await

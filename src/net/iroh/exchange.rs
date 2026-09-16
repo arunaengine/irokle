@@ -154,10 +154,9 @@ impl std::ops::Deref for SyncResponse {
     }
 }
 
-/// Reads the responses of an exchange, charging each frame to the result pool
-/// before it is allocated. Only the first frame may wait: waiting while this
-/// exchange holds result bytes could wait on itself, so a later frame that
-/// finds the pool full fails the exchange.
+/// Reads responses while charging each frame before allocation. Only the first
+/// frame may wait for capacity; later exhaustion fails while held bytes remain
+/// owned.
 pub(super) async fn read_responses(
     recv: &mut iroh::endpoint::RecvStream,
     sync_io_timeout: Duration,
@@ -239,8 +238,7 @@ pub(super) async fn read_frame_head(
     sync_io_timeout: Duration,
 ) -> io::Result<Option<(usize, u8)>> {
     let mut head = [0_u8; 5];
-    let Some(first_read) = read_some_with_timeout(recv, &mut head[..1], sync_io_timeout).await?
-    else {
+    let Some(first_read) = read_some(recv, &mut head[..1], sync_io_timeout).await? else {
         return Ok(None);
     };
     if first_read == 0 {
@@ -249,8 +247,7 @@ pub(super) async fn read_frame_head(
 
     let mut read = first_read;
     while read < 4 {
-        let Some(n) = read_some_with_timeout(recv, &mut head[read..4], sync_io_timeout).await?
-        else {
+        let Some(n) = read_some(recv, &mut head[read..4], sync_io_timeout).await? else {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "incomplete sync frame length",
@@ -303,7 +300,7 @@ pub(super) async fn read_frame_body(
     })
 }
 
-async fn read_some_with_timeout(
+async fn read_some(
     recv: &mut iroh::endpoint::RecvStream,
     buf: &mut [u8],
     sync_io_timeout: Duration,

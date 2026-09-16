@@ -317,7 +317,7 @@ async fn saturated_shutdown() {
         async move { net.sync_with(bob_addr, &messages).await.map(drop) }
     });
     tokio::time::timeout(Duration::from_secs(60), async {
-        while net.outbound.available_permits() > MAX_RESYNC_PEER_CONCURRENCY - 2 {
+        while net.outbound.available_permits() > MAX_RESYNC_PEERS - 2 {
             tokio::task::yield_now().await;
         }
     })
@@ -357,7 +357,7 @@ async fn entry_points_admitted() {
         .acquire_many_owned(CONTROL_JOBS as u32)
         .await
         .unwrap();
-    let calls = (0..3 * MAX_RESYNC_PEER_CONCURRENCY)
+    let calls = (0..3 * MAX_RESYNC_PEERS)
         .map(|_| {
             let net = Arc::clone(&net);
             let addr = bob_addr.clone();
@@ -366,7 +366,7 @@ async fn entry_points_admitted() {
         })
         .collect::<Vec<_>>();
     tokio::time::timeout(Duration::from_secs(60), async {
-        while MAX_SERVED_STREAMS - bob_net.served.available_permits() < MAX_RESYNC_PEER_CONCURRENCY
+        while MAX_SERVED_STREAMS - bob_net.served.available_permits() < MAX_RESYNC_PEERS
         {
             tokio::task::yield_now().await;
         }
@@ -379,7 +379,7 @@ async fn entry_points_admitted() {
     assert_eq!(net.outbound.available_permits(), 0);
     assert_eq!(
         net.outbound_sync_streams(),
-        MAX_RESYNC_PEER_CONCURRENCY as u64
+        MAX_RESYNC_PEERS as u64
     );
 
     // An embedder's stream is refused, not queued, while served slots are full.
@@ -404,7 +404,7 @@ async fn entry_points_admitted() {
     }
     assert_eq!(
         net.outbound_sync_streams(),
-        3 * MAX_RESYNC_PEER_CONCURRENCY as u64
+        3 * MAX_RESYNC_PEERS as u64
     );
     let replies = bob_net.handle_messages(alice_id, messages).unwrap();
     assert!(!replies.is_empty());
@@ -414,16 +414,15 @@ async fn entry_points_admitted() {
     assert_eq!(bob_net.served.available_permits(), MAX_SERVED_STREAMS);
     assert_eq!(
         net.outbound.available_permits(),
-        MAX_RESYNC_PEER_CONCURRENCY
+        MAX_RESYNC_PEERS
     );
     assert_released(&net);
     assert_released(&bob_net);
 }
 
-/// Data, control, session and result pools and both worker lanes are full, a
-/// started storage job loses its requester, and shutdown begins: shutdown waits
-/// for that job alone, which keeps its charge until it ends, and every pool,
-/// lane and slot is whole afterwards.
+/// All pools and worker lanes are full; a started storage job loses its requester.
+/// Shutdown waits for that job, preserving its charge until it ends.
+/// Every pool, lane, and slot is whole afterward.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_budgets_shutdown() {
     let lookup = Lookup::new();
@@ -511,11 +510,9 @@ async fn full_budgets_shutdown() {
     );
 }
 
-/// Every pool and lane is full while a durable node's activation of a topic
-/// pushed to it is paused before publication and the pushing requester goes
-/// away. Shutdown waits for that job alone; the activation then publishes,
-/// every pool, lane and slot is whole, and the reopened store holds the whole
-/// topic with no staging left.
+/// A durable activation is paused after staging while all pools and lanes are full.
+/// Shutdown waits for it; activation then publishes the topic and leaves no staging.
+/// A reopen sees the complete topic.
 #[cfg(feature = "fjall")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn saturated_activation_reopen() {

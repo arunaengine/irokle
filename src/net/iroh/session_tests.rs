@@ -53,9 +53,7 @@ async fn replies_follow_branch() {
     } else {
         ([right, right_event], [left, left_event])
     };
-    let remote = super::super::peer_id_to_endpoint_addr(author.peer_id())
-        .unwrap()
-        .id;
+    let remote = super::super::endpoint_addr(author.peer_id()).unwrap().id;
     let mut session = SyncSession::new(remote);
     session
         .handle(&net, SyncMessage::Open(author.sync_open(topic_id)))

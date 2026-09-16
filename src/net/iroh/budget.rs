@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Bytes a net owns while it works. Every charge comes from a node-wide pool,
-//! moves with the data it covers and is released when that data is dropped.
-//!
-//! Wire lengths are measured exactly. Decoded sizes are conservative upper
-//! bounds include clock tries and temporary decoding allocations, plus inline
-//! message and operation storage. None of them is measured memory.
-//!
-//! A task never waits on a pool while it holds bytes of that pool, so charges
-//! cannot wait on each other. Growth that would need such a wait fails instead.
+//! Node-wide reservations follow library-owned data until its owner drops.
+//! Wire lengths are exact; decoded bounds estimate clocks, temporary and inline storage.
+//! A task never waits while holding bytes of the same pool; such growth fails.
 
 use std::collections::BTreeMap;
 use std::io;

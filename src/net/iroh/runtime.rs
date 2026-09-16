@@ -12,12 +12,12 @@ use crate::Storage;
 use super::IrohNet;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_SYNC_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RESYNC_INTERVAL: Duration = Duration::from_secs(5);
-const DEFAULT_RESYNC_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-const DEFAULT_RESYNC_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
-const DEFAULT_FULL_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const DEFAULT_FULL_SWEEP_TIME_OF_DAY: Duration = Duration::from_secs(3 * 60 * 60);
+const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_SWEEP_TIME: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// Result of [`IrohNet::shutdown_with_timeout`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,12 +126,12 @@ impl Default for IrohRuntimeConfig {
     fn default() -> Self {
         Self {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            sync_io_timeout: DEFAULT_SYNC_IO_TIMEOUT,
+            sync_io_timeout: DEFAULT_IO_TIMEOUT,
             resync_interval: DEFAULT_RESYNC_INTERVAL,
-            resync_initial_backoff: DEFAULT_RESYNC_INITIAL_BACKOFF,
-            resync_max_backoff: DEFAULT_RESYNC_MAX_BACKOFF,
-            full_sweep_interval: DEFAULT_FULL_SWEEP_INTERVAL,
-            full_sweep_time_of_day: DEFAULT_FULL_SWEEP_TIME_OF_DAY,
+            resync_initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            resync_max_backoff: DEFAULT_MAX_BACKOFF,
+            full_sweep_interval: DEFAULT_SWEEP_INTERVAL,
+            full_sweep_time_of_day: DEFAULT_SWEEP_TIME,
         }
     }
 }

@@ -15,6 +15,8 @@ mod frame;
 #[cfg(feature = "iroh")]
 mod iroh;
 
+#[cfg(any(feature = "iroh", test))]
+use frame::MAX_SYNC_DATA_OPS_PER_MESSAGE as MAX_DATA_OPS;
 pub use frame::{
     IROKLE_SYNC_ALPN, MAX_SYNC_DATA_OPS_PER_MESSAGE, decode_frame, decode_frames,
     decode_sync_message, decoded_message_bound, encode_frame, encode_frames, encode_sync_message,
@@ -73,7 +75,7 @@ pub(crate) fn sync_data_page(
         }
         let joined = overhead + count_len(current.len() + 1)? + current_len + op_len;
         let joins = !current.is_empty()
-            && current.len() < MAX_SYNC_DATA_OPS_PER_MESSAGE
+            && current.len() < MAX_DATA_OPS
             && joined <= frame::MAX_FRAME_LEN + 4;
         let open_bytes = if current.is_empty() {
             0

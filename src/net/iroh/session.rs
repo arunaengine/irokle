@@ -6,22 +6,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 
-use crate::net::frame::MAX_SYNC_DATA_OPS_PER_MESSAGE;
+use crate::net::frame::MAX_SYNC_DATA_OPS_PER_MESSAGE as MAX_DATA_OPS;
 use crate::sync::SyncMessage;
 use crate::{PeerId, Storage};
 
 use super::budget::{ByteBudget, Charge, OwnedClass, Pool};
 use super::exchange::reply_fits;
 use super::{
-    IROKLE_SYNC_ALPN, SharedNet, StreamLimits, invalid_data, message_topic_id,
-    peer_id_from_endpoint_id, peer_may_open_topic,
+    IROKLE_SYNC_ALPN, SharedNet, StreamLimits, invalid_data, may_open_topic, message_topic_id,
+    peer_from_endpoint,
 };
 
-/// The failure a sync message reports when its handling must be contained to
-/// one topic instead of aborting the stream. Every message that names a topic
-/// and does real work belongs here; the session validates the protocol and the
-/// peer binding before this point, so those failures still indict the peer.
-fn per_topic_failure_scope(message: &SyncMessage) -> Option<crate::sync::SyncFailure> {
+/// Contain work failures to one topic after validating protocol and peer binding.
+/// Messages without topic-local work remain at the stream boundary.
+fn failure_scope(message: &SyncMessage) -> Option<crate::sync::SyncFailure> {
     let (topic_id, code) = match message {
         SyncMessage::Open(open) => (open.topic_id, crate::sync::SyncFailureCode::Open),
         SyncMessage::Fingerprint(fingerprint) => (
@@ -61,7 +59,7 @@ pub(super) struct SyncSession {
 impl SyncSession {
     pub(super) fn new(peer: iroh::EndpointId) -> Self {
         Self {
-            authenticated_peer_id: peer_id_from_endpoint_id(peer),
+            authenticated_peer_id: peer_from_endpoint(peer),
             remote_peer_id: None,
             open_topic_id: None,
             open_allowed: false,
@@ -124,7 +122,7 @@ impl SyncSession {
             self.open_topic_id = Some(open.topic_id);
             self.open_allowed = false;
             let allowed = match net.node.storage().topic_state(&open.topic_id) {
-                Ok(state) => state.is_none_or(|state| peer_may_open_topic(&state, open.peer_id)),
+                Ok(state) => state.is_none_or(|state| may_open_topic(&state, open.peer_id)),
                 Err(error) => {
                     tracing::warn!(topic_id = %open.topic_id, %error, "failed to authorize sync topic");
                     false
@@ -169,7 +167,7 @@ impl SyncSession {
         }
 
         match message {
-            SyncMessage::Data(data) if data.ops.len() > MAX_SYNC_DATA_OPS_PER_MESSAGE => {
+            SyncMessage::Data(data) if data.ops.len() > MAX_DATA_OPS => {
                 Err(invalid_data("sync data has too many operations"))
             }
             SyncMessage::Ack(ack) => {
@@ -187,7 +185,7 @@ impl SyncSession {
                 // A data-plane failure fails only its topic, explicitly, so the
                 // other topics batched into the stream keep their replies.
                 // Framing and authentication failures above stay fatal.
-                let failure = per_topic_failure_scope(&message);
+                let failure = failure_scope(&message);
                 let replies = match message {
                     SyncMessage::Summary(summary) => {
                         let replies = net.summary_reply(self.authenticated_peer_id, &summary);
@@ -312,9 +310,7 @@ impl SyncSession {
                 left -= 1;
                 let mut budget = crate::sync::PageBudget::from_credit(request.credit);
                 budget.bytes = budget.bytes.min(share_bytes);
-                budget.ops = budget
-                    .ops
-                    .min(share_messages.saturating_mul(MAX_SYNC_DATA_OPS_PER_MESSAGE));
+                budget.ops = budget.ops.min(share_messages.saturating_mul(MAX_DATA_OPS));
                 // What is left of the output grant bounds decoded pages too.
                 let grant_left = granted.saturating_sub(held);
                 budget.ops = budget.ops.min(grant_left / (2 * size_of::<crate::Op>()));
