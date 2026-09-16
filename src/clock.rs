@@ -12,6 +12,10 @@ use std::sync::{Arc, Weak};
 #[cfg(feature = "fjall")]
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(feature = "fjall")]
+#[path = "clock/scan.rs"]
+pub(crate) mod scan;
+
 /// Positions per actor. Clones share structure: entries live in a persistent
 /// trie over the nibbles of actor ids, so a clock derived from another by a
 /// few changes copies only the paths to them. Iteration is in id order and

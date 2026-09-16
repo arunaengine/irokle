@@ -43,6 +43,46 @@ struct Counting;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
+#[test]
+#[ignore = "allocator measurement requires its own process and one test thread"]
+fn scan_allocation_bounds() {
+    for count in [128_u32, 1024, 4096] {
+        let mut clock = clock::ActorClock::new();
+        let mut records = std::collections::BTreeMap::new();
+        for index in 0..count {
+            clock.observe(ids::ActorId::hash(index.to_le_bytes()), u64::from(index));
+            records.extend(
+                clock
+                    .unstored_nodes(|hash| Ok(records.contains_key(hash)))
+                    .unwrap(),
+            );
+        }
+        let before = LIVE.load(Ordering::Relaxed);
+        PEAK.store(before, Ordering::Relaxed);
+        let mut scan = clock::scan::ClockScan::default();
+        for (hash, bytes) in &records {
+            scan.push(hash, bytes).unwrap();
+        }
+        scan.validate(&clock.root_hash().unwrap(), |_| {
+            panic!("unexpected point read")
+        })
+        .unwrap();
+        let retained = LIVE.load(Ordering::Relaxed) - before;
+        let peak = PEAK.load(Ordering::Relaxed) - before;
+        let bound = scan.bytes();
+        assert!(
+            retained <= bound && peak <= bound,
+            "{count}: retained={retained} peak={peak} bound={bound}"
+        );
+        println!(
+            "clock_scan actors={count} nodes={} retained={retained} peak={peak} bound={bound}",
+            records.len()
+        );
+        drop(scan);
+        assert!(LIVE.load(Ordering::Relaxed) <= before + 4096);
+    }
+}
+
 unsafe extern "C" {
     fn malloc_usable_size(pointer: *mut std::ffi::c_void) -> usize;
 }

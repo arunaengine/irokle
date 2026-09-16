@@ -2369,18 +2369,21 @@ impl FjallStorage {
     pub(super) fn validate_meta(
         tx: &impl fjall::Readable,
         records: &fjall::OptimisticTxKeyspace,
+        topic: &TopicId,
         bytes: &[u8],
-        cache: &crate::clock::ClockCache,
+        cache: &mut crate::clock::scan::ClockScan,
     ) -> Result<()> {
-        let stored: StoredMeta = postcard::from_bytes(bytes)?;
-        if let StoredClock::Nodes(root) = stored.observed_clock {
-            let clock = ActorClock::load(&root, cache, |hash| {
+        let (header, tail) = header_tail(bytes)?;
+        if header.topic_id != *topic {
+            return Err(Error::TopicMismatch);
+        }
+        if let StoredClock::Nodes(root) = clock_tail(tail)? {
+            cache.validate(&root, |hash| {
                 Ok(
-                    fjall::Readable::get(tx, records, clock_node_key(&stored.topic_id, hash))?
+                    fjall::Readable::get(tx, records, clock_node_key(topic, hash))?
                         .map(|bytes| bytes.to_vec()),
                 )
             })?;
-            cache.keep(&clock);
         }
         Ok(())
     }
