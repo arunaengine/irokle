@@ -84,7 +84,7 @@ impl Records {
         &mut self,
         read: &dyn SnapshotRead,
         id: &OpId,
-        slice: &mut super::plan::Slice,
+        slice: &mut super::slice::Slice,
     ) -> std::result::Result<Option<Record>, LoadError> {
         if let Some(mut record) = self.records.remove(id) {
             self.bytes -= record.claim.bytes;
@@ -214,7 +214,7 @@ mod tests {
         read: &dyn SnapshotRead,
         id: &OpId,
     ) -> crate::Result<Option<Record>> {
-        let mut slice = super::super::plan::Slice::new(Arc::default(), 1024, 0)?;
+        let mut slice = super::super::slice::Slice::new(Arc::default(), 1024, 0)?;
         match records.take(read, id, &mut slice) {
             Ok(record) => Ok(record),
             Err(LoadError::Failed(error)) => Err(error),
@@ -319,8 +319,8 @@ mod tests {
         let bytes = postcard::experimental::serialized_size(&op).unwrap();
         let pool = Arc::new(RecordPool::default());
         let mut records = Records::new(Arc::clone(&pool));
-        let work = Arc::new(super::super::plan::PageWork::default());
-        let mut slice = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)
+        let work = Arc::new(super::super::slice::PageWork::default());
+        let mut slice = super::super::slice::Slice::new(Arc::clone(&work), 16, 0)
             .unwrap()
             .with_decode_limit(bytes);
         store
@@ -343,13 +343,13 @@ mod tests {
                 ));
                 assert_eq!(probe.decoded.get(), 1, "exhaustion must precede decoding");
                 assert_eq!(pool.bytes(), 0);
-                let mut resumed = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)?
+                let mut resumed = super::super::slice::Slice::new(Arc::clone(&work), 16, 0)?
                     .with_decode_limit(bytes);
                 let record = records.take(&probe, &id, &mut resumed).unwrap().unwrap();
                 assert_eq!(probe.decoded.get(), 2);
                 assert_eq!(record.op, op);
                 drop(record);
-                let mut small = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)?
+                let mut small = super::super::slice::Slice::new(Arc::clone(&work), 16, 0)?
                     .with_decode_limit(bytes - 1);
                 assert!(matches!(
                     records.take(&probe, &id, &mut small),

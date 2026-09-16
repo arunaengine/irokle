@@ -5,13 +5,17 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub use irokle::{Error, Op, OpId, Result, TopicPayload, ids};
+pub use irokle::{Error, FjallStorage, Op, OpId, Result, TopicPayload, ids};
 
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 
 mod storage {
-    pub use irokle::storage::SnapshotRead;
+    pub use irokle::storage::{OpMeta, SnapshotRead, TopicView};
 }
+
+#[path = "../src/sync/slice.rs"]
+#[allow(dead_code)]
+mod slice;
 
 #[path = "../src/sync/records.rs"]
 mod records;
@@ -19,10 +23,12 @@ mod records;
 mod tests {
     pub mod support {
         pub use bytes::Bytes;
+        pub use irokle::{ActorId, PeerId};
         pub use irokle::{
             Ed25519Signer, Event, EventEnvelope, MemoryStorage, Signer, Storage, TopicGenesis,
             TopicId, actor_id_for, oplog,
         };
+        pub use std::collections::BTreeSet;
         #[derive(serde::Serialize, serde::Deserialize)]
         pub struct Note {
             pub text: String,
@@ -464,10 +470,20 @@ fn record_allocation_bounds() {
         log.receive_ops(vec![join.clone()]).unwrap();
         let pool = std::sync::Arc::new(records::RecordPool::default());
         let mut records = records::Records::new(std::sync::Arc::clone(&pool));
+        let mut first_slice =
+            slice::Slice::new(std::sync::Arc::default(), slice::MAX_PAGE_VISITS, 0).unwrap();
+        let mut second_slice =
+            slice::Slice::new(std::sync::Arc::default(), slice::MAX_PAGE_VISITS, 0).unwrap();
         let before = LIVE.load(Ordering::Relaxed);
         PEAK.store(before, Ordering::Relaxed);
         let record = store
-            .read_snapshot(|read| records.take(read, &join.id))
+            .read_snapshot(
+                |read| match records.take(read, &join.id, &mut first_slice) {
+                    Ok(record) => Ok(record),
+                    Err(records::LoadError::Failed(error)) => Err(error),
+                    Err(records::LoadError::Yield) => panic!("fresh record slice exhausted"),
+                },
+            )
             .unwrap()
             .unwrap();
         records.keep(record);
@@ -480,7 +496,13 @@ fn record_allocation_bounds() {
             "record: {allocated} retained, {peak} peak, {bound} bound"
         );
         let record = store
-            .read_snapshot(|read| records.take(read, &join.id))
+            .read_snapshot(
+                |read| match records.take(read, &join.id, &mut second_slice) {
+                    Ok(record) => Ok(record),
+                    Err(records::LoadError::Failed(error)) => Err(error),
+                    Err(records::LoadError::Yield) => panic!("fresh record slice exhausted"),
+                },
+            )
             .unwrap()
             .unwrap();
         assert_eq!(record.op, join);

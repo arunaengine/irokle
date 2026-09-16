@@ -7,8 +7,8 @@ use std::ops::Bound::{Excluded, Unbounded};
 use crate::storage::SnapshotRead;
 use crate::{ActorClock, ActorId, Op, OpId, Result, TopicId};
 
-use super::plan::Slice;
 use super::records::{LoadError, Records};
+use super::slice::Slice;
 use super::space::tree_bytes;
 use super::{ActorScope, MAX_PAGE_MISSING, PageBudget, SyncRequest};
 
@@ -52,7 +52,7 @@ pub(super) struct RepairPage {
 impl Repair {
     pub(super) fn root_limit() -> usize {
         // Leave a quarter of traversal workspace for independent forward progress.
-        let limit = super::continuation::MAX_CONTINUATION_BYTES * 3 / 4;
+        let limit = super::slice::MAX_CONTINUATION_BYTES * 3 / 4;
         let mut low = 0;
         let mut high = super::MAX_REQUEST_ITEMS;
         while low < high {

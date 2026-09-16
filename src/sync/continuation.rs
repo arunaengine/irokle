@@ -11,12 +11,11 @@ use crate::storage::RequestView;
 use crate::{ActorClock, ActorId, Error, OpId, PeerId, Result, TopicId};
 
 use super::plan::Frontier;
+use super::slice::MAX_CONTINUATION_BYTES;
 use super::{ActorWindow, SyncRequest, SyncSummary};
 
 /// Plans one engine keeps at once.
 pub(crate) const MAX_CONTINUATIONS: usize = 16;
-/// Estimated bytes one kept plan may hold.
-pub(super) const MAX_CONTINUATION_BYTES: usize = 4 * 1024 * 1024;
 /// Reservations for captured immutable clocks, separate from traversal workspace.
 const MAX_CLOCK_BYTES: usize = 128 * 1024 * 1024;
 const CLOCK_POOL_BYTES: usize = 256 * 1024 * 1024;

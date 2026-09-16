@@ -16,6 +16,7 @@ mod plan;
 mod records;
 mod repair;
 mod request;
+mod slice;
 mod space;
 mod types;
 
@@ -28,11 +29,11 @@ mod preparation_tests;
 #[cfg(test)]
 pub(crate) use continuation::MAX_CONTINUATIONS;
 use continuation::{Continuation, Continuations};
-#[cfg(test)]
-pub(crate) use plan::PageWorkSnapshot;
-use plan::{MAX_PAGE_VISITS, PageWork};
 pub use request::RequestKnowledge;
 use request::{ActorScope, request_ranges};
+#[cfg(test)]
+pub(crate) use slice::PageWorkSnapshot;
+use slice::{MAX_PAGE_VISITS, PageWork};
 pub use types::{
     ActorFilter, ActorRangeHint, ActorWindow, PageBudget, SyncAck, SyncCredit, SyncData,
     SyncFailure, SyncFailureCode, SyncFingerprint, SyncMessage, SyncOpen, SyncPage, SyncPlan,
@@ -688,7 +689,7 @@ impl<S: Storage> SyncEngine<S> {
         request: &SyncRequest,
         budget: PageBudget,
     ) -> Result<PlannedPage> {
-        let mut slice = plan::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
+        let mut slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
         slice.auth_read()?;
         slice.capture(0, 512, 512)?;
         self.oplog
@@ -704,7 +705,7 @@ impl<S: Storage> SyncEngine<S> {
         request: &SyncRequest,
         budget: PageBudget,
     ) -> Result<PlannedPage> {
-        let slice = plan::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
+        let slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
         self.response_known(read, peer_id, request, budget, None, slice)
     }
 
@@ -716,7 +717,7 @@ impl<S: Storage> SyncEngine<S> {
         budget: PageBudget,
         summary: &SyncSummary,
     ) -> Result<PlannedPage> {
-        let mut slice = plan::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
+        let mut slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
         slice.auth_read()?;
         slice.capture(0, 512, 512)?;
         self.oplog.storage().read_snapshot(|read| {
@@ -731,7 +732,7 @@ impl<S: Storage> SyncEngine<S> {
         request: &SyncRequest,
         budget: PageBudget,
         summary: Option<&SyncSummary>,
-        mut slice: plan::Slice,
+        mut slice: slice::Slice,
     ) -> Result<PlannedPage> {
         // Every local root drops before this active reservation, including on errors.
         let mut clocks = None;
@@ -759,7 +760,11 @@ impl<S: Storage> SyncEngine<S> {
             .saturating_add(space::tree_bytes::<ActorId, ()>(hints))
             .saturating_add(space::tree_bytes::<ActorId, Option<u64>>(MAX_PAGE_OPS))
             .saturating_add(filter.map_or(0, |filter| 2 * filter.bits.len()));
-        slice.prepare_input(input_work, input_bytes)?;
+        slice.prepare_input(
+            input_work,
+            input_bytes,
+            16 * MAX_REQUEST_ITEMS + 8 * (MAX_PAGE_OPS + MAX_PAGE_MISSING),
+        )?;
         let scope = ActorScope::new(&request.actor_range_hints, &request.window);
         let view = read.sync_identity(&request.topic_id, &peer_id, &mut |charge| {
             reserve_snapshot(&mut slice, charge)
@@ -1130,7 +1135,7 @@ impl<S: Storage> SyncEngine<S> {
     }
 }
 
-fn reserve_snapshot(slice: &mut plan::Slice, charge: SnapshotCharge) -> Result<()> {
+fn reserve_snapshot(slice: &mut slice::Slice, charge: SnapshotCharge) -> Result<()> {
     match charge {
         SnapshotCharge::Read { bytes } => {
             slice.auth_read()?;
