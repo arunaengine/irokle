@@ -215,7 +215,7 @@ def shell_scan(source):
         clean.append("".join(output))
     text = "\n".join(clean)
     unsupported = ((r"(^|[^<])<<<?", "redirection"),
-                   (r"(^|[;&|]\s*)(case|select|coproc)\b", "command"),
+                   (r"(^\s*|[;&|]\s*)(case|select|coproc|eval)\b", "command"),
                    (r"[<>]\(", "process substitution"))
     for pattern, label in unsupported:
         match = re.search(pattern, text, re.MULTILINE)
@@ -228,9 +228,9 @@ def shell_scan(source):
     for number, line in enumerate(clean, 1):
         for match in re.finditer(r"(?:^|[\s;(&|])([A-Za-z_][A-Za-z0-9_]*)(?:\[[^]]+\])?\s*=", line):
             names.append(Name("variable", match.group(1), number))
-        for match in re.finditer(r"(?:^|[;&]\s*)(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)", line):
+        for match in re.finditer(r"(?:^\s*|[;&]\s*)(?:function\s+)?([A-Za-z_][A-Za-z0-9_-]*)\s*\(\s*\)", line):
             names.append(Name("function", match.group(1), number))
-        for match in re.finditer(r"(?:^|[;&]\s*)function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{|$)", line):
+        for match in re.finditer(r"(?:^\s*|[;&]\s*)function\s+([A-Za-z_][A-Za-z0-9_-]*)\s*(?:\{|$)", line):
             names.append(Name("function", match.group(1), number))
         match = re.search(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b", line)
         if match:
@@ -404,6 +404,8 @@ def layout_issues(paths, rules):
     for path in maintained:
         parent = Path(path).parent.as_posix()
         folders.setdefault("." if parent == "." else parent, []).append(path)
+        for ancestor in Path(path).parents:
+            folders.setdefault(ancestor.as_posix(), [])
     required = set(rules["required_roots"])
     domains = {entry["path"]: entry for entry in rules["small_domains"]}
     generic = set(rules["generic_prefixes"])
@@ -425,7 +427,7 @@ def layout_issues(paths, rules):
             if len(grouped) >= 3:
                 issues.append(Issue(folder, 1, "shared_prefix", prefix,
                                     f"{len(grouped)} sibling files require a {prefix} domain"))
-        if folder not in required and not valid_domain and 0 < len(direct) < 5:
+        if folder not in required and not valid_domain and len(direct) < 5:
             issues.append(Issue(folder, 1, "folder_size", Path(folder).name,
                                 f"optional folder has {len(direct)} direct maintained files"))
     for folder in domains.keys() - folders.keys():
