@@ -1194,6 +1194,15 @@ pub(super) mod fjall {
 
     #[test]
     fn clearing_conflict_isolated() {
+        clearing_isolated(false);
+    }
+
+    #[test]
+    fn clearing_buffer_isolated() {
+        clearing_isolated(true);
+    }
+
+    fn clearing_isolated(buffer: bool) {
         let dir = tempfile::tempdir().unwrap();
         let limits = StagingLimits {
             namespaces: 2,
@@ -1205,17 +1214,26 @@ pub(super) mod fjall {
         let (source, topic, ops) = history(163, 2, 32);
         let (old, _) = staged(&storage, source.peer_id(), topic, &ops);
         let charged = bytes(&ops);
-        storage.set_hook(|at| {
+        storage.set_hook(move |at| {
             if at == Hook::DeleteChunk {
-                Err(Error::AdmissionConflict)
+                Err(if buffer {
+                    Error::StorageBuffer {
+                        required: 2,
+                        limit: 1,
+                    }
+                } else {
+                    Error::AdmissionConflict
+                })
             } else {
                 Ok(())
             }
         });
-        assert!(matches!(
-            storage.discard_provisional(&old),
-            Err(Error::AdmissionConflict)
-        ));
+        let error = storage.discard_provisional(&old).unwrap_err();
+        assert!(if buffer {
+            matches!(error, Error::StorageBuffer { .. })
+        } else {
+            matches!(error, Error::AdmissionConflict)
+        });
         let other = storage.clone();
         let (source, topic, ops) = history(164, 2, 32);
         let fresh = other

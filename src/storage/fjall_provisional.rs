@@ -221,6 +221,7 @@ impl FjallStorage {
                         .is_some_and(|record| record.clearing && record.session == session),
                 )
             };
+            let mut chunk = CHUNK;
             let owned = loop {
                 self.hook(Hook::DeleteChunk)?;
                 let removed = self.transaction(|tx| {
@@ -228,17 +229,24 @@ impl FjallStorage {
                         return Ok(None);
                     }
                     let mut keys = Vec::new();
-                    for item in fjall::Readable::iter(tx, &store).take(CHUNK) {
+                    for item in fjall::Readable::iter(tx, &store).take(chunk) {
                         keys.push(item.key()?.to_vec());
                     }
                     for key in &keys {
                         tx.remove(&store, key.clone())?;
                     }
                     Ok(Some(keys.len()))
-                })?;
+                });
+                let removed = match removed {
+                    Err(Error::StorageBuffer { .. }) if chunk > 1 => {
+                        chunk = chunk.div_ceil(2);
+                        continue;
+                    }
+                    result => result?,
+                };
                 match removed {
                     None => break false,
-                    Some(removed) if removed < CHUNK => break true,
+                    Some(removed) if removed < chunk => break true,
                     Some(_) => {}
                 }
             };
@@ -292,7 +300,7 @@ impl FjallStorage {
     ) -> Result<ProvisionalTopic> {
         self.main_store()?;
         match self.reclaim_slots() {
-            Ok(()) | Err(Error::AdmissionConflict) => {}
+            Ok(()) | Err(Error::AdmissionConflict | Error::StorageBuffer { .. }) => {}
             Err(error) => return Err(error),
         }
         let limits = self.limits;
@@ -561,11 +569,12 @@ impl FjallStorage {
         let topic_id = provisional.topic_id;
         let clocks = crate::clock::ClockCache::default();
         let mut after: Option<Vec<u8>> = None;
+        let mut chunk = CHUNK;
         loop {
             self.hook(Hook::CopyChunk)?;
             // The claim freezes this namespace; validation needs no write-conflict reads.
             let read = self.db.read_tx();
-            let (seen, last) = self.transaction_bulk(|tx| {
+            let copied = self.transaction_bulk(|tx| {
                 tx.activation();
                 Self::tx_claimed(tx, &self.records, &topic_id, provisional.session)?;
                 let mut seen = 0;
@@ -578,7 +587,7 @@ impl FjallStorage {
                     store,
                     (start, std::ops::Bound::Unbounded),
                 )
-                .take(CHUNK)
+                .take(chunk)
                 {
                     let (key, value) = item.into_inner()?;
                     seen += 1;
@@ -591,9 +600,16 @@ impl FjallStorage {
                     last = Some(key.to_vec());
                 }
                 Ok((seen, last))
-            })?;
+            });
+            let (seen, last) = match copied {
+                Err(Error::StorageBuffer { .. }) if chunk > 1 => {
+                    chunk = chunk.div_ceil(2);
+                    continue;
+                }
+                result => result?,
+            };
             after = last.or(after);
-            if seen < CHUNK {
+            if seen < chunk {
                 return Ok(());
             }
         }

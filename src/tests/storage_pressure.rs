@@ -83,3 +83,94 @@ fn metadata_nodes_charged() {
     assert_eq!(usage.reserved.values().sum::<u64>(), 0);
     assert!(usage.database_bytes >= usage.journal_bytes);
 }
+
+#[test]
+fn small_buffers_progress() {
+    let source = super::progress::reverse_chain(MemoryStorage::new(), 129);
+    let topic = source.topic_id;
+    let ops = oplog::topological(source.log.storage(), &topic).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let storage = FjallStorage::open(directory.path()).unwrap();
+    let (provisional, state) =
+        super::ownership::fjall::staged(&storage, ops[0].signed.body.author, topic, &ops);
+    let mut pressure = StoragePressure::default();
+    pressure.buffer_bytes = 96 * 1024;
+    pressure.recovery_buffer_bytes = 96 * 1024;
+    let storage = storage.with_storage_pressure(pressure).unwrap();
+    storage
+        .activate_provisional(
+            &provisional,
+            &state,
+            crate::storage::AdmissionEffects::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        storage.list_op_ids(&topic).unwrap(),
+        source.log.storage().list_op_ids(&topic).unwrap()
+    );
+    assert_eq!(
+        storage.actor_clock(&topic).unwrap(),
+        source.log.storage().actor_clock(&topic).unwrap()
+    );
+    assert!(storage.slot_bytes().unwrap().is_empty());
+    let usage = storage.storage_usage().unwrap();
+    assert_eq!(usage.reserved.values().sum::<u64>(), 0);
+    assert!(usage.peak_reserved[&StorageDomain::Activation] <= 96 * 1024);
+    drop(storage);
+    let reopened = FjallStorage::open(directory.path()).unwrap();
+    for op in ops {
+        assert_eq!(reopened.get_op(&op.id).unwrap(), Some(op.clone()));
+        assert_eq!(
+            reopened.get_meta(&op.id).unwrap(),
+            source.log.storage().get_meta(&op.id).unwrap()
+        );
+    }
+}
+
+#[test]
+fn small_migration_progress() {
+    let source = super::progress::reverse_chain(MemoryStorage::new(), 129);
+    let topic = source.topic_id;
+    let ops = oplog::topological(source.log.storage(), &topic).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    {
+        let db = ::fjall::OptimisticTxDatabase::builder(directory.path())
+            .open()
+            .unwrap();
+        let storage = FjallStorage::from_database(db.clone()).unwrap();
+        super::ownership::fjall::staged(&storage, ops[0].signed.body.author, topic, &ops);
+        let slot = db
+            .keyspace("bootstrap-0", ::fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let records = db
+            .keyspace("records", ::fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut tx = db.write_tx().unwrap();
+        crate::storage::write_legacy_metas(&mut tx, &slot).unwrap();
+        tx.insert(&records, b"sv", postcard::to_allocvec(&6_u32).unwrap());
+        tx.commit().unwrap().unwrap();
+        db.persist(::fjall::PersistMode::SyncAll).unwrap();
+    }
+    let mut pressure = StoragePressure::default();
+    pressure.recovery_buffer_bytes = 256 * 1024;
+    let storage = FjallStorage::open_with_pressure(directory.path(), pressure).unwrap();
+    assert!(!storage.migrating().unwrap());
+    assert!(storage.topic_state(&topic).unwrap().is_none());
+    let provisional = storage.provisional_topics().unwrap().pop().unwrap();
+    let view = storage.provisional_store(&provisional).unwrap().unwrap();
+    for op in ops {
+        assert_eq!(
+            view.get_meta(&op.id).unwrap(),
+            source.log.storage().get_meta(&op.id).unwrap()
+        );
+    }
+    assert_eq!(
+        storage
+            .storage_usage()
+            .unwrap()
+            .reserved
+            .values()
+            .sum::<u64>(),
+        0
+    );
+}

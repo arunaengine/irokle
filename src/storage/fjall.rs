@@ -687,8 +687,17 @@ impl FjallStorage {
 
     /// Run up to `steps` of the steps a schema 7 upgrade has left.
     fn finish_clock_migration(&self, steps: usize) -> Result<()> {
+        let mut limit = MIGRATION_RECORDS;
         for _ in 0..steps {
-            if !self.transaction(|tx| self.tx_clock_migration_step(tx))? {
+            let more = loop {
+                match self.transaction(|tx| self.tx_clock_migration_step(tx, limit)) {
+                    Err(Error::StorageBuffer { .. }) if limit > 1 => {
+                        limit = limit.div_ceil(2);
+                    }
+                    result => break result?,
+                }
+            };
+            if !more {
                 return Ok(());
             }
         }
@@ -697,7 +706,7 @@ impl FjallStorage {
 
     /// Rewrite the next bounded run of legacy metadata records, or move the
     /// cursor to the next keyspace, or remove it. False once none is left.
-    fn tx_clock_migration_step(&self, tx: &mut Transaction) -> Result<bool> {
+    fn tx_clock_migration_step(&self, tx: &mut Transaction, limit: usize) -> Result<bool> {
         let Some(cursor) = Self::tx_get::<ClockMigration>(tx, &self.records, CLOCK_MIGRATION)?
         else {
             return Ok(false);
@@ -719,7 +728,7 @@ impl FjallStorage {
             &records,
             (start, std::ops::Bound::Excluded(b"n".to_vec())),
         ) {
-            if legacy.len() == MIGRATION_RECORDS || entries > MIGRATION_ENTRIES {
+            if legacy.len() == limit || entries > MIGRATION_ENTRIES {
                 ended = false;
                 break;
             }
