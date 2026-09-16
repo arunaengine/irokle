@@ -133,8 +133,8 @@ impl Iterator for SyncResponsesIter {
 }
 
 /// An original returned message holding its batch's shared reservation.
-/// Borrow through `AsRef` or dereferencing; independent caller-created clones
-/// allocate outside this reservation, and there is no detaching conversion.
+/// Borrow through `AsRef` or dereferencing; caller-created clones and their shared
+/// buffers are outside this reservation. There is no detaching conversion.
 pub struct SyncResponse {
     message: SyncMessage,
     _charges: Arc<Vec<Charge>>,
