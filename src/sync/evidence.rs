@@ -71,9 +71,9 @@ impl<S: Storage> SyncEngine<S> {
                 }
             }
             Err(err) => {
-                let message = err.to_string();
+                let source = std::sync::Arc::new(err);
                 for index in validated {
-                    results[index] = Err(Error::Storage(message.clone()));
+                    results[index] = Err(Error::Shared(std::sync::Arc::clone(&source)));
                 }
             }
         }

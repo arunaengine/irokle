@@ -24,8 +24,8 @@ pub use frame::{
 pub(crate) use iroh::StreamLimits;
 #[cfg(feature = "iroh")]
 pub use iroh::{
-    IrohNet, IrohRuntimeConfig, OwnedBytes, OwnedClass, ShutdownOutcome, SyncResponses,
-    SyncResponsesIter,
+    IrohNet, IrohRuntimeConfig, OwnedBytes, OwnedClass, ShutdownOutcome, SyncResponse,
+    SyncResponses, SyncResponsesIter,
 };
 
 #[cfg(test)]
@@ -154,6 +154,16 @@ pub fn _message_type_name(message: &SyncMessage) -> &'static str {
     }
 }
 
-fn invalid_data(error: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{0}")]
+struct SharedError(#[source] std::sync::Arc<dyn std::error::Error + Send + Sync>);
+
+impl SharedError {
+    fn new(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self(std::sync::Arc::from(error.into()))
+    }
+}
+
+fn invalid_data(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, SharedError::new(error))
 }

@@ -54,8 +54,8 @@ impl SyncReadLimits {
     }
 }
 
-/// Messages of one exchange or embedded stream, charged to the net's byte
-/// budget until this value, or the iterator it turns into, is dropped.
+/// Messages charged until their batch, consuming iterator and owned items drop.
+/// Borrowed `messages()` and `iter()` retain their existing message interfaces.
 pub struct SyncResponses {
     pub(super) messages: Vec<SyncMessage>,
     pub(super) charges: Vec<Charge>,
@@ -81,36 +81,76 @@ impl SyncResponses {
     pub(super) fn into_parts(self) -> (Vec<SyncMessage>, Vec<Charge>) {
         (self.messages, self.charges)
     }
+
+    pub(super) fn into_session(
+        self,
+        budget: &Arc<ByteBudget>,
+    ) -> io::Result<(Vec<SyncMessage>, Arc<Vec<Charge>>)> {
+        let bytes = self.charges.iter().fold(0_usize, |bytes, charge| {
+            bytes.saturating_add(charge.bytes())
+        });
+        // Retained replies must not occupy the pool their next exchange needs.
+        let held = budget.try_take(Pool::Session, bytes, OwnedClass::Session)?;
+        let (messages, charges) = self.into_parts();
+        let lease = Arc::new(vec![held]);
+        drop(charges);
+        Ok((messages, lease))
+    }
 }
 
 impl IntoIterator for SyncResponses {
-    type Item = SyncMessage;
+    type Item = SyncResponse;
     type IntoIter = SyncResponsesIter;
 
     fn into_iter(self) -> SyncResponsesIter {
         SyncResponsesIter {
             messages: self.messages.into_iter(),
-            _charges: self.charges,
+            charges: Arc::new(self.charges),
         }
     }
 }
 
-/// Owned messages of one exchange or embedded stream. The charge of all of
-/// them is released when the iterator is dropped.
+/// Consuming iterator yielding leased items instead of bare `SyncMessage`s.
+/// The whole batch remains charged until its iterator and final item drop.
 pub struct SyncResponsesIter {
     messages: std::vec::IntoIter<SyncMessage>,
-    _charges: Vec<Charge>,
+    charges: Arc<Vec<Charge>>,
 }
 
 impl Iterator for SyncResponsesIter {
-    type Item = SyncMessage;
+    type Item = SyncResponse;
 
-    fn next(&mut self) -> Option<SyncMessage> {
-        self.messages.next()
+    fn next(&mut self) -> Option<SyncResponse> {
+        self.messages.next().map(|message| SyncResponse {
+            message,
+            _charges: Arc::clone(&self.charges),
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.messages.size_hint()
+    }
+}
+
+/// An original returned message holding its batch's shared reservation.
+/// Borrow through `AsRef` or dereferencing; independent caller-created clones
+/// allocate outside this reservation, and there is no detaching conversion.
+pub struct SyncResponse {
+    message: SyncMessage,
+    _charges: Arc<Vec<Charge>>,
+}
+
+impl AsRef<SyncMessage> for SyncResponse {
+    fn as_ref(&self) -> &SyncMessage {
+        &self.message
+    }
+}
+
+impl std::ops::Deref for SyncResponse {
+    type Target = SyncMessage;
+
+    fn deref(&self) -> &SyncMessage {
+        &self.message
     }
 }
 
@@ -124,8 +164,8 @@ pub(super) async fn read_responses(
     stream_limits: StreamLimits,
     budget: &Arc<ByteBudget>,
 ) -> io::Result<SyncResponses> {
-    let mut messages = Vec::new();
     let mut held: Option<Charge> = None;
+    let mut messages = Vec::new();
     let mut limits = SyncReadLimits::new(stream_limits);
     while let Some((len, tag)) = read_frame_head(recv, sync_io_timeout).await? {
         let frame_index = limits.observe_frame(len)?;

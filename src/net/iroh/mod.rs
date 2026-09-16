@@ -25,7 +25,7 @@ pub use budget::{OwnedBytes, OwnedClass};
 use exchange::{
     SyncReadLimits, read_frame_body, read_frame_head, read_responses, write_sync_messages,
 };
-pub use exchange::{SyncResponses, SyncResponsesIter};
+pub use exchange::{SyncResponse, SyncResponses, SyncResponsesIter};
 use pool::ConnectionPool;
 pub use runtime::{IrohRuntimeConfig, ShutdownOutcome};
 use runtime::{LoopGuard, TaskTracker};
@@ -72,7 +72,6 @@ const LOG_INDEX_BYTES: usize = 256 * 1024;
 const CONTROL_JOBS: usize = 4;
 /// Storage jobs running at once for admission and page planning.
 const BULK_JOBS: usize = 2;
-const NO_PROGRESS: &str = "sync exchange made no progress";
 
 /// Bounds of one sync stream. Tests scale them down; everything else uses the
 /// defaults.
@@ -646,6 +645,12 @@ impl<S: Storage> SharedNet<S> {
         peer_id: PeerId,
         results: impl IntoIterator<Item = std::result::Result<(), &'a io::Error>>,
     ) {
+        let results = results.into_iter().filter(|result| {
+            matches!(
+                exchange_state(*result, false),
+                ExchangeState::Complete | ExchangeState::Retryable
+            )
+        });
         if !self.node.note_peer_outcome(peer_id, results) {
             return;
         }
@@ -1011,25 +1016,35 @@ impl<S: Storage> SharedNet<S> {
 
         // An advancing page continues even when outbound evidence reads clean:
         // the peer may still hold more of the inbound goal.
-        if advanced && result.is_ok() {
+        let state = exchange_state(result, advanced);
+        if state == ExchangeState::Advancing {
             self.resync_scheduler
                 .complete_dirty(claim.settle(), RESYNC_PROGRESS_TURN);
             return;
         }
-        if !needs_sync && result.is_ok() {
+        if !needs_sync && state == ExchangeState::Complete {
             self.resync_scheduler.complete_clean(claim.settle());
             return;
         }
 
-        match result {
-            Ok(()) => self
+        match state {
+            ExchangeState::Complete | ExchangeState::Advancing => self
                 .resync_scheduler
                 .complete_dirty(claim.settle(), runtime.resync_interval),
-            Err(_) => self.resync_scheduler.complete_failed(
-                claim.settle(),
-                runtime.resync_initial_backoff,
-                runtime.resync_max_backoff,
-            ),
+            ExchangeState::Rejected | ExchangeState::Reconcile => {
+                self.resync_scheduler.complete_failed(
+                    claim.settle(),
+                    runtime.resync_max_backoff,
+                    runtime.resync_max_backoff,
+                );
+            }
+            ExchangeState::Blocked | ExchangeState::Retryable => {
+                self.resync_scheduler.complete_failed(
+                    claim.settle(),
+                    runtime.resync_initial_backoff,
+                    runtime.resync_max_backoff,
+                );
+            }
         }
     }
 
@@ -1349,6 +1364,9 @@ impl<S: Storage> IrohNet<S> {
                         || error.kind() == io::ErrorKind::TimedOut
                     {
                         let _ = self.pool.remove(&connection);
+                    }
+                    if exchange_state(Err(&error), false) != ExchangeState::Retryable {
+                        return Err(error);
                     }
                     last_error = Some(error);
                 }
@@ -1818,7 +1836,11 @@ impl<S: Storage> IrohNet<S> {
         if fingerprints.is_empty() {
             return BatchOutcomes::new(outcomes, advanced, settled);
         }
-        let responses = match self.exchange(peer.clone(), &request).await {
+        let (responses, lease) = match self
+            .exchange(peer.clone(), &request)
+            .await
+            .and_then(|responses| responses.into_session(&self.budget))
+        {
             Ok(responses) => responses,
             Err(error) => {
                 for topic_id in fingerprints.keys() {
@@ -1861,9 +1883,10 @@ impl<S: Storage> IrohNet<S> {
         }
         // Two identically damaged stores still match, so the local integrity
         // check decides whether a matching fingerprint counts as synced.
+        let held_lease = Arc::clone(&lease);
         let decided = self
             .run_job(Lane::Control, move |shared| {
-                matching
+                let decided = matching
                     .into_iter()
                     .map(|(topic_id, fingerprint)| {
                         if !shared.topic_is_whole(topic_id) {
@@ -1887,11 +1910,12 @@ impl<S: Storage> IrohNet<S> {
                             });
                         (topic_id, outcome)
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (decided, held_lease)
             })
             .await;
         let decided = match decided {
-            Ok(decided) => decided,
+            Ok((decided, _held_lease)) => decided,
             Err(error) => {
                 for topic_id in fingerprints.keys() {
                     outcomes
@@ -1930,9 +1954,13 @@ impl<S: Storage> IrohNet<S> {
                 .collect::<Vec<_>>();
             let taken = std::mem::take(&mut queue);
             let held = carried.take();
+            let held_lease = Arc::clone(&lease);
             let planned = self
                 .run_job(Lane::Bulk, move |shared| {
-                    shared.plan_group(remote_peer_id, taken, held, limits)
+                    (
+                        shared.plan_group(remote_peer_id, taken, held, limits),
+                        held_lease,
+                    )
                 })
                 .await;
             let PlannedGroup {
@@ -1941,7 +1969,7 @@ impl<S: Storage> IrohNet<S> {
                 rest,
                 outcomes: planned_outcomes,
             } = match planned {
-                Ok(planned) => planned,
+                Ok((planned, _held_lease)) => planned,
                 Err(error) => {
                     for topic_id in unplanned {
                         outcomes.insert(topic_id, Err(clone_error(&error)));
@@ -1959,6 +1987,7 @@ impl<S: Storage> IrohNet<S> {
                 peer.clone(),
                 remote_peer_id,
                 group,
+                Arc::clone(&lease),
                 &mut outcomes,
                 &mut advanced,
             )
@@ -2419,6 +2448,7 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         remote_peer_id: PeerId,
         group: Vec<PlannedTopicSync>,
+        source_lease: Arc<Vec<Charge>>,
         outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
         advanced: &mut BTreeSet<crate::TopicId>,
     ) {
@@ -2434,20 +2464,22 @@ impl<S: Storage> IrohNet<S> {
         };
         // Progress is measured toward each topic's captured goal only. Bytes
         // moved, repeated ids and unrelated local writes are not progress.
+        let held_lease = Arc::clone(&source_lease);
         let measured = self
             .run_job(Lane::Control, move |shared| {
-                group
+                let measured = group
                     .into_iter()
                     .map(|planned| {
                         let before =
                             shared.goal_progress(remote_peer_id, planned.topic_id, &planned.goal);
                         (planned, before)
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (measured, held_lease)
             })
             .await;
         let measured = match measured {
-            Ok(measured) => measured,
+            Ok((measured, _held_lease)) => measured,
             Err(error) => {
                 fail_group(outcomes, &error);
                 return;
@@ -2475,8 +2507,12 @@ impl<S: Storage> IrohNet<S> {
             }
             messages.extend(planned.messages);
         }
-        let (responses, charge) = match self.exchange(peer.clone(), &messages).await {
-            Ok(responses) => responses.into_parts(),
+        let (responses, lease) = match self
+            .exchange(peer.clone(), &messages)
+            .await
+            .and_then(|responses| responses.into_session(&self.budget))
+        {
+            Ok(responses) => responses,
             Err(error) => {
                 fail_group(outcomes, &error);
                 return;
@@ -2488,17 +2524,18 @@ impl<S: Storage> IrohNet<S> {
             .iter()
             .map(|(topic_id, (goal, _))| (*topic_id, goal.genesis))
             .collect::<BTreeMap<_, _>>();
+        let held_lease = Arc::clone(&lease);
         let replies = self
             .run_job(Lane::Bulk, move |shared| {
-                let _charge = charge;
-                shared.batch_replies(
+                let replies = shared.batch_replies(
                     remote_peer_id,
                     &topics,
                     &geneses,
                     responses,
                     owed_acks,
                     more,
-                )
+                );
+                (replies, held_lease)
             })
             .await;
         let BatchReplies {
@@ -2509,7 +2546,7 @@ impl<S: Storage> IrohNet<S> {
             more,
             unexpected,
         } = match replies {
-            Ok(replies) => replies,
+            Ok((replies, _held_lease)) => replies,
             Err(error) => {
                 fail_group(outcomes, &error);
                 return;
@@ -2520,14 +2557,15 @@ impl<S: Storage> IrohNet<S> {
             fail_group(outcomes, &error);
             return;
         }
+        let held_lease = Arc::clone(&lease);
         let applied = self
             .run_job(Lane::Control, move |shared| {
                 let results = shared.node.apply_sync_acks(&acks);
-                (acks, results)
+                (acks, results, held_lease)
             })
             .await;
         match applied {
-            Ok((acks, results)) => {
+            Ok((acks, results, _held_lease)) => {
                 for (ack, result) in acks.iter().zip(results) {
                     if let Err(error) = result {
                         outcomes.insert(ack.topic_id, Err(invalid_data(error)));
@@ -2552,19 +2590,21 @@ impl<S: Storage> IrohNet<S> {
             .iter()
             .map(|(topic_id, _)| *topic_id)
             .collect::<Vec<_>>();
+        let held_lease = Arc::clone(&source_lease);
         let measured = self
             .run_job(Lane::Control, move |shared| {
-                goals
+                let measured = goals
                     .into_iter()
                     .map(|(topic_id, (goal, before))| {
                         let after = shared.goal_progress(remote_peer_id, topic_id, &goal);
                         (topic_id, goal, before, after)
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (measured, held_lease)
             })
             .await;
         let measured = match measured {
-            Ok(measured) => measured,
+            Ok((measured, _held_lease)) => measured,
             Err(error) => {
                 for topic_id in goal_topics {
                     outcomes.insert(topic_id, Err(clone_error(&error)));
@@ -2581,7 +2621,9 @@ impl<S: Storage> IrohNet<S> {
                     advanced.insert(topic_id);
                     Ok(())
                 }
-                Ok(_) => Err(invalid_data(NO_PROGRESS)),
+                Ok(_) => Err(invalid_data(crate::Error::SyncCapacity(
+                    "sync exchange made no progress".into(),
+                ))),
                 Err(error) => Err(error),
             };
             outcomes.insert(topic_id, outcome);
@@ -2661,8 +2703,14 @@ impl<S: Storage> IrohNet<S> {
                 })
                 .collect::<BTreeSet<_>>();
             let mut acks = Vec::new();
-            match self.exchange(peer.clone(), &messages).await {
-                Ok(responses) => {
+            let mut held_lease = None;
+            match self
+                .exchange(peer.clone(), &messages)
+                .await
+                .and_then(|responses| responses.into_session(&self.budget))
+            {
+                Ok((responses, lease)) => {
+                    held_lease = Some(lease);
                     for response in responses {
                         match response {
                             SyncMessage::Summary(summary) if topics.contains(&summary.topic_id) => {
@@ -2702,14 +2750,15 @@ impl<S: Storage> IrohNet<S> {
                 }
             }
             if !acks.is_empty() {
+                let job_lease = held_lease.clone();
                 let applied = self
                     .run_job(Lane::Control, move |shared| {
                         let results = shared.node.apply_sync_acks(&acks);
-                        (acks, results)
+                        (acks, results, job_lease)
                     })
                     .await;
                 match applied {
-                    Ok((acks, results)) => {
+                    Ok((acks, results, _held_lease)) => {
                         for (ack, result) in acks.iter().zip(results) {
                             if let Err(error) = result {
                                 outcomes.insert(ack.topic_id, Err(invalid_data(error)));
@@ -3792,8 +3841,60 @@ fn message_topic_id(message: &SyncMessage) -> Option<crate::TopicId> {
 /// One topic's result, whether it advanced, and the claim held for it.
 type TopicResult = (crate::TopicId, io::Result<()>, bool, Option<ClaimGuard>);
 
-/// The typed outcome of one topic attempt: an exchange that stopped without
-/// moving toward its goal is blocked, any other error failed it.
+/// Exchange progress controls retry cadence before errors become status text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExchangeState {
+    Complete,
+    Advancing,
+    Blocked,
+    Retryable,
+    Rejected,
+    Reconcile,
+}
+
+fn exchange_state(result: std::result::Result<(), &io::Error>, advanced: bool) -> ExchangeState {
+    let Err(error) = result else {
+        return if advanced {
+            ExchangeState::Advancing
+        } else {
+            ExchangeState::Complete
+        };
+    };
+    let mut source = error
+        .get_ref()
+        .map(|source| source as &dyn std::error::Error);
+    while let Some(cause) = source {
+        if let Some(cause) = cause.downcast_ref::<crate::Error>() {
+            match cause.cause() {
+                crate::Error::SyncCapacity(_)
+                | crate::Error::MemoryPressure { .. }
+                | crate::Error::StagingCapacity(_)
+                | crate::Error::EvictionJournalFull => return ExchangeState::Blocked,
+                #[cfg(feature = "fjall")]
+                crate::Error::StoragePressure(_) | crate::Error::StorageBuffer { .. } => {
+                    return ExchangeState::Blocked;
+                }
+                #[cfg(feature = "fjall")]
+                crate::Error::ReopenRequired(_) => return ExchangeState::Reconcile,
+                crate::Error::Storage(_) | crate::Error::AdmissionConflict => {
+                    return ExchangeState::Retryable;
+                }
+                #[cfg(feature = "fjall")]
+                crate::Error::Fjall(_) | crate::Error::StorageProbe(_) => {
+                    return ExchangeState::Retryable;
+                }
+                _ => {}
+            }
+        }
+        source = cause.source();
+    }
+    match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory => ExchangeState::Blocked,
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => ExchangeState::Rejected,
+        _ => ExchangeState::Retryable,
+    }
+}
+
 fn attempt_outcome(
     result: std::result::Result<(), &io::Error>,
     advanced: bool,
@@ -3801,12 +3902,12 @@ fn attempt_outcome(
     match result {
         Ok(()) if advanced => crate::AttemptOutcome::Advanced,
         Ok(()) => crate::AttemptOutcome::Complete,
-        Err(error)
-            if error.kind() == io::ErrorKind::InvalidData && error.to_string() == NO_PROGRESS =>
-        {
-            crate::AttemptOutcome::Blocked(error.to_string())
-        }
-        Err(error) => crate::AttemptOutcome::Failed(error.to_string()),
+        Err(error) => match exchange_state(Err(error), advanced) {
+            ExchangeState::Blocked | ExchangeState::Reconcile => {
+                crate::AttemptOutcome::Blocked(error.to_string())
+            }
+            _ => crate::AttemptOutcome::Failed(error.to_string()),
+        },
     }
 }
 
@@ -3823,11 +3924,20 @@ fn timed_out(message: &'static str) -> io::Error {
 }
 
 fn clone_error(error: &io::Error) -> io::Error {
+    if let Some(source) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<super::SharedError>())
+    {
+        return io::Error::new(error.kind(), source.clone());
+    }
+    if let Some(code) = error.raw_os_error() {
+        return io::Error::from_raw_os_error(code);
+    }
     io::Error::new(error.kind(), error.to_string())
 }
 
-fn other(error: impl std::fmt::Display) -> io::Error {
-    io::Error::other(error.to_string())
+fn other(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::other(super::SharedError::new(error))
 }
 
 #[cfg(test)]
@@ -3842,6 +3952,50 @@ mod budget_tests;
 mod tests {
     use super::*;
     use crate::TopicId;
+
+    #[test]
+    fn typed_decisions() {
+        for wording in ["credit exhausted", "wording changed"] {
+            let error = invalid_data(crate::Error::SyncCapacity(wording.into()));
+            for error in [&error, &clone_error(&error)] {
+                assert_eq!(exchange_state(Err(error), false), ExchangeState::Blocked);
+                assert!(matches!(
+                    attempt_outcome(Err(error), false),
+                    crate::AttemptOutcome::Blocked(_)
+                ));
+            }
+        }
+        let rejected = invalid_data("sync exchange made no progress");
+        assert_eq!(
+            exchange_state(Err(&rejected), false),
+            ExchangeState::Rejected
+        );
+        let transport = timed_out("no reply");
+        assert_eq!(
+            exchange_state(Err(&transport), false),
+            ExchangeState::Retryable
+        );
+        assert_eq!(exchange_state(Ok(()), false), ExchangeState::Complete);
+        assert_eq!(exchange_state(Ok(()), true), ExchangeState::Advancing);
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn reconciliation_survives_copy() {
+        let error = invalid_data(crate::Error::Shared(Arc::new(
+            crate::Error::ReopenRequired(fjall::Error::Poisoned),
+        )));
+        let copied = clone_error(&error);
+        drop(error);
+        assert_eq!(
+            exchange_state(Err(&copied), false),
+            ExchangeState::Reconcile
+        );
+        assert!(matches!(
+            attempt_outcome(Err(&copied), false),
+            crate::AttemptOutcome::Blocked(_)
+        ));
+    }
 
     /// Wide enough that the second backoff step cannot be mistaken for the
     /// first on a slow machine.

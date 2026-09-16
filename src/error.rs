@@ -111,6 +111,10 @@ pub enum Error {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// One backend failure shared by every attempted item of a batch.
+    #[error("{0}")]
+    Shared(#[source] std::sync::Arc<Error>),
+
     #[cfg(feature = "fjall")]
     #[error("storage pressure: {0}")]
     StoragePressure(String),
@@ -154,4 +158,15 @@ pub enum Error {
     #[cfg(feature = "fjall")]
     #[error("storage requires reopen and transaction outcome verification: {0}")]
     ReopenRequired(#[source] fjall::Error),
+}
+
+impl Error {
+    /// The typed cause beneath shared batch ownership.
+    pub fn cause(&self) -> &Self {
+        let mut cause = self;
+        while let Self::Shared(source) = cause {
+            cause = source;
+        }
+        cause
+    }
 }

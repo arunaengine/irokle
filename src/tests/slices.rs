@@ -368,12 +368,12 @@ mod sessions {
                 .unwrap()
                 .unwrap()
                 .unwrap();
-            for reply in replies {
+            for reply in replies.iter() {
                 match reply {
                     SyncMessage::Data(data) => {
                         client
                             .node()
-                            .receive_sync_data_from(alice.peer_id(), data)
+                            .receive_sync_data_from(alice.peer_id(), data.clone())
                             .unwrap();
                     }
                     SyncMessage::Failure(failure) => panic!("accepted plan refused: {failure:?}"),

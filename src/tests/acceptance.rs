@@ -195,8 +195,6 @@ async fn races_beside_topic() {
             serving
                 .handle_messages(member_id, messages)
                 .unwrap()
-                .into_iter()
-                .collect::<Vec<_>>()
         },
         move || super::branch::reset_to_new(&writer, &branches),
     );
@@ -205,11 +203,11 @@ async fn races_beside_topic() {
         |reply| matches!(reply, SyncMessage::Failure(failure) if failure.topic_id == replaced),
     );
     assert!(
-        refused || served_ids(&replies, replaced).is_subset(&old),
+        refused || served_ids(replies.messages(), replaced).is_subset(&old),
         "a request accepted on the old genesis served new-branch ops"
     );
     assert_eq!(
-        served_ids(&replies, normal.id()),
+        served_ids(replies.messages(), normal.id()),
         storage.list_op_ids(&normal.id()).unwrap(),
         "the other request of the stream was not served in full"
     );

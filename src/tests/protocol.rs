@@ -278,13 +278,11 @@ async fn stream_pair(limits: StreamLimits) -> (Peer, Peer) {
     (alice, bob)
 }
 
-fn serve_stream(alice: &Peer, bob: &Peer, messages: Vec<SyncMessage>) -> Vec<SyncMessage> {
+fn serve_stream(alice: &Peer, bob: &Peer, messages: Vec<SyncMessage>) -> net::SyncResponses {
     alice
         .net
         .handle_messages(bob.net.endpoint().id(), messages)
         .unwrap()
-        .into_iter()
-        .collect()
 }
 
 /// Controls that fill the message budget exactly leave no room for data, but
@@ -313,9 +311,9 @@ async fn controls_fill_budget() {
     let replies = serve_stream(&alice, &bob, messages);
     assert_eq!(replies.len(), limits.messages);
     for topic_id in &topics {
-        assert!(acked(&replies, *topic_id));
-        assert_eq!(page_more(&replies, *topic_id), Some(true));
-        assert!(data_ids(&replies, *topic_id).is_empty());
+        assert!(acked(replies.messages(), *topic_id));
+        assert_eq!(page_more(replies.messages(), *topic_id), Some(true));
+        assert!(data_ids(replies.messages(), *topic_id).is_empty());
     }
     alice.net.shutdown().await;
     bob.net.shutdown().await;
@@ -343,10 +341,10 @@ async fn duplicates_served_once() {
     ];
 
     let replies = serve_stream(&alice, &bob, messages);
-    let served = data_ids(&replies, topic_id);
+    let served = data_ids(replies.messages(), topic_id);
     let expected = owned[1..].iter().map(|op| op.id).collect::<Vec<_>>();
     assert_eq!(served, expected);
-    assert_eq!(page_more(&replies, topic_id), Some(false));
+    assert_eq!(page_more(replies.messages(), topic_id), Some(false));
     alice.net.shutdown().await;
     bob.net.shutdown().await;
 }
@@ -380,11 +378,11 @@ async fn hot_topic_shares() {
     }
 
     let replies = serve_stream(&alice, &bob, messages);
-    assert_eq!(page_more(&replies, hot), Some(true));
-    assert!(!data_ids(&replies, hot).is_empty());
+    assert_eq!(page_more(replies.messages(), hot), Some(true));
+    assert!(!data_ids(replies.messages(), hot).is_empty());
     for topic_id in &quiet {
-        assert_eq!(data_ids(&replies, *topic_id).len(), 5);
-        assert_eq!(page_more(&replies, *topic_id), Some(false));
+        assert_eq!(data_ids(replies.messages(), *topic_id).len(), 5);
+        assert_eq!(page_more(replies.messages(), *topic_id), Some(false));
     }
     alice.net.shutdown().await;
     bob.net.shutdown().await;
@@ -405,8 +403,8 @@ async fn wrong_branch_fails() {
         &bob,
         vec![open(&bob.node, topic_id), SyncMessage::Request(request)],
     );
-    assert!(data_ids(&replies, topic_id).is_empty());
-    assert_eq!(page_more(&replies, topic_id), None);
+    assert!(data_ids(replies.messages(), topic_id).is_empty());
+    assert_eq!(page_more(replies.messages(), topic_id), None);
     assert!(replies.iter().any(|reply| matches!(
         reply,
         SyncMessage::Failure(failure)
@@ -443,7 +441,7 @@ async fn forged_credit_bounded() {
             SyncMessage::Request(events_request(&alice.node, topic_id, forged)),
         ],
     );
-    let served = data_ids(&replies, topic_id).len();
+    let served = data_ids(replies.messages(), topic_id).len();
     assert!(served > 0 && served <= limit.ops as usize, "{served}");
     let bytes = replies
         .iter()
@@ -451,7 +449,7 @@ async fn forged_credit_bounded() {
         .map(|reply| crate::net::framed_message_len(reply).unwrap())
         .sum::<usize>();
     assert!(bytes as u64 <= limit.bytes);
-    assert_eq!(page_more(&replies, topic_id), Some(true));
+    assert_eq!(page_more(replies.messages(), topic_id), Some(true));
     alice.net.shutdown().await;
     bob.net.shutdown().await;
 }
@@ -770,10 +768,10 @@ async fn large_topics_progress() {
             messages.push(SyncMessage::Request(request));
         }
         let replies = serve_stream(&alice, &bob, messages);
-        assert!(framed_bytes(&replies) <= limits.bytes);
+        assert!(framed_bytes(replies.messages()) <= limits.bytes);
         let mut progressed = false;
         for (topic_id, (ops, sent)) in served.iter_mut() {
-            let ids = data_ids(&replies, *topic_id);
+            let ids = data_ids(replies.messages(), *topic_id);
             let expected = ops[*sent..*sent + ids.len()]
                 .iter()
                 .map(|op| op.id)
