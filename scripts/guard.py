@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-"""Run a command in its own capped Linux user scope with a headroom watchdog.
-
-Usage: guard.py REPOSITORY NEW_LOG COMMAND [ARGUMENT ...]
-The entire command tree shares 8 GiB, no swap, low CPU/I/O priority, two build
-jobs and two test threads. Refuse or stop below 4 GiB available RAM or 8 GiB
-filesystem headroom. JSON lines record resource samples and the final exit.
+"""Run a command in a capped Linux user scope with a headroom watchdog.
+See scripts/README.md for limits, invocation, and resource evidence.
 """
 
 import json
@@ -15,18 +11,6 @@ import subprocess
 import sys
 import time
 import uuid
-
-
-def resources(repo):
-    memory = {line.split(":")[0]: int(line.split()[1]) * 1024
-              for line in Path("/proc/meminfo").read_text().splitlines()}
-    return {"available_memory": memory["MemAvailable"],
-            "filesystem_free": shutil.disk_usage(repo).free,
-            "load": Path("/proc/loadavg").read_text().strip()}
-
-
-def healthy(sample):
-    return sample["available_memory"] >= 4 * 1024**3 and sample["filesystem_free"] >= 8 * 1024**3
 
 
 def main():
@@ -74,6 +58,21 @@ def main():
                                check=False, timeout=30)
                 process.wait(timeout=30)
             return 1
+
+
+
+def resources(repo):
+    memory = {line.split(":")[0]: int(line.split()[1]) * 1024
+              for line in Path("/proc/meminfo").read_text().splitlines()}
+    return {"available_memory": memory["MemAvailable"],
+            "filesystem_free": shutil.disk_usage(repo).free,
+            "load": Path("/proc/loadavg").read_text().strip()}
+
+
+def healthy(sample):
+    return sample["available_memory"] >= 4 * 1024**3 and sample["filesystem_free"] >= 8 * 1024**3
+
+
 
 
 if __name__ == "__main__":

@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""Run immutable old/current Irokle test binaries as independent sync/5 peers.
-
-Usage: compatibility.py CURRENT_REPO OLD_REPO CURRENT_BINARY OLD_BINARY
-                        FIXTURE_DIRECTORY NEW_RESULTS [CASE ...]
-Run under guard.py. Every child log must contain exactly the selected test.
+"""Run immutable old/current binaries as independent sync/5 peers.
+Run under guard.py; scripts/README.md describes fixtures and exact selections.
 """
 
 import csv
@@ -21,6 +18,22 @@ from checks import identity, inspect_log, save
 
 TEST = "tests::versions::peer_process"
 CASES = ("ordinary", "bootstrap", "window", "reconnect", "collision", "fallback", "branch")
+
+
+def main():
+    def interrupted(signum, _frame):
+        raise InterruptedError(f"version campaign interrupted by signal {signum}")
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, interrupted)
+    if len(sys.argv) < 7:
+        raise ValueError(__doc__)
+    current, old, current_binary, old_binary, fixtures = [Path(value).resolve(strict=True)
+                                                        for value in sys.argv[1:6]]
+    output = Path(sys.argv[6]).resolve()
+    return run({"current": current, "old": old}, {"current": current_binary, "old": old_binary},
+               fixtures, output, sys.argv[7:] or list(CASES))
+
 
 
 def digest(path):
@@ -128,19 +141,6 @@ def run(repositories, binaries, fixtures, output, cases):
     return 0 if passed else 1
 
 
-def main():
-    def interrupted(signum, _frame):
-        raise InterruptedError(f"version campaign interrupted by signal {signum}")
-
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(signum, interrupted)
-    if len(sys.argv) < 7:
-        raise ValueError(__doc__)
-    current, old, current_binary, old_binary, fixtures = [Path(value).resolve(strict=True)
-                                                        for value in sys.argv[1:6]]
-    output = Path(sys.argv[6]).resolve()
-    return run({"current": current, "old": old}, {"current": current_binary, "old": old_binary},
-               fixtures, output, sys.argv[7:] or list(CASES))
 
 
 if __name__ == "__main__":

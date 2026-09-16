@@ -8,6 +8,18 @@ from pathlib import Path
 import re
 
 
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("log", type=Path)
+    parser.add_argument("cycles", type=int)
+    args = parser.parse_args()
+    content = args.log.read_bytes()
+    result = summarize(content.decode(), args.cycles)
+    result.update(log=str(args.log), sha256=hashlib.sha256(content).hexdigest())
+    print(json.dumps(result, indent=2))
+
+
+
 def summarize(text, cycles):
     samples = [(int(cycle), int(size)) for cycle, size in re.findall(
         r"^cycle=(\d+) .*?directory_bytes=(\d+) ", text, re.MULTILINE)]
@@ -22,11 +34,4 @@ def summarize(text, cycles):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("log", type=Path)
-    parser.add_argument("cycles", type=int)
-    args = parser.parse_args()
-    content = args.log.read_bytes()
-    result = summarize(content.decode(), args.cycles)
-    result.update(log=str(args.log), sha256=hashlib.sha256(content).hexdigest())
-    print(json.dumps(result, indent=2))
+    main()

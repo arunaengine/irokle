@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Print the required serial check manifest; run it through checks.sh.
-
-The launcher must enforce memory limits for the entire runner and its children.
-"""
+"""Print the required serial check manifest for the capped checks.sh runner."""
 
 import json
 import sys
+
+
+def main():
+    print(json.dumps(cases(), indent=2))
+
 
 
 def cases():
@@ -31,11 +33,16 @@ def cases():
                                    "--", "-D", "warnings"]),
         ])
     commands.extend((f"{name}-1.95", ["+1.95.0", *args]) for name, args in commands[:9])
-    result = [{"label": name, "argv": ["cargo", *args], "timeout": 7200}
+    result = [{"label": name,
+               "argv": (["env", "RUSTDOCFLAGS=-D warnings"] if name.startswith("doc") else [])
+                       + ["cargo", *args], "timeout": 7200}
               for name, args in commands]
+    result.insert(0, {"label": "style", "timeout": 120,
+                      "argv": [sys.executable, "-B", "scripts/style.py"]})
     for name in ("pending::fjall_drains_complete", "planning::catch_up_costs",
                  "planning::pull_hundred_thousand", "progress::window_chain_boundary",
-                 "staging::fjall_invite_beyond_caps", "staging::memory_invite_beyond_caps"):
+                 "requests::real_join_finishes",
+                 "staging::fjall_invite_caps", "staging::memory_invite_caps"):
         exact = f"tests::{name}"
         result.append({"label": f"ignored-{name.split('::')[-1]}", "timeout": 7200,
                        "argv": ["cargo", "test", "--locked", "--all-features", "--lib", exact,
@@ -46,4 +53,4 @@ def cases():
 
 
 if __name__ == "__main__":
-    print(json.dumps(cases(), indent=2))
+    main()

@@ -12,6 +12,8 @@ Follow the canonical [repository style and structure policy](STYLE.md) for all o
 Please make sure that all contributions compile and do not produce any errors. These commands match CI:
 
 ```bash
+python3 -B -m unittest discover -s scripts -v
+python3 -B scripts/style.py
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
@@ -19,7 +21,7 @@ cargo check --locked --all-features --all-targets
 cargo clippy --locked --all-features --all-targets -- -D warnings
 cargo test --locked --all-features --lib --test derive
 cargo test --locked --all-features --doc
-cargo doc --locked --all-features --no-deps
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --all-features --no-deps
 ```
 
 CI also runs the Iroh network tests in Linux network namespaces. They need `iproute2`, `nftables` and permission to create namespaces:

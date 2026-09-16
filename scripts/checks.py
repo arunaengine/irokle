@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-"""Run a JSON check list serially, collecting evidence and propagating failure.
-
-Usage: checks.py REPOSITORY NEW_RESULT_DIRECTORY CASES_JSON
-Cases contain label, argv, timeout (seconds), optional tests (exact Rust names)
-and required_logs (repository-relative paths). No shell is implied by argv.
-Heavy commands must include an enforced resource wrapper in their argv.
+"""Run serial JSON checks with exact source, test, and log evidence.
+See scripts/README.md for the manifest and enforced resource wrapper.
 """
 
 import argparse
@@ -18,6 +14,21 @@ import signal
 import subprocess
 import sys
 import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("repo", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("cases", type=Path)
+    args = parser.parse_args()
+    try:
+        return run(args.repo.resolve(strict=True), args.output.resolve(),
+                   json.loads(args.cases.read_text()))
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        print(f"check runner failed: {error}", file=sys.stderr)
+        return 1
+
 
 
 def git(repo, *args):
@@ -196,18 +207,6 @@ def run(repo, output, cases):
     return (128 + interrupted) if interrupted else int(failed)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("repo", type=Path)
-    parser.add_argument("output", type=Path)
-    parser.add_argument("cases", type=Path)
-    args = parser.parse_args()
-    try:
-        return run(args.repo.resolve(strict=True), args.output.resolve(),
-                   json.loads(args.cases.read_text()))
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-        print(f"check runner failed: {error}", file=sys.stderr)
-        return 1
 
 
 if __name__ == "__main__":
