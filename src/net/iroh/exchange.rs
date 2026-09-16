@@ -313,3 +313,7 @@ async fn read_some_with_timeout(
         .map_err(|_| timed_out("sync read timed out"))?
         .map_err(other)
 }
+
+#[cfg(test)]
+#[path = "exchange_tests.rs"]
+mod tests;
