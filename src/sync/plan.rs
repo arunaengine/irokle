@@ -689,6 +689,10 @@ impl Pager<'_> {
                 self.ended = true;
                 break;
             }
+            self.settle()?;
+            if self.ended {
+                break;
+            }
             self.fill()?;
             if self.ended || self.selecting.is_some() || self.exhausted() {
                 self.ended = true;
@@ -1105,72 +1109,182 @@ impl Pager<'_> {
     }
 
     /// `actor_id` sent `seq`: every head waiting for that position may resume.
-    fn wake(&mut self, actor_id: ActorId, seq: u64) {
-        let Some(waiting) = self.suspended.get_mut(&actor_id) else {
-            return;
-        };
-        let (ready, rest) = std::mem::take(waiting)
-            .into_iter()
-            .partition::<Vec<_>, _>(|(needed, _)| *needed <= seq);
-        *waiting = rest;
-        self.resumable
-            .extend(ready.into_iter().map(|(_, head)| head));
+    fn wake(&mut self, actor: ActorId, seq: u64) {
+        if self.suspended.contains_key(&actor) {
+            self.updates.push_back(Update::Wake {
+                actor,
+                seq,
+                index: 0,
+            });
+        }
     }
 
     /// `actor_id` sent everything up to `limit`. Heads still waiting on it need
     /// a later position: the actor continues once up to the highest of them,
     /// and a waiter no stored position can satisfy is blocked.
-    fn reach(&mut self, actor_id: ActorId, limit: u64) -> Result<()> {
-        self.states.insert(actor_id, ActorState::Reached(limit));
-        let waiting = self.suspended.remove(&actor_id).unwrap_or_default();
-        let local_seq = self.local.get(&actor_id);
-        let raised = waiting
-            .iter()
-            .map(|(needed, _)| *needed)
-            .filter(|needed| *needed > limit && (self.scope.informed() || *needed <= local_seq))
-            .max();
-        if let Some(raised) = raised {
-            self.activate(actor_id, limit, raised)?;
-        }
-        let continues = matches!(self.states.get(&actor_id), Some(ActorState::Active));
-        for (needed, head) in waiting {
-            if continues && raised.is_some_and(|raised| needed <= raised) {
-                self.suspended
-                    .entry(actor_id)
-                    .or_default()
-                    .push((needed, head));
-            } else {
-                self.block(head.1, head.3);
-            }
-        }
-        if self.scope.informed()
-            && matches!(self.states.get(&actor_id), Some(ActorState::Reached(_)))
-        {
-            self.states.remove(&actor_id);
+    fn reach(&mut self, actor: ActorId, limit: u64) -> Result<()> {
+        self.states.insert(actor, ActorState::Reached(limit));
+        if self.suspended.contains_key(&actor) {
+            self.updates.push_back(Update::Raise {
+                actor,
+                limit,
+                index: 0,
+                raised: None,
+            });
+        } else if self.scope.informed() {
+            self.states.remove(&actor);
         }
         Ok(())
     }
 
     /// Stop `actor_id` at `id`, and every head waiting on it.
-    fn block(&mut self, actor_id: ActorId, id: OpId) {
+    fn block(&mut self, actor: ActorId, id: OpId) {
         self.blocked.insert(id);
-        self.stop(actor_id);
+        self.stop(actor);
     }
 
     /// Stop `actor_id` and every head suspended on it, transitively.
-    fn stop(&mut self, actor_id: ActorId) {
-        self.states.insert(actor_id, ActorState::Blocked);
+    fn stop(&mut self, actor: ActorId) {
+        self.states.insert(actor, ActorState::Blocked);
         self.more = true;
-        let mut stopped = vec![actor_id];
-        while let Some(stopped_actor) = stopped.pop() {
-            for (_, (_, waiter, _, id, _)) in
-                self.suspended.remove(&stopped_actor).unwrap_or_default()
-            {
-                self.blocked.insert(id);
-                self.states.insert(waiter, ActorState::Blocked);
-                stopped.push(waiter);
+        if self.suspended.contains_key(&actor) {
+            self.updates.push_back(Update::Stop(actor));
+        }
+    }
+
+    fn settle(&mut self) -> Result<()> {
+        while let Some(update) = self.updates.pop_front() {
+            match update {
+                Update::Wake { actor, seq, index } => {
+                    let next = self
+                        .suspended
+                        .get(&actor)
+                        .and_then(|waiting| waiting.get(index))
+                        .copied();
+                    let Some((needed, head)) = next else { continue };
+                    if !self.slice.actor() {
+                        self.updates.push_front(update);
+                        self.ended = true;
+                        return Ok(());
+                    }
+                    let index = if needed <= seq {
+                        if let Some(waiting) = self.suspended.get_mut(&actor) {
+                            waiting.swap_remove(index);
+                            if waiting.is_empty() {
+                                self.suspended.remove(&actor);
+                            }
+                        }
+                        self.resumable.push_back(head);
+                        index
+                    } else {
+                        index + 1
+                    };
+                    self.updates.push_front(Update::Wake { actor, seq, index });
+                }
+                Update::Raise {
+                    actor,
+                    limit,
+                    index,
+                    mut raised,
+                } => {
+                    let next = self
+                        .suspended
+                        .get(&actor)
+                        .and_then(|waiting| waiting.get(index))
+                        .copied();
+                    if let Some((needed, _)) = next {
+                        if !self.slice.actor() {
+                            self.updates.push_front(update);
+                            self.ended = true;
+                            return Ok(());
+                        }
+                        if needed > limit
+                            && (self.scope.informed() || needed <= self.local.get(&actor))
+                        {
+                            raised = Some(raised.map_or(needed, |raised| raised.max(needed)));
+                        }
+                        self.updates.push_front(Update::Raise {
+                            actor,
+                            limit,
+                            index: index + 1,
+                            raised,
+                        });
+                    } else {
+                        if let Some(raised) = raised {
+                            self.activate(actor, limit, raised)?;
+                        }
+                        self.updates.push_front(Update::Finish {
+                            actor,
+                            raised,
+                            index: 0,
+                        });
+                    }
+                }
+                Update::Finish {
+                    actor,
+                    raised,
+                    index,
+                } => {
+                    let next = self
+                        .suspended
+                        .get(&actor)
+                        .and_then(|waiting| waiting.get(index))
+                        .copied();
+                    let Some((needed, head)) = next else {
+                        if self.scope.informed()
+                            && matches!(self.states.get(&actor), Some(ActorState::Reached(_)))
+                        {
+                            self.states.remove(&actor);
+                        }
+                        continue;
+                    };
+                    if !self.slice.actor() {
+                        self.updates.push_front(update);
+                        self.ended = true;
+                        return Ok(());
+                    }
+                    let index = if raised.is_some_and(|raised| needed <= raised) {
+                        index + 1
+                    } else {
+                        if let Some(waiting) = self.suspended.get_mut(&actor) {
+                            waiting.swap_remove(index);
+                            if waiting.is_empty() {
+                                self.suspended.remove(&actor);
+                            }
+                        }
+                        self.block(head.1, head.3);
+                        index
+                    };
+                    self.updates.push_front(Update::Finish {
+                        actor,
+                        raised,
+                        index,
+                    });
+                }
+                Update::Stop(actor) => {
+                    let next = self
+                        .suspended
+                        .get(&actor)
+                        .and_then(|waiting| waiting.last())
+                        .copied();
+                    let Some((_, head)) = next else { continue };
+                    if !self.slice.actor() {
+                        self.updates.push_front(update);
+                        self.ended = true;
+                        return Ok(());
+                    }
+                    if let Some(waiting) = self.suspended.get_mut(&actor) {
+                        waiting.pop();
+                        if waiting.is_empty() {
+                            self.suspended.remove(&actor);
+                        }
+                    }
+                    self.block(head.1, head.3);
+                    self.updates.push_front(Update::Stop(actor));
+                }
             }
         }
+        Ok(())
     }
 }
 
