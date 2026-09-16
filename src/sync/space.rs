@@ -1,5 +1,20 @@
 //! Collection allocation estimates used by retained traversal state.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub(super) fn reserve_bytes(pool: &AtomicUsize, bytes: usize, limit: usize) -> bool {
+    let mut held = pool.load(Ordering::Acquire);
+    loop {
+        let Some(next) = held.checked_add(bytes).filter(|sum| *sum <= limit) else {
+            return false;
+        };
+        match pool.compare_exchange_weak(held, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(current) => held = current,
+        }
+    }
+}
+
 pub(super) fn tree_bytes<K, V>(entries: usize) -> usize {
     // Rust 1.95/1.97 nodes hold eleven entries, at least five outside the root.
     // Include a possibly retained empty root, internal edges and allocator slack.

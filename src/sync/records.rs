@@ -86,14 +86,7 @@ impl Records {
             }
             let bytes = charge(bytes);
             loop {
-                if self
-                    .pool
-                    .live
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                        held.checked_add(bytes).filter(|sum| *sum <= POOL_BYTES)
-                    })
-                    .is_ok()
-                {
+                if super::space::reserve_bytes(&self.pool.live, bytes, POOL_BYTES) {
                     break;
                 }
                 if !self.evict() {
@@ -141,15 +134,7 @@ impl Records {
         while self.bytes + record.claim.bytes > CACHE_BYTES && self.evict() {}
         // Idle caches leave room for both bulk workers' largest decoded records.
         let cache_limit = POOL_BYTES - 2 * charge(super::MAX_PAGE_BYTES);
-        if self
-            .pool
-            .cached
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                held.checked_add(record.claim.bytes)
-                    .filter(|sum| *sum <= cache_limit)
-            })
-            .is_err()
-        {
+        if !super::space::reserve_bytes(&self.pool.cached, record.claim.bytes, cache_limit) {
             return;
         }
         record.claim.cached = true;

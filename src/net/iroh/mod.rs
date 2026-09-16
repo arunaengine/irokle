@@ -282,6 +282,37 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
     accept_hooks: AcceptHooks,
 }
 
+// SAFETY: checked_threads verifies every field is Send + Sync without omission.
+// Explicit impls bound the recursive Irokle -> IrohNet -> SharedNet proof.
+unsafe impl<S: Storage> Send for IrohNet<S> {}
+// SAFETY: the same exhaustive field checks validate shared access.
+unsafe impl<S: Storage> Sync for IrohNet<S> {}
+
+impl<S: Storage> IrohNet<S> {
+    fn checked_threads(self) -> Self {
+        fn check<T: Send + Sync>(_: &T) {}
+        let Self {
+            pool,
+            accept_started,
+            resync_started,
+            quarantine_started,
+            outbound_streams,
+            shared,
+            #[cfg(test)]
+            accept_hooks,
+        } = &self;
+        check(pool);
+        check(accept_started);
+        check(resync_started);
+        check(quarantine_started);
+        check(outbound_streams);
+        check(shared);
+        #[cfg(test)]
+        check(accept_hooks);
+        self
+    }
+}
+
 /// Test-only accept loop knobs: a lower connection cap, and a semaphore every
 /// handshake waits on before it runs, so tests can hold handshakes pending.
 #[cfg(test)]
@@ -441,7 +472,8 @@ impl<S: Storage> IrohNet<S> {
                 #[cfg(test)]
                 lane_times: Default::default(),
             }),
-        })
+        }
+        .checked_threads())
     }
 
     #[cfg(test)]

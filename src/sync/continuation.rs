@@ -139,12 +139,11 @@ impl ClockClaim {
             )));
         }
         let added = bytes.saturating_sub(self.bytes);
-        self.pool
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                held.checked_add(added)
-                    .filter(|sum| *sum <= CLOCK_POOL_BYTES)
-            })
-            .map_err(|_| Error::SyncCapacity("captured clock pool is occupied".into()))?;
+        if !super::space::reserve_bytes(&self.pool, added, CLOCK_POOL_BYTES) {
+            return Err(Error::SyncCapacity(
+                "captured clock pool is occupied".into(),
+            ));
+        }
         self.bytes += added;
         Ok(())
     }

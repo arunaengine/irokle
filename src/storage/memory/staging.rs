@@ -238,10 +238,10 @@ impl MemoryStorage {
         if inner.topics.contains_key(&topic_id) {
             return Err(Error::AdmissionConflict);
         }
-        if !staging
+        if staging
             .namespaces
             .get(&(provisional.source, topic_id))
-            .is_some_and(|(current, _)| current.session == provisional.session)
+            .is_none_or(|(current, _)| current.session != provisional.session)
         {
             return Err(Error::StaleIncarnation);
         }
