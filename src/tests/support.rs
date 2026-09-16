@@ -416,6 +416,40 @@ struct StaleSnapshot<'a, S> {
 }
 
 impl<S: Storage> crate::storage::SnapshotRead for StaleSnapshot<'_, S> {
+    fn sync_identity(
+        &self,
+        topic: &TopicId,
+        peer: &PeerId,
+        reserve: &mut dyn FnMut(crate::storage::SnapshotCharge) -> Result<(), Error>,
+    ) -> Result<Option<crate::storage::RequestView>, Error> {
+        *self
+            .hooks
+            .sync_counts
+            .lock()
+            .unwrap()
+            .entry("authorization")
+            .or_default() += 1;
+        let view = self.read.sync_identity(topic, peer, reserve);
+        self.hooks.gate_read(GatePoint::View(*topic));
+        view
+    }
+
+    fn sync_clock(
+        &self,
+        topic: &TopicId,
+        actors: Option<&BTreeSet<ActorId>>,
+        reserve: &mut dyn FnMut(crate::storage::SnapshotCharge) -> Result<(), Error>,
+    ) -> Result<ActorClock, Error> {
+        *self
+            .hooks
+            .sync_counts
+            .lock()
+            .unwrap()
+            .entry("clock_capture")
+            .or_default() += 1;
+        self.read.sync_clock(topic, actors, reserve)
+    }
+
     fn topic_view(
         &self,
         topic_id: &TopicId,
@@ -430,6 +464,19 @@ impl<S: Storage> crate::storage::SnapshotRead for StaleSnapshot<'_, S> {
             return Ok(hidden);
         }
         self.read.get_op(id)
+    }
+    fn get_reserved_op(
+        &self,
+        id: &OpId,
+        reserve: &mut dyn FnMut(usize) -> Result<(), Error>,
+    ) -> Result<Option<Op>, Error> {
+        if let Some(hidden) = self.hooks.op_hook(id) {
+            if let Some(op) = &hidden {
+                reserve(postcard::experimental::serialized_size(op)?)?;
+            }
+            return Ok(hidden);
+        }
+        self.read.get_reserved_op(id, reserve)
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<crate::storage::OpMeta>, Error> {
         let meta = self.read.get_meta(id);
