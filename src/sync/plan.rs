@@ -508,6 +508,7 @@ impl Frontier {
             || !self.updates.is_empty()
             || !self.pending.is_empty()
             || !self.active.is_empty()
+            || !self.pending.is_empty()
             || !self.resumable.is_empty()
             || self.selecting.is_some()
             || !self.deferred.is_empty()
@@ -752,6 +753,7 @@ impl Pager<'_> {
             || self.remainder
             || self.selecting.is_some()
             || !self.active.is_empty()
+            || !self.pending.is_empty()
             || !self.resumable.is_empty()
             || self.suspended.values().any(|waiting| !waiting.is_empty())
             || !self.deferred.is_empty();
@@ -808,26 +810,40 @@ impl Pager<'_> {
     fn fill(&mut self) -> Result<()> {
         if let Some(selected) = self.selecting.take() {
             self.select(selected)?;
-            if self.selecting.is_some() {
+            if self.selecting.is_some() || self.ended {
                 return Ok(());
             }
         }
         while self.active.len() < self.window && !self.exhausted() {
+            if let Some(scan) = self.pending.pop_front() {
+                if let Some(head) = self.head(scan)? {
+                    self.active.push(Reverse(head));
+                }
+                if self.ended {
+                    return Ok(());
+                }
+                continue;
+            }
             if let Some(head) = self.resumable.pop_front() {
-                let (_, actor_id, _, _, _) = head;
+                if !self.slice.actor() {
+                    self.resumable.push_front(head);
+                    break;
+                }
                 self.active.push(Reverse(head));
-                self.states.insert(actor_id, ActorState::Active);
+                self.states.insert(head.1, ActorState::Active);
                 continue;
             }
-            let Some((actor_id, _)) = self.deferred.next() else {
-                return Ok(());
+            if self.deferred.is_empty() || !self.slice.actor() {
+                break;
+            }
+            let Some((actor, _)) = self.deferred.next() else {
+                break;
             };
-            self.scan();
-            let limit = self.limit(&actor_id);
-            if self.states.contains_key(&actor_id) || limit <= self.covered.get(&actor_id) {
+            let limit = self.limit(&actor);
+            if self.states.contains_key(&actor) || limit <= self.covered.get(&actor) {
                 continue;
             }
-            self.activate(actor_id, self.covered.get(&actor_id), limit)?;
+            self.activate(actor, self.covered.get(&actor), limit)?;
         }
         Ok(())
     }
@@ -835,76 +851,118 @@ impl Pager<'_> {
     /// Queue the op after `after` on `actor_id`, up to `limit`; callers keep
     /// `after < limit`. A gap in the index stops the actor and names the
     /// record the next indexed op follows.
-    fn activate(&mut self, actor_id: ActorId, after: u64, limit: u64) -> Result<()> {
-        if let Some(head) = self.head(actor_id, after, limit)? {
-            self.active.push(Reverse(head));
-            self.states.insert(actor_id, ActorState::Active);
+    fn activate(&mut self, actor: ActorId, after: u64, limit: u64) -> Result<()> {
+        if !self.states.contains_key(&actor) {
+            // One actor may own a head, a suspended entry, a cursor and its state.
+            self.slice.reserve(768)?;
         }
+        self.pending.push_back(HeadScan {
+            actor,
+            after,
+            limit,
+            next: None,
+        });
+        self.states.insert(actor, ActorState::Active);
         Ok(())
     }
 
-    fn head(&mut self, actor_id: ActorId, after: u64, limit: u64) -> Result<Option<RangeHead>> {
-        self.visit();
-        let next = self
-            .read
-            .actor_range(self.topic_id, &actor_id, after, 1)?
-            .pop();
-        // The clock is ahead of the index, so no id names the lost position.
-        let Some((seq, id)) = next else {
-            self.stop(actor_id);
+    fn head(&mut self, mut scan: HeadScan) -> Result<Option<RangeHead>> {
+        if scan.next.is_none() {
+            if !self.visit() {
+                self.pending.push_front(scan);
+                self.ended = true;
+                return Ok(None);
+            }
+            scan.next = self
+                .read
+                .actor_range(self.topic_id, &scan.actor, scan.after, 1)?
+                .pop();
+            if scan.next.is_none() {
+                self.stop(scan.actor);
+                return Ok(None);
+            }
+        }
+        if !self.visit() {
+            self.pending.push_front(scan);
+            self.ended = true;
+            return Ok(None);
+        }
+        let Some((seq, id)) = scan.next else {
             return Ok(None);
         };
-        self.visit();
         let meta = self.read.get_header(&id)?;
-        if seq != after + 1 || meta.is_none() {
-            match meta.filter(|_| seq != after + 1) {
+        if seq != scan.after + 1 || meta.is_none() {
+            self.slice.reserve(256)?;
+            match meta.filter(|_| seq != scan.after + 1) {
                 Some(meta) => self.missing.extend(meta.actor_prev),
                 None => {
                     self.missing.insert(id);
                 }
             }
-            self.stop(actor_id);
+            self.stop(scan.actor);
             return Ok(None);
         }
-        Ok(meta.map(|meta| (meta.generation, actor_id, seq, id, limit)))
-    }
-
-    fn scan(&mut self) {
-        self.slice.scanned += 1;
-        self.work.actors.fetch_add(1, Ordering::Relaxed);
+        Ok(meta.map(|meta| (meta.generation, scan.actor, seq, id, scan.limit)))
     }
 
     /// Retain only the oldest heads while the bounded inventory cursor advances.
     fn select(&mut self, mut selected: BinaryHeap<RangeHead>) -> Result<()> {
-        while !self.exhausted() {
-            let Some((actor, _)) = self.deferred.next() else {
-                for head in selected {
-                    self.states.insert(head.1, ActorState::Active);
-                    self.active.push(Reverse(head));
-                }
-                // Finish inventory before spending a fresh slice on its selected page.
-                self.ended = self.slice.scanned > 0;
-                return Ok(());
-            };
-            self.scan();
-            let (after, limit) = (self.covered.get(&actor), self.limit(&actor));
-            if after >= limit {
-                continue;
-            }
-            if let Some(head) = self.head(actor, after, limit)? {
-                if selected.len() < self.window {
-                    selected.push(head);
-                } else {
-                    self.remainder = true;
-                    if selected.peek().is_some_and(|last| head < *last) {
-                        selected.pop();
-                        selected.push(head);
+        loop {
+            if self.pending.is_empty() && self.deferred.is_empty() {
+                while !selected.is_empty() {
+                    if !self.slice.actor() {
+                        self.selecting = Some(selected);
+                        return Ok(());
+                    }
+                    if let Some(head) = selected.pop() {
+                        self.slice.reserve(768)?;
+                        self.states.insert(head.1, ActorState::Active);
+                        self.active.push(Reverse(head));
                     }
                 }
+                self.ended = true;
+                return Ok(());
+            }
+            if self.exhausted() {
+                self.selecting = Some(selected);
+                return Ok(());
+            }
+            if let Some(scan) = self.pending.pop_front() {
+                if let Some(head) = self.head(scan)? {
+                    if selected.len() < self.window {
+                        self.slice.reserve(2 * size_of::<RangeHead>())?;
+                        selected.push(head);
+                    } else {
+                        self.remainder = true;
+                        if selected.peek().is_some_and(|last| head < *last) {
+                            selected.pop();
+                            selected.push(head);
+                        }
+                    }
+                }
+                if self.ended {
+                    self.selecting = Some(selected);
+                    return Ok(());
+                }
+                continue;
+            }
+            if !self.slice.actor() {
+                self.selecting = Some(selected);
+                return Ok(());
+            }
+            let Some((actor, _)) = self.deferred.next() else {
+                continue;
+            };
+            let (after, limit) = (self.covered.get(&actor), self.limit(&actor));
+            if after < limit {
+                self.pending.push_back(HeadScan {
+                    actor,
+                    after,
+                    limit,
+                    next: None,
+                });
             }
         }
-        self.selecting = Some(selected);
-        Ok(())
     }
 
     /// What `meta` still waits for: an unsent or blocked dependency, a missing
