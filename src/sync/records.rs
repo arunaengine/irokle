@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::storage::SnapshotRead;
-use crate::{Error, Op, OpId, Result, TopicPayload};
+use crate::{Error, Op, OpId, TopicPayload};
 
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const POOL_BYTES: usize = 256 * 1024 * 1024;
@@ -33,6 +33,18 @@ pub(super) struct Record {
     pub(super) op: Op,
     claim: Claim,
     owned: bool,
+}
+
+#[derive(Debug)]
+pub(super) enum LoadError {
+    Yield,
+    Failed(Error),
+}
+
+impl From<Error> for LoadError {
+    fn from(error: Error) -> Self {
+        Self::Failed(error)
+    }
 }
 
 struct Claim {
@@ -68,7 +80,25 @@ impl Records {
         true
     }
 
-    pub(super) fn take(&mut self, read: &dyn SnapshotRead, id: &OpId) -> Result<Option<Record>> {
+    pub(super) fn take(&mut self, read: &dyn SnapshotRead, id: &OpId) -> crate::Result<Option<Record>> {
+        let mut slice = super::plan::Slice::new(
+            Arc::new(super::plan::PageWork::default()),
+            super::plan::MAX_PAGE_VISITS,
+            0,
+        )?;
+        match self.take_slice(read, id, &mut slice) {
+            Ok(record) => Ok(record),
+            Err(LoadError::Failed(error)) => Err(error),
+            Err(LoadError::Yield) => Err(Error::SyncCapacity("operation exceeds slice capacity".into())),
+        }
+    }
+
+    pub(super) fn take_slice(
+        &mut self,
+        read: &dyn SnapshotRead,
+        id: &OpId,
+        slice: &mut super::plan::Slice,
+    ) -> std::result::Result<Option<Record>, LoadError> {
         if let Some(mut record) = self.records.remove(id) {
             self.bytes -= record.claim.bytes;
             record.claim.cached = false;
@@ -78,11 +108,17 @@ impl Records {
             return Ok(Some(record));
         }
         let mut claim = None;
+        let mut denied = None;
         let op = read.get_reserved_op(id, &mut |bytes| {
             if bytes > super::MAX_PAGE_BYTES {
                 return Err(Error::SyncCapacity(
                     "operation exceeds page capacity".into(),
                 ));
+            }
+            if !slice.decode(bytes)? {
+                let marker = Arc::new(Error::SyncCapacity("slice decode allowance exhausted".into()));
+                denied = Some(Arc::clone(&marker));
+                return Err(Error::Shared(marker));
             }
             let bytes = charge(bytes);
             loop {
@@ -101,16 +137,26 @@ impl Records {
                 cached: false,
             });
             Ok(())
-        })?;
+        });
+        let op = match op {
+            Ok(op) => op,
+            // Only our own admission refusal yields; backend errors retain their cause.
+            Err(Error::Shared(source))
+                if denied.as_ref().is_some_and(|marker| Arc::ptr_eq(marker, &source)) =>
+            {
+                return Err(LoadError::Yield);
+            }
+            Err(error) => return Err(error.into()),
+        };
         let Some(op) = op else {
             return Ok(None);
         };
         let mut claim = claim.ok_or_else(|| Error::Storage("operation was not reserved".into()))?;
-        let actual = charge(postcard::experimental::serialized_size(&op)?);
+        let actual = charge(postcard::experimental::serialized_size(&op).map_err(Error::from)?);
         if actual > claim.bytes {
             return Err(Error::SyncCapacity(
                 "operation exceeded its reservation".into(),
-            ));
+            ).into());
         }
         claim
             .pool
@@ -138,19 +184,24 @@ impl Records {
             return;
         }
         record.claim.cached = true;
-        if !record.owned {
-            if let TopicPayload::Event(event) = &mut record.op.signed.body.payload {
-                event.payload = bytes::Bytes::copy_from_slice(&event.payload);
-            }
-            record.owned = true;
-        }
+        record.own_payload();
         self.bytes += record.claim.bytes;
         self.records.insert(record.op.id, record);
     }
 }
 
 impl Record {
-    pub(super) fn into_op(self) -> Op {
+    fn own_payload(&mut self) {
+        if !self.owned {
+            if let TopicPayload::Event(event) = &mut self.op.signed.body.payload {
+                event.payload = bytes::Bytes::copy_from_slice(&event.payload);
+            }
+            self.owned = true;
+        }
+    }
+
+    pub(super) fn into_op(mut self) -> Op {
+        self.own_payload();
         self.op
     }
 }
@@ -169,12 +220,28 @@ mod tests {
     use super::*;
     use crate::tests::support::*;
 
+    fn read_record(
+        records: &mut Records,
+        read: &dyn SnapshotRead,
+        id: &OpId,
+    ) -> crate::Result<Option<Record>> {
+        let mut slice = super::super::plan::Slice::new(Arc::default(), 1024, 0)?;
+        match records.take_slice(read, id, &mut slice) {
+            Ok(record) => Ok(record),
+            Err(LoadError::Failed(error)) => Err(error),
+            Err(LoadError::Yield) => panic!("fresh record slice exhausted"),
+        }
+    }
+
     fn stored_event() -> (MemoryStorage, OpId) {
         stored_payload(Bytes::from(vec![0; 1024 * 1024]).slice(..1))
     }
 
     fn stored_payload(payload: Bytes) -> (MemoryStorage, OpId) {
-        let store = MemoryStorage::new();
+        stored_in(MemoryStorage::new(), payload)
+    }
+
+    fn stored_in<S: Storage>(store: S, payload: Bytes) -> (S, OpId) {
         let signer = Ed25519Signer::from_bytes(&[219; 32]);
         let topic = TopicId::hash(b"record-reservations");
         let actor = actor_id_for(topic, signer.peer_id());
@@ -200,6 +267,149 @@ mod tests {
         (store, op.id)
     }
 
+    struct DecodeProbe<'a> {
+        read: &'a dyn SnapshotRead,
+        decoded: std::cell::Cell<usize>,
+        failure: std::cell::RefCell<Option<Error>>,
+    }
+
+    impl SnapshotRead for DecodeProbe<'_> {
+        fn get_reserved_op(
+            &self,
+            id: &OpId,
+            reserve: &mut dyn FnMut(usize) -> crate::Result<()>,
+        ) -> crate::Result<Option<Op>> {
+            let result = self.read.get_reserved_op(id, reserve);
+            if matches!(&result, Ok(Some(_))) {
+                self.decoded.set(self.decoded.get() + 1);
+            }
+            match self.failure.borrow_mut().take() {
+                Some(error) => Err(error),
+                None => result,
+            }
+        }
+
+        fn get_op(&self, id: &OpId) -> crate::Result<Option<Op>> {
+            self.read.get_op(id)
+        }
+
+        fn get_meta(&self, id: &OpId) -> crate::Result<Option<crate::storage::OpMeta>> {
+            self.read.get_meta(id)
+        }
+
+        fn topic_view(
+            &self,
+            topic: &TopicId,
+            peer: Option<&PeerId>,
+        ) -> crate::Result<Option<crate::storage::TopicView>> {
+            self.read.topic_view(topic, peer)
+        }
+
+        fn dep_resolvable(&self, id: &OpId) -> crate::Result<bool> {
+            self.read.dep_resolvable(id)
+        }
+
+        fn actor_range(
+            &self,
+            topic: &TopicId,
+            actor: &ActorId,
+            after: u64,
+            limit: usize,
+        ) -> crate::Result<Vec<(u64, OpId)>> {
+            self.read.actor_range(topic, actor, after, limit)
+        }
+
+        fn list_op_ids(&self, topic: &TopicId) -> crate::Result<BTreeSet<OpId>> {
+            self.read.list_op_ids(topic)
+        }
+    }
+
+    fn decode_slices<S: Storage>(store: S) {
+        let (store, id) = stored_in(store, Bytes::from(vec![7; 4096]));
+        let op = store.get_op(&id).unwrap().unwrap();
+        let bytes = postcard::experimental::serialized_size(&op).unwrap();
+        let pool = Arc::new(RecordPool::default());
+        let mut records = Records::new(Arc::clone(&pool));
+        let work = Arc::new(super::super::plan::PageWork::default());
+        let mut slice = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)
+            .unwrap()
+            .with_decode_limit(bytes);
+        store.read_snapshot(|read| {
+            let probe = DecodeProbe {
+                read,
+                decoded: Default::default(),
+                failure: Default::default(),
+            };
+            let record = records.take_slice(&probe, &id, &mut slice).unwrap().unwrap();
+            assert_eq!(probe.decoded.get(), 1);
+            records.keep(record);
+            let cached = records.take_slice(&probe, &id, &mut slice).unwrap().unwrap();
+            assert_eq!(probe.decoded.get(), 1, "cached records require no decode");
+            drop(cached);
+            assert_eq!(pool.bytes(), 0);
+            assert!(matches!(records.take_slice(&probe, &id, &mut slice), Err(LoadError::Yield)));
+            assert_eq!(probe.decoded.get(), 1, "exhaustion must precede decoding");
+            assert_eq!(pool.bytes(), 0);
+            let mut resumed = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)?
+                .with_decode_limit(bytes);
+            let record = records.take_slice(&probe, &id, &mut resumed).unwrap().unwrap();
+            assert_eq!(probe.decoded.get(), 2);
+            assert_eq!(record.op, op);
+            drop(record);
+            let mut small = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)?
+                .with_decode_limit(bytes - 1);
+            assert!(matches!(
+                records.take_slice(&probe, &id, &mut small),
+                Err(LoadError::Failed(Error::SyncCapacity(_)))
+            ));
+            assert_eq!(probe.decoded.get(), 2);
+            let failure = Arc::new(Error::SyncCapacity("slice decode allowance exhausted".into()));
+            *probe.failure.borrow_mut() = Some(Error::Shared(Arc::clone(&failure)));
+            match records.take_slice(&probe, &id, &mut slice) {
+                Err(LoadError::Failed(Error::Shared(source))) => assert!(Arc::ptr_eq(&source, &failure)),
+                _ => panic!("backend failure was mistaken for slice exhaustion"),
+            }
+            assert_eq!(probe.decoded.get(), 2);
+            assert_eq!(pool.bytes(), 0);
+            Ok(())
+        }).unwrap();
+        assert_eq!(work.snapshot(0).decoded, (2 * bytes) as u64);
+    }
+
+    #[test]
+    fn decoding_is_sliced() {
+        decode_slices(MemoryStorage::new());
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn fjall_decoding_sliced() {
+        let directory = tempfile::tempdir().unwrap();
+        decode_slices(crate::FjallStorage::open(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn direct_payload_owned() {
+        let (store, id) = stored_event();
+        let original = store.get_op(&id).unwrap().unwrap();
+        let pool = Arc::new(RecordPool::default());
+        let mut records = Records::new(Arc::clone(&pool));
+        let record = store.read_snapshot(|read| read_record(&mut records, read, &id)).unwrap().unwrap();
+        assert!(pool.bytes() > 0);
+        let output = record.into_op();
+        let (TopicPayload::Event(before), TopicPayload::Event(after)) = (
+            &original.signed.body.payload,
+            &output.signed.body.payload,
+        ) else {
+            unreachable!()
+        };
+        assert_eq!(before.payload, after.payload);
+        assert_ne!(before.payload.as_ptr(), after.payload.as_ptr());
+        assert_eq!(output, original);
+        output.validate().unwrap();
+        assert_eq!(pool.bytes(), 0);
+    }
+
     #[test]
     fn idle_caches_progress() {
         let (store, id) = stored_payload(Bytes::from(vec![0; 2 * 1024 * 1024]));
@@ -208,7 +418,7 @@ mod tests {
         for n in 0..128 {
             let mut records = Records::new(Arc::clone(&pool));
             let record = store
-                .read_snapshot(|read| records.take(read, &id))
+                .read_snapshot(|read| read_record(&mut records, read, &id))
                 .unwrap_or_else(|error| panic!("goal {n} starved by idle caches: {error}"))
                 .unwrap();
             records.keep(record);
@@ -218,11 +428,11 @@ mod tests {
         let mut first = Records::new(Arc::clone(&pool));
         let mut second = Records::new(Arc::clone(&pool));
         let first = large
-            .read_snapshot(|read| first.take(read, &id))
+            .read_snapshot(|read| read_record(&mut first, read, &id))
             .unwrap()
             .unwrap();
         let second = large
-            .read_snapshot(|read| second.take(read, &id))
+            .read_snapshot(|read| read_record(&mut second, read, &id))
             .unwrap()
             .unwrap();
         assert!(pool.bytes() <= POOL_BYTES);
@@ -237,7 +447,7 @@ mod tests {
         let pool = Arc::new(RecordPool::default());
         let mut records = Records::new(Arc::clone(&pool));
         let record = store
-            .read_snapshot(|read| records.take(read, &id))
+            .read_snapshot(|read| read_record(&mut records, read, &id))
             .unwrap()
             .unwrap();
         let bytes = record.claim.bytes;
@@ -250,7 +460,7 @@ mod tests {
         pool.live.fetch_add(busy.bytes, Ordering::AcqRel);
         let mut other = Records::new(Arc::clone(&pool));
         assert!(matches!(
-            store.read_snapshot(|read| other.take(read, &id)),
+            store.read_snapshot(|read| read_record(&mut other, read, &id)),
             Err(Error::SyncCapacity(_))
         ));
         assert_eq!(pool.bytes(), POOL_BYTES);
@@ -258,7 +468,7 @@ mod tests {
         drop(busy);
         let before = store.counters().op_reads;
         let record = store
-            .read_snapshot(|read| records.take(read, &id))
+            .read_snapshot(|read| read_record(&mut records, read, &id))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -284,12 +494,12 @@ mod tests {
         let mut records = Records::new(Arc::clone(&pool));
         let original = store.get_op(&id).unwrap().unwrap();
         let record = store
-            .read_snapshot(|read| records.take(read, &id))
+            .read_snapshot(|read| read_record(&mut records, read, &id))
             .unwrap()
             .unwrap();
         records.keep(record);
         let record = store
-            .read_snapshot(|read| records.take(read, &id))
+            .read_snapshot(|read| read_record(&mut records, read, &id))
             .unwrap()
             .unwrap();
         let (TopicPayload::Event(before), TopicPayload::Event(after)) = (
