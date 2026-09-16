@@ -1,7 +1,7 @@
 use super::support::*;
 use crate::storage as crate_storage;
 
-fn assert_single_actor_chain<S: Storage>(storage: S) {
+fn assert_actor_chain<S: Storage>(storage: S) {
     let config = NodeConfig {
         signer: Ed25519Signer::from_bytes(&[45; 32]),
         default_write_concern: WriteConcern::Local,
@@ -49,11 +49,11 @@ fn assert_single_actor_chain<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_facades_share_actor() {
-    assert_single_actor_chain(MemoryStorage::new());
+fn memory_serializes_facades() {
+    assert_actor_chain(MemoryStorage::new());
 }
 
-fn assert_unique_topic_ids<S: Storage>(storage: S) {
+fn assert_unique_topics<S: Storage>(storage: S) {
     let config = NodeConfig {
         signer: Ed25519Signer::from_bytes(&[46; 32]),
         default_write_concern: WriteConcern::Local,
@@ -84,8 +84,8 @@ fn assert_unique_topic_ids<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_unique_topic_ids() {
-    assert_unique_topic_ids(MemoryStorage::new());
+fn memory_unique_topics() {
+    assert_unique_topics(MemoryStorage::new());
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn memory_reconciles_pending() {
     assert_pending_reconciles(MemoryStorage::new());
 }
 
-fn assert_reset_topic_clears_everything<S: Storage>(storage: S) {
+fn assert_reset_clears<S: Storage>(storage: S) {
     let signer = Ed25519Signer::from_bytes(&[71; 32]);
     let peer = signer.peer_id();
     let other_peer = PeerId::hash(b"reset-other-peer");
@@ -333,16 +333,16 @@ fn assert_reset_topic_clears_everything<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_reset_topic_clears_everything() {
-    assert_reset_topic_clears_everything(MemoryStorage::new());
+fn memory_reset_clears() {
+    assert_reset_clears(MemoryStorage::new());
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_reset_topic_clears_everything() {
+fn fjall_reset_clears() {
     let dir = tempfile::tempdir().unwrap();
     let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_reset_topic_clears_everything(storage);
+    assert_reset_clears(storage);
 }
 
 fn seed_chain<S: Storage>(storage: &S, topic_id: TopicId, seed: u8, events: &[&str]) -> ActorId {
@@ -375,7 +375,7 @@ fn seed_chain<S: Storage>(storage: &S, topic_id: TopicId, seed: u8, events: &[&s
     actor
 }
 
-fn assert_reset_topic_and_admit_is_atomic<S: Storage>(storage: S) {
+fn assert_reset_atomic<S: Storage>(storage: S) {
     let topic_id = TopicId::hash(b"reset-admit-topic");
     let local_actor = seed_chain(&storage, topic_id, 61, &["one", "two"]);
     let old_ids = storage.list_op_ids(&topic_id).unwrap();
@@ -470,7 +470,7 @@ fn assert_reset_topic_and_admit_is_atomic<S: Storage>(storage: S) {
     assert!(storage.topic_state(&survivor_id).unwrap().is_some());
 }
 
-fn assert_reset_topic_and_admit_rejects_stale_state<S: Storage>(storage: S) {
+fn assert_reset_stale<S: Storage>(storage: S) {
     let topic_id = TopicId::hash(b"stale-reset-admit-topic");
     let actor = seed_chain(&storage, topic_id, 64, &["one"]);
     let stale_state = storage.topic_state(&topic_id).unwrap().unwrap();
@@ -533,29 +533,29 @@ fn assert_reset_topic_and_admit_rejects_stale_state<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_reset_topic_and_admit_is_atomic() {
-    assert_reset_topic_and_admit_is_atomic(MemoryStorage::new());
+fn memory_reset_atomic() {
+    assert_reset_atomic(MemoryStorage::new());
 }
 
 #[test]
-fn memory_reset_topic_and_admit_rejects_stale_state() {
-    assert_reset_topic_and_admit_rejects_stale_state(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_reset_topic_and_admit_is_atomic() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_reset_topic_and_admit_is_atomic(storage);
+fn memory_reset_stale() {
+    assert_reset_stale(MemoryStorage::new());
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_reset_topic_and_admit_rejects_stale_state() {
+fn fjall_reset_atomic() {
     let dir = tempfile::tempdir().unwrap();
     let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_reset_topic_and_admit_rejects_stale_state(storage);
+    assert_reset_atomic(storage);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_reset_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+    assert_reset_stale(storage);
 }
 
 /// What a lost eviction must still be recoverable from: the topic, the chain it
@@ -783,7 +783,7 @@ fn fjall_bounds_journal() {
 }
 
 #[test]
-fn rejects_too_many_pending_deps() {
+fn rejects_pending_overflow() {
     let signer = Ed25519Signer::from_bytes(&[49; 32]);
     let topic_id = TopicId::hash(b"pending-limit-topic");
     let deps = (0..=crate_storage::MAX_PENDING_MISSING_DEPS)
@@ -827,7 +827,7 @@ fn builder_selects_fjall() {
 
 #[cfg(feature = "fjall")]
 #[test]
-fn builder_accepts_fjall_db() {
+fn builder_fjall_db() {
     let dir = tempfile::tempdir().unwrap();
     let db = fjall::OptimisticTxDatabase::builder(dir.path())
         .open()
@@ -843,23 +843,23 @@ fn builder_accepts_fjall_db() {
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_facades_share_actor() {
+fn fjall_serializes_facades() {
     let dir = tempfile::tempdir().unwrap();
     let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_single_actor_chain(storage);
+    assert_actor_chain(storage);
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_unique_topic_ids() {
+fn fjall_unique_topics() {
     let dir = tempfile::tempdir().unwrap();
     let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_unique_topic_ids(storage);
+    assert_unique_topics(storage);
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_persists_topic_state() {
+fn fjall_persists_state() {
     let dir = tempfile::tempdir().unwrap();
     let signer = Ed25519Signer::from_bytes(&[7; 32]);
     let config = NodeConfig {
@@ -954,7 +954,7 @@ fn seed_pair(topic_id: TopicId, seed: u8) -> [(Op, crate_storage::OpMeta); 2] {
     })
 }
 
-fn assert_rejects_dangling_entry<S: Storage>(storage: S) {
+fn assert_dangling_entry<S: Storage>(storage: S) {
     // The durability boundary must refuse an op whose dependency has no meta,
     // however the caller's pre-transaction reads decided the dep was there.
     let topic_id = TopicId::hash(b"dangling-entry-topic");
@@ -977,11 +977,11 @@ fn assert_rejects_dangling_entry<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_rejects_dangling_entry() {
-    assert_rejects_dangling_entry(MemoryStorage::new());
+fn memory_dangling_entry() {
+    assert_dangling_entry(MemoryStorage::new());
 }
 
-fn assert_rejects_partial_dep<S: Corrupt>(storage: S, drop_op: bool) {
+fn assert_partial_dep<S: Corrupt>(storage: S, drop_op: bool) {
     // Half a dependency is a hole, not a resolved edge: neither an op record
     // without metadata nor metadata without its op may let a descendant commit.
     let topic_id = TopicId::hash(b"partial-dep-topic");
@@ -1020,18 +1020,18 @@ fn assert_rejects_partial_dep<S: Corrupt>(storage: S, drop_op: bool) {
 }
 
 #[test]
-fn memory_rejects_partial_dep() {
-    assert_rejects_partial_dep(MemoryStorage::new(), true);
-    assert_rejects_partial_dep(MemoryStorage::new(), false);
+fn memory_partial_dep() {
+    assert_partial_dep(MemoryStorage::new(), true);
+    assert_partial_dep(MemoryStorage::new(), false);
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_rejects_partial_dep() {
+fn fjall_partial_dep() {
     let dir = tempfile::tempdir().unwrap();
-    assert_rejects_partial_dep(crate_storage::FjallStorage::open(dir.path()).unwrap(), true);
+    assert_partial_dep(crate_storage::FjallStorage::open(dir.path()).unwrap(), true);
     let dir = tempfile::tempdir().unwrap();
-    assert_rejects_partial_dep(
+    assert_partial_dep(
         crate_storage::FjallStorage::open(dir.path()).unwrap(),
         false,
     );
@@ -1039,12 +1039,12 @@ fn fjall_rejects_partial_dep() {
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_rejects_dangling_entry() {
+fn fjall_dangling_entry() {
     let dir = tempfile::tempdir().unwrap();
-    assert_rejects_dangling_entry(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    assert_dangling_entry(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
-fn assert_purges_waiter_closure<S: Storage>(storage: S) {
+fn assert_waiter_purge<S: Storage>(storage: S) {
     // Dropping a dependency that can never arrive must take its whole waiter
     // chain with it in one durable step.
     let topic_id = TopicId::hash(b"waiter-closure-topic");
@@ -1077,15 +1077,15 @@ fn assert_purges_waiter_closure<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_purges_waiter_closure() {
-    assert_purges_waiter_closure(MemoryStorage::new());
+fn memory_waiter_purge() {
+    assert_waiter_purge(MemoryStorage::new());
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_purges_waiter_closure() {
+fn fjall_waiter_purge() {
     let dir = tempfile::tempdir().unwrap();
-    assert_purges_waiter_closure(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    assert_waiter_purge(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Everything a caller can observe about one topic, so a failed reset can be
@@ -2063,7 +2063,7 @@ fn assert_attempt_order<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S) {
 /// Replaying the results a status remembers counts nothing again and leaves
 /// the newest outcome in place, before and after a reopen; the first result of
 /// an older attempt still counts.
-fn assert_replay_counts_once<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S) {
+fn assert_replay_once<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S) {
     let peer = PeerId::hash(b"replay-peer");
     let topic_id = TopicId::hash(b"replay-topic");
     let epoch = storage.next_attempt_epoch().unwrap();
@@ -2111,16 +2111,16 @@ fn assert_replay_counts_once<S: Storage>(storage: S, reopen: impl FnOnce(S) -> S
 }
 
 #[test]
-fn memory_replay_counts_once() {
-    assert_replay_counts_once(MemoryStorage::new(), |storage| storage);
+fn memory_replay_once() {
+    assert_replay_once(MemoryStorage::new(), |storage| storage);
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_replay_counts_once() {
+fn fjall_replay_once() {
     let dir = tempfile::tempdir().unwrap();
     let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_replay_counts_once(storage, |storage| {
+    assert_replay_once(storage, |storage| {
         drop(storage);
         crate_storage::FjallStorage::open(dir.path()).unwrap()
     });
@@ -2145,7 +2145,7 @@ fn fjall_attempt_order() {
 /// A status written before attempt identities still reads, and takes one.
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_reads_legacy_status() {
+fn fjall_legacy_status() {
     let dir = tempfile::tempdir().unwrap();
     let peer = PeerId::hash(b"legacy-status-peer");
     let topic_id = TopicId::hash(b"legacy-status-topic");
@@ -2193,7 +2193,7 @@ fn fjall_reads_legacy_status() {
 /// Buffered pending payloads are bounded by bytes, not only by record count: a
 /// count budget multiplied by the frame limit is far more memory than a node
 /// should hold. The charge is released again when the record goes.
-fn assert_pending_byte_budget<S: Storage>(storage: S) {
+fn assert_pending_bytes<S: Storage>(storage: S) {
     let signer = Ed25519Signer::from_bytes(&[170; 32]);
     let source = signer.peer_id();
     let topic_id = TopicId::hash(b"pending-bytes-topic");
@@ -2289,21 +2289,21 @@ fn assert_pending_byte_budget<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_pending_byte_budget() {
-    assert_pending_byte_budget(MemoryStorage::new());
+fn memory_pending_bytes() {
+    assert_pending_bytes(MemoryStorage::new());
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_pending_byte_budget() {
+fn fjall_pending_bytes() {
     let dir = tempfile::tempdir().unwrap();
-    assert_pending_byte_budget(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    assert_pending_bytes(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Rewrite a current database into the schema 2 layout that predates byte counters:
 /// peer-first acks and obligations, legacy obligation shapes and whole pending records.
 #[cfg(feature = "fjall")]
-fn downgrade_to_schema_two(
+fn downgrade_schema_two(
     db: &fjall::OptimisticTxDatabase,
     topic_id: TopicId,
     peer: PeerId,
@@ -2410,7 +2410,7 @@ fn downgrade_to_schema_two(
 /// byte counters it never had are rebuilt instead of reading as an empty pool.
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_upgrades_schema_two() {
+fn fjall_upgrade_two() {
     let dir = tempfile::tempdir().unwrap();
     let source = node(140);
     let peer = PeerId::hash(b"upgrade-peer");
@@ -2471,7 +2471,7 @@ fn fjall_upgrades_schema_two() {
         let db = fjall::OptimisticTxDatabase::builder(dir.path())
             .open()
             .unwrap();
-        downgrade_to_schema_two(
+        downgrade_schema_two(
             &db,
             topic.id(),
             peer,
@@ -2537,7 +2537,7 @@ fn fjall_upgrades_schema_two() {
 /// schema 2 with nothing half moved, and a future version is refused outright.
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_refuses_bad_schema() {
+fn fjall_bad_schema() {
     use fjall::Readable;
     let dir = tempfile::tempdir().unwrap();
     let peer = PeerId::hash(b"refuse-peer");
@@ -2547,7 +2547,7 @@ fn fjall_refuses_bad_schema() {
         let db = fjall::OptimisticTxDatabase::builder(dir.path())
             .open()
             .unwrap();
-        downgrade_to_schema_two(
+        downgrade_schema_two(
             &db,
             topic_id,
             peer,

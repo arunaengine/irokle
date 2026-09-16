@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Disk bytes of a Fjall store under sustained bootstrap staging churn, beside
-//! the staged and clearing bytes its staging limits count. Logical deletion
-//! does not return file space at once. Run explicitly:
-//! `cargo test --release --features fjall --test staging_churn -- --ignored --nocapture`.
+//! Disk bytes of a Fjall store under bootstrap staging churn, alongside staged and clearing
+//! bytes counted by its limits. Logical deletion does not return file space at once; run
+//! explicitly: `cargo test --release --features fjall --test staging_churn -- --ignored --nocapture`.
 
 #![cfg(feature = "fjall")]
 
@@ -81,10 +80,9 @@ fn breakdown(path: &std::path::Path) -> String {
     parts.join(" ")
 }
 
-/// Stage a history of about 6 MiB, end its session and open the next one,
-/// which empties the ended slot, for `CHURN_CYCLES` cycles (200 by default);
-/// every ten cycles report the directory bytes and the staged bytes the store
-/// counts.
+/// Stage about 6 MiB of history, end its session, and open the next one to empty its slot
+/// for `CHURN_CYCLES` cycles (200 by default). Every ten cycles report directory bytes and
+/// staged bytes counted by the store.
 #[test]
 #[ignore = "writes gigabytes of staging churn, run explicitly"]
 fn fjall_staging_churn() {

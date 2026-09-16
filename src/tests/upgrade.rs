@@ -300,7 +300,7 @@ fn refuses_future_version() {
 /// Schema 4 staging named no branch or session: the upgrade discards it as
 /// unacknowledged provisional state and keeps the active topic whole.
 #[test]
-fn upgrades_staged_schema_four() {
+fn upgrade_schema_four() {
     let dir = fixture_copy("fjall-schema4-e112523");
     let m = Manifest::read(dir.path());
     let path = dir.path().join("db");
@@ -331,7 +331,7 @@ fn upgrades_staged_schema_four() {
 /// activation interrupted at schema 5 keeps its claim, stays hidden, and
 /// completes on the current code; reopening upgrades nothing twice.
 #[test]
-fn upgrades_staged_schema_five() {
+fn upgrade_schema_five() {
     let dir = fixture_copy("fjall-schema5-68e4c19");
     let m = Manifest::read(dir.path());
     let path = dir.path().join("db");
@@ -391,10 +391,9 @@ fn upgrades_staged_schema_five() {
     assert_eq!(storage.provisional_topics().unwrap(), vec![staged]);
 }
 
-/// A migrated store reopened after staging part of a late invitation, after a
-/// history cursor read part of a topic, and after an admitted event is still
-/// owed to another member: each is kept exactly, the migrated eviction record
-/// stays until it is acknowledged, and the staging then activates.
+/// Migration preserves staged invitations, a history cursor and an owed event.
+/// The eviction record stays until acknowledged, then staging activates.
+/// Reopening preserves each state exactly.
 #[test]
 fn reopen_keeps_progress() {
     use crate::history::HistoryOrder;
@@ -572,13 +571,11 @@ fn legacy_metas(path: &Path, name: &str) -> BTreeMap<OpId, crate_storage::OpMeta
         .collect()
 }
 
-/// Schema 6 metadata held every observed clock entry. The upgrade to schema 7
-/// names each clock by its root node in the main keyspace and in the staged,
-/// activating and clearing slot keyspaces. Stopped after any step, as a crash
-/// would stop it, the next open finishes it; every record then reads exactly
-/// as before, the interrupted activation completes and the cleared slot empties.
+/// Schema 6 stored every observed clock entry; schema 7 keys each clock by its root node.
+/// An interrupted migration resumes on the next open across active and staging keyspaces.
+/// Records remain readable, activation completes, and cleared slots empty.
 #[test]
-fn upgrades_clock_schema_six() {
+fn upgrade_clock_six() {
     let original = fixture_copy("fjall-schema6-512b158");
     let m = Manifest::read(original.path());
     let path = original.path().join("db");

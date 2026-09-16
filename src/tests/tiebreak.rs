@@ -113,7 +113,7 @@ fn assert_fork_converged(fork: &Fork) {
 }
 
 #[test]
-fn fork_resolves_to_smaller_genesis() {
+fn smaller_genesis_wins() {
     let fork = build_fork(1, 2);
     assert_fork_converged(&fork);
 
@@ -175,7 +175,7 @@ fn unrelated_genesis_proceeds() {
 }
 
 #[test]
-fn sync_receive_data_returns_genesis_eviction() {
+fn receive_genesis_eviction() {
     let topic_id = TopicId::hash(b"genesis-fork-sync-receive");
     let (oplog_a, signer_a, g_a, e_a) = seed_side(topic_id, 1, 2, "a-branch");
     let (oplog_b, signer_b, g_b, e_b) = seed_side(topic_id, 2, 1, "b-branch");
@@ -229,7 +229,7 @@ fn sync_receive_data_returns_genesis_eviction() {
 }
 
 #[test]
-fn node_receive_sync_data_from_returns_genesis_eviction() {
+fn node_reports_eviction() {
     let topic_id = TopicId::hash(b"genesis-fork-node-receive");
     let (_, signer_a, g_a, e_a) = seed_side(topic_id, 1, 2, "a-branch");
     let (_, signer_b, g_b, e_b) = seed_side(topic_id, 2, 1, "b-branch");
@@ -272,7 +272,7 @@ fn node_receive_sync_data_from_returns_genesis_eviction() {
 }
 
 #[test]
-fn non_member_smaller_genesis_does_not_reset() {
+fn nonmember_no_reset() {
     let topic_id = TopicId::hash(b"genesis-fork-topic");
     // Local chain with no other members, so its membership is exactly {local}.
     let local_signer = Ed25519Signer::from_bytes(&[1; 32]);
@@ -359,7 +359,7 @@ fn non_member_smaller_genesis_does_not_reset() {
 }
 
 #[test]
-fn fork_resolution_is_symmetric() {
+fn fork_symmetric() {
     // Deterministic ed25519 signing makes genesis ids stable, so scanning seed
     // pairs surfaces both orderings (each physical side wins at least once).
     let mut saw_a_win = false;
@@ -380,7 +380,7 @@ fn fork_resolution_is_symmetric() {
 }
 
 #[test]
-fn reset_completeness_lets_acks_converge() {
+fn reset_acks_converge() {
     let fork = build_fork(1, 2);
     assert_fork_converged(&fork);
 
@@ -447,11 +447,10 @@ fn reset_completeness_lets_acks_converge() {
 }
 
 #[test]
-fn winner_purges_losing_pending() {
-    // `build_fork` feeds the loser's [genesis, event] to the winner in one
-    // batch. The winner keeps its own smaller genesis and filters the loser
-    // genesis, so the loser event lands in pending waiting on a genesis that
-    // will never arrive. The resolution must purge it.
+fn winner_purges_pending() {
+    // `build_fork` feeds the loser's [genesis, event] in one batch.
+    // The winner filters the loser genesis, so its event waits on an id that never arrives.
+    // Resolution must purge that pending event.
     let fork = build_fork(1, 2);
     assert_fork_converged(&fork);
 
@@ -487,7 +486,7 @@ fn winner_purges_losing_pending() {
 }
 
 #[test]
-fn adoption_preserves_partial_winner_pending() {
+fn adoption_partial_pending() {
     // The winning chain can arrive partially: a descendant whose parent is not
     // in the batch must survive in pending through the adoption reset instead
     // of being wiped by it.
@@ -575,7 +574,7 @@ fn adoption_preserves_partial_winner_pending() {
 }
 
 #[test]
-fn resending_winner_genesis_is_a_noop() {
+fn winner_genesis_noop() {
     let fork = build_fork(1, 2);
     let before = admitted_ids(&fork.winner_oplog, &fork.topic_id);
     let again = fork
@@ -591,7 +590,7 @@ fn resending_winner_genesis_is_a_noop() {
 }
 
 #[test]
-fn fresh_topic_genesis_admits_without_resolution() {
+fn fresh_genesis_admits() {
     let signer = Ed25519Signer::from_bytes(&[1; 32]);
     let topic_id = TopicId::hash(b"fresh-topic");
     let actor = actor_id_for(topic_id, signer.peer_id());
@@ -627,7 +626,7 @@ fn fresh_topic_genesis_admits_without_resolution() {
 }
 
 #[test]
-fn structurally_invalid_genesis_is_rejected_without_reset() {
+fn invalid_genesis_unchanged() {
     let fork = build_fork(1, 2);
     let winner_genesis = fork.winner_genesis.id;
 
@@ -682,7 +681,7 @@ fn assert_dag_whole(oplog: &Oplog, topic_id: &TopicId) {
 }
 
 #[test]
-fn reset_defers_stale_dependents() {
+fn reset_stale_dependents() {
     // The reset path reads dep presence before it wipes the topic. An op whose
     // dependency only exists in the chain about to be discarded must be
     // buffered, never admitted against storage that is one step from empty.
@@ -726,7 +725,7 @@ fn reset_defers_stale_dependents() {
 }
 
 #[test]
-fn reset_keeps_dag_whole() {
+fn reset_preserves_dag() {
     let fork = build_fork(13, 14);
     assert_dag_whole(&fork.winner_oplog, &fork.topic_id);
     assert_dag_whole(&fork.loser_oplog, &fork.topic_id);
@@ -1137,7 +1136,7 @@ fn fjall_eviction_recovers() {
 /// A quarantine rebuild retried after a lost commit checks each surviving
 /// op's signature once.
 #[test]
-fn quarantine_retry_checks_once() {
+fn quarantine_retry_once() {
     let storage = StaleReadStorage::new(MemoryStorage::new());
     let topic_id = orphaned_topic(&storage, 214);
     let log = Oplog::with_storage(storage.clone());
