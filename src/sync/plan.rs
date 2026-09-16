@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::clock::ClockCursor;
-use crate::storage::{SnapshotRead, Storage};
+use crate::storage::{DependencyCursor, OpHeader, SnapshotRead, Storage};
 use crate::{ActorClock, ActorId, Error, Op, OpId, Result, TopicId};
 
 use super::request::need;
@@ -28,6 +28,10 @@ pub(crate) struct PageWork {
     edges: AtomicU64,
     ended: AtomicU64,
     resumed: AtomicU64,
+    decoded: AtomicU64,
+    preparation: AtomicU64,
+    auth_reads: AtomicU64,
+    captured: AtomicU64,
 }
 
 /// A copy of [`PageWork`] with the bytes kept plans hold at one moment.
@@ -40,6 +44,11 @@ pub(crate) struct PageWorkSnapshot {
     pub(crate) edges: u64,
     pub(crate) ended: u64,
     pub(crate) resumed: u64,
+    /// Encoded upper-bound bytes admitted for decoding, including failed loads.
+    pub(crate) decoded: u64,
+    pub(crate) preparation: u64,
+    pub(crate) auth_reads: u64,
+    pub(crate) captured: u64,
     pub(crate) kept_bytes: u64,
 }
 
@@ -61,8 +70,172 @@ impl PageWork {
             edges: self.edges.load(Ordering::Relaxed),
             ended: self.ended.load(Ordering::Relaxed),
             resumed: self.resumed.load(Ordering::Relaxed),
+            decoded: self.decoded.load(Ordering::Relaxed),
+            preparation: self.preparation.load(Ordering::Relaxed),
+            auth_reads: self.auth_reads.load(Ordering::Relaxed),
+            captured: self.captured.load(Ordering::Relaxed),
             kept_bytes: kept_bytes as u64,
         }
+    }
+}
+
+pub(super) struct Slice {
+    work: std::sync::Arc<PageWork>,
+    limit: usize,
+    visits: usize,
+    scanned: usize,
+    edges: usize,
+    workspace: usize,
+    decoded: usize,
+    decode_limit: usize,
+    preparation: usize,
+    input_units: usize,
+    prep_bytes: usize,
+    auth_reads: usize,
+    captured: usize,
+}
+
+impl Slice {
+    pub(super) fn new(
+        work: std::sync::Arc<PageWork>,
+        limit: usize,
+        workspace: usize,
+    ) -> Result<Self> {
+        let mut slice = Self {
+            work,
+            limit,
+            visits: 0,
+            scanned: 0,
+            edges: 0,
+            workspace: 0,
+            decoded: 0,
+            decode_limit: MAX_PAGE_BYTES,
+            preparation: 0,
+            input_units: 0,
+            prep_bytes: 0,
+            auth_reads: 0,
+            captured: 0,
+        };
+        slice.reserve(workspace)?;
+        Ok(slice)
+    }
+
+    pub(super) fn read(&mut self) -> bool {
+        if self.visits + self.scanned >= self.limit {
+            return false;
+        }
+        self.visits += 1;
+        self.work.visits.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    pub(super) fn actor(&mut self) -> bool {
+        if self.visits + self.scanned >= self.limit {
+            return false;
+        }
+        self.scanned += 1;
+        self.work.actors.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    pub(super) fn edge(&mut self) -> bool {
+        if self.edges >= self.limit {
+            return false;
+        }
+        self.edges += 1;
+        self.work.edges.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    pub(super) fn exhausted(&self) -> bool {
+        self.visits + self.scanned >= self.limit || self.edges >= self.limit
+    }
+
+    pub(super) fn reserve(&mut self, bytes: usize) -> Result<()> {
+        let required = self.workspace.saturating_add(bytes);
+        if required > super::continuation::MAX_CONTINUATION_BYTES {
+            return Err(Error::SyncCapacity(format!(
+                "planner workspace needs {required} bytes; reduce the request's wants or actor window"
+            )));
+        }
+        self.workspace = required;
+        Ok(())
+    }
+
+    pub(super) fn prepare(&mut self, units: usize, bytes: usize) -> Result<()> {
+        let units = self.preparation.saturating_add(units);
+        let bytes = self.prep_bytes.saturating_add(bytes);
+        if units > 16 * MAX_PAGE_VISITS || bytes > 128 * 1024 * 1024 {
+            return Err(Error::SyncCapacity(
+                "request preparation exceeds its entry or memory envelope; reduce the actor window or wants".into(),
+            ));
+        }
+        self.work
+            .preparation
+            .fetch_add((units - self.preparation) as u64, Ordering::Relaxed);
+        self.preparation = units;
+        self.prep_bytes = bytes;
+        Ok(())
+    }
+
+    pub(super) fn prepare_input(&mut self, units: usize, bytes: usize) -> Result<()> {
+        let units = self.input_units.saturating_add(units);
+        let bytes = self.prep_bytes.saturating_add(bytes);
+        let limit = 16 * super::MAX_REQUEST_ITEMS
+            + 8 * (super::MAX_PAGE_OPS + MAX_PAGE_MISSING);
+        if units > limit || bytes > 128 * 1024 * 1024 {
+            return Err(Error::SyncCapacity(
+                "request input exceeds its work or memory limit; reduce wants, hints or filter bytes".into(),
+            ));
+        }
+        self.work.preparation.fetch_add((units - self.input_units) as u64, Ordering::Relaxed);
+        self.input_units = units;
+        self.prep_bytes = bytes;
+        Ok(())
+    }
+
+    pub(super) fn auth_read(&mut self) -> Result<()> {
+        if self.auth_reads >= 16 {
+            return Err(Error::SyncCapacity(
+                "request authorization exceeds its metadata envelope".into(),
+            ));
+        }
+        self.auth_reads += 1;
+        self.work.auth_reads.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(super) fn capture(&mut self, entries: usize, raw: usize, bytes: usize) -> Result<()> {
+        if raw > MAX_PAGE_BYTES.saturating_sub(self.captured) {
+            return Err(Error::SyncCapacity(
+                "request snapshot exceeds its encoded metadata envelope".into(),
+            ));
+        }
+        self.prepare(entries, bytes)?;
+        self.captured += raw;
+        self.work.captured.fetch_add(raw as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(super) fn decode(&mut self, bytes: usize) -> Result<bool> {
+        if bytes > self.decode_limit {
+            return Err(Error::SyncCapacity(format!(
+                "operation decoding needs {bytes} bytes, slice capacity {}",
+                self.decode_limit,
+            )));
+        }
+        if bytes > self.decode_limit - self.decoded {
+            return Ok(false);
+        }
+        self.decoded += bytes;
+        self.work.decoded.fetch_add(bytes as u64, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_decode_limit(mut self, limit: usize) -> Self {
+        self.decode_limit = limit;
+        self
     }
 }
 

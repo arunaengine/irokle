@@ -125,14 +125,23 @@ pub(crate) fn need(needed: &mut BTreeMap<ActorId, u64>, actor_id: ActorId, gener
 /// and any other actor is unknown.
 pub(crate) struct ActorScope<'a> {
     pub(super) named: BTreeSet<ActorId>,
+    prefixes: BTreeMap<ActorId, u64>,
     window: &'a ActorWindow,
     held: Option<&'a ActorClock>,
 }
 
 impl<'a> ActorScope<'a> {
     pub(crate) fn new(hints: &[ActorRangeHint], window: &'a ActorWindow) -> Self {
+        let mut prefixes = BTreeMap::<ActorId, u64>::new();
+        for hint in hints {
+            prefixes
+                .entry(hint.actor_id)
+                .and_modify(|known| *known = (*known).min(hint.from_exclusive))
+                .or_insert(hint.from_exclusive);
+        }
         Self {
-            named: hints.iter().map(|hint| hint.actor_id).collect(),
+            named: prefixes.keys().copied().collect(),
+            prefixes,
             window,
             held: None,
         }
@@ -147,6 +156,7 @@ impl<'a> ActorScope<'a> {
         };
         ActorScope {
             named: BTreeSet::new(),
+            prefixes: BTreeMap::new(),
             window: &WHOLE,
             held: None,
         }
@@ -170,9 +180,10 @@ impl<'a> ActorScope<'a> {
     }
 
     pub(crate) fn known_prefix(&self, actor: &ActorId) -> Option<u64> {
-        (!self.named.contains(actor))
-            .then(|| self.held.map(|held| held.get(actor)))
-            .flatten()
+        self.prefixes
+            .get(actor)
+            .copied()
+            .or_else(|| self.held.map(|held| held.get(actor)))
     }
 }
 
