@@ -37,6 +37,7 @@ def main():
     command = ["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}",
                "-p", "MemoryMax=8G", "-p", "MemorySwapMax=0", "env", "CARGO_BUILD_JOBS=2",
                "RUST_TEST_THREADS=2", "CARGO_INCREMENTAL=0", "CARGO_PROFILE_DEV_DEBUG=0",
+               "CARGO_SAFE_ACTIVE=1",
                "PYTHONDONTWRITEBYTECODE=1", "nice", "-n", "19", "ionice", "-c3", *sys.argv[3:]]
     process = None
     with log.open("x") as output:
