@@ -798,3 +798,243 @@ async fn slow_storage_control() {
         runs,
     );
 }
+
+fn held_fixture(author: &Ed25519Signer, reader: PeerId, ops: usize, bytes: usize) -> Vec<Op> {
+    let topic_id = TopicId::hash("bench-held-item/v1");
+    let actor_id = actor_id_for(topic_id, author.peer_id());
+    let genesis = Op::sign(
+        OpBody {
+            topic_id,
+            author: author.peer_id(),
+            actor_id,
+            actor_seq: 1,
+            actor_prev: None,
+            deps: BTreeSet::new(),
+            generation: 0,
+            payload: TopicPayload::Genesis(TopicGenesis::new(
+                Note::TYPE_ID,
+                [author.peer_id(), reader],
+            )),
+        },
+        author,
+    )
+    .unwrap();
+    let mut chain = Vec::with_capacity(ops + 1);
+    chain.push(genesis);
+    for index in 0..ops {
+        let previous = chain.last().unwrap();
+        let payload = TopicPayload::Event(
+            EventEnvelope::encode_event(&Note {
+                text: format!("{index:08}{}", "x".repeat(bytes)),
+            })
+            .unwrap(),
+        );
+        chain.push(
+            Op::sign(
+                OpBody {
+                    topic_id,
+                    author: author.peer_id(),
+                    actor_id,
+                    actor_seq: previous.signed.body.actor_seq + 1,
+                    actor_prev: Some(previous.id),
+                    deps: [previous.id].into(),
+                    generation: previous.signed.body.generation + 1,
+                    payload,
+                },
+                author,
+            )
+            .unwrap(),
+        );
+    }
+    chain
+}
+
+fn result_bytes<S: Storage>(net: &net::IrohNet<S>) -> u64 {
+    net.owned_bytes()
+        .current
+        .get(&net::OwnedClass::Results)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn held_input(name: &str, fallback: usize) -> usize {
+    std::env::var(name).map_or(fallback, |value| value.parse().unwrap())
+}
+
+async fn held_sample(rep: usize, ops: usize, bytes: usize) {
+    let lookup = MemoryLookup::new();
+    let alice_key = iroh::SecretKey::from_bytes(&[70; 32]);
+    let bob_key = iroh::SecretKey::from_bytes(&[71; 32]);
+    let alice_endpoint = bind(&lookup, Some(alice_key), None).await;
+    let bob_endpoint = bind(&lookup, Some(bob_key), None).await;
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .with_write_concern(WriteConcern::Local)
+        .with_net(alice_endpoint)
+        .build()
+        .unwrap();
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(bob_endpoint.secret_key())
+        .with_peer_whitelist([alice.peer_id()])
+        .build()
+        .unwrap();
+    let alice_endpoint = alice.endpoint().unwrap().clone();
+    let alice_addr = ready_addr(&alice_endpoint).await;
+    let chain = held_fixture(alice.signer(), bob.peer_id(), ops, bytes);
+    let encoded = postcard::to_allocvec(&chain).unwrap();
+    let hash = blake3::hash(&encoded);
+    let topic_id = chain[0].signed.body.topic_id;
+    oplog::Oplog::with_storage(alice.storage().clone())
+        .receive_ops(chain.clone())
+        .unwrap();
+    bob.receive_sync_data_from(
+        alice.peer_id(),
+        SyncData {
+            topic_id,
+            ops: chain[..1].to_vec(),
+        },
+    )
+    .unwrap();
+    let messages = full_request(&bob, alice.peer_id(), topic_id);
+    let net = net::IrohNet::new_with_config(bob_endpoint, bob, runtime()).unwrap();
+
+    let reads = alice.storage().counters();
+    let alice_wire = sent_bytes(&alice_endpoint);
+    let bob_wire = sent_bytes(net.endpoint());
+    let started = Instant::now();
+    let responses = tokio::time::timeout(CAP, net.sync_with(alice_addr.clone(), &messages))
+        .await
+        .expect("full response timed out")
+        .unwrap();
+    let full_ms = millis(started);
+    let full_done = responses
+        .iter()
+        .any(|message| matches!(message, crate::sync::SyncMessage::Page(page) if !page.more));
+    let full_messages = responses.len();
+    let data_index = responses
+        .iter()
+        .position(|message| matches!(message, crate::sync::SyncMessage::Data(_)))
+        .expect("full response contained no data");
+    let full_ops = responses
+        .iter()
+        .filter_map(|message| match message {
+            crate::sync::SyncMessage::Data(data) => Some(data.ops.len()),
+            _ => None,
+        })
+        .sum::<usize>();
+    let (held_data_count, held_data_bytes) = responses
+        .iter()
+        .nth(data_index)
+        .map(|message| match message {
+            crate::sync::SyncMessage::Data(data) => (
+                data.ops.len(),
+                postcard::experimental::serialized_size(&data.ops).unwrap() as u64,
+            ),
+            _ => unreachable!(),
+        })
+        .unwrap();
+    let full_exact = responses
+        .iter()
+        .flat_map(|message| match message {
+            crate::sync::SyncMessage::Data(data) => data.ops.as_slice(),
+            _ => &[],
+        })
+        .eq(chain[1..].iter());
+    let full_complete = full_done && full_exact;
+    let alice_first = sent_bytes(&alice_endpoint);
+    let bob_first = sent_bytes(net.endpoint());
+    let batch_owned = result_bytes(&net);
+    let mut collected = responses.into_iter().collect::<Vec<_>>();
+    let collect_owned = result_bytes(&net);
+    std::hint::black_box(&collected);
+    let one = collected.swap_remove(data_index);
+    drop(collected);
+    let one_owned = result_bytes(&net);
+    std::hint::black_box(&one);
+    let released_held = u64::from(one_owned == 0);
+    drop(one);
+    let full_drop = result_bytes(&net);
+    let first_reads = alice.storage().counters();
+
+    let started = Instant::now();
+    let responses = tokio::time::timeout(CAP, net.sync_with(alice_addr, &messages))
+        .await
+        .expect("partial response timed out")
+        .unwrap();
+    let partial_ms = millis(started);
+    let partial_done = responses
+        .iter()
+        .any(|message| matches!(message, crate::sync::SyncMessage::Page(page) if !page.more));
+    let partial_messages = responses.len();
+    let data_index = responses
+        .iter()
+        .position(|message| matches!(message, crate::sync::SyncMessage::Data(_)))
+        .expect("partial response contained no data");
+    let partial_ops = responses
+        .iter()
+        .filter_map(|message| match message {
+            crate::sync::SyncMessage::Data(data) => Some(data.ops.len()),
+            _ => None,
+        })
+        .sum::<usize>();
+    let partial_exact = responses
+        .iter()
+        .flat_map(|message| match message {
+            crate::sync::SyncMessage::Data(data) => data.ops.as_slice(),
+            _ => &[],
+        })
+        .eq(chain[1..].iter());
+    let partial_complete = partial_done && partial_exact;
+    let partial = responses
+        .into_iter()
+        .skip(data_index)
+        .take(1)
+        .collect::<Vec<_>>();
+    let partial_owned = result_bytes(&net);
+    std::hint::black_box(&partial);
+    let partial_released = u64::from(!partial.is_empty() && partial_owned == 0);
+    drop(partial);
+    let partial_drop = result_bytes(&net);
+    let final_reads = alice.storage().counters();
+    let owned = net.owned_bytes();
+    eprintln!(
+        "bench_detail name=held_item_cost rep={rep} backend=memory cache_policy=cold_then_warm ops={ops} payload_bytes={bytes} fixture_ops={} fixture_bytes={} fixture_blake3={hash} full_ms={full_ms:.6} partial_ms={partial_ms:.6} complete={} full_complete={full_complete} partial_complete={partial_complete} full_exact={full_exact} partial_exact={partial_exact} full_messages={full_messages} partial_messages={partial_messages} full_ops={full_ops} partial_ops={partial_ops} held_data_count={held_data_count} held_data_bytes={held_data_bytes} batch_owned={batch_owned} collect_owned={collect_owned} one_owned={one_owned} full_drop={full_drop} partial_owned={partial_owned} partial_drop={partial_drop} released_held={released_held} partial_released={partial_released} cold_reply_bytes={} cold_request_bytes={} warm_reply_bytes={} warm_request_bytes={} cold_op_reads={} cold_meta_reads={} cold_index_reads={} warm_op_reads={} warm_meta_reads={} warm_index_reads={} result_peak={} jobs_peak={}",
+        chain.len(),
+        encoded.len(),
+        full_complete && partial_complete,
+        alice_first - alice_wire,
+        bob_first - bob_wire,
+        sent_bytes(&alice_endpoint) - alice_first,
+        sent_bytes(net.endpoint()) - bob_first,
+        first_reads.op_reads - reads.op_reads,
+        first_reads.meta_reads - reads.meta_reads,
+        first_reads.index_reads - reads.index_reads,
+        final_reads.op_reads - first_reads.op_reads,
+        final_reads.meta_reads - first_reads.meta_reads,
+        final_reads.index_reads - first_reads.index_reads,
+        owned
+            .peak
+            .get(&net::OwnedClass::Results)
+            .copied()
+            .unwrap_or(0),
+        owned.peak_jobs,
+    );
+    net.shutdown().await;
+    alice.shutdown_iroh().await;
+    assert!(
+        full_complete && partial_complete,
+        "RPC output differed from the signed fixture"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement, run explicitly"]
+async fn held_item_cost() {
+    let reps = held_input("IROKLE_HELD_REPS", 3);
+    let ops = held_input("IROKLE_HELD_OPS", 1024);
+    let bytes = held_input("IROKLE_HELD_BYTES", 4096);
+    assert!(reps > 0 && ops > 0 && ops <= 4095 && bytes > 0);
+    for rep in 0..reps {
+        held_sample(rep, ops, bytes).await;
+    }
+}
