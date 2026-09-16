@@ -1173,3 +1173,109 @@ fn fjall_batch_rolls_back() {
         );
     }
 }
+
+#[test]
+fn batch_preserves_causes() {
+    let pressure = Error::MemoryPressure {
+        domain: crate::storage::MemoryDomain::Workspace,
+        required: 10,
+        limit: 1,
+    };
+    for error in [pressure, Error::Storage("temporary failure".into())] {
+        shared_failure(error);
+    }
+}
+
+fn shared_failure(error: Error) {
+    let expected = std::mem::discriminant(&error);
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let (node, mut acks, topics, peer) = batch_ack_fixture(storage.clone());
+    acks[1].genesis = Some(OpId::hash(b"obsolete branch"));
+    acks[1].sign(&Ed25519Signer::from_bytes(&[88; 32])).unwrap();
+    *storage.ack_fault.lock().unwrap() = Some(AckFault {
+        committed: false,
+        error,
+    });
+    let results = node.apply_sync_acks(&acks);
+    assert_eq!(results.len(), 3);
+    assert!(matches!(results[1], Err(Error::StaleIncarnation)));
+    let (Err(Error::Shared(first)), Err(Error::Shared(last))) = (&results[0], &results[2]) else {
+        panic!("backend failure must remain shared and typed: {results:?}");
+    };
+    assert!(Arc::ptr_eq(first, last));
+    assert_eq!(std::mem::discriminant(first.cause()), expected);
+    assert!(std::error::Error::source(results[0].as_ref().unwrap_err()).is_some());
+    assert_eq!(
+        storage.ack_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    for topic in topics {
+        assert!(storage.peer_ack(&peer, &topic).unwrap().is_none());
+        assert!(!storage.sync_obligations(&peer, &topic).unwrap().is_empty());
+    }
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn backend_causes_survive() {
+    for error in [
+        Error::ReopenRequired(fjall::Error::Poisoned),
+        Error::StoragePressure("disk headroom".into()),
+        Error::StorageBuffer {
+            required: 10,
+            limit: 1,
+        },
+        Error::StorageProbe(std::io::Error::other("probe unavailable")),
+        Error::Fjall(fjall::Error::Poisoned),
+    ] {
+        shared_failure(error);
+    }
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn uncertain_ack_reopens() {
+    for batch in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let storage =
+            StaleReadStorage::new(crate_storage::FjallStorage::open(directory.path()).unwrap());
+        let (node, acks, topics, peer) = batch_ack_fixture(storage.clone());
+        let before = storage.list_op_ids(&topics[0]).unwrap();
+        *storage.ack_fault.lock().unwrap() = Some(AckFault {
+            committed: true,
+            error: Error::ReopenRequired(fjall::Error::Poisoned),
+        });
+        let result = if batch {
+            node.apply_sync_acks(&acks[..1]).pop().unwrap()
+        } else {
+            node.apply_sync_ack(&acks[0])
+        };
+        assert!(matches!(
+            result.unwrap_err().cause(),
+            Error::ReopenRequired(_)
+        ));
+        assert_eq!(
+            storage.ack_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(storage.list_op_ids(&topics[0]).unwrap(), before);
+        assert!(storage.peer_ack(&peer, &topics[0]).unwrap().is_some());
+        for topic in &topics[1..] {
+            assert!(!storage.sync_obligations(&peer, topic).unwrap().is_empty());
+            assert!(storage.peer_ack(&peer, topic).unwrap().is_none());
+        }
+        drop((node, storage));
+        let reopened = crate_storage::FjallStorage::open(directory.path()).unwrap();
+        assert_eq!(reopened.list_op_ids(&topics[0]).unwrap(), before);
+        assert!(reopened.peer_ack(&peer, &topics[0]).unwrap().is_some());
+        assert!(
+            reopened
+                .sync_obligations(&peer, &topics[0])
+                .unwrap()
+                .is_empty()
+        );
+        for topic in &topics[1..] {
+            assert!(!reopened.sync_obligations(&peer, topic).unwrap().is_empty());
+        }
+    }
+}

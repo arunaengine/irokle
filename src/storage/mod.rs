@@ -665,8 +665,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// [`crate::Error::NotTopicMember`].
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize>;
     /// Apply acks in order as [`Storage::apply_peer_ack`] would, one result per ack, so one
-    /// uncertifiable ack neither commits nor discards the rest. A batching backend returns a
-    /// backend failure as the outer error and commits nothing.
+    /// uncertifiable ack neither commits nor discards the rest. Backend failures use the outer
+    /// error; uncertain commits require reopening and reconciliation before retry or cleanup.
     fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<Vec<Result<usize>>> {
         Ok(acks
             .into_iter()

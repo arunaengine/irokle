@@ -271,6 +271,11 @@ pub(crate) fn interleave<S: Storage, T: Send + 'static>(
     planned
 }
 
+pub(crate) struct AckFault {
+    pub(crate) committed: bool,
+    pub(crate) error: Error,
+}
+
 /// Storage wrapper that simulates the stale reads of a concurrent admission:
 /// `get_op`/`actor_index` report "unknown" exactly once for ops in the
 /// one-shot sets, so a duplicate slips past the batch dedup check and reaches
@@ -282,6 +287,8 @@ pub(crate) fn interleave<S: Storage, T: Send + 'static>(
 #[derive(Clone)]
 pub(crate) struct StaleReadStorage<S = MemoryStorage> {
     pub(crate) op_reads: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) ack_fault: Arc<std::sync::Mutex<Option<AckFault>>>,
+    pub(crate) ack_calls: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) inner: S,
     pub(crate) hidden_ops: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
     pub(crate) hidden_index: Arc<std::sync::Mutex<BTreeSet<OpId>>>,
@@ -308,6 +315,8 @@ impl<S: Storage> StaleReadStorage<S> {
         Self {
             inner,
             op_reads: Arc::default(),
+            ack_fault: Arc::default(),
+            ack_calls: Arc::default(),
             hidden_ops: Arc::default(),
             hidden_index: Arc::default(),
             mid_commit_ops: Arc::default(),
@@ -651,7 +660,31 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
         self.inner.all_sync_obligations()
     }
     fn apply_peer_ack(&self, ack: crate::storage::PeerAck) -> Result<usize, Error> {
+        self.ack_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let fault = self.ack_fault.lock().unwrap().take();
+        if let Some(fault) = fault {
+            if fault.committed {
+                self.inner.apply_peer_ack(ack)?;
+            }
+            return Err(fault.error);
+        }
         self.inner.apply_peer_ack(ack)
+    }
+    fn apply_peer_acks(
+        &self,
+        acks: Vec<crate::storage::PeerAck>,
+    ) -> Result<Vec<Result<usize, Error>>, Error> {
+        self.ack_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let fault = self.ack_fault.lock().unwrap().take();
+        if let Some(fault) = fault {
+            if fault.committed {
+                self.inner.apply_peer_acks(acks)?;
+            }
+            return Err(fault.error);
+        }
+        self.inner.apply_peer_acks(acks)
     }
     fn sync_obligations(
         &self,
