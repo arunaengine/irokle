@@ -6,12 +6,6 @@ use irokle::{Irokle, TopicConfig};
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, timeout};
 
-#[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
-#[irokle(type_id = "example.intro.message")]
-struct IntroEvent {
-    text: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
@@ -58,4 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("bob rejected membership with a signed remove-peer control op");
 
     Ok(())
+}
+
+#[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
+#[irokle(type_id = "example.intro.message")]
+struct IntroEvent {
+    text: String,
 }

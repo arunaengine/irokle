@@ -206,16 +206,16 @@ A `SyncObligation` names the work one peer still owes for one topic. Its `target
 
 With `fjall` and `iroh`, durable recovery means reopening the same Fjall path and reusing the same Iroh `SecretKey`, because the Iroh key defines the node’s `PeerId`. Production applications should persist the Iroh secret in their normal secret-management system, restrict filesystem permissions for local key files, and back up the key with the Fjall database path.
 
-See `examples/iroh_fjall_recovery.rs` for a complete example that creates a topic, closes the endpoint, reopens the database with the same key, lists recovered topics, and reads typed history.
+See `examples/iroh/fjall_recovery.rs` for a complete example that creates a topic, closes the endpoint, reopens the database with the same key, lists recovered topics, and reads typed history.
 
 ## Examples
 
 - `examples/basic.rs`: in-memory typed events plus transport-neutral sync planning, including the receive outcome of a first receive.
 - `examples/rdf.rs`: observed-remove RDF projection implemented as application code on top of event history.
-- `examples/iroh_chat.rs`: NodeId-only Iroh chat sync using discovery.
-- `examples/iroh_topic_intro.rs`: introduces a peer to a topic, opens it on the receiver, then rejects membership.
-- `examples/iroh_fjall_recovery.rs`: reopens an Iroh/Fjall node from disk with the same Iroh secret key.
-- `examples/iroh_runtime_config.rs`: builds an Iroh node with custom runtime timeouts and resync interval.
+- `examples/iroh/chat.rs`: NodeId-only Iroh chat sync using discovery.
+- `examples/iroh/topic_intro.rs`: introduces a peer to a topic, opens it on the receiver, then rejects membership.
+- `examples/iroh/fjall_recovery.rs`: reopens an Iroh/Fjall node from disk with the same Iroh secret key.
+- `examples/iroh/runtime_config.rs`: builds an Iroh node with custom runtime timeouts and resync interval.
 
 Run examples with features as needed:
 

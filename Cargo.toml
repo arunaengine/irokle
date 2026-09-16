@@ -59,16 +59,20 @@ tempfile = "3.27.0"
 
 [[example]]
 name = "iroh_chat"
+path = "examples/iroh/chat.rs"
 required-features = ["iroh"]
 
 [[example]]
 name = "iroh_topic_intro"
+path = "examples/iroh/topic_intro.rs"
 required-features = ["iroh"]
 
 [[example]]
 name = "iroh_fjall_recovery"
+path = "examples/iroh/fjall_recovery.rs"
 required-features = ["iroh", "fjall"]
 
 [[example]]
 name = "iroh_runtime_config"
+path = "examples/iroh/runtime_config.rs"
 required-features = ["iroh"]

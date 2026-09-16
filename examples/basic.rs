@@ -5,13 +5,6 @@ use irokle::history::HistoryOrder;
 use irokle::{Ed25519Signer, Irokle, ReceiveOutcome, TopicConfig};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
-#[irokle(type_id = "example.chat.message")]
-struct ChatEvent {
-    author: String,
-    text: String,
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let alice = Irokle::builder()
         .with_signer(Ed25519Signer::from_bytes(&[1; 32]))
@@ -66,4 +59,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+#[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
+#[irokle(type_id = "example.chat.message")]
+struct ChatEvent {
+    author: String,
+    text: String,
 }

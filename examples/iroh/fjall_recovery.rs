@@ -5,12 +5,6 @@ use irokle::history::HistoryOrder;
 use irokle::{Irokle, TopicConfig};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
-#[irokle(type_id = "example.recovery.note")]
-struct Note {
-    text: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secret_key = iroh::SecretKey::generate();
@@ -52,4 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     recovered.shutdown_iroh().await;
     Ok(())
+}
+
+#[derive(Clone, Debug, irokle::Event, Deserialize, Serialize)]
+#[irokle(type_id = "example.recovery.note")]
+struct Note {
+    text: String,
 }
