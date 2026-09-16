@@ -997,3 +997,246 @@ fn provisional_sessions() {
     let params = "sources=64 fragment_ops=64";
     each_backend("sessions", params, many_sessions, many_sessions);
 }
+
+#[derive(Default)]
+struct SliceCost {
+    planning_ns: u64,
+    admission_ns: u64,
+    slices: u64,
+    output_ops: u64,
+    output_bytes: u64,
+    max_visits: u64,
+    max_actors: u64,
+    max_edges: u64,
+    max_raw_reads: u64,
+    kept_peak: u64,
+    overshoots: u64,
+    premature_completion: u64,
+}
+
+fn bounded_fixture(repair: bool) -> (Ed25519Signer, PeerId, Vec<Op>) {
+    let author = signer(181);
+    let reader = signer(182).peer_id();
+    let count = if repair { 64 } else { 128 };
+    let name = if repair {
+        "bench-repair-forward"
+    } else {
+        "bench-wide-dependencies"
+    };
+    let mut ops = signed_chain(&author, name, &[reader], count, note);
+    if !repair {
+        let last = ops.last().unwrap();
+        let mut body = last.signed.body.clone();
+        body.actor_seq += 1;
+        body.actor_prev = Some(last.id);
+        body.generation += 1;
+        body.deps = ops.iter().map(|op| op.id).collect();
+        body.payload = note(count + 1);
+        ops.push(Op::sign(body, &author).unwrap());
+    }
+    (author, reader, ops)
+}
+
+fn bounded_page<S: Storage + PayloadReads>(
+    storage: Counting<S>,
+    repair: bool,
+    informed: bool,
+    rep: usize,
+) -> Sample {
+    use crate::sync::{ActorRangeHint, SyncRequest};
+    let setup = Instant::now();
+    let (author, peer, ops) = bounded_fixture(repair);
+    let topic = ops[0].signed.body.topic_id;
+    let encoded = postcard::to_allocvec(&ops).unwrap();
+    let hash = blake3::hash(&encoded);
+    let name = if repair {
+        "repair_forward"
+    } else {
+        "wide_dependencies"
+    };
+    let backend = if std::any::type_name::<S>().contains("FjallStorage") {
+        "fjall"
+    } else {
+        "memory"
+    };
+    load(&storage, &ops);
+    let log = Oplog::with_storage(storage.clone());
+    let responder = SyncEngine::new(log, author.peer_id()).with_page_visits(8, 1);
+    let destination = Oplog::new();
+    destination
+        .receive_ops(ops[..ops.len() - 1].to_vec())
+        .unwrap();
+    let receiver = SyncEngine::new(destination.clone(), peer);
+    let actor = ops[0].signed.body.actor_id;
+    let goal = ops.last().unwrap().signed.body.actor_seq;
+    let mut request = SyncRequest {
+        topic_id: topic,
+        known: BTreeSet::new(),
+        wants: if repair {
+            ops[1..17].iter().map(|op| op.id).collect()
+        } else {
+            BTreeSet::new()
+        },
+        actor_range_hints: vec![ActorRangeHint {
+            actor_id: actor,
+            from_exclusive: goal - 1,
+            to_inclusive: goal,
+        }],
+        genesis: Some(ops[0].id),
+        credit: crate::sync::SyncCredit {
+            ops: 1,
+            bytes: crate::sync::MAX_PAGE_BYTES as u64,
+        },
+        window: Default::default(),
+    };
+    let setup_ns = setup.elapsed().as_nanos() as u64;
+    let mut cost = SliceCost::default();
+    let raw_start = storage.snapshot();
+    let work_start = responder.page_work();
+    let convergence = Instant::now();
+    let mut complete = false;
+    for _ in 0..8192 {
+        let held = receiver.summary(topic).unwrap();
+        let before = responder.page_work();
+        let raw_before = storage.snapshot();
+        let started = Instant::now();
+        let budget = PageBudget::from_credit(request.credit);
+        let page = if informed {
+            responder.response_with(peer, &request, budget, &held)
+        } else {
+            responder.response_page(peer, &request, budget)
+        }
+        .unwrap();
+        cost.planning_ns += started.elapsed().as_nanos() as u64;
+        let raw_after = storage.snapshot();
+        let after = responder.page_work();
+        let visits = after.visits - before.visits;
+        let actors = after.actors - before.actors;
+        let edges = after.edges - before.edges;
+        let raw_reads = (0..3)
+            .map(|index| raw_after[index] - raw_before[index])
+            .sum();
+        cost.slices += 1;
+        cost.max_visits = cost.max_visits.max(visits);
+        cost.max_actors = cost.max_actors.max(actors);
+        cost.max_edges = cost.max_edges.max(edges);
+        cost.max_raw_reads = cost.max_raw_reads.max(raw_reads);
+        cost.kept_peak = cost.kept_peak.max(after.kept_bytes);
+        cost.overshoots += u64::from(visits + actors > 8 || edges > 8);
+        assert!(page.missing.is_empty() && page.positions.is_empty());
+        assert!(page.too_large.is_none());
+        assert!(page.ops.len() <= 1);
+        for op in &page.ops {
+            for dependency in &op.signed.body.deps {
+                assert!(destination.storage().dep_resolvable(dependency).unwrap());
+            }
+            request.wants.remove(&op.id);
+            cost.output_bytes += postcard::experimental::serialized_size(op).unwrap() as u64;
+        }
+        cost.output_ops += page.ops.len() as u64;
+        let admission = Instant::now();
+        destination.receive_ops(page.ops).unwrap();
+        cost.admission_ns += admission.elapsed().as_nanos() as u64;
+        let clock = destination.storage().actor_clock(&topic).unwrap();
+        request.actor_range_hints[0].from_exclusive = clock.get(&actor);
+        complete = request.wants.is_empty() && clock.get(&actor) == goal;
+        // Both revisions serve the captured goal even when the baseline's flag ends early.
+        if !page.more && !complete {
+            cost.premature_completion += 1;
+        }
+        if complete {
+            break;
+        }
+    }
+    let convergence_ns = convergence.elapsed().as_nanos() as u64;
+    assert!(
+        complete,
+        "bounded fixture did not converge after 8192 slices"
+    );
+    for op in &ops {
+        assert_eq!(
+            destination.storage().get_op(&op.id).unwrap().as_ref(),
+            Some(op)
+        );
+    }
+    let work = responder.page_work();
+    let mut counters = vec![
+        ("setup_ns", setup_ns),
+        ("admission_ns", cost.admission_ns),
+        ("convergence_ns", convergence_ns),
+        ("slices", cost.slices),
+        ("output_ops", cost.output_ops),
+        ("output_bytes", cost.output_bytes),
+        ("visits", work.visits - work_start.visits),
+        ("actors", work.actors - work_start.actors),
+        ("edges", work.edges - work_start.edges),
+        ("resumed", work.resumed - work_start.resumed),
+        ("max_visits", cost.max_visits),
+        ("max_actors", cost.max_actors),
+        ("max_edges", cost.max_edges),
+        ("max_raw_reads", cost.max_raw_reads),
+        ("kept_peak_bytes", cost.kept_peak),
+        ("overshoot_slices", cost.overshoots),
+        ("premature_completion", cost.premature_completion),
+    ];
+    counters.extend(read_delta(raw_start, storage.snapshot()));
+    let values = counters
+        .iter()
+        .map(|(key, value)| format!(" {key}={value}"))
+        .collect::<String>();
+    eprintln!(
+        "bench_detail name={name} backend={backend} informed={informed} rep={rep} completion_policy=captured_goal visits_limit=8 credit_ops=1 fixture_blake3={hash} fixture_bytes={} planning_ns={} complete=true decoded_bytes=null workspace_peak=null{values}",
+        encoded.len(),
+        cost.planning_ns
+    );
+    Sample {
+        ms: cost.planning_ns as f64 / 1_000_000.0,
+        counters,
+    }
+}
+
+fn bounded_backends(repair: bool, informed: bool) {
+    let reps =
+        std::env::var("IROKLE_BOUND_REPS").map_or(3, |value| value.parse::<usize>().unwrap());
+    assert!(reps > 0, "measurement needs at least one sample");
+    let name = if repair {
+        "repair_forward"
+    } else {
+        "wide_dependencies"
+    };
+    let shape = if repair {
+        "wants=16 chain_ops=64"
+    } else {
+        "dependencies=129"
+    };
+    let params = format!("informed={informed} {shape} visits=8 credit_ops=1");
+    let memory = (0..reps)
+        .map(|rep| bounded_page(Counting::new(MemoryStorage::new()), repair, informed, rep))
+        .collect();
+    report(name, &format!("backend=memory {params}"), memory);
+    let fjall = (0..reps)
+        .map(|rep| {
+            let directory = tempfile::tempdir().unwrap();
+            let storage =
+                FjallStorage::open_with_persist_mode(directory.path(), persist_mode()).unwrap();
+            bounded_page(Counting::new(storage), repair, informed, rep)
+        })
+        .collect();
+    report(name, &format!("backend=fjall {params}"), fjall);
+}
+
+#[test]
+#[ignore = "paired bounded-page measurement, run explicitly"]
+fn wide_dependencies() {
+    for informed in [false, true] {
+        bounded_backends(false, informed);
+    }
+}
+
+#[test]
+#[ignore = "paired bounded-page measurement, run explicitly"]
+fn repair_forward() {
+    for informed in [false, true] {
+        bounded_backends(true, informed);
+    }
+}
