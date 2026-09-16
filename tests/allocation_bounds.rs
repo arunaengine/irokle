@@ -72,6 +72,76 @@ static COUNTING: Counting = Counting;
 
 #[test]
 #[ignore = "allocator measurement requires its own process and one test thread"]
+fn memory_store_bounds() {
+    use irokle::{
+        Ed25519Signer, EventEnvelope, MemoryStorage, Signer, Storage, TopicGenesis, TopicId,
+        actor_id_for,
+    };
+    use tests::support::Note;
+    for (count, wide) in [33, 256, 512, 1024]
+        .into_iter()
+        .flat_map(|n| [(n, false), (n, true)])
+    {
+        let writers = (0..if wide { count } else { 0 })
+            .map(|n: usize| {
+                let mut seed = [201; 32];
+                seed[..8].copy_from_slice(&(n as u64).to_le_bytes());
+                Ed25519Signer::from_bytes(&seed)
+            })
+            .collect::<Vec<_>>();
+        let owner = Ed25519Signer::from_bytes(&[200; 32]);
+        let topic = TopicId::hash(format!("memory-allocation/{count}/{wide}"));
+        let source = irokle::oplog::Oplog::new();
+        source
+            .create_topic_genesis(
+                topic,
+                actor_id_for(topic, owner.peer_id()),
+                TopicGenesis::new(
+                    "test.note",
+                    writers.iter().chain([&owner]).map(Signer::peer_id),
+                ),
+                &owner,
+            )
+            .unwrap();
+        for n in 0..count {
+            let note = Note {
+                text: n.to_string(),
+            };
+            let signer = writers.get(n).unwrap_or(&owner);
+            source
+                .create_event_op(
+                    topic,
+                    actor_id_for(topic, signer.peer_id()),
+                    EventEnvelope::encode_event(&note).unwrap(),
+                    signer,
+                )
+                .unwrap();
+        }
+        let ops = irokle::oplog::topological(source.storage(), &topic).unwrap();
+        let storage = MemoryStorage::new();
+        let before = LIVE.load(Ordering::Relaxed);
+        PEAK.store(before, Ordering::Relaxed);
+        let log = irokle::oplog::Oplog::with_storage(storage.clone());
+        log.receive_ops(ops.clone()).unwrap();
+        drop(log);
+        let allocated = LIVE.load(Ordering::Relaxed) - before;
+        let peak = PEAK.load(Ordering::Relaxed) - before;
+        let usage = storage.memory_usage().unwrap();
+        let reserved = usage.reserved.values().sum::<u64>();
+        println!(
+            "memory wide={wide} records={} allocator_bytes={allocated} peak_bytes={peak} reserved_bytes={reserved}",
+            ops.len()
+        );
+        assert!(
+            allocated as u64 <= reserved,
+            "retained Memory allocations exceed reservations"
+        );
+        assert_eq!(storage.list_op_ids(&topic).unwrap().len(), ops.len());
+    }
+}
+
+#[test]
+#[ignore = "allocator measurement requires its own process and one test thread"]
 fn captured_clock_bounds() {
     for entries in [1024_u32, 2048, 65_536] {
         let before = LIVE.load(Ordering::Relaxed);
@@ -352,7 +422,7 @@ fn record_allocation_bounds() {
         )
         .unwrap();
         log.receive_ops(vec![join.clone()]).unwrap();
-        let pool = std::sync::Arc::new(AtomicUsize::new(0));
+        let pool = std::sync::Arc::new(records::RecordPool::default());
         let mut records = records::Records::new(std::sync::Arc::clone(&pool));
         let before = LIVE.load(Ordering::Relaxed);
         PEAK.store(before, Ordering::Relaxed);
@@ -364,7 +434,7 @@ fn record_allocation_bounds() {
         assert!(records.contains(&join.id));
         let allocated = LIVE.load(Ordering::Relaxed) - before;
         let peak = PEAK.load(Ordering::Relaxed) - before;
-        let bound = pool.load(Ordering::Acquire) + 4096;
+        let bound = pool.bytes() + 4096;
         assert!(
             allocated <= bound && peak <= bound,
             "record: {allocated} retained, {peak} peak, {bound} bound"
@@ -376,7 +446,7 @@ fn record_allocation_bounds() {
         assert_eq!(record.op, join);
         drop(record);
         drop(records);
-        assert_eq!(pool.load(Ordering::Acquire), 0);
+        assert_eq!(pool.bytes(), 0);
         println!(
             "record dependencies={entries} allocator_bytes={allocated} peak_bytes={peak} bound={bound}"
         );

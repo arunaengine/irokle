@@ -10,8 +10,21 @@ use crate::{Error, Op, OpId, Result, TopicPayload};
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const POOL_BYTES: usize = 256 * 1024 * 1024;
 
+#[derive(Default)]
+pub(super) struct RecordPool {
+    live: AtomicUsize,
+    cached: AtomicUsize,
+}
+
+impl RecordPool {
+    #[cfg(test)]
+    pub(super) fn bytes(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+}
+
 pub(super) struct Records {
-    pool: Arc<AtomicUsize>,
+    pool: Arc<RecordPool>,
     records: BTreeMap<OpId, Record>,
     bytes: usize,
 }
@@ -23,8 +36,9 @@ pub(super) struct Record {
 }
 
 struct Claim {
-    pool: Arc<AtomicUsize>,
+    pool: Arc<RecordPool>,
     bytes: usize,
+    cached: bool,
 }
 
 fn charge(bytes: usize) -> usize {
@@ -34,7 +48,7 @@ fn charge(bytes: usize) -> usize {
 }
 
 impl Records {
-    pub(super) fn new(pool: Arc<AtomicUsize>) -> Self {
+    pub(super) fn new(pool: Arc<RecordPool>) -> Self {
         Self {
             pool,
             records: BTreeMap::new(),
@@ -55,8 +69,12 @@ impl Records {
     }
 
     pub(super) fn take(&mut self, read: &dyn SnapshotRead, id: &OpId) -> Result<Option<Record>> {
-        if let Some(record) = self.records.remove(id) {
+        if let Some(mut record) = self.records.remove(id) {
             self.bytes -= record.claim.bytes;
+            record.claim.cached = false;
+            self.pool
+                .cached
+                .fetch_sub(record.claim.bytes, Ordering::AcqRel);
             return Ok(Some(record));
         }
         let mut claim = None;
@@ -70,6 +88,7 @@ impl Records {
             loop {
                 if self
                     .pool
+                    .live
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
                         held.checked_add(bytes).filter(|sum| *sum <= POOL_BYTES)
                     })
@@ -86,6 +105,7 @@ impl Records {
             claim = Some(Claim {
                 pool: Arc::clone(&self.pool),
                 bytes,
+                cached: false,
             });
             Ok(())
         })?;
@@ -99,7 +119,10 @@ impl Records {
                 "operation exceeded its reservation".into(),
             ));
         }
-        claim.pool.fetch_sub(claim.bytes - actual, Ordering::AcqRel);
+        claim
+            .pool
+            .live
+            .fetch_sub(claim.bytes - actual, Ordering::AcqRel);
         claim.bytes = actual;
         Ok(Some(Record {
             op,
@@ -116,6 +139,20 @@ impl Records {
             self.bytes -= old.claim.bytes;
         }
         while self.bytes + record.claim.bytes > CACHE_BYTES && self.evict() {}
+        // Idle caches leave room for both bulk workers' largest decoded records.
+        let cache_limit = POOL_BYTES - 2 * charge(super::MAX_PAGE_BYTES);
+        if self
+            .pool
+            .cached
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(record.claim.bytes)
+                    .filter(|sum| *sum <= cache_limit)
+            })
+            .is_err()
+        {
+            return;
+        }
+        record.claim.cached = true;
         if !record.owned {
             if let TopicPayload::Event(event) = &mut record.op.signed.body.payload {
                 event.payload = bytes::Bytes::copy_from_slice(&event.payload);
@@ -135,7 +172,10 @@ impl Record {
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        self.pool.fetch_sub(self.bytes, Ordering::AcqRel);
+        if self.cached {
+            self.pool.cached.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+        self.pool.live.fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
@@ -145,6 +185,10 @@ mod tests {
     use crate::tests::support::*;
 
     fn stored_event() -> (MemoryStorage, OpId) {
+        stored_payload(Bytes::from(vec![0; 1024 * 1024]).slice(..1))
+    }
+
+    fn stored_payload(payload: Bytes) -> (MemoryStorage, OpId) {
         let store = MemoryStorage::new();
         let signer = Ed25519Signer::from_bytes(&[219; 32]);
         let topic = TopicId::hash(b"record-reservations");
@@ -163,7 +207,7 @@ mod tests {
                 actor,
                 EventEnvelope {
                     type_id: Note::TYPE_ID.into(),
-                    payload: Bytes::from(vec![0; 1024 * 1024]).slice(..1),
+                    payload,
                 },
                 &signer,
             )
@@ -172,27 +216,59 @@ mod tests {
     }
 
     #[test]
+    fn idle_caches_progress() {
+        let (store, id) = stored_payload(Bytes::from(vec![0; 2 * 1024 * 1024]));
+        let pool = Arc::new(RecordPool::default());
+        let mut goals = Vec::new();
+        for n in 0..128 {
+            let mut records = Records::new(Arc::clone(&pool));
+            let record = store
+                .read_snapshot(|read| records.take(read, &id))
+                .unwrap_or_else(|error| panic!("goal {n} starved by idle caches: {error}"))
+                .unwrap();
+            records.keep(record);
+            goals.push(records);
+        }
+        let (large, id) = stored_payload(Bytes::from(vec![0; 16 * 1024 * 1024 - 4096]));
+        let mut first = Records::new(Arc::clone(&pool));
+        let mut second = Records::new(Arc::clone(&pool));
+        let first = large
+            .read_snapshot(|read| first.take(read, &id))
+            .unwrap()
+            .unwrap();
+        let second = large
+            .read_snapshot(|read| second.take(read, &id))
+            .unwrap()
+            .unwrap();
+        assert!(pool.bytes() <= POOL_BYTES);
+        drop((first, second));
+        drop(goals);
+        assert_eq!(pool.bytes(), 0);
+    }
+
+    #[test]
     fn claims_release() {
         let (store, id) = stored_event();
-        let pool = Arc::new(AtomicUsize::new(0));
+        let pool = Arc::new(RecordPool::default());
         let mut records = Records::new(Arc::clone(&pool));
         let record = store
             .read_snapshot(|read| records.take(read, &id))
             .unwrap()
             .unwrap();
         let bytes = record.claim.bytes;
-        assert_eq!(pool.load(Ordering::Acquire), bytes);
+        assert_eq!(pool.bytes(), bytes);
         let busy = Claim {
             pool: Arc::clone(&pool),
             bytes: POOL_BYTES - bytes,
+            cached: false,
         };
-        pool.fetch_add(busy.bytes, Ordering::AcqRel);
+        pool.live.fetch_add(busy.bytes, Ordering::AcqRel);
         let mut other = Records::new(Arc::clone(&pool));
         assert!(matches!(
             store.read_snapshot(|read| other.take(read, &id)),
             Err(Error::SyncCapacity(_))
         ));
-        assert_eq!(pool.load(Ordering::Acquire), POOL_BYTES);
+        assert_eq!(pool.bytes(), POOL_BYTES);
         records.keep(record);
         drop(busy);
         let before = store.counters().op_reads;
@@ -205,7 +281,7 @@ mod tests {
             before,
             "reuse the reserved operation"
         );
-        assert_eq!(pool.load(Ordering::Acquire), bytes);
+        assert_eq!(pool.bytes(), bytes);
         assert!(
             std::panic::catch_unwind(move || {
                 let _record = record;
@@ -213,13 +289,13 @@ mod tests {
             })
             .is_err()
         );
-        assert_eq!(pool.load(Ordering::Acquire), 0);
+        assert_eq!(pool.bytes(), 0);
     }
 
     #[test]
     fn payload_owned() {
         let (store, id) = stored_event();
-        let pool = Arc::new(AtomicUsize::new(0));
+        let pool = Arc::new(RecordPool::default());
         let mut records = Records::new(Arc::clone(&pool));
         let original = store.get_op(&id).unwrap().unwrap();
         let record = store
@@ -242,6 +318,6 @@ mod tests {
         let copied = record.into_op();
         copied.validate().unwrap();
         assert_eq!(copied, original);
-        assert_eq!(pool.load(Ordering::Acquire), 0);
+        assert_eq!(pool.bytes(), 0);
     }
 }

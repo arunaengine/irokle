@@ -161,7 +161,7 @@ pub(super) struct Continuations {
     entries: BTreeMap<(PeerId, TopicId), Continuation>,
     capacity: usize,
     clocks: Arc<AtomicUsize>,
-    records: Arc<AtomicUsize>,
+    records: Arc<super::records::RecordPool>,
 }
 
 impl Continuations {
@@ -266,7 +266,7 @@ impl Continuations {
                 super::space::tree_bytes::<(PeerId, TopicId), Continuation>(self.entries.len())
             }
             + self.clocks.load(Ordering::Acquire)
-            + self.records.load(Ordering::Acquire)
+            + self.records.bytes()
     }
 }
 
