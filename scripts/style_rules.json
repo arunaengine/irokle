@@ -1,0 +1,345 @@
+{
+  "maintained_extensions": [
+    ".json",
+    ".lock",
+    ".md",
+    ".py",
+    ".rs",
+    ".sh",
+    ".toml",
+    ".yaml",
+    ".yml"
+  ],
+  "source_extensions": [
+    ".py",
+    ".rs",
+    ".sh"
+  ],
+  "required_roots": [
+    ".",
+    ".github/workflows",
+    "examples",
+    "irokle-derive",
+    "irokle-derive/src",
+    "scripts",
+    "src",
+    "src/tests",
+    "tests",
+    "tests/iroh_patchbay_sync",
+    "tests/fixtures"
+  ],
+  "small_domains": [
+    {
+      "path": "examples/iroh",
+      "members": [
+        "chat.rs",
+        "fjall_recovery.rs",
+        "runtime_config.rs",
+        "topic_intro.rs"
+      ],
+      "reason": "The four direct files are the grouped Iroh example domain.",
+      "source": "STYLE.md section 1 and assignment section 6"
+    },
+    {
+      "path": "src/storage/fjall",
+      "members": [
+        "pending.rs",
+        "provisional.rs",
+        "store.rs"
+      ],
+      "reason": "The three direct files are the grouped Fjall backend implementation.",
+      "source": "STYLE.md section 1 and assignment section 6"
+    },
+    {
+      "path": "src/storage/memory",
+      "members": [
+        "budget.rs",
+        "metadata.rs",
+        "staging.rs"
+      ],
+      "reason": "The three direct files form the Memory backend domain.",
+      "source": "STYLE.md section 1 and assignment section 6"
+    }
+  ],
+  "generic_prefixes": [
+    "add",
+    "check",
+    "get",
+    "read",
+    "run",
+    "set",
+    "test",
+    "write"
+  ],
+  "skip_paths": [
+    {
+      "path": ".gitignore",
+      "rules": [
+        "content",
+        "layout"
+      ],
+      "reason": "Git requires this conventional repository control filename.",
+      "source": "Git repository interface"
+    },
+    {
+      "path": "LICENSE-APACHE",
+      "rules": [
+        "content",
+        "layout"
+      ],
+      "reason": "The mandatory license notice has a fixed conventional name and text.",
+      "source": "Apache-2.0 distribution notice"
+    },
+    {
+      "path": "LICENSE-MIT",
+      "rules": [
+        "content",
+        "layout"
+      ],
+      "reason": "The mandatory license notice has a fixed conventional name and text.",
+      "source": "MIT distribution notice"
+    },
+    {
+      "prefix": "tests/fixtures/fjall-schema1-24417de",
+      "rules": [
+        "content",
+        "layout"
+      ],
+      "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
+      "source": "tests/fixtures/README.md"
+    },
+    {
+      "prefix": "tests/fixtures/fjall-schema2-54db4f9",
+      "rules": [
+        "content",
+        "layout"
+      ],
+      "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
+      "source": "tests/fixtures/README.md"
+    },
+    {
+      "prefix": "tests/fixtures/fjall-schema2-fb5ea2b",
+      "rules": [
+        "content",
+        "layout"
+      ],
+      "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
+      "source": "tests/fixtures/README.md"
+    },
+    {
+      "prefix": "tests/fixtures/fjall-schema4-e112523",
+      "rules": [
+        "content",
+        "layout"
+      ],
+      "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
+      "source": "tests/fixtures/README.md"
+    },
+    {
+      "prefix": "tests/fixtures/fjall-schema5-68e4c19",
+      "rules": [
+        "content",
+        "layout"
+      ],
+      "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
+      "source": "tests/fixtures/README.md"
+    },
+    {
+      "prefix": "tests/fixtures/fjall-schema6-512b158",
+      "rules": [
+        "content",
+        "layout"
+      ],
+      "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
+      "source": "tests/fixtures/README.md"
+    }
+  ],
+  "exceptions": [
+    {
+      "path": "scripts/style.py",
+      "rule": "name_terms",
+      "name": "visit_AsyncFunctionDef",
+      "kind": "function",
+      "reason": "Python AST dispatch requires the visitor method to match the node class name.",
+      "source": "Python ast.NodeVisitor interface"
+    },
+    {
+      "path": "src/crypto.rs",
+      "rule": "name_terms",
+      "name": "from_iroh_secret_key",
+      "kind": "function",
+      "reason": "Retain the public Iroh signer constructor for source compatibility.",
+      "source": "Ed25519Signer public API and From<&iroh::SecretKey> adapter"
+    },
+    {
+      "path": "src/node/builder.rs",
+      "rule": "name_terms",
+      "name": "with_iroh_runtime_config",
+      "kind": "function",
+      "reason": "Retain the public builder method used to configure Iroh runtime behavior.",
+      "source": "IrokleBuilder public Iroh runtime configuration API"
+    },
+    {
+      "path": "src/node/builder.rs",
+      "rule": "name_terms",
+      "name": "with_iroh_secret_key",
+      "kind": "function",
+      "reason": "Retain the public builder method used to select an Iroh identity.",
+      "source": "IrokleBuilder public Iroh secret-key API"
+    },
+    {
+      "path": "src/node/builder.rs",
+      "rule": "name_terms",
+      "name": "with_fjall_path_and_persist_mode",
+      "kind": "function",
+      "reason": "Retain the public builder method that selects Fjall path and durability behavior.",
+      "source": "IrokleBuilder public Fjall persist-mode API"
+    },
+    {
+      "path": "src/node/builder.rs",
+      "rule": "name_terms",
+      "name": "with_fjall_database_and_persist_mode",
+      "kind": "function",
+      "reason": "Retain the public builder method that wraps an existing Fjall database with its persist mode.",
+      "source": "IrokleBuilder public Fjall database and persist-mode API"
+    },
+    {
+      "path": "src/node/mod.rs",
+      "rule": "name_terms",
+      "name": "create_topic_with_event",
+      "kind": "function",
+      "reason": "Retain the public atomic topic-and-first-event constructor.",
+      "source": "Irokle public topic creation API"
+    },
+    {
+      "path": "src/node/mod.rs",
+      "rule": "name_terms",
+      "name": "plan_sync_response_data",
+      "kind": "function",
+      "reason": "Retain the public transport-neutral response planner name.",
+      "source": "Irokle public sync planning API and README usage"
+    },
+    {
+      "path": "src/node/mod.rs",
+      "rule": "name_terms",
+      "name": "receive_sync_data_from",
+      "kind": "function",
+      "reason": "Retain the public receive method used by manual sync callers.",
+      "source": "Irokle public sync receive API and README usage"
+    },
+    {
+      "path": "src/node/mod.rs",
+      "rule": "name_terms",
+      "name": "receive_sync_data_from_evicting",
+      "kind": "function",
+      "reason": "Retain the public receive method that exposes genesis tie-break evictions.",
+      "source": "Irokle public eviction-aware sync receive API"
+    },
+    {
+      "path": "src/node/mod.rs",
+      "rule": "name_terms",
+      "name": "receive_sync_data_as_local",
+      "kind": "function",
+      "reason": "Retain the public local-source sync receive entry point.",
+      "source": "Irokle public local sync receive API"
+    },
+    {
+      "path": "src/node/mod.rs",
+      "rule": "name_terms",
+      "name": "add_peer_to_whitelist",
+      "kind": "function",
+      "reason": "Retain the public single-peer whitelist mutator.",
+      "source": "Irokle public peer whitelist API and integration callers"
+    },
+    {
+      "path": "src/node/mod.rs",
+      "rule": "name_terms",
+      "name": "add_peers_to_whitelist",
+      "kind": "function",
+      "reason": "Retain the public multi-peer whitelist mutator.",
+      "source": "Irokle public peer whitelist API and integration callers"
+    },
+    {
+      "path": "src/topic.rs",
+      "rule": "name_terms",
+      "name": "DEFAULT_MAX_SYNC_PEERS",
+      "kind": "constant",
+      "reason": "Retain the public replication-policy default constant.",
+      "source": "ReplicationPolicy public default API and serialized configuration behavior"
+    },
+    {
+      "path": "src/topic.rs",
+      "rule": "name_terms",
+      "name": "with_max_sync_peers",
+      "kind": "function",
+      "reason": "Retain the public replication fanout builder method.",
+      "source": "ReplicationPolicy public configuration API"
+    },
+    {
+      "path": "src/frame.rs",
+      "rule": "name_terms",
+      "name": "MAX_SYNC_DATA_OPS_PER_MESSAGE",
+      "kind": "constant",
+      "reason": "Public framing limit used by external callers, session handling and tests.",
+      "source": "Reviewed public Rust contract at 6be58d6; public_constant"
+    },
+    {
+      "path": "src/net.rs",
+      "rule": "name_terms",
+      "name": "MAX_SYNC_DATA_OPS_PER_MESSAGE",
+      "kind": "binding",
+      "reason": "Public net re-export preserves the framing limit source contract.",
+      "source": "Reviewed public Rust contract at 6be58d6; public_reexport"
+    },
+    {
+      "path": "src/iroh/runtime.rs",
+      "rule": "name_terms",
+      "name": "full_sweep_time_of_day",
+      "kind": "field",
+      "reason": "Public runtime configuration field and serialized construction API.",
+      "source": "Reviewed public Rust contract at 6be58d6; public_field"
+    },
+    {
+      "path": "src/iroh/mod.rs",
+      "rule": "name_terms",
+      "name": "new_with_alpns_and_config",
+      "kind": "function",
+      "reason": "Existing public constructor source contract.",
+      "source": "Reviewed public Rust contract at 6be58d6; public_method"
+    },
+    {
+      "path": "src/iroh/mod.rs",
+      "rule": "name_terms",
+      "name": "new_with_alpns_config_and_sink",
+      "kind": "function",
+      "reason": "Existing public constructor source contract.",
+      "source": "Reviewed public Rust contract at 6be58d6; public_method"
+    },
+    {
+      "path": "src/iroh/mod.rs",
+      "rule": "name_terms",
+      "name": "start_configured_resync_loop",
+      "kind": "function",
+      "reason": "Existing public lifecycle API.",
+      "source": "Reviewed public Rust contract at 6be58d6; public_method"
+    }
+  ],
+  "macro_inputs": {
+    "forward": {
+      "mode": "function_list"
+    },
+    "id_type": {
+      "mode": "single_type"
+    }
+  },
+  "test_paths": [
+    "src/tests",
+    "src/iroh/session_tests.rs",
+    "src/iroh/exchange_tests.rs",
+    "src/storage/pressure_tests.rs",
+    "src/sync/preparation_tests.rs"
+  ],
+  "mandatory_notices": [
+    "// SPDX-License-Identifier: MIT OR Apache-2.0"
+  ]
+}
