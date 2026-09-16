@@ -22,6 +22,8 @@ mod types;
 #[cfg(test)]
 mod page_tests;
 
+#[cfg(test)]
+mod preparation_tests;
 
 #[cfg(test)]
 pub(crate) use continuation::MAX_CONTINUATIONS;
