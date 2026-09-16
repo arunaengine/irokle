@@ -13,8 +13,8 @@ use super::super::{
     check_namespaces, merged_obligation,
 };
 use super::{
-    MemoryInner, MemoryStorage, MetadataPlan, ObligationKind, topic_state_locked,
-    put_obligation_locked,
+    MemoryInner, MemoryStorage, MetadataPlan, ObligationKind, put_obligation_locked,
+    topic_state_locked,
 };
 
 /// Registered provisional namespaces with their records. Lock order: this

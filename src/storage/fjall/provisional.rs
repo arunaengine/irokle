@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Fjall registry owns staging, activation, publication, and clearing.
-//! Each transaction rechecks ownership before copying, deleting, or releasing.
+#![doc = include_str!("provisional.md")]
 
 use std::collections::BTreeSet;
 
@@ -9,11 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ActorClock, Error, OpId, PeerId, Result, TopicId};
 
-use super::store::{FjallStorage, Hook};
 use super::super::{
     AdmissionEffects, PeerAck, ProvisionalTopic, StagingLimits, StagingQuota, TopicState,
     ack_covers, check_namespaces,
 };
+use super::store::{FjallStorage, Hook};
 
 type Tx = super::super::pressure::Transaction;
 type Records = fjall::OptimisticTxKeyspace;
@@ -184,8 +183,7 @@ impl FjallStorage {
         Ok(StagingQuota::new(limits, others, source))
     }
 
-    /// Reclaim ended slots in bounded transactions, rechecking the session before
-    /// each delete and release so late passes cannot touch a replacement session.
+    #[doc = include_str!("../contracts/reclaim_slots.md")]
     fn reclaim_slots(&self) -> Result<()> {
         let mut clearing = Vec::new();
         for item in fjall::Readable::prefix(&self.db.read_tx(), &self.records, SLOT) {
@@ -509,8 +507,7 @@ impl FjallStorage {
         Ok(())
     }
 
-    /// Claim one topic activation and freeze `provisional` in one transaction.
-    /// Repeated claims by the same session are allowed; other claims are refused.
+    #[doc = include_str!("../contracts/claim_activation.md")]
     fn claim_activation(
         &self,
         provisional: &ProvisionalTopic,

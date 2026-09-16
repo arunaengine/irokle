@@ -179,8 +179,7 @@ impl FjallStorage {
         Self::open_with_persist_mode(path, fjall::PersistMode::SyncAll)
     }
 
-    /// Open Fjall with an explicit persist mode. `SyncAll` preserves existing
-    /// durability; `Buffer` lets callers place the durability boundary.
+    #[doc = include_str!("../contracts/persist_mode.md")]
     pub fn open_with_persist_mode(
         path: impl AsRef<Path>,
         persist_mode: fjall::PersistMode,
@@ -386,9 +385,7 @@ impl FjallStorage {
         }
     }
 
-    /// Upgrade schema 1 atomically: preserve uncertified acks, seed pending byte
-    /// counters, and bump the version only after all rewrites. Reopen retries the
-    /// transaction if interrupted.
+    #[doc = include_str!("../contracts/schema_two.md")]
     fn migrate_schema_two(&self) -> Result<()> {
         self.transaction(|tx| {
             // A concurrent facade may have finished the upgrade already.
@@ -646,9 +643,7 @@ impl FjallStorage {
         Ok(())
     }
 
-    /// Upgrade schema 6 to the shared clock-node layout. A cursor marks the
-    /// bounded rewrite across the main and slot keyspaces so reopening resumes
-    /// an interrupted step.
+    #[doc = include_str!("../contracts/schema_seven.md")]
     fn migrate_schema_seven(&self, steps: usize) -> Result<()> {
         self.transaction(|tx| {
             if Self::tx_get::<u32>(tx, &self.records, SCHEMA_VERSION_KEY)? != Some(6) {

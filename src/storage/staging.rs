@@ -46,9 +46,7 @@ impl StagingLimits {
     };
 }
 
-/// Provisional history for a topic not yet held locally. The value scopes reads
-/// to its session and writes until activation begins; data stays invisible until
-/// membership is proven and activation completes.
+#[doc = include_str!("contracts/provisional_topic.md")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvisionalTopic {
     pub source: PeerId,

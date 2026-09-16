@@ -11,9 +11,7 @@ use crate::{
 pub const MAX_PENDING_OPS_TOTAL: usize = 4096;
 pub const MAX_PENDING_OPS_PER_SOURCE: usize = 1024;
 pub const MAX_PENDING_WAITERS_PER_DEP: usize = 1024;
-/// Buffered operations have total and per-source byte limits. Counts alone do
-/// not bound memory when one operation is large, so core enforces these limits
-/// for every backend.
+#[doc = include_str!("contracts/pending_bytes.md")]
 pub const MAX_PENDING_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 pub const MAX_PENDING_BYTES_PER_SOURCE: usize = 16 * 1024 * 1024;
 pub const MAX_PENDING_MISSING_DEPS: usize = 128;
@@ -23,8 +21,7 @@ pub const MAX_PENDING_OPS_PER_TOPIC: usize = 2048;
 pub const MAX_PENDING_BYTES_PER_TOPIC: usize = 32 * 1024 * 1024;
 /// Rejected op ids a topic remembers, oldest dropped first.
 pub const MAX_REJECTED_PER_TOPIC: usize = 4096;
-/// Unacknowledged eviction records are bounded. Refuse overflow so a reset does
-/// not discard payloads while no other durable owner exists.
+#[doc = include_str!("contracts/eviction_limit.md")]
 pub const MAX_PENDING_EVICTIONS: usize = 1024;
 
 /// Reads of one coherent snapshot of a store. Every method sees the same commit,
@@ -160,9 +157,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {
         Ok(self.get_meta(id)?.as_ref().map(OpPosition::from))
     }
-    /// A dependency is complete only when both its operation and metadata exist.
-    /// Backends must check both from one snapshot so callers never traverse a
-    /// half-stored edge.
+    #[doc = include_str!("contracts/dep_resolvable.md")]
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
         Ok(self.get_op(id)?.is_some() && self.get_meta(id)?.is_some())
     }
@@ -224,13 +219,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// actively pulled instead of stranding its dependents forever.
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
-    /// Atomically remove every pending dependent of `dep_id`. Genesis resolution
-    /// uses this when the dependency cannot arrive; partial removal would strand
-    /// waiters and retain quota for impossible work.
+    #[doc = include_str!("contracts/purge_waiters.md")]
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize>;
-    /// Atomically remove an invalid pending subtree, or do nothing when its root
-    /// is gone. The returned count includes the root and preserves concurrent
-    /// admissions.
+    #[doc = include_str!("contracts/reject_subtree.md")]
     fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>>;
@@ -243,9 +234,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
         expected_genesis: Option<OpId>,
     ) -> Result<()>;
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>>;
-    /// Persist `ack` and clear satisfied obligations atomically. Read current
-    /// branch and membership in that operation; stale branches and removed peers
-    /// must not clear obligations.
+    #[doc = include_str!("contracts/apply_peer_ack.md")]
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize>;
     /// Apply acks in order as [`Storage::apply_peer_ack`] would, one result per ack, so one
     /// uncertifiable ack neither commits nor discards the rest. Backend failures use the outer
@@ -270,8 +259,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// every start of a transport gets an epoch no earlier start used.
     fn next_attempt_epoch(&self) -> Result<u64>;
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()>;
-    /// Fold `update` atomically into one peer status and return the result.
-    /// Concurrent updates must preserve counter increments and the newest state.
+    #[doc = include_str!("contracts/update_sync_status.md")]
     fn update_sync_status(
         &self,
         peer_id: &PeerId,
@@ -293,14 +281,10 @@ pub trait Storage: Clone + Send + Sync + 'static {
         expected_genesis: Option<OpId>,
     ) -> Result<usize>;
 
-    /// Atomically remove every topic record, index, clock, pending op, ack,
-    /// obligation, and status. Partial reset leaves stale frontier evidence and
-    /// prevents convergence.
+    #[doc = include_str!("contracts/reset_topic.md")]
     fn reset_topic(&self, topic_id: &TopicId) -> Result<usize>;
 
-    /// Verify `expected_topic_state`, reset the topic, and admit `batch` in one
-    /// durable operation. Genesis adoption then leaves either the old chain or
-    /// the complete winner, and stale resolvers cannot overwrite newer state.
+    #[doc = include_str!("contracts/reset_admit.md")]
     fn reset_topic_and_admit(
         &self,
         topic_id: &TopicId,
@@ -319,9 +303,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// only remaining copy of the payloads its reset removed.
     fn pending_evictions(&self) -> Result<Vec<TopicEviction>>;
 
-    /// Release `key` after the consumer durably owns its payloads. An absent key
-    /// is accepted because acknowledgement is idempotent and crash recovery
-    /// may repeat it.
+    #[doc = include_str!("contracts/clear_eviction.md")]
     fn clear_eviction(&self, key: &EvictionKey) -> Result<()>;
 
     /// Whether `peer_id` holds `op_id` on the branch that currently stores it. Required:
@@ -339,9 +321,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn staging_limits(&self) -> StagingLimits;
     /// Every provisional bootstrap namespace, read at one moment.
     fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>>;
-    /// Open `source`'s namespace for `topic_id`, empty at `genesis` when absent.
-    /// Existing namespaces remain unchanged; active or over-limit namespaces
-    /// return an admission or staging capacity error.
+    #[doc = include_str!("contracts/open_provisional.md")]
     fn open_provisional(
         &self,
         source: PeerId,
@@ -349,17 +329,13 @@ pub trait Storage: Clone + Send + Sync + 'static {
         genesis: OpId,
         now_ms: u64,
     ) -> Result<ProvisionalTopic>;
-    /// Return the namespace store for `provisional`, or `None` after its session
-    /// ends. Reads and writes recheck the session before effects and enforce the
-    /// namespace, total, and source byte limits.
+    #[doc = include_str!("contracts/provisional_store.md")]
     fn provisional_store(&self, provisional: &ProvisionalTopic) -> Result<Option<Self>>;
     /// Serialized op bytes this store holds, admitted and buffered.
     fn stored_bytes(&self) -> Result<u64>;
     /// Record a write to the namespace while its session is current.
     fn touch_provisional(&self, provisional: &ProvisionalTopic, now_ms: u64) -> Result<()>;
-    /// Activate `provisional` after claiming its topic and freezing `expected`.
-    /// Publication installs state, heads, clock, and `effects` atomically; an
-    /// interrupted activation remains hidden and resumes on the next call.
+    #[doc = include_str!("contracts/activate_provisional.md")]
     fn activate_provisional(
         &self,
         provisional: &ProvisionalTopic,
@@ -380,6 +356,7 @@ pub use staging::{
 pub(super) use staging::{StagingQuota, check_namespaces};
 
 mod evidence;
+#[cfg(test)]
 pub(crate) use evidence::MAX_RECENT_ATTEMPTS;
 pub(super) use evidence::{
     AckCommit, ack_commit, ack_covers, ack_reached_op, apply_status_update, merged_obligation,

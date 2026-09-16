@@ -1,0 +1,1 @@
+Atomically drop a permanently invalid pending `op_id` and every pending op transitively waiting on it, or nothing at all once `op_id` is no longer buffered, so a concurrent admission keeps its waiters. Required rather than defaulted for the same atomicity reason as above; the count returned includes `op_id`.
