@@ -243,6 +243,28 @@ impl Slice {
 /// generation needing each, and the frontier of a slice that ended empty.
 pub(super) type PlannedSlice = (PlannedPage, BTreeMap<ActorId, u64>, Option<Frontier>);
 
+#[derive(Default)]
+struct DependencyScan {
+    after: Option<OpId>,
+    needed: BTreeMap<ActorId, (u64, u64)>,
+    checked: Option<ActorId>,
+    revision: u64,
+    ancestry: Vec<Ancestor>,
+}
+
+struct Ancestor {
+    id: OpId,
+    actor: ActorId,
+    seq: u64,
+    cursor: DependencyCursor,
+    pending: Option<Dependency>,
+}
+
+struct Dependency {
+    id: OpId,
+    header: Option<OpHeader>,
+}
+
 /// How far one actor of a page plan got.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActorState {
@@ -258,6 +280,18 @@ enum ActorState {
 
 /// Retained traversal state, with a separate reservation for operation records.
 pub(super) struct Frontier {
+    pub(super) repair: Option<super::repair::Repair>,
+    pub(super) evictable: bool,
+    revision: u64,
+    offered: Vec<Offered>,
+    offer_positions: BTreeSet<ActorId>,
+    offer_missing: BTreeSet<OpId>,
+    offer_floor: Option<ActorClock>,
+    replay: usize,
+    pub(super) replaying: bool,
+    fresh: bool,
+    pending: VecDeque<HeadScan>,
+    updates: VecDeque<Update>,
     active: BinaryHeap<Reverse<RangeHead>>,
     selecting: Option<BinaryHeap<RangeHead>>,
     remainder: bool,
@@ -269,16 +303,235 @@ pub(super) struct Frontier {
     blocked: BTreeSet<OpId>,
     missing: BTreeSet<OpId>,
     positions: BTreeMap<ActorId, u64>,
-    checked: BTreeMap<OpId, OpId>,
-    records: super::records::Records,
+    checked: BTreeMap<OpId, DependencyScan>,
+    pub(super) records: super::records::Records,
+}
+
+#[derive(Clone, Copy)]
+struct HeadScan {
+    actor: ActorId,
+    after: u64,
+    limit: u64,
+    next: Option<(u64, OpId)>,
+}
+
+#[derive(Clone, Copy)]
+enum Update {
+    Wake {
+        actor: ActorId,
+        seq: u64,
+        index: usize,
+    },
+    Raise {
+        actor: ActorId,
+        limit: u64,
+        index: usize,
+        raised: Option<u64>,
+    },
+    Finish {
+        actor: ActorId,
+        raised: Option<u64>,
+        index: usize,
+    },
+    Stop(ActorId),
+}
+
+#[derive(Clone, Copy)]
+struct Offered {
+    id: OpId,
+    actor: ActorId,
+    seq: u64,
+    held: bool,
 }
 
 impl Frontier {
+    pub(super) fn new(
+        peer: &ActorClock,
+        scope: &ActorScope<'_>,
+        window: usize,
+        records: super::records::Records,
+    ) -> Self {
+        Self {
+            repair: None,
+            evictable: false,
+            revision: 0,
+            offered: Vec::new(),
+            offer_positions: BTreeSet::new(),
+            offer_missing: BTreeSet::new(),
+            offer_floor: None,
+            replay: 0,
+            replaying: false,
+            fresh: true,
+            pending: VecDeque::new(),
+            updates: VecDeque::new(),
+            active: BinaryHeap::new(),
+            selecting: (scope.informed() && scope.named.len() > window).then(BinaryHeap::new),
+            remainder: false,
+            deferred: ClockCursor::default(),
+            suspended: BTreeMap::new(),
+            resumable: VecDeque::new(),
+            states: BTreeMap::new(),
+            covered: peer.clone(),
+            blocked: BTreeSet::new(),
+            missing: BTreeSet::new(),
+            positions: BTreeMap::new(),
+            checked: BTreeMap::new(),
+            records,
+        }
+    }
+
+    pub(super) fn discover(&mut self, actor: ActorId, seq: u64) {
+        self.covered.set(actor, seq);
+        if let Some(floor) = &mut self.offer_floor {
+            floor.set(actor, seq);
+        }
+        self.positions.remove(&actor);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub(super) fn offer_count(&self) -> usize {
+        self.offered.len()
+    }
+
+    pub(super) fn scan_entries(&self) -> usize {
+        self.suspended.len().saturating_add(self.checked.len())
+    }
+
+    pub(super) fn offer_floor(&self) -> &ActorClock {
+        self.offer_floor.as_ref().unwrap_or(&self.covered)
+    }
+
+    pub(super) fn capture_offer(&mut self, page: &PlannedPage, floor: ActorClock) -> Result<()> {
+        let ops = &page.ops;
+        if self.replaying || ops.is_empty() {
+            return Ok(());
+        }
+        let required = self
+            .bytes()
+            .saturating_add(super::space::vector_bytes::<Offered>(ops.len()))
+            .saturating_add(super::space::tree_bytes::<ActorId, ()>(
+                page.positions.len(),
+            ))
+            .saturating_add(super::space::tree_bytes::<OpId, ()>(page.missing.len()));
+        if required > super::continuation::MAX_CONTINUATION_BYTES {
+            return Err(Error::SyncCapacity(
+                "offered page identifiers exceed retained workspace".into(),
+            ));
+        }
+        self.offered = ops
+            .iter()
+            .map(|op| Offered {
+                id: op.id,
+                actor: op.signed.body.actor_id,
+                seq: op.signed.body.actor_seq,
+                held: false,
+            })
+            .collect();
+        let mut proof = self.covered.clone();
+        let mut first = BTreeMap::<ActorId, u64>::new();
+        for op in ops {
+            let body = &op.signed.body;
+            first
+                .entry(body.actor_id)
+                .and_modify(|seq| *seq = (*seq).min(body.actor_seq))
+                .or_insert(body.actor_seq);
+        }
+        for (actor, seq) in first {
+            proof.set(actor, floor.get(&actor).max(seq.saturating_sub(1)));
+        }
+        self.offer_floor = Some(proof);
+        self.offer_positions = page.positions.clone();
+        self.offer_missing = page.missing.clone();
+        self.replay = 0;
+        Ok(())
+    }
+
+    pub(super) fn confirm_offer(
+        &mut self,
+        request: &super::SyncRequest,
+        held: Option<&ActorClock>,
+        full: bool,
+    ) {
+        if full || self.offered.is_empty() {
+            self.clear_offer();
+            return;
+        }
+        let mut named = self
+            .offered
+            .iter()
+            .map(|offer| (offer.actor, None::<u64>))
+            .collect::<BTreeMap<_, _>>();
+        for hint in &request.actor_range_hints {
+            if let Some(known) = named.get_mut(&hint.actor_id) {
+                *known =
+                    Some(known.map_or(hint.from_exclusive, |known| known.min(hint.from_exclusive)));
+            }
+        }
+        let mut first = None;
+        for (index, offer) in self.offered.iter_mut().enumerate() {
+            let prefix = named.get(&offer.actor).copied().flatten();
+            let confirmed = match held {
+                Some(clock) => {
+                    clock.get(&offer.actor) >= offer.seq
+                        && prefix.is_none_or(|prefix| prefix >= offer.seq)
+                }
+                None => prefix.map_or_else(
+                    || request.window.holds(&offer.actor),
+                    |prefix| prefix >= offer.seq,
+                ),
+            };
+            offer.held = confirmed && !request.wants.contains(&offer.id);
+            if !offer.held && first.is_none() {
+                first = Some(index);
+            }
+        }
+        if let Some(first) = first {
+            self.replay = first;
+            self.replaying = true;
+        } else {
+            self.clear_offer();
+        }
+    }
+
+    fn clear_offer(&mut self) {
+        self.offered = Vec::new();
+        self.offer_positions = BTreeSet::new();
+        self.offer_missing = BTreeSet::new();
+        self.offer_floor = None;
+        self.replay = 0;
+        self.replaying = false;
+    }
+
+    pub(super) fn advancing(&self) -> bool {
+        self.fresh
+            || self.replaying
+            || !self.updates.is_empty()
+            || !self.pending.is_empty()
+            || !self.active.is_empty()
+            || !self.resumable.is_empty()
+            || self.selecting.is_some()
+            || !self.deferred.is_empty()
+    }
+
+    pub(super) fn admit(&mut self, ops: &[Op]) {
+        for op in ops {
+            let body = &op.signed.body;
+            if self.covered.get(&body.actor_id).checked_add(1) == Some(body.actor_seq) {
+                self.covered.observe(body.actor_id, body.actor_seq);
+                self.revision = self.revision.wrapping_add(1);
+            }
+        }
+    }
+
     pub(super) fn confirm(&mut self, request: &super::SyncRequest, local: &ActorClock) {
         for hint in &request.actor_range_hints {
             let known = hint.from_exclusive.min(local.get(&hint.actor_id));
-            if known > 0 {
+            if self.positions.remove(&hint.actor_id).is_some() {
+                self.revision = self.revision.wrapping_add(1);
+            }
+            if known > self.covered.get(&hint.actor_id) {
                 self.covered.observe(hint.actor_id, known);
+                self.revision = self.revision.wrapping_add(1);
             }
         }
     }
@@ -299,7 +552,13 @@ impl Frontier {
             .values()
             .map(|waiting| vector_bytes::<(u64, RangeHead)>(waiting.capacity()))
             .sum::<usize>();
-        vector_bytes::<RangeHead>(self.active.capacity())
+        self.repair.as_ref().map_or(0, super::repair::Repair::bytes)
+            + vector_bytes::<Offered>(self.offered.capacity())
+            + tree_bytes::<ActorId, ()>(self.offer_positions.len())
+            + tree_bytes::<OpId, ()>(self.offer_missing.len())
+            + vector_bytes::<HeadScan>(self.pending.capacity())
+            + vector_bytes::<Update>(self.updates.capacity())
+            + vector_bytes::<RangeHead>(self.active.capacity())
             + self
                 .selecting
                 .as_ref()
@@ -313,7 +572,15 @@ impl Frontier {
             + tree_bytes::<ActorId, u64>(self.positions.len())
             + vector_bytes::<RangeHead>(self.resumable.capacity())
             + tree_bytes::<ActorId, ActorState>(self.states.len())
-            + tree_bytes::<OpId, OpId>(self.checked.len())
+            + tree_bytes::<OpId, DependencyScan>(self.checked.len())
+            + self
+                .checked
+                .values()
+                .map(|scan| {
+                    tree_bytes::<ActorId, (u64, u64)>(scan.needed.len())
+                        + vector_bytes::<Ancestor>(scan.ancestry.capacity())
+                })
+                .sum::<usize>()
             + 4096
     }
 }
@@ -365,7 +632,7 @@ struct Pager<'a> {
     /// Actors the request left unknown, with the lowest generation needing each.
     positions: BTreeMap<ActorId, u64>,
     more: bool,
-    checked: BTreeMap<OpId, OpId>,
+    checked: BTreeMap<OpId, DependencyScan>,
     records: super::records::Records,
 }
 
@@ -499,6 +766,18 @@ impl Pager<'_> {
         .then(|| {
             self.work.ended.fetch_add(1, Ordering::Relaxed);
             Frontier {
+                repair: None,
+                evictable: false,
+                revision: 0,
+                offered: Vec::new(),
+                offer_positions: BTreeSet::new(),
+                offer_missing: BTreeSet::new(),
+                offer_floor: None,
+                replay: 0,
+                replaying: false,
+                fresh: false,
+                pending: VecDeque::new(),
+                updates: VecDeque::new(),
                 active: self.active,
                 selecting: self.selecting,
                 remainder: self.remainder,
@@ -634,7 +913,7 @@ impl Pager<'_> {
     fn wait_for(&mut self, op: &Op) -> Result<Wait> {
         let mut unknown = false;
         let mut waits = None;
-        let after = self.checked.get(&op.id).copied();
+        let after = self.checked.get(&op.id).and_then(|scan| scan.after);
         let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
         for dep in op
             .signed
@@ -668,7 +947,7 @@ impl Pager<'_> {
             }
             if self.scope.holds_prefix(&dep_actor, dep_seq) {
                 self.covered.observe(dep_actor, dep_seq);
-                self.checked.insert(op.id, *dep);
+                self.checked.entry(op.id).or_default().after = Some(*dep);
                 continue;
             }
             // Omitted from the request is not held: the requester names it next.
@@ -682,7 +961,7 @@ impl Pager<'_> {
                 }
                 waits = Some(Wait::Position(dep_actor, dep_seq));
             } else if self.scope.informed() {
-                self.checked.insert(op.id, *dep);
+                self.checked.entry(op.id).or_default().after = Some(*dep);
             }
         }
         self.checked.remove(&op.id);
