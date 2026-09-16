@@ -1568,4 +1568,91 @@ impl<S: Storage> SyncEngine<S> {
         let slice = Slice::new(std::sync::Arc::clone(&self.work), self.page_visits, 0)?;
         self.resume_slice(read, topic_id, (local, goal, frontier), (scope, self.page_positions), budget, slice)
     }
+
+    pub(super) fn replay_page(
+        &self,
+        read: &dyn SnapshotRead,
+        topic: &TopicId,
+        frontier: &mut Frontier,
+        budget: PageBudget,
+        slice: &mut Slice,
+    ) -> Result<PlannedPage> {
+        slice.prepare(
+            frontier.offer_positions.len() + frontier.offer_missing.len(),
+            super::space::tree_bytes::<ActorId, u64>(frontier.offer_positions.len())
+                + super::space::tree_bytes::<OpId, ()>(frontier.offer_missing.len()),
+        )?;
+        let mut page = PlannedPage {
+            more: true,
+            missing: frontier.offer_missing.clone(),
+            positions: frontier.offer_positions.clone(),
+            ..PlannedPage::default()
+        };
+        let mut bytes = 0;
+        while let Some(offer) = frontier.offered.get(frontier.replay).copied() {
+            if page.ops.len() >= budget.ops || bytes >= budget.bytes {
+                break;
+            }
+            if offer.held {
+                if !slice.actor() {
+                    break;
+                }
+                if let Some(floor) = &mut frontier.offer_floor {
+                    floor.observe(offer.actor, offer.seq);
+                }
+                frontier.replay += 1;
+                continue;
+            }
+            if !frontier.records.contains(&offer.id) && !slice.read() {
+                break;
+            }
+            let record = match frontier.records.take_slice(read, &offer.id, slice) {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    if page.missing.len() >= MAX_PAGE_MISSING && !page.missing.contains(&offer.id) {
+                        return Err(Error::SyncCapacity(
+                            "offered page missing records exceed result capacity".into(),
+                        ));
+                    }
+                    page.missing.insert(offer.id);
+                    break;
+                }
+                Err(super::records::LoadError::Yield) => break,
+                Err(super::records::LoadError::Failed(error)) => return Err(error),
+            };
+            let body = &record.op.signed.body;
+            if record.op.id != offer.id
+                || body.actor_id != offer.actor
+                || body.actor_seq != offer.seq
+            {
+                return Err(Error::InvalidOpId);
+            }
+            if body.topic_id != *topic {
+                return Err(Error::TopicMismatch);
+            }
+            let size = postcard::experimental::serialized_size(&record.op)?;
+            if size > budget.bytes - bytes {
+                if page.ops.is_empty() {
+                    page.too_large = Some(offer.id);
+                }
+                frontier.records.keep(record);
+                break;
+            }
+            bytes += size;
+            page.ops.push(record.into_op());
+            frontier.replay += 1;
+        }
+        if frontier.replay == frontier.offered.len() {
+            frontier.clear_offer();
+        }
+        page.continued = frontier.replaying
+            && page.ops.is_empty()
+            && page.missing.is_empty()
+            && page.too_large.is_none();
+        frontier.evictable = !page.ops.is_empty();
+        if page.continued {
+            self.work.ended.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(page)
+    }
 }

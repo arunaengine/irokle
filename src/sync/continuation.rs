@@ -69,42 +69,100 @@ impl Continuation {
     }
 
     /// Resume only with the same branch/session and confirmed positions.
-    /// Without a full summary, require the original window and named positions.
+    /// Without a full summary, require the original window and confirmed named prefixes.
     fn resumes(
-        &self,
+        &mut self,
         view: &RequestView,
         request: &SyncRequest,
         summary: Option<&SyncSummary>,
     ) -> bool {
-        if self.genesis != view.genesis || self.epoch != view.epoch {
+        if self.genesis != view.genesis
+            || self.epoch != view.epoch
+            || self.peer.is_some() != summary.is_some()
+        {
             return false;
         }
-        if let Some(peer) = self.peer {
-            return summary.is_some_and(|summary| {
-                let (current, clock) = peer_scope(summary, view.genesis);
-                let empty = ActorClock::new();
+        let empty = ActorClock::new();
+        let floor = self.frontier.offer_floor();
+        let (confirmed, full, held) = if let Some(peer) = self.peer {
+            let Some(summary) = summary else {
+                return false;
+            };
+            let (current, clock) = peer_scope(summary, view.genesis);
+            let clock = clock.unwrap_or(&empty);
+            let confirms = |required: &ActorClock| {
                 peer == current
-                    && clock.unwrap_or(&empty).dominates(self.frontier.clock())
+                    && clock.dominates(required)
                     && request
                         .actor_range_hints
                         .iter()
-                        .all(|hint| hint.from_exclusive >= self.frontier.covered(&hint.actor_id))
-            });
+                        .all(|hint| hint.from_exclusive >= required.get(&hint.actor_id))
+            };
+            (
+                confirms(floor),
+                confirms(self.frontier.clock()),
+                Some(clock),
+            )
+        } else {
+            let named = named(request);
+            let confirms = |required: &ActorClock| {
+                self.named.iter().all(|(actor, from)| {
+                    named.get(actor).map_or_else(
+                        || self.window.holds(actor),
+                        |current| current >= from && *current >= required.get(actor),
+                    )
+                })
+            };
+            let compatible = self.window == request.window
+                && named.iter().all(|(actor, from)| {
+                    self.named
+                        .binary_search_by_key(actor, |(actor, _)| *actor)
+                        .is_ok()
+                        || self.frontier.covered(actor) == *from
+                        || (!self.window.holds(actor) && *from <= self.local.get(actor))
+                });
+            let full = confirms(self.frontier.clock())
+                && request
+                    .actor_range_hints
+                    .iter()
+                    .all(|hint| hint.from_exclusive >= self.frontier.covered(&hint.actor_id));
+            (compatible && confirms(floor), full, None)
+        };
+        if !confirmed
+            || !self
+                .frontier
+                .repair
+                .as_mut()
+                .is_none_or(|repair| repair.confirms(request))
+        {
+            return false;
         }
-        let named = named(request);
-        self.genesis == view.genesis
-            && self.epoch == view.epoch
-            && self.window == request.window
-            && self
-                .named
-                .iter()
-                .all(|(actor_id, from)| named.get(actor_id) == Some(from))
-            && named.iter().all(|(actor_id, from)| {
-                self.named
-                    .binary_search_by_key(actor_id, |(actor, _)| *actor)
-                    .is_ok()
-                    || self.frontier.covered(actor_id) == *from
-            })
+        if self.peer.is_none() {
+            let named = named(request);
+            for (actor, _) in &self.named {
+                if !named.contains_key(actor) && self.window.holds(actor) {
+                    self.frontier.discover(*actor, self.local.get(actor));
+                }
+            }
+            for hint in &request.actor_range_hints {
+                if !self.window.holds(&hint.actor_id)
+                    && self
+                        .named
+                        .binary_search_by_key(&hint.actor_id, |(actor, _)| *actor)
+                        .is_err()
+                {
+                    self.frontier.discover(hint.actor_id, hint.from_exclusive);
+                }
+            }
+        }
+        let full = full
+            && !self
+                .frontier
+                .repair
+                .as_ref()
+                .is_some_and(super::repair::Repair::offered);
+        self.frontier.confirm_offer(request, held, full);
+        true
     }
 
     /// A conservative estimate of the bytes this plan holds.
@@ -218,17 +276,16 @@ impl Continuations {
         request: &SyncRequest,
         summary: Option<&SyncSummary>,
     ) -> Option<Continuation> {
-        let kept = self.entries.remove(&key)?;
+        let mut kept = self.entries.remove(&key)?;
         if self.entries.is_empty() {
             self.entries = BTreeMap::new();
         }
         kept.resumes(view, request, summary).then_some(kept)
     }
 
-    /// Keep `continuation` for `key`, making room from plans idle too long.
-    /// Refused with a capacity error when it is too large or every place holds
-    /// a plan still in use, since an empty slice that cannot be kept would
-    /// repeat forever.
+    /// Idle plans expire; a data-producing plan may yield its slot to another goal.
+    /// Empty advancing prefixes stay protected, or retries could repeat forever.
+    /// Fair progress requires finite goals and service for admitted requests.
     pub(super) fn keep(
         &mut self,
         key: (PeerId, TopicId),
@@ -243,10 +300,20 @@ impl Continuations {
         self.entries
             .retain(|_, kept| kept.used.elapsed() < CONTINUATION_IDLE);
         if !self.entries.contains_key(&key) && self.entries.len() >= self.capacity {
-            return Err(Error::SyncCapacity(format!(
-                "all {} retained plan slots are occupied",
-                self.capacity
-            )));
+            let evictable = self
+                .entries
+                .iter()
+                .filter(|(_, kept)| kept.frontier.evictable)
+                .min_by_key(|(_, kept)| kept.used)
+                .map(|(key, _)| *key);
+            if let Some(evictable) = evictable {
+                self.entries.remove(&evictable);
+            } else {
+                return Err(Error::SyncCapacity(format!(
+                    "all {} plan slots protect unfinished slices; resume them or retry after a data page",
+                    self.capacity
+                )));
+            }
         }
         self.entries.insert(key, continuation);
         Ok(())
