@@ -17,6 +17,7 @@
   ],
   "required_roots": [
     ".",
+    ".github",
     ".github/workflows",
     "examples",
     "irokle-derive",
@@ -45,9 +46,10 @@
       "members": [
         "pending.rs",
         "provisional.rs",
-        "store.rs"
+        "store.rs",
+        "provisional.md"
       ],
-      "reason": "The three direct files are the grouped Fjall backend implementation.",
+      "reason": "The three backend implementation files and the lifecycle documentation form the grouped Fjall domain.",
       "source": "STYLE.md section 1 and assignment section 6"
     },
     {
@@ -58,6 +60,19 @@
         "staging.rs"
       ],
       "reason": "The three direct files form the Memory backend domain.",
+      "source": "STYLE.md section 1 and assignment section 6"
+    },
+    {
+      "path": "src/node",
+      "members": [
+        "bootstrap.rs",
+        "builder.rs",
+        "peers.rs",
+        "topic.rs",
+        "peer_selection.md",
+        "response_page.md"
+      ],
+      "reason": "Four node implementation children form the established facade family; two documentation assets preserve its public contracts.",
       "source": "STYLE.md section 1 and assignment section 6"
     }
   ],
@@ -152,6 +167,15 @@
       ],
       "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
       "source": "tests/fixtures/README.md"
+    },
+    {
+      "prefix": "tests/fixtures/contracts",
+      "rules": [
+        "content",
+        "layout"
+      ],
+      "reason": "Frozen reviewed-baseline operation, ACK, summary, request, page, receipt and configuration bytes with a provenance manifest.",
+      "source": "tests/fixtures/contracts/README.md"
     }
   ],
   "exceptions": [
@@ -322,6 +346,278 @@
       "kind": "function",
       "reason": "Existing public lifecycle API.",
       "source": "Reviewed public Rust contract at 6be58d6; public_method"
+    },
+    {
+      "path": "src/oplog/genesis.rs",
+      "rule": "name_terms",
+      "name": "create_topic_genesis_with_event",
+      "kind": "function",
+      "reason": "Preserve the existing public constructor or admission method for source compatibility.",
+      "source": "Public API at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/oplog/mod.rs",
+      "rule": "name_terms",
+      "name": "receive_ops_from_peer",
+      "kind": "function",
+      "reason": "Preserve the existing public constructor or admission method for source compatibility.",
+      "source": "Public API at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/oplog/mod.rs",
+      "rule": "name_terms",
+      "name": "receive_ops_from_peer_evicting",
+      "kind": "function",
+      "reason": "Preserve the existing public constructor or admission method for source compatibility.",
+      "source": "Public API at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/fjall/store.rs",
+      "rule": "name_terms",
+      "name": "open_with_persist_mode",
+      "kind": "function",
+      "reason": "Preserve the existing public constructor or admission method for source compatibility.",
+      "source": "Public API at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/fjall/store.rs",
+      "rule": "name_terms",
+      "name": "from_database_with_persist_mode",
+      "kind": "function",
+      "reason": "Preserve the existing public constructor or admission method for source compatibility.",
+      "source": "Public API at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/fjall/store.rs",
+      "rule": "name_terms",
+      "name": "reset_topic_and_admit",
+      "kind": "function",
+      "reason": "The public Storage trait and its implementations must retain the existing method spelling.",
+      "source": "Storage public trait at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/fjall/store.rs",
+      "rule": "name_terms",
+      "name": "clear_peer_sync_state",
+      "kind": "function",
+      "reason": "The public Storage trait and its implementations must retain the existing method spelling.",
+      "source": "Storage public trait at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/memory/mod.rs",
+      "rule": "name_terms",
+      "name": "clear_peer_sync_state",
+      "kind": "function",
+      "reason": "The public Storage trait and its implementations must retain the existing method spelling.",
+      "source": "Storage public trait at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/memory/mod.rs",
+      "rule": "name_terms",
+      "name": "reset_topic_and_admit",
+      "kind": "function",
+      "reason": "The public Storage trait and its implementations must retain the existing method spelling.",
+      "source": "Storage public trait at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_PENDING_OPS_TOTAL",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_PENDING_OPS_PER_SOURCE",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_PENDING_WAITERS_PER_DEP",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_PENDING_BYTES_TOTAL",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_PENDING_BYTES_PER_SOURCE",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_PENDING_MISSING_DEPS",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_PENDING_OPS_PER_TOPIC",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_PENDING_BYTES_PER_TOPIC",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_REJECTED_PER_TOPIC",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "clear_peer_sync_state",
+      "kind": "function",
+      "reason": "The public Storage trait and its implementations must retain the existing method spelling.",
+      "source": "Storage public trait at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "reset_topic_and_admit",
+      "kind": "function",
+      "reason": "The public Storage trait and its implementations must retain the existing method spelling.",
+      "source": "Storage public trait at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_STAGED_BYTES_PER_SESSION",
+      "kind": "binding",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_STAGED_BYTES_TOTAL",
+      "kind": "binding",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_STAGED_IDLE_MS",
+      "kind": "binding",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_STAGED_SESSIONS_PER_SOURCE",
+      "kind": "binding",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/staging.rs",
+      "rule": "name_terms",
+      "name": "MAX_STAGED_BYTES_TOTAL",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/staging.rs",
+      "rule": "name_terms",
+      "name": "MAX_STAGED_BYTES_PER_SESSION",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/staging.rs",
+      "rule": "name_terms",
+      "name": "MAX_STAGED_SESSIONS_PER_SOURCE",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/storage/staging.rs",
+      "rule": "name_terms",
+      "name": "MAX_STAGED_IDLE_MS",
+      "kind": "constant",
+      "reason": "Preserve the published storage limit constant and its public re-export; internal imports use shorter aliases.",
+      "source": "Public storage constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/tests/support.rs",
+      "rule": "name_terms",
+      "name": "clear_peer_sync_state",
+      "kind": "function",
+      "reason": "StaleReadStorage must implement the inherited Storage method with its exact trait name.",
+      "source": "Storage trait implementation in test support"
+    },
+    {
+      "path": "src/tests/support.rs",
+      "rule": "name_terms",
+      "name": "reset_topic_and_admit",
+      "kind": "function",
+      "reason": "StaleReadStorage must implement the inherited Storage method with its exact trait name.",
+      "source": "Storage trait implementation in test support"
+    },
+    {
+      "path": "src/tests/bench.rs",
+      "rule": "name_terms",
+      "name": "clear_peer_sync_state",
+      "kind": "function",
+      "reason": "The benchmark storage adapter implements the public Storage trait with its required method names.",
+      "source": "Storage public trait at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/tests/bench.rs",
+      "rule": "name_terms",
+      "name": "reset_topic_and_admit",
+      "kind": "function",
+      "reason": "The benchmark storage adapter implements the public Storage trait with its required method names.",
+      "source": "Storage public trait at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/sync/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_ACTOR_RANGE_HINT_SPAN",
+      "kind": "constant",
+      "reason": "Preserve the existing public sync limit name; crate-private aliases provide short internal names.",
+      "source": "Public sync constants at reviewed baseline 6be58d6"
+    },
+    {
+      "path": "src/sync/mod.rs",
+      "rule": "name_terms",
+      "name": "MAX_ACTOR_FILTER_BYTES",
+      "kind": "constant",
+      "reason": "Preserve the existing public sync limit name; crate-private aliases provide short internal names.",
+      "source": "Public sync constants at reviewed baseline 6be58d6"
     }
   ],
   "macro_inputs": {
@@ -337,7 +633,9 @@
     "src/iroh/session_tests.rs",
     "src/iroh/exchange_tests.rs",
     "src/storage/pressure_tests.rs",
-    "src/sync/preparation_tests.rs"
+    "src/sync/preparation_tests.rs",
+    "src/sync/page_tests.rs",
+    "src/sync/repair_tests.rs"
   ],
   "mandatory_notices": [
     "// SPDX-License-Identifier: MIT OR Apache-2.0"
