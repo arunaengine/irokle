@@ -232,7 +232,10 @@ impl SyncSession {
         };
         // Promotion supersedes the staging this stream reported before.
         self.receipts.remove(&ack.topic_id);
-        if let Some(earlier) = self.replies.remove(&ack.topic_id) {
+        if let Some(earlier) = self.replies.remove(&ack.topic_id)
+            && earlier.genesis == ack.genesis
+            && earlier.peer_id == ack.peer_id
+        {
             ack.accepted.extend(earlier.accepted);
             ack.sign(net.node.signer()).map_err(invalid_data)?;
         }
@@ -456,3 +459,7 @@ impl SyncSession {
         Ok(responses)
     }
 }
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;
