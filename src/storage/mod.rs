@@ -3,10 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
-
 use crate::crypto::canonical_bytes;
-use crate::topic::ReplicationPolicy;
 use crate::{
     ActorClock, ActorId, EvictionKey, Op, OpId, PeerId, Result, TopicEviction, TopicId, TopicInfo,
 };

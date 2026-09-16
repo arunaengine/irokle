@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{ActorClock, OpId, PeerId, Result, TopicId};
+use super::{OpPosition, TopicState};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerAck {
@@ -147,8 +148,6 @@ pub struct SyncStatusUpdate {
     /// reused across restarts.
     pub attempt: Option<(u64, u64)>,
 }
-
-use super::{OpPosition, TopicState};
 
 pub(crate) fn ack_covers(
     ack: Option<&PeerAck>,

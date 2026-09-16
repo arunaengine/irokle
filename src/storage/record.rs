@@ -6,14 +6,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::topic::ReplicationPolicy;
-use crate::{ActorClock, ActorId, Op, OpId, PeerId, TopicId};
+use crate::{ActorClock, ActorId, Op, OpId, PeerId, Result, TopicId};
 use super::{
     MAX_PENDING_OPS_TOTAL, MAX_PENDING_BYTES_PER_TOPIC,
     MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL, MAX_PENDING_MISSING_DEPS,
     MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_PER_TOPIC, MAX_PENDING_WAITERS_PER_DEP,
     MAX_REJECTED_PER_TOPIC, PeerAck, SyncObligation,
 };
-use crate::Result;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpMeta {
