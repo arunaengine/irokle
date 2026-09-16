@@ -241,10 +241,9 @@ impl SyncSession {
         Ok(())
     }
 
-    /// Apply the stream's acks independently, then reply: every control first,
-    /// then one bounded page per request, sharing what is left of the stream
-    /// budget among the requests still to serve. Pages hold at most `granted`
-    /// bytes; the bytes they hold are returned with the reply.
+    /// Apply ACKs independently, then share the remaining stream budget among requests.
+    /// Complete page controls precede data allocation, preserving every requirement.
+    /// Return the replies and the pages' retained-byte bound.
     pub(super) fn finish<S: Storage>(
         &mut self,
         net: &SharedNet<S>,
@@ -276,13 +275,16 @@ impl SyncSession {
         let Some(peer_id) = self.remote_peer_id else {
             return Ok((responses, 0));
         };
-        let page_len = crate::net::framed_message_len(&SyncMessage::Page(crate::sync::SyncPage {
+        let empty_page = crate::sync::SyncPage {
             topic_id: crate::TopicId::default(),
             more: false,
             missing: BTreeSet::new(),
             positions: BTreeSet::new(),
             continued: false,
-        }))?;
+        };
+        let empty_len =
+            postcard::experimental::serialized_size(&empty_page).map_err(invalid_data)?;
+        let page_len = crate::net::framed_message_len(&SyncMessage::Page(empty_page))?;
         let mut bytes = requests.len() * page_len;
         for response in &responses {
             bytes += crate::net::framed_message_len(response)?;
@@ -318,32 +320,53 @@ impl SyncSession {
                 budget.bytes = budget
                     .bytes
                     .min(grant_left.saturating_sub(ops_bytes) / super::budget::DECODED_FACTOR);
-                let plan =
-                    |planner: &crate::sync::SyncEngine<S>| match self.summaries.get(&topic_id) {
+                let plan = |planner: &crate::sync::SyncEngine<S>| {
+                    let mut page = match self.summaries.get(&topic_id) {
                         Some(summary) => planner.response_with(peer_id, &request, budget, summary),
                         None => planner.response_page(peer_id, &request, budget),
+                    }?;
+                    let result = crate::sync::SyncPage {
+                        topic_id,
+                        more: page.more,
+                        missing: std::mem::take(&mut page.missing),
+                        positions: std::mem::take(&mut page.positions),
+                        continued: page.continued,
                     };
+                    // The Page variant and frame prefix are fixed; only its body grows.
+                    let extra = postcard::experimental::serialized_size(&result)? - empty_len;
+                    if extra > share_bytes {
+                        planner.release_plan(peer_id, topic_id);
+                        // Protocol 5 names the failed stage, so the remote cannot identify capacity.
+                        return Err(crate::Error::SyncCapacity(
+                            "complete page control exceeds its stream share; reduce the topic batch".into(),
+                        ));
+                    }
+                    Ok((page, result, extra))
+                };
                 let planned = if served {
                     net.goals
                         .with_plan((peer_id, topic_id), net.node.sync_engine(), plan)
                 } else {
                     plan(net.node.sync_engine())
                 };
-                let mut page = match planned {
+                let (page, mut result, extra) = match planned {
                     Ok(page) => page,
                     Err(error) => {
                         tracing::warn!(%topic_id, %error, "failing one sync request");
-                        responses.push(SyncMessage::Failure(crate::sync::SyncFailure {
+                        let failure = SyncMessage::Failure(crate::sync::SyncFailure {
                             topic_id,
                             code: crate::sync::SyncFailureCode::Request,
-                        }));
+                        });
+                        let size = crate::net::framed_message_len(&failure)?;
+                        held = held.saturating_add(ByteBudget::page_bound(size, 0));
+                        responses.push(failure);
                         continue;
                     }
                 };
                 #[cfg(test)]
                 net.node.storage().sync_boundary(
                     topic_id,
-                    if page.continued {
+                    if result.continued {
                         "continuation"
                     } else if page.ops.is_empty() {
                         "positions"
@@ -351,24 +374,32 @@ impl SyncSession {
                         "plan"
                     },
                 );
-                if served && page.continued && page.positions.is_empty() {
+                if served
+                    && result.continued
+                    && result.positions.is_empty()
+                    && result.missing.is_empty()
+                {
                     self.requests.insert(topic_id, request);
                     self.requests.extend(pending);
                     self.requests.extend(deferred);
                     return Ok((responses, held));
                 }
                 if served {
-                    page.continued = false;
+                    result.continued = false;
                 }
-                let data =
-                    crate::net::sync_data_page(topic_id, page.ops, share_messages, share_bytes)?;
-                let more = page.more || data.cut;
+                let data = crate::net::sync_data_page(
+                    topic_id,
+                    page.ops,
+                    share_messages,
+                    share_bytes - extra,
+                )?;
+                result.more |= data.cut;
                 if !pass
                     && data.messages.is_empty()
-                    && more
-                    && page.missing.is_empty()
-                    && page.positions.is_empty()
-                    && !page.continued
+                    && result.more
+                    && result.missing.is_empty()
+                    && result.positions.is_empty()
+                    && !result.continued
                 {
                     deferred.push((topic_id, request));
                     continue;
@@ -381,24 +412,6 @@ impl SyncSession {
                 });
                 held = held.saturating_add(ByteBudget::page_bound(data.bytes, ops));
                 responses.extend(data.messages);
-                // Missing ids are advisory: they take only bytes no share needs.
-                // Positions go last, since the next request depends on them.
-                let mut result = crate::sync::SyncPage {
-                    topic_id,
-                    more,
-                    missing: page.missing,
-                    positions: page.positions,
-                    continued: page.continued,
-                };
-                let mut extra =
-                    crate::net::framed_message_len(&SyncMessage::Page(result.clone()))? - page_len;
-                while extra > limits.bytes - bytes {
-                    if result.missing.pop_last().is_none() {
-                        result.positions.pop_last();
-                    }
-                    extra = crate::net::framed_message_len(&SyncMessage::Page(result.clone()))?
-                        - page_len;
-                }
                 bytes += extra;
                 held = held.saturating_add(ByteBudget::page_bound(page_len + extra, 0));
                 responses.push(SyncMessage::Page(result));
