@@ -1,7 +1,12 @@
 //! Reservations for records that can exist independently of operations.
 
-use super::budget::NodePlan;
-use super::*;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use super::budget::{Charge, NodePlan};
+use super::{MemoryDomain, MemoryInner, ObligationKind};
+use crate::storage::{ObligationTarget, PeerAck, SyncObligation, SyncPeerStatus};
+use crate::{ActorClock, EvictionKey, PeerId, Result, TopicId};
 
 pub(super) fn obligation_bytes(obligation: &SyncObligation) -> u64 {
     4096 + match &obligation.target {

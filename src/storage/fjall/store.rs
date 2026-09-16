@@ -10,9 +10,9 @@ use crate::{
     TopicInfo,
 };
 
-use super::fjall_provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
-use super::pressure::{Pressure, Transaction};
-use super::{
+use super::provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
+use super::super::pressure::{Pressure, Transaction};
+use super::super::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
     ObligationTarget, OpMeta, OpPosition, PeerAck, ProvisionalTopic, SnapshotRead, StagingLimits,
     Storage, StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState,
@@ -131,7 +131,7 @@ struct LegacyPeerAck {
 struct LegacyPeerStatus {
     peer_id: PeerId,
     topic_id: TopicId,
-    state: super::SyncPeerState,
+    state: super::super::SyncPeerState,
     pending_obligations: usize,
     failed_attempts: u64,
     successful_attempts: u64,
@@ -208,7 +208,7 @@ impl FjallStorage {
     /// Install pressure admission before creating or migrating Irokle records.
     pub fn open_with_pressure(
         path: impl AsRef<Path>,
-        pressure: super::StoragePressure,
+        pressure: super::super::StoragePressure,
     ) -> Result<Self> {
         let db = fjall::OptimisticTxDatabase::builder(path).open()?;
         Self::from_database_policy(db, fjall::PersistMode::SyncAll, Some(pressure))
@@ -217,7 +217,7 @@ impl FjallStorage {
     /// Use caller-managed database allocation with pressure admission during migration.
     pub fn from_database_pressure(
         db: fjall::OptimisticTxDatabase,
-        pressure: super::StoragePressure,
+        pressure: super::super::StoragePressure,
     ) -> Result<Self> {
         Self::from_database_policy(db, fjall::PersistMode::SyncAll, Some(pressure))
     }
@@ -225,7 +225,7 @@ impl FjallStorage {
     fn from_database_policy(
         db: fjall::OptimisticTxDatabase,
         persist_mode: fjall::PersistMode,
-        policy: Option<super::StoragePressure>,
+        policy: Option<super::super::StoragePressure>,
     ) -> Result<Self> {
         let records = db.keyspace("records", fjall::KeyspaceCreateOptions::default)?;
         let pressure = Pressure::shared(records.path())?;
@@ -635,7 +635,7 @@ impl FjallStorage {
     /// Charge every slot a schema 6 store left clearing with the bytes its
     /// keyspace still counts, which schema 6 no longer charged anywhere.
     fn tx_charge_clearing(&self, tx: &mut Transaction) -> Result<()> {
-        use super::fjall_provisional::{ClearingCharge, SLOT, SlotRecord, clearing_key};
+        use super::provisional::{ClearingCharge, SLOT, SlotRecord, clearing_key};
         let mut clearing = Vec::new();
         for item in fjall::Readable::prefix(tx, &self.records, SLOT) {
             let (key, value) = item.into_inner()?;
@@ -756,10 +756,10 @@ impl FjallStorage {
             })
         } else {
             let mut slots = Vec::new();
-            for item in fjall::Readable::prefix(tx, &self.records, super::fjall_provisional::SLOT) {
+            for item in fjall::Readable::prefix(tx, &self.records, super::provisional::SLOT) {
                 let key = item.key()?;
                 let slot = key
-                    .get(super::fjall_provisional::SLOT.len()..)
+                    .get(super::provisional::SLOT.len()..)
                     .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
                     .map(u32::from_be_bytes)
                     .ok_or_else(|| Error::Storage("corrupt fjall bootstrap slot key".into()))?;
@@ -808,13 +808,13 @@ impl FjallStorage {
     }
 
     /// Set one shared policy for every facade of this database while writes are idle.
-    pub fn with_storage_pressure(self, policy: super::StoragePressure) -> Result<Self> {
+    pub fn with_storage_pressure(self, policy: super::super::StoragePressure) -> Result<Self> {
         self.pressure.configure(policy)?;
         Ok(self)
     }
 
     /// Reservations and backend measurements, including hidden copies and journal data.
-    pub fn storage_usage(&self) -> Result<super::StorageUsage> {
+    pub fn storage_usage(&self) -> Result<super::super::StorageUsage> {
         let mut usage = self.pressure.usage()?;
         usage.database_bytes = self.db.inner().disk_space()?;
         usage.journal_bytes = self.db.inner().journal_disk_space()?;
@@ -2512,16 +2512,16 @@ struct HeaderPrefix {
     actor_prev: Option<OpId>,
 }
 
-fn decode_header(bytes: &[u8]) -> Result<super::OpHeader> {
+fn decode_header(bytes: &[u8]) -> Result<super::super::OpHeader> {
     Ok(header_tail(bytes)?.0)
 }
 
-fn header_tail(bytes: &[u8]) -> Result<(super::OpHeader, &[u8])> {
+fn header_tail(bytes: &[u8]) -> Result<(super::super::OpHeader, &[u8])> {
     let (prefix, rest): (HeaderPrefix, _) = postcard::take_from_bytes(bytes)?;
     let rest = skip_ids(rest)?;
     let (generation, rest): (u64, _) = postcard::take_from_bytes(rest)?;
     Ok((
-        super::OpHeader {
+        super::super::OpHeader {
             topic_id: prefix.topic_id,
             actor_id: prefix.actor_id,
             actor_seq: prefix.actor_seq,
@@ -2654,7 +2654,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
         let op: Op = postcard::from_bytes(&bytes)?;
         Ok(self.shown(&op.signed.body.topic_id)?.then_some(op))
     }
-    fn get_observation(&self, id: &OpId) -> Result<Option<(super::OpHeader, ActorClock)>> {
+    fn get_observation(&self, id: &OpId) -> Result<Option<(super::super::OpHeader, ActorClock)>> {
         self.store.counters.count_meta();
         let Some(bytes) = fjall::Readable::get(
             &self.tx,
@@ -2675,7 +2675,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
         Ok(Some((header, clock)))
     }
 
-    fn get_header(&self, id: &OpId) -> Result<Option<super::OpHeader>> {
+    fn get_header(&self, id: &OpId) -> Result<Option<super::super::OpHeader>> {
         self.store.counters.count_meta();
         let header = fjall::Readable::get(
             &self.tx,
@@ -2695,7 +2695,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
         topic_id: &TopicId,
         peer_id: &PeerId,
         actors: &BTreeSet<ActorId>,
-    ) -> Result<Option<super::RequestView>> {
+    ) -> Result<Option<super::super::RequestView>> {
         let state: Option<TopicState> = FjallStorage::tx_get(
             &self.tx,
             &self.store.records,
@@ -2719,7 +2719,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
         .transpose()?
         .unwrap_or_default();
         self.counted.set(Some((*topic_id, count)));
-        Ok(Some(super::RequestView {
+        Ok(Some(super::super::RequestView {
             genesis: state.genesis,
             epoch,
             member: state.members.contains(peer_id),
@@ -2915,7 +2915,7 @@ mod tests {
             assert!(clock_tail(&tail[..tail.len() - 1]).is_err());
             assert_eq!(
                 decode_header(&bytes).unwrap(),
-                super::super::OpHeader {
+                crate::storage::OpHeader {
                     topic_id: meta.topic_id,
                     actor_id: meta.actor_id,
                     actor_seq: meta.actor_seq,

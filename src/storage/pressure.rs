@@ -405,4 +405,5 @@ impl fjall::Readable for Transaction {
 }
 
 #[cfg(test)]
+#[path = "pressure_tests.rs"]
 mod tests;

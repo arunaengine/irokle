@@ -20,13 +20,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ActorClock, Error, OpId, PeerId, Result, TopicId};
 
-use super::fjall::{FjallStorage, Hook};
-use super::{
+use super::store::{FjallStorage, Hook};
+use super::super::{
     AdmissionEffects, PeerAck, ProvisionalTopic, StagingLimits, StagingQuota, TopicState,
     ack_covers, check_namespaces,
 };
 
-type Tx = super::pressure::Transaction;
+type Tx = super::super::pressure::Transaction;
 type Records = fjall::OptimisticTxKeyspace;
 
 /// Namespace record, `bn<source><topic>`. No other key begins with `b`.

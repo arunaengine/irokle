@@ -836,10 +836,6 @@ pub use memory::{MemoryDomain, MemoryLimits, MemoryStorage, MemoryUsage};
 #[cfg(feature = "fjall")]
 mod fjall;
 #[cfg(feature = "fjall")]
-mod fjall_pending;
-#[cfg(feature = "fjall")]
-mod fjall_provisional;
-#[cfg(feature = "fjall")]
 mod pressure;
 #[cfg(feature = "fjall")]
 pub use fjall::FjallStorage;

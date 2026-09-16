@@ -13,7 +13,7 @@ use std::sync::{Arc, Weak};
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "fjall")]
-#[path = "clock/scan.rs"]
+#[path = "clock_scan.rs"]
 pub(crate) mod scan;
 
 /// Positions per actor. Clones share structure: entries live in a persistent

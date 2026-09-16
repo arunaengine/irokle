@@ -6,13 +6,13 @@ use std::ops::Bound;
 
 use crate::{Error, Op, OpId, PeerId, Result, TopicId};
 
-use super::fjall::FjallStorage;
-use super::{
+use super::store::FjallStorage;
+use super::super::{
     MAX_PENDING_MISSING_DEPS, MAX_PENDING_WAITERS_PER_DEP, MAX_REJECTED_PER_TOPIC, OpMeta,
     PendingRecord, PendingUsage, check_pending_quota, pending_op_bytes,
 };
 
-type Tx = super::pressure::Transaction;
+type Tx = super::super::pressure::Transaction;
 type Records = fjall::OptimisticTxKeyspace;
 
 /// Payload of a buffered op, `pp<op>`.
@@ -102,7 +102,7 @@ impl FjallStorage {
         Ok(count)
     }
 
-    /// Buffer `op`, see [`super::Storage::put_pending_op`].
+    /// Buffer `op`, see [`super::super::Storage::put_pending_op`].
     pub(super) fn tx_put_pending(
         tx: &mut Tx,
         records: &Records,
