@@ -324,26 +324,78 @@ fn unknown_want_named() {
 
 /// A summary naming more unresolvable heads than one request may carry yields
 /// a request the responder accepts, instead of one it refuses on every attempt.
-#[test]
-fn wants_fit_request() {
+fn assert_wants_fit<S: Storage>(storage: S) {
     let reader_id = Ed25519Signer::from_bytes(&[250; 32]).peer_id();
-    let source_log = Oplog::new();
-    let (genesis, _) = independent_chains(&source_log, reader_id, &[3]);
+    let (genesis, chains) = independent_chains(&Oplog::new(), reader_id, &[3]);
+    let source_log = Oplog::with_storage(storage);
+    source_log.receive_ops(vec![genesis.clone()]).unwrap();
+    source_log.receive_ops(chains[0].clone()).unwrap();
     let topic_id = genesis.signed.body.topic_id;
     let owner = Ed25519Signer::from_bytes(&[244; 32]).peer_id();
-    let source = SyncEngine::new(source_log, owner);
-    let reader = Oplog::new();
-    reader.receive_ops(vec![genesis.clone()]).unwrap();
-    let reader_engine = SyncEngine::new(reader, reader_id);
-    let mut summary: SyncSummary = source.summary(topic_id).unwrap();
-    summary.heads = (0..70_000_u32)
-        .map(|index| OpId::hash(index.to_le_bytes()))
-        .collect();
-    let request = reader_engine.plan_request(owner, &summary).unwrap();
-    assert!(request.wants.len() + request.actor_range_hints.len() <= 65_536);
-    source
-        .response_page(reader_id, &request, PageBudget::from_credit(request.credit))
-        .expect("a request within the item limit is served");
+    for informed in [false, true] {
+        let source = SyncEngine::new(source_log.clone(), owner);
+        let reader = Oplog::new();
+        reader.receive_ops(vec![genesis.clone()]).unwrap();
+        let reader_engine = SyncEngine::new(reader.clone(), reader_id);
+        let mut summary: SyncSummary = source.summary(topic_id).unwrap();
+        summary.heads = (0..70_000_u32)
+            .map(|index| OpId::hash(index.to_le_bytes()))
+            .collect();
+        let request = reader_engine.plan_request(owner, &summary).unwrap();
+        assert!(request.wants.len() + request.actor_range_hints.len() <= 65_536);
+        assert!(!request.wants.is_empty() && request.wants.len() < summary.heads.len());
+        let mut oversized = request.clone();
+        oversized.wants = summary
+            .heads
+            .iter()
+            .take(65_536 - request.actor_range_hints.len())
+            .copied()
+            .collect();
+        let budget = PageBudget::from_credit(request.credit);
+        let held = reader_engine.summary(topic_id).unwrap();
+        let refused = if informed {
+            source.response_with(reader_id, &oversized, budget, &held)
+        } else {
+            source.response_page(reader_id, &oversized, budget)
+        };
+        assert!(matches!(refused, Err(Error::SyncCapacity(_))));
+        let mut missing = BTreeSet::new();
+        let mut received = BTreeSet::new();
+        let mut finished = false;
+        for _ in 0..request.wants.len().div_ceil(sync::MAX_PAGE_MISSING) + 2 {
+            let page = if informed {
+                source.response_with(reader_id, &request, budget, &held)
+            } else {
+                source.response_page(reader_id, &request, budget)
+            }
+            .expect("a generated request is served within the workspace limit");
+            missing.extend(page.missing);
+            received.extend(page.ops.iter().map(|op| op.id));
+            reader.receive_ops(page.ops).unwrap();
+            if !page.more {
+                finished = true;
+                break;
+            }
+        }
+        assert!(
+            finished,
+            "missing roots must not starve independent forward data"
+        );
+        assert_eq!(missing, request.wants);
+        assert_eq!(received, chains[0].iter().map(|op| op.id).collect());
+    }
+}
+
+#[test]
+fn wants_fit_request() {
+    assert_wants_fit(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_wants_fit() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_wants_fit(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// A request accepted on one genesis is refused as stale once a reset replaced

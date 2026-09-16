@@ -507,18 +507,31 @@ impl<S: Storage> SyncEngine<S> {
                 }
             }
         }
-        // A request past the item limit is refused whole, so the wants are cut
-        // to what one request may carry beside the positions a page asked for
-        // and one hint for an actor behind; the rest follow once these resolve.
+        // Leave room for repair state, needed positions and one forward hint.
+        // Unselected roots remain unresolved and follow once this window resolves.
         let behind = remote
             .actor_clock
             .iter()
             .any(|(actor_id, seq)| *seq > view.clock.get(actor_id));
         let reserved = if behind { 1 + knowledge.positions() } else { 0 };
-        let need = need
-            .into_iter()
-            .take(self.request_items.saturating_sub(reserved))
-            .collect::<BTreeSet<_>>();
+        let limit = self
+            .request_items
+            .saturating_sub(reserved)
+            .min(repair::Repair::root_limit());
+        let need = if need.len() > limit {
+            // Known ancestors must precede descendants across repair windows.
+            let mut ordered = BTreeSet::new();
+            for id in need {
+                let generation = read.get_header(&id)?.map(|header| header.generation);
+                ordered.insert((generation.is_none(), generation, id));
+                if ordered.len() > limit {
+                    ordered.pop_last();
+                }
+            }
+            ordered.into_iter().map(|(_, _, id)| id).collect()
+        } else {
+            need
+        };
         let items = self.request_items - need.len();
         let (actor_range_hints, window) =
             request_ranges(&view.clock, &remote.actor_clock, items, knowledge);

@@ -50,6 +50,26 @@ pub(super) struct RepairPage {
 }
 
 impl Repair {
+    pub(super) fn root_limit() -> usize {
+        // Leave a quarter of traversal workspace for independent forward progress.
+        let limit = super::continuation::MAX_CONTINUATION_BYTES * 3 / 4;
+        let mut low = 0;
+        let mut high = super::MAX_REQUEST_ITEMS;
+        while low < high {
+            let roots = low + (high - low).div_ceil(2);
+            let bytes = 4 * tree_bytes::<OpId, ()>(roots)
+                + tree_bytes::<(u64, OpId), ()>(roots)
+                + tree_bytes::<OpId, Scan>(roots)
+                + tree_bytes::<OpId, ()>(roots.min(MAX_PAGE_MISSING));
+            if bytes <= limit {
+                low = roots;
+            } else {
+                high = roots - 1;
+            }
+        }
+        low
+    }
+
     pub(super) fn new(wants: &BTreeSet<OpId>, slice: &mut Slice) -> Result<Self> {
         // Input copying is admission work bounded by MAX_REQUEST_ITEMS, independent of reads.
         slice.reserve(
