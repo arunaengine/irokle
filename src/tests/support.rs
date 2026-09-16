@@ -436,6 +436,14 @@ impl<S: Storage> crate::storage::SnapshotRead for StaleSnapshot<'_, S> {
         self.hooks.gate_read(GatePoint::Meta(*id));
         meta
     }
+    fn dependency_ids(
+        &self,
+        id: &OpId,
+        cursor: crate::storage::DependencyCursor,
+        limit: usize,
+    ) -> Result<Option<Vec<OpId>>, Error> {
+        self.read.dependency_ids(id, cursor, limit)
+    }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool, Error> {
         self.read.dep_resolvable(id)
     }

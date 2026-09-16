@@ -583,3 +583,147 @@ async fn fjall_push_excluded() {
     )
     .await;
 }
+
+fn bounded_dependencies<S: Storage>(storage: S, counts: impl Fn(&S) -> crate::CounterSnapshot) {
+    use crate::storage::DependencyCursor;
+    let source = super::progress::reverse_chain(storage.clone(), 128);
+    let expected = storage.list_op_ids(&source.topic_id).unwrap();
+    let signer = Ed25519Signer::from_bytes(&[230; 32]);
+    let joined = Op::sign(
+        OpBody {
+            topic_id: source.topic_id,
+            author: signer.peer_id(),
+            actor_id: actor_id_for(source.topic_id, signer.peer_id()),
+            actor_seq: 2,
+            actor_prev: Some(source.genesis.id),
+            deps: expected.clone(),
+            generation: 129,
+            payload: TopicPayload::Event(
+                EventEnvelope::encode_event(&Note {
+                    text: "wide".into(),
+                })
+                .unwrap(),
+            ),
+        },
+        &signer,
+    )
+    .unwrap();
+    joined.signed.verify().unwrap();
+    source.log.receive_op(joined.clone()).unwrap();
+    let before = counts(&storage);
+    let mut cursor = DependencyCursor::default();
+    let mut found = Vec::new();
+    let mut reads = 0;
+    loop {
+        let page = storage
+            .read_snapshot(|read| read.dependency_ids(&joined.id, cursor, 3))
+            .unwrap()
+            .unwrap();
+        reads += 1;
+        let after = counts(&storage);
+        assert_eq!(after.meta_reads - before.meta_reads, reads);
+        assert_eq!(
+            after.op_reads, before.op_reads,
+            "dependency reads must not decode payloads"
+        );
+        assert!(page.len() <= 3 && page.capacity() <= 3);
+        if page.is_empty() {
+            break;
+        }
+        assert!(
+            page.iter()
+                .all(|id| cursor.after.is_none_or(|previous| previous < *id))
+        );
+        cursor.offset += page.len();
+        cursor.after = page.last().copied();
+        found.extend(page);
+    }
+    assert_eq!(found, expected.into_iter().collect::<Vec<_>>());
+    assert_eq!(cursor.offset, 129);
+    storage
+        .read_snapshot(|read| {
+            assert!(
+                read.dependency_ids(&source.genesis.id, DependencyCursor::default(), 3)?
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                read.dependency_ids(
+                    &OpId::hash(b"unknown dependency root"),
+                    DependencyCursor::default(),
+                    3
+                )?
+                .is_none()
+            );
+            assert!(matches!(
+                read.dependency_ids(&joined.id, cursor, 0),
+                Err(Error::SyncCapacity(_))
+            ));
+            assert!(
+                read.dependency_ids(
+                    &joined.id,
+                    DependencyCursor {
+                        offset: usize::MAX,
+                        after: cursor.after
+                    },
+                    3
+                )
+                .is_err()
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn memory_dependency_slices() {
+    bounded_dependencies(MemoryStorage::new(), MemoryStorage::counters);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_dependency_slices() {
+    let directory = tempfile::tempdir().unwrap();
+    bounded_dependencies(
+        crate::FjallStorage::open(directory.path()).unwrap(),
+        crate::FjallStorage::counters,
+    );
+}
+
+#[test]
+fn unsupported_dependencies_block() {
+    use crate::storage::{SnapshotRead, TopicView};
+    struct Unsupported;
+    impl SnapshotRead for Unsupported {
+        fn topic_view(&self, _: &TopicId, _: Option<&PeerId>) -> crate::Result<Option<TopicView>> {
+            panic!("unexpected read")
+        }
+        fn get_op(&self, _: &OpId) -> crate::Result<Option<Op>> {
+            panic!("unexpected payload read")
+        }
+        fn get_meta(&self, _: &OpId) -> crate::Result<Option<crate::storage::OpMeta>> {
+            panic!("unexpected unbounded metadata read")
+        }
+        fn dep_resolvable(&self, _: &OpId) -> crate::Result<bool> {
+            panic!("unexpected read")
+        }
+        fn actor_range(
+            &self,
+            _: &TopicId,
+            _: &ActorId,
+            _: u64,
+            _: usize,
+        ) -> crate::Result<Vec<(u64, OpId)>> {
+            panic!("unexpected read")
+        }
+        fn list_op_ids(&self, _: &TopicId) -> crate::Result<BTreeSet<OpId>> {
+            panic!("unexpected read")
+        }
+    }
+    let result = Unsupported.dependency_ids(
+        &OpId::hash(b"unknown"),
+        crate::storage::DependencyCursor::default(),
+        3,
+    );
+    assert!(matches!(result, Err(Error::SyncCapacity(_))));
+}

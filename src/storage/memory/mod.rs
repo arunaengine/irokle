@@ -934,6 +934,38 @@ impl SnapshotRead for MemorySnapshot<'_> {
         Ok(self.inner.meta.get(id).map(super::OpHeader::from))
     }
 
+    fn dependency_ids(
+        &self,
+        id: &OpId,
+        cursor: super::DependencyCursor,
+        limit: usize,
+    ) -> Result<Option<Vec<OpId>>> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if limit == 0 {
+            return Err(Error::SyncCapacity(
+                "dependency read limit must be positive".into(),
+            ));
+        }
+        self.counters.count_meta();
+        let Some(meta) = self.inner.meta.get(id) else {
+            return Ok(None);
+        };
+        if cursor.offset > meta.deps.len()
+            || (cursor.offset == 0) != cursor.after.is_none()
+            || cursor
+                .after
+                .is_some_and(|after| !meta.deps.contains(&after))
+        {
+            return Err(Error::Decode(
+                "dependency cursor does not match metadata".into(),
+            ));
+        }
+        let start = cursor.after.map_or(Unbounded, Excluded);
+        let mut ids = Vec::with_capacity(limit.min(meta.deps.len()));
+        ids.extend(meta.deps.range((start, Unbounded)).take(limit).copied());
+        Ok(Some(ids))
+    }
+
     fn request_view(
         &self,
         topic_id: &TopicId,

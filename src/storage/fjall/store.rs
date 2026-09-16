@@ -10,7 +10,6 @@ use crate::{
     TopicInfo,
 };
 
-use super::provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
 use super::super::pressure::{Pressure, Transaction};
 use super::super::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
@@ -21,6 +20,7 @@ use super::super::{
     new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
     topic_fingerprint_for, validate_batch, validate_heads,
 };
+use super::provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
 
 #[cfg(feature = "fjall")]
 #[derive(Clone)]
@@ -2542,6 +2542,48 @@ fn skip_ids(bytes: &[u8]) -> Result<&[u8]> {
         .ok_or_else(|| Error::Decode("truncated dependency IDs".into()))
 }
 
+fn dependency_slice(
+    bytes: &[u8],
+    cursor: super::super::DependencyCursor,
+    limit: usize,
+) -> Result<Vec<OpId>> {
+    let (_, rest): (HeaderPrefix, _) = postcard::take_from_bytes(bytes)?;
+    let (count, rest): (usize, _) = postcard::take_from_bytes(rest)?;
+    let length = count
+        .checked_mul(OpId::LEN)
+        .ok_or_else(|| Error::Decode("dependency length overflow".into()))?;
+    let ids = rest
+        .get(..length)
+        .ok_or_else(|| Error::Decode("truncated dependency IDs".into()))?;
+    let decode = |index: usize| -> OpId {
+        let mut id = [0; OpId::LEN];
+        id.copy_from_slice(&ids[index * OpId::LEN..(index + 1) * OpId::LEN]);
+        OpId::from_bytes(id)
+    };
+    if cursor.offset > count
+        || (cursor.offset == 0) != cursor.after.is_none()
+        || cursor.offset > 0 && cursor.after != Some(decode(cursor.offset - 1))
+    {
+        return Err(Error::Decode(
+            "dependency cursor does not match metadata".into(),
+        ));
+    }
+    let count = limit.min(count - cursor.offset);
+    let mut found = Vec::with_capacity(count);
+    let mut previous = cursor.after;
+    for index in cursor.offset..cursor.offset + count {
+        let id = decode(index);
+        if previous.is_some_and(|previous| previous >= id) {
+            return Err(Error::Decode(
+                "stored dependency IDs are not strictly ordered".into(),
+            ));
+        }
+        found.push(id);
+        previous = Some(id);
+    }
+    Ok(found)
+}
+
 fn clock_tail(bytes: &[u8]) -> Result<StoredClock> {
     let (clock, rest): (StoredClock, _) = postcard::take_from_bytes(bytes)?;
     let (_, rest): (bool, _) = postcard::take_from_bytes(rest)?;
@@ -2688,6 +2730,33 @@ impl SnapshotRead for FjallSnapshot<'_> {
             Some(header) if self.shown(&header.topic_id)? => Ok(Some(header)),
             _ => Ok(None),
         }
+    }
+
+    fn dependency_ids(
+        &self,
+        id: &OpId,
+        cursor: super::super::DependencyCursor,
+        limit: usize,
+    ) -> Result<Option<Vec<OpId>>> {
+        if limit == 0 {
+            return Err(Error::SyncCapacity(
+                "dependency read limit must be positive".into(),
+            ));
+        }
+        self.store.counters.count_meta();
+        let Some(bytes) = fjall::Readable::get(
+            &self.tx,
+            &self.store.records,
+            FjallStorage::key_id(b"m", id),
+        )?
+        else {
+            return Ok(None);
+        };
+        let (header, _) = header_tail(&bytes)?;
+        if !self.shown(&header.topic_id)? {
+            return Ok(None);
+        }
+        dependency_slice(&bytes, cursor, limit).map(Some)
     }
 
     fn request_view(
@@ -2843,6 +2912,62 @@ fn clear_satisfied_tx(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dependency_corruption_refused() {
+        use super::*;
+        use crate::storage::DependencyCursor;
+        let meta = StoredMeta {
+            id: OpId::hash(b"dependency slicing"),
+            topic_id: TopicId::hash(b"topic"),
+            author: PeerId::hash(b"author"),
+            actor_id: ActorId::hash(b"actor"),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [1, 2, 3].map(|byte| OpId::from_bytes([byte; 32])).into(),
+            generation: 4,
+            observed_clock: StoredClock::Inline(ActorClock::new()),
+            ready: true,
+            missing_deps: BTreeSet::new(),
+        };
+        let bytes = postcard::to_allocvec(&meta).unwrap();
+        let (_, rest): (HeaderPrefix, _) = postcard::take_from_bytes(&bytes).unwrap();
+        let count_start = bytes.len() - rest.len();
+        let (_, ids): (usize, _) = postcard::take_from_bytes(rest).unwrap();
+        let ids_start = bytes.len() - ids.len();
+        let start = DependencyCursor::default();
+        assert_eq!(
+            dependency_slice(&bytes, start, 1).unwrap(),
+            vec![OpId::from_bytes([1; 32])]
+        );
+        assert!(dependency_slice(&bytes[..ids_start + 95], start, 1).is_err());
+        let count = postcard::to_allocvec(&usize::MAX).unwrap();
+        let overflow = [&bytes[..count_start], &count, &bytes[ids_start..]].concat();
+        assert!(dependency_slice(&overflow, start, 1).is_err());
+        for corrupted in [[1, 3, 2], [1, 2, 2]] {
+            let mut damaged = bytes.clone();
+            for (index, byte) in corrupted.into_iter().enumerate() {
+                damaged[ids_start + index * 32..ids_start + (index + 1) * 32].fill(byte);
+            }
+            let mut cursor = start;
+            for _ in 0..2 {
+                let page = dependency_slice(&damaged, cursor, 1).unwrap();
+                cursor.offset += page.len();
+                cursor.after = page.last().copied();
+            }
+            assert!(dependency_slice(&damaged, cursor, 1).is_err());
+        }
+        let invalid = DependencyCursor {
+            offset: 1,
+            after: Some(OpId::from_bytes([9; 32])),
+        };
+        assert!(dependency_slice(&bytes, invalid, 1).is_err());
+        let invalid = DependencyCursor {
+            offset: usize::MAX,
+            after: Some(OpId::from_bytes([3; 32])),
+        };
+        assert!(dependency_slice(&bytes, invalid, 1).is_err());
+    }
+
     #[test]
     fn root_matches_clock() {
         use super::*;

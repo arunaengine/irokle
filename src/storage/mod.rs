@@ -466,6 +466,13 @@ pub struct RequestView {
     pub clock: ActorClock,
 }
 
+/// Resume dependency reads within the same operation and branch snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DependencyCursor {
+    pub offset: usize,
+    pub after: Option<OpId>,
+}
+
 /// Reads of one coherent snapshot of a store. Every method sees the same commit,
 /// so a planner can authorize a peer, select positions and load records without
 /// mixing a state before and after a concurrent write.
@@ -515,6 +522,19 @@ pub trait SnapshotRead {
     /// Position fields without dependency collections; see [`OpHeader`].
     fn get_header(&self, id: &OpId) -> Result<Option<OpHeader>> {
         Ok(self.get_position(id)?.as_ref().map(OpHeader::from))
+    }
+    /// Read at most `limit` dependency IDs after this cursor, without decoding payloads.
+    /// Advance both cursor fields by the returned IDs; a shorter page ends the set.
+    /// Unsupported backends must implement bounded reads before serving sliced goals.
+    fn dependency_ids(
+        &self,
+        _id: &OpId,
+        _cursor: DependencyCursor,
+        _limit: usize,
+    ) -> Result<Option<Vec<OpId>>> {
+        Err(crate::Error::SyncCapacity(
+            "backend must implement bounded dependency reads".into(),
+        ))
     }
     /// Header and observed clock without copying the dependency collection.
     fn get_observation(&self, id: &OpId) -> Result<Option<(OpHeader, ActorClock)>> {
