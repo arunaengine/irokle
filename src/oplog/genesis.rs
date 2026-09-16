@@ -83,11 +83,7 @@ impl<S: super::Storage> Oplog<S> {
         .map(|(op, _)| op)
     }
 
-    /// Create a topic genesis op plus its first event op and admit both in a
-    /// single storage transaction. The event op chains off the genesis
-    /// (actor_seq 2, actor_prev/deps = genesis op). Returns `(genesis, event)`.
-    /// Fails with [`Error::InvalidGenesis`] if the topic already exists, same
-    /// as [`Self::create_topic_genesis`].
+    #[doc = include_str!("contracts/create_genesis_event.md")]
     pub fn create_topic_genesis_with_event(
         &self,
         topic_id: TopicId,
@@ -202,12 +198,8 @@ impl<S: super::Storage> Oplog<S> {
         )
         .map(|(op, _)| op)
     }
-    /// Resolve a genesis tie-break for a batch that carries a structurally
-    /// valid genesis. Returns the ops to admit (unchanged when the incoming
-    /// genesis wins or there is no collision; with a losing foreign genesis
-    /// filtered out when the local one wins), the reset the admission must
-    /// perform when the local topic loses, and any rejected genesis to purge
-    /// from pending.
+    /// Resolve a valid genesis collision, returning admitted ops, an optional reset
+    /// plan when the local topic loses, and an optional rejected genesis to purge.
     pub(super) fn resolve_genesis_collision(
         &self,
         ops: Vec<Op>,
@@ -233,14 +225,8 @@ impl<S: super::Storage> Oplog<S> {
         // `Ord` is lexicographic over those bytes, so both nodes pick the same
         // winner with no coordination.
         if genesis.id < state.genesis {
-            // A smaller foreign genesis only wins if its author is a current
-            // member of the LOCAL chain, the same membership the admission
-            // path enforces for NotTopicMember (`state.members`, which folds in
-            // AddPeer/RemovePeer control ops), not the genesis `initial_peers`
-            // alone. Genesis op ids are grindable, so an unauthenticated
-            // smaller id must not be allowed to force a topic reset.
-            // Consequence: two forks with disjoint memberships never auto-
-            // converge; the warn below is the intended, deliberate signal.
+            // A smaller foreign genesis may reset only for a current local member:
+            // genesis ids are grindable, so disjoint-membership forks do not auto-converge.
             if !state.members.contains(&genesis.signed.body.author) {
                 tracing::warn!(
                     %topic_id,
@@ -281,12 +267,9 @@ impl<S: super::Storage> Oplog<S> {
         }
     }
 
-    /// Extract the local topic chain's non-genesis payloads (ordered by actor,
-    /// then sequence) so the application can re-emit them under the winning
-    /// genesis. The actual reset is deferred: the winner batch's admission runs
-    /// the reset and the writes in one storage transaction
-    /// (`reset_topic_and_admit`), so a crash cannot land between them. These
-    /// reads stay outside that transaction.
+    /// Collect local non-genesis payloads by actor and sequence for re-emission.
+    /// Reset and winner writes commit together in `reset_topic_and_admit`; reads
+    /// stay outside that transaction.
     fn extract_eviction(
         &self,
         topic_id: TopicId,
@@ -303,10 +286,9 @@ impl<S: super::Storage> Oplog<S> {
         })
     }
 
-    /// Payloads for the ops named by `ids`, ordered by actor then sequence so
-    /// re-emission preserves each actor's order. A half-stored id is reported
-    /// and skipped: its payload cannot be read, and failing here would strand
-    /// the whole topic instead of discarding one unreadable record.
+    /// Return payloads for `ids` ordered by actor and sequence for re-emission.
+    /// Missing metadata or payloads are logged and skipped, so one damaged record
+    /// does not strand the topic.
     pub(super) fn evicted_ops(&self, ids: &BTreeSet<OpId>) -> Result<Vec<super::EvictedOp>> {
         let mut metas = Vec::new();
         for id in ids {

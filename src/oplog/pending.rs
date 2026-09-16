@@ -7,9 +7,10 @@ use crate::{Error, Op, OpId, Result, TopicPayload, actor_id_for};
 
 use super::admission::{checked_next, is_permanent_rejection};
 use super::{
-    Admitted, BatchOverlay, MAX_DRAIN_OPS, MAX_PENDING_MISSING_DEPS, OpAdmission, Oplog,
-    PendingVerdict, READY_SLICE, ReceiveEffects, StoredOp, admission_failure,
+    Admitted, BatchOverlay, MAX_DRAIN_OPS, OpAdmission, Oplog, PendingVerdict, READY_SLICE,
+    ReceiveEffects, StoredOp, admission_failure,
 };
+use crate::storage::MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS;
 
 impl<S: super::Storage> Oplog<S> {
     /// Admit every buffered op whose dependencies resolved, in finite passes.
@@ -97,7 +98,7 @@ impl<S: super::Storage> Oplog<S> {
                 };
                 // Pending ops re-queued from storage are not in verified; they
                 // get re-verified during admission like before.
-                let (batch_accepted, batch_eviction) = match self.admit_ops_batch_retry(
+                let (batch_accepted, batch_eviction) = match self.admit_batch(
                     batch_source_peer,
                     ops,
                     verified,
@@ -237,7 +238,7 @@ impl<S: super::Storage> Oplog<S> {
         state: Option<&TopicState>,
     ) -> Result<OpAdmission> {
         let body = &op.signed.body;
-        if missing_deps.len() > MAX_PENDING_MISSING_DEPS {
+        if missing_deps.len() > MAX_MISSING_DEPS {
             return Err(Error::Storage(
                 "pending op has too many missing deps".into(),
             ));

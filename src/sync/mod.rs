@@ -1078,16 +1078,15 @@ impl<S: Storage> SyncEngine<S> {
             }
             data_op_ids.insert(op.id);
         }
-        let (admitted, failure) = match self.oplog.receive_ops_from_peer_preverified(
-            Some(source_peer_id),
-            data.ops,
-            verified,
-            effects,
-        ) {
-            Ok(admitted) => (admitted, None),
-            Err(Error::AdmissionCommitted { admitted, source }) => (*admitted, Some(source)),
-            Err(error) => return Err(error),
-        };
+        let (admitted, failure) =
+            match self
+                .oplog
+                .receive_preverified(Some(source_peer_id), data.ops, verified, effects)
+            {
+                Ok(admitted) => (admitted, None),
+                Err(Error::AdmissionCommitted { admitted, source }) => (*admitted, Some(source)),
+                Err(error) => return Err(error),
+            };
         // Admission also flushes buffered ops of other topics; an ack speaks
         // for its own topic only, and its reader files obligations under it.
         let mut ack = SyncAck {

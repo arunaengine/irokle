@@ -693,7 +693,7 @@ fn assert_batch_views<S: Storage>(storage: S, chunk: usize) {
         };
     for batch in ops.chunks(chunk) {
         reader
-            .receive_ops_from_peer_preverified(
+            .receive_preverified(
                 Some(source.genesis.signed.body.author),
                 batch.to_vec(),
                 &BTreeSet::new(),

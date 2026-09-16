@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::{
-    AdmissionEffects, AdmittedBatch, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, SnapshotRead,
-    Storage, TopicState, TopicView,
+    AdmissionEffects, AdmittedBatch, MemoryStorage, OpMeta, SnapshotRead, Storage, TopicState,
+    TopicView,
 };
 use crate::{
     ActorId, Error, EvictionKey, Op, OpBody, OpId, PeerId, Result, SignedOp, TopicId, TopicPayload,
@@ -59,10 +59,8 @@ enum PendingVerdict {
     Retain,
 }
 
-/// How much of an op the local store already holds. `Repair` is an id the local
-/// chain already accounts for while its records are missing or half written:
-/// refilling it is not an append, so the actor-position checks that guard a new
-/// op do not apply to it.
+/// How much of an op the local store holds. `Repair` means its id is already in
+/// the chain but records are incomplete; refilling it is not an append.
 enum StoredOp {
     Absent,
     Repair,
@@ -92,10 +90,8 @@ struct QuarantinePlan {
     evicted: Vec<EvictedOp>,
 }
 
-/// The batch-local view admission validates against: the entries this batch has
-/// already accepted, plus whether the topic is being reset. A reset removes the
-/// stored actor slots and tips of the topic in the same transaction, so they
-/// must not count towards the position of an op the batch installs.
+/// Batch-local validation view, including accepted entries and reset state. A
+/// reset removes stored actor slots and tips, so they cannot affect new positions.
 struct BatchOverlay<'a> {
     ops: &'a BTreeMap<OpId, Op>,
     meta: &'a BTreeMap<OpId, OpMeta>,
@@ -125,13 +121,7 @@ pub struct EvictedOp {
     pub payload: TopicPayload,
 }
 
-/// Reports ops discarded from a topic's local chain. A genesis tie-break sets
-/// `losing_genesis` to the replaced chain's genesis and `winning_genesis` to the
-/// foreign one that took its place; a quarantine of ops no head reaches has no
-/// second genesis to name, so both fields carry the surviving genesis and equal
-/// fields are what tells the two apart. `evicted` holds the discarded
-/// non-genesis payloads ordered by `(actor_id, actor_seq)`; re-emission is the
-/// embedder's responsibility.
+#[doc = include_str!("contracts/topic_eviction.md")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicEviction {
     pub topic_id: TopicId,
@@ -141,10 +131,7 @@ pub struct TopicEviction {
 }
 
 impl TopicEviction {
-    /// Identity of this eviction's durable journal record, derived from its
-    /// content. The same discarded chain always names the same record, so
-    /// repeating the write, the delivery, or the recovery cannot multiply
-    /// entries, and a consumer can acknowledge a record from the eviction alone.
+    #[doc = include_str!("contracts/eviction_key.md")]
     pub fn key(&self) -> EvictionKey {
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.topic_id.as_ref());
@@ -282,11 +269,7 @@ impl<S: Storage> Oplog<S> {
         }
     }
 
-    /// Ids this topic references but cannot resolve: admitted ops whose own
-    /// records are incomplete, dependencies of admitted ops that are not fully
-    /// stored, and the holes buffered ops are still waiting for. An empty set
-    /// means every admitted op is locally usable, which is what lets sync
-    /// certify the topic; anything else is turned into concrete repair wants.
+    #[doc = include_str!("contracts/topic_unresolved.md")]
     pub fn topic_unresolved(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
         self.storage
             .read_snapshot(|read| match read.topic_view(topic_id, None)? {
@@ -347,23 +330,15 @@ impl<S: Storage> Oplog<S> {
         })
     }
 
-    /// Drop the record of which topics were found whole, so the next integrity
-    /// question audits the stored records again. Admission cannot introduce a
-    /// hole, but damage from outside irokle can, and nothing else would ever
-    /// ask a second time.
+    #[doc = include_str!("contracts/recheck_topics.md")]
     pub fn recheck_topics(&self) -> Result<()> {
         self.whole_topics()?.clear();
         *self.membership_cache()? = MembershipCache::default();
         Ok(())
     }
 
-    /// Ops the topic stores that no head reaches. Admission puts every new op
-    /// into `heads` and takes it out only when a later op names it as a
-    /// dependency, so the head closure covers exactly the ops the local chain
-    /// accounts for. Anything outside it was never part of this lineage's
-    /// frontier and its ancestry cannot be validated against the current
-    /// genesis: the pre-`reset_topic_and_admit` genesis reset could leave such
-    /// a descendant behind after removing the losing chain it stood on.
+    /// Return stored ops unreachable from current heads. Reachability defines
+    /// the local lineage; replaced-genesis descendants lie outside its frontier.
     fn topic_orphans(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         let mut reachable = BTreeSet::new();
         let mut frontier = self
@@ -387,13 +362,7 @@ impl<S: Storage> Oplog<S> {
         Ok(orphans)
     }
 
-    /// Discard the ops no head reaches and rebuild the topic from the ops that
-    /// remain, in the single transaction genesis adoption already uses. The
-    /// survivors are re-validated and re-admitted from the genesis up, so heads,
-    /// clock, actor indexes, generation and fingerprint come back agreeing with
-    /// one current-genesis DAG, and acks and obligations naming the old frontier
-    /// are dropped rather than carried over. Returns the discarded payloads for
-    /// re-emission, or `None` when there is nothing to quarantine.
+    #[doc = include_str!("contracts/quarantine_orphans.md")]
     pub fn quarantine_orphans(&self, topic_id: &TopicId) -> Result<Option<TopicEviction>> {
         if self.topic_orphans(topic_id)?.is_empty() {
             return Ok(None);
@@ -445,11 +414,8 @@ impl<S: Storage> Oplog<S> {
         Err(Error::AdmissionConflict)
     }
 
-    /// Split the topic's stored ops into the head closure and the orphans.
-    /// Refuses while the head closure itself has a hole: that is ordinary
-    /// repair work sync must finish first, and a rebuild would drop the whole
-    /// branch standing on it. Refuses too when the closure does not reach the
-    /// recorded genesis, since then there is no chain left to rebuild from.
+    /// Plan a quarantine by splitting stored ops into reachable survivors and orphans.
+    /// Refuse when the frontier has holes or cannot reach the recorded genesis.
     fn plan_quarantine(&self, topic_id: &TopicId) -> Result<Option<QuarantinePlan>> {
         let Some(state) = self.storage.topic_state(topic_id)? else {
             return Ok(None);
@@ -531,7 +497,7 @@ impl<S: Storage> Oplog<S> {
     /// Like [`Self::receive_ops_from_peer_evicting`], but skips signature checks
     /// for ids in `verified`, which the caller validated (ids are content-addressed).
     /// `effects` computes what each admitted batch commits alongside its ops.
-    pub(crate) fn receive_ops_from_peer_preverified(
+    pub(crate) fn receive_preverified(
         &self,
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
@@ -547,7 +513,7 @@ impl<S: Storage> Oplog<S> {
         Ok(op)
     }
 
-    fn admit_ops_batch_retry(
+    fn admit_batch(
         &self,
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
@@ -958,10 +924,8 @@ impl<S: Storage> Oplog<S> {
             self.storage.put_admitted_batch(batch)?;
         }
 
-        // Buffer not-yet-ready ops last: on the reset path the reset above wipes
-        // the topic's pending, so a partial winner batch's descendants must be
-        // written after it to survive. A pending op's missing deps are never in
-        // `entries`, so ordering after admission cannot spuriously reject it.
+        // Buffer pending ops after admission so reset descendants survive; missing dependencies
+        // stay out of admitted entries and cannot be rejected by this ordering.
         for (op, missing_deps) in pending {
             let source_peer = source_peer.unwrap_or(op.signed.body.author);
             let buffered = self.storage.put_pending_bound(
@@ -1078,7 +1042,7 @@ impl<S: Storage> Oplog<S> {
                 let author_is_member = if body.deps == current.heads {
                     current.members.contains(&body.author)
                 } else {
-                    self.topic_state_for_deps(&body.topic_id, &body.deps)?
+                    self.state_for_deps(&body.topic_id, &body.deps)?
                         .members
                         .contains(&body.author)
                 };
@@ -1094,7 +1058,7 @@ impl<S: Storage> Oplog<S> {
                 let author_is_member = if body.deps == current.heads {
                     current.members.contains(&body.author)
                 } else {
-                    self.topic_state_for_deps(&body.topic_id, &body.deps)?
+                    self.state_for_deps(&body.topic_id, &body.deps)?
                         .members
                         .contains(&body.author)
                 };
@@ -1122,7 +1086,7 @@ impl<S: Storage> Oplog<S> {
 
     fn meta_for(&self, op: &Op) -> Result<OpMeta> {
         let body = &op.signed.body;
-        let observed_clock = self.observed_clock_for_deps(&body.topic_id, &body.deps)?;
+        let observed_clock = self.clock_from_deps(&body.topic_id, &body.deps)?;
         Ok(OpMeta {
             id: op.id,
             topic_id: body.topic_id,
@@ -1329,10 +1293,8 @@ impl<S: Storage> Oplog<S> {
         Ok(OpAdmission::Admit)
     }
 
-    /// The stored actor slot and tip, or `None` on the reset path. A reset wipes
-    /// every actor index and tip of the topic in the same transaction as the
-    /// admission, so validating against them would judge the batch by a chain
-    /// that is about to stop existing.
+    /// Return the stored actor slot and tip, or `None` during reset. Reset clears
+    /// both in the same transaction, so validation must ignore the old chain.
     fn stored_actor_index(&self, body: &OpBody, reset: bool) -> Result<Option<OpId>> {
         if reset {
             return Ok(None);
@@ -1348,11 +1310,8 @@ impl<S: Storage> Oplog<S> {
         self.storage.actor_tip(&body.topic_id, &body.actor_id)
     }
 
-    /// Re-reads storage after a tip/seq mismatch: a concurrent admission may
-    /// have committed this exact op between the batch dedup check and the
-    /// validation reads. Only a completely stored op is such a duplicate; a
-    /// half-stored one is damage that [`Self::stored_op_state`] routes into
-    /// repair, and calling it a duplicate is what left it broken forever.
+    /// Re-read storage after a tip or sequence mismatch. Only a fully stored op
+    /// is a duplicate; half-stored data must remain repairable.
     fn is_admitted_duplicate(&self, op: &Op) -> Result<bool> {
         self.storage.dep_resolvable(&op.id)
     }
@@ -1401,7 +1360,7 @@ impl<S: Storage> Oplog<S> {
         merge_states(deps, projections)
     }
 
-    fn observed_clock_for_deps(
+    fn clock_from_deps(
         &self,
         topic_id: &TopicId,
         deps: &BTreeSet<crate::OpId>,
@@ -1479,7 +1438,7 @@ impl<S: Storage> Oplog<S> {
         })
     }
 
-    fn topic_state_for_deps(
+    fn state_for_deps(
         &self,
         topic_id: &TopicId,
         deps: &BTreeSet<crate::OpId>,

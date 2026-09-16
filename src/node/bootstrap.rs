@@ -176,10 +176,12 @@ impl<S: Storage> Irokle<S> {
             bytes = bytes.saturating_add(crate::storage::pending_op_bytes(op)? as u64);
         }
         make_room(storage, &provisional, bytes)?;
-        let admitted = self
-            .oplog
-            .sharing_membership(store)
-            .receive_ops_from_peer_preverified(Some(source), data.ops.clone(), verified, None);
+        let admitted = self.oplog.sharing_membership(store).receive_preverified(
+            Some(source),
+            data.ops.clone(),
+            verified,
+            None,
+        );
         storage.touch_provisional(&provisional, now_ms)?;
         // The ack of an activating fragment names its ops the topic now holds.
         let outcome = match self.activate_proven(&provisional, source) {
