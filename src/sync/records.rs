@@ -80,20 +80,7 @@ impl Records {
         true
     }
 
-    pub(super) fn take(&mut self, read: &dyn SnapshotRead, id: &OpId) -> crate::Result<Option<Record>> {
-        let mut slice = super::plan::Slice::new(
-            Arc::new(super::plan::PageWork::default()),
-            super::plan::MAX_PAGE_VISITS,
-            0,
-        )?;
-        match self.take_slice(read, id, &mut slice) {
-            Ok(record) => Ok(record),
-            Err(LoadError::Failed(error)) => Err(error),
-            Err(LoadError::Yield) => Err(Error::SyncCapacity("operation exceeds slice capacity".into())),
-        }
-    }
-
-    pub(super) fn take_slice(
+    pub(super) fn take(
         &mut self,
         read: &dyn SnapshotRead,
         id: &OpId,
@@ -226,7 +213,7 @@ mod tests {
         id: &OpId,
     ) -> crate::Result<Option<Record>> {
         let mut slice = super::super::plan::Slice::new(Arc::default(), 1024, 0)?;
-        match records.take_slice(read, id, &mut slice) {
+        match records.take(read, id, &mut slice) {
             Ok(record) => Ok(record),
             Err(LoadError::Failed(error)) => Err(error),
             Err(LoadError::Yield) => panic!("fresh record slice exhausted"),
@@ -340,32 +327,32 @@ mod tests {
                 decoded: Default::default(),
                 failure: Default::default(),
             };
-            let record = records.take_slice(&probe, &id, &mut slice).unwrap().unwrap();
+            let record = records.take(&probe, &id, &mut slice).unwrap().unwrap();
             assert_eq!(probe.decoded.get(), 1);
             records.keep(record);
-            let cached = records.take_slice(&probe, &id, &mut slice).unwrap().unwrap();
+            let cached = records.take(&probe, &id, &mut slice).unwrap().unwrap();
             assert_eq!(probe.decoded.get(), 1, "cached records require no decode");
             drop(cached);
             assert_eq!(pool.bytes(), 0);
-            assert!(matches!(records.take_slice(&probe, &id, &mut slice), Err(LoadError::Yield)));
+            assert!(matches!(records.take(&probe, &id, &mut slice), Err(LoadError::Yield)));
             assert_eq!(probe.decoded.get(), 1, "exhaustion must precede decoding");
             assert_eq!(pool.bytes(), 0);
             let mut resumed = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)?
                 .with_decode_limit(bytes);
-            let record = records.take_slice(&probe, &id, &mut resumed).unwrap().unwrap();
+            let record = records.take(&probe, &id, &mut resumed).unwrap().unwrap();
             assert_eq!(probe.decoded.get(), 2);
             assert_eq!(record.op, op);
             drop(record);
             let mut small = super::super::plan::Slice::new(Arc::clone(&work), 16, 0)?
                 .with_decode_limit(bytes - 1);
             assert!(matches!(
-                records.take_slice(&probe, &id, &mut small),
+                records.take(&probe, &id, &mut small),
                 Err(LoadError::Failed(Error::SyncCapacity(_)))
             ));
             assert_eq!(probe.decoded.get(), 2);
             let failure = Arc::new(Error::SyncCapacity("slice decode allowance exhausted".into()));
             *probe.failure.borrow_mut() = Some(Error::Shared(Arc::clone(&failure)));
-            match records.take_slice(&probe, &id, &mut slice) {
+            match records.take(&probe, &id, &mut slice) {
                 Err(LoadError::Failed(Error::Shared(source))) => assert!(Arc::ptr_eq(&source, &failure)),
                 _ => panic!("backend failure was mistaken for slice exhaustion"),
             }

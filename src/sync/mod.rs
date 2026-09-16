@@ -983,7 +983,7 @@ impl<S: Storage> SyncEngine<S> {
             }
             return Ok(page);
         }
-        let (mut planned, positions, mut frontier) = self.resume_slice(
+        let (mut planned, positions, mut frontier) = self.resume_page(
             read,
             &request.topic_id,
             (&captured, &goal, frontier),

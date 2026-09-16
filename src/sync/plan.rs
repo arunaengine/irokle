@@ -508,7 +508,6 @@ impl Frontier {
             || !self.updates.is_empty()
             || !self.pending.is_empty()
             || !self.active.is_empty()
-            || !self.pending.is_empty()
             || !self.resumable.is_empty()
             || self.selecting.is_some()
             || !self.deferred.is_empty()
@@ -588,8 +587,8 @@ impl Frontier {
 
 /// What an op still needs before it can be sent.
 enum Wait {
-    Unknown,
     Yield,
+    Unknown,
     Ready,
     Blocked,
     Position(ActorId, u64),
@@ -726,7 +725,7 @@ impl Pager<'_> {
                 self.ended = true;
                 break;
             }
-            let record = match self.records.take_slice(self.read, &id, &mut self.slice) {
+            let record = match self.records.take(self.read, &id, &mut self.slice) {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     self.missing.insert(id);
@@ -851,7 +850,6 @@ impl Pager<'_> {
         Ok((page, positions, frontier))
     }
 
-    /// Fill free slots: resumed heads first, then deferred actors in order.
     fn fill(&mut self) -> Result<()> {
         if let Some(selected) = self.selecting.take() {
             self.select(selected)?;
@@ -893,9 +891,6 @@ impl Pager<'_> {
         Ok(())
     }
 
-    /// Queue the op after `after` on `actor_id`, up to `limit`; callers keep
-    /// `after < limit`. A gap in the index stops the actor and names the
-    /// record the next indexed op follows.
     fn activate(&mut self, actor: ActorId, after: u64, limit: u64) -> Result<()> {
         if !self.states.contains_key(&actor) {
             // One actor may own a head, a suspended entry, a cursor and its state.
@@ -950,7 +945,6 @@ impl Pager<'_> {
         Ok(meta.map(|meta| (meta.generation, scan.actor, seq, id, scan.limit)))
     }
 
-    /// Retain only the oldest heads while the bounded inventory cursor advances.
     fn select(&mut self, mut selected: BinaryHeap<RangeHead>) -> Result<()> {
         loop {
             if self.pending.is_empty() && self.deferred.is_empty() {
@@ -1008,120 +1002,6 @@ impl Pager<'_> {
                 });
             }
         }
-    }
-
-    /// What `meta` still waits for: an unsent or blocked dependency, a missing
-    /// record, positions of actors the request did not describe, all named at
-    /// once, or a position of another actor the peer does not hold yet.
-    fn observe(&mut self, actor: ActorId, seq: u64) {
-        if seq > self.covered.get(&actor) {
-            self.covered.observe(actor, seq);
-            self.revision = self.revision.wrapping_add(1);
-        }
-    }
-
-    fn position(&mut self, actor: ActorId, generation: u64) -> Result<bool> {
-        if !self.positions.contains_key(&actor) {
-            if self.positions.len() >= self.position_limit {
-                return Ok(false);
-            }
-            self.slice.reserve(256)?;
-        }
-        need(&mut self.positions, actor, generation);
-        Ok(true)
-    }
-
-    fn demand(&mut self, scan: &mut DependencyScan, meta: &OpHeader) -> Result<bool> {
-        if !scan.needed.contains_key(&meta.actor_id) {
-            if scan.needed.len() >= self.position_limit {
-                return Ok(false);
-            }
-            self.slice.reserve(256)?;
-        }
-        if !self.position(meta.actor_id, meta.generation)? {
-            return Ok(false);
-        }
-        scan.needed
-            .entry(meta.actor_id)
-            .and_modify(|needed| {
-                needed.0 = needed.0.max(meta.actor_seq);
-                needed.1 = needed.1.min(meta.generation);
-            })
-            .or_insert((meta.actor_seq, meta.generation));
-        Ok(true)
-    }
-
-    fn unknown_ancestors(&mut self, scan: &mut DependencyScan) -> Result<bool> {
-        while let Some(mut frame) = scan.ancestry.pop() {
-            if !self.scope.unknown(&frame.actor)
-                && (self.scope.holds_prefix(&frame.actor, frame.seq)
-                    || self.covered.get(&frame.actor) >= frame.seq)
-            {
-                if !self.slice.actor() {
-                    scan.ancestry.push(frame);
-                    return Ok(false);
-                }
-                continue;
-            }
-            if frame.pending.is_none() {
-                if !self.visit() {
-                    scan.ancestry.push(frame);
-                    return Ok(false);
-                }
-                let next = self.read.dependency_ids(&frame.id, frame.cursor, 1)?;
-                let Some(mut next) = next else {
-                    self.slice.reserve(256)?;
-                    self.missing.insert(frame.id);
-                    continue;
-                };
-                let Some(id) = next.pop() else { continue };
-                frame.pending = Some(Dependency { id, header: None });
-            }
-            let Some(mut dependency) = frame.pending.take() else {
-                continue;
-            };
-            if dependency.header.is_none() {
-                if self.exhausted() || !self.slice.edge() || !self.visit() {
-                    frame.pending = Some(dependency);
-                    scan.ancestry.push(frame);
-                    return Ok(false);
-                }
-                dependency.header = self.read.get_header(&dependency.id)?;
-            }
-            let mut descend = false;
-            if let Some(meta) = &dependency.header
-                && self.scope.unknown(&meta.actor_id)
-                && scan
-                    .needed
-                    .get(&meta.actor_id)
-                    .is_none_or(|needed| needed.0 < meta.actor_seq)
-            {
-                if !self.demand(scan, meta)? {
-                    frame.pending = Some(dependency);
-                    scan.ancestry.push(frame);
-                    return Ok(false);
-                }
-                descend = true;
-            }
-            frame.cursor.offset = frame
-                .cursor
-                .offset
-                .checked_add(1)
-                .ok_or_else(|| Error::SyncCapacity("dependency cursor overflow".into()))?;
-            frame.cursor.after = Some(dependency.id);
-            scan.ancestry.push(frame);
-            if descend && let Some(meta) = dependency.header {
-                self.slice.reserve(2 * size_of::<Ancestor>())?;
-                scan.ancestry.push(Ancestor {
-                    id: dependency.id,
-                    actor: meta.actor_id,
-                    seq: meta.actor_seq,
-                    cursor: DependencyCursor::default(),
-                    pending: None,
-                });
-            }
-        }
-        Ok(true)
     }
 
     fn wait_for(&mut self, op: &Op) -> Result<Wait> {
@@ -1240,10 +1120,117 @@ impl Pager<'_> {
         }
     }
 
-    /// Name the unknown actors of `id`'s ancestry too, up to the page's
-    /// position limit, so one result names a run of a dependency chain instead
-    /// of one link per request. A walk stops at actors the request describes
-    /// and at actors already named, so shared ancestry is walked once.
+    fn observe(&mut self, actor: ActorId, seq: u64) {
+        if seq > self.covered.get(&actor) {
+            self.covered.observe(actor, seq);
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    fn position(&mut self, actor: ActorId, generation: u64) -> Result<bool> {
+        if !self.positions.contains_key(&actor) {
+            if self.positions.len() >= self.position_limit {
+                return Ok(false);
+            }
+            self.slice.reserve(256)?;
+        }
+        need(&mut self.positions, actor, generation);
+        Ok(true)
+    }
+
+    fn demand(&mut self, scan: &mut DependencyScan, meta: &OpHeader) -> Result<bool> {
+        if !scan.needed.contains_key(&meta.actor_id) {
+            if scan.needed.len() >= self.position_limit {
+                return Ok(false);
+            }
+            self.slice.reserve(256)?;
+        }
+        if !self.position(meta.actor_id, meta.generation)? {
+            return Ok(false);
+        }
+        scan.needed
+            .entry(meta.actor_id)
+            .and_modify(|needed| {
+                needed.0 = needed.0.max(meta.actor_seq);
+                needed.1 = needed.1.min(meta.generation);
+            })
+            .or_insert((meta.actor_seq, meta.generation));
+        Ok(true)
+    }
+
+    fn unknown_ancestors(&mut self, scan: &mut DependencyScan) -> Result<bool> {
+        while let Some(mut frame) = scan.ancestry.pop() {
+            if !self.scope.unknown(&frame.actor)
+                && (self.scope.holds_prefix(&frame.actor, frame.seq)
+                    || self.covered.get(&frame.actor) >= frame.seq)
+            {
+                if !self.slice.actor() {
+                    scan.ancestry.push(frame);
+                    return Ok(false);
+                }
+                continue;
+            }
+            if frame.pending.is_none() {
+                if !self.visit() {
+                    scan.ancestry.push(frame);
+                    return Ok(false);
+                }
+                let next = self.read.dependency_ids(&frame.id, frame.cursor, 1)?;
+                let Some(mut next) = next else {
+                    self.slice.reserve(256)?;
+                    self.missing.insert(frame.id);
+                    continue;
+                };
+                let Some(id) = next.pop() else { continue };
+                frame.pending = Some(Dependency { id, header: None });
+            }
+            let Some(mut dependency) = frame.pending.take() else {
+                continue;
+            };
+            if dependency.header.is_none() {
+                if self.exhausted() || !self.slice.edge() || !self.visit() {
+                    frame.pending = Some(dependency);
+                    scan.ancestry.push(frame);
+                    return Ok(false);
+                }
+                dependency.header = self.read.get_header(&dependency.id)?;
+            }
+            let mut descend = false;
+            if let Some(meta) = &dependency.header
+                && self.scope.unknown(&meta.actor_id)
+                && scan
+                    .needed
+                    .get(&meta.actor_id)
+                    .is_none_or(|needed| needed.0 < meta.actor_seq)
+            {
+                if !self.demand(scan, meta)? {
+                    frame.pending = Some(dependency);
+                    scan.ancestry.push(frame);
+                    return Ok(false);
+                }
+                descend = true;
+            }
+            frame.cursor.offset = frame
+                .cursor
+                .offset
+                .checked_add(1)
+                .ok_or_else(|| Error::SyncCapacity("dependency cursor overflow".into()))?;
+            frame.cursor.after = Some(dependency.id);
+            scan.ancestry.push(frame);
+            if descend && let Some(meta) = dependency.header {
+                self.slice.reserve(2 * size_of::<Ancestor>())?;
+                scan.ancestry.push(Ancestor {
+                    id: dependency.id,
+                    actor: meta.actor_id,
+                    seq: meta.actor_seq,
+                    cursor: DependencyCursor::default(),
+                    pending: None,
+                });
+            }
+        }
+        Ok(true)
+    }
+
     /// Park `head` until `dep_actor` reaches `dep_seq`, activating that actor
     /// when it has no head yet. A dependency beyond the goal is ancestry the
     /// goal needs, so the dependency actor's limit rises to cover it.
@@ -1281,7 +1268,6 @@ impl Pager<'_> {
         Ok(())
     }
 
-    /// `actor_id` sent `seq`: every head waiting for that position may resume.
     fn wake(&mut self, actor: ActorId, seq: u64) {
         if self.suspended.contains_key(&actor) {
             self.updates.push_back(Update::Wake {
@@ -1292,9 +1278,6 @@ impl Pager<'_> {
         }
     }
 
-    /// `actor_id` sent everything up to `limit`. Heads still waiting on it need
-    /// a later position: the actor continues once up to the highest of them,
-    /// and a waiter no stored position can satisfy is blocked.
     fn reach(&mut self, actor: ActorId, limit: u64) -> Result<()> {
         self.states.insert(actor, ActorState::Reached(limit));
         if self.suspended.contains_key(&actor) {
@@ -1310,13 +1293,11 @@ impl Pager<'_> {
         Ok(())
     }
 
-    /// Stop `actor_id` at `id`, and every head waiting on it.
     fn block(&mut self, actor: ActorId, id: OpId) {
         self.blocked.insert(id);
         self.stop(actor);
     }
 
-    /// Stop `actor_id` and every head suspended on it, transitively.
     fn stop(&mut self, actor: ActorId) {
         self.states.insert(actor, ActorState::Blocked);
         self.more = true;
@@ -1512,7 +1493,7 @@ impl<S: Storage> SyncEngine<S> {
 
     /// One more slice of the kept plan `frontier`, against the clocks it
     /// planned on and a request with the same scope.
-    pub(super) fn resume_slice(
+    pub(super) fn resume_page(
         &self,
         read: &dyn SnapshotRead,
         topic_id: &TopicId,
@@ -1557,18 +1538,6 @@ impl<S: Storage> SyncEngine<S> {
         pager.plan(budget, fresh)
     }
 
-    pub(super) fn resume_page(
-        &self,
-        read: &dyn SnapshotRead,
-        topic_id: &TopicId,
-        (local, goal, frontier): (&ActorClock, &ActorClock, Frontier),
-        scope: &ActorScope<'_>,
-        budget: PageBudget,
-    ) -> Result<PlannedSlice> {
-        let slice = Slice::new(std::sync::Arc::clone(&self.work), self.page_visits, 0)?;
-        self.resume_slice(read, topic_id, (local, goal, frontier), (scope, self.page_positions), budget, slice)
-    }
-
     pub(super) fn replay_page(
         &self,
         read: &dyn SnapshotRead,
@@ -1606,7 +1575,7 @@ impl<S: Storage> SyncEngine<S> {
             if !frontier.records.contains(&offer.id) && !slice.read() {
                 break;
             }
-            let record = match frontier.records.take_slice(read, &offer.id, slice) {
+            let record = match frontier.records.take(read, &offer.id, slice) {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     if page.missing.len() >= MAX_PAGE_MISSING && !page.missing.contains(&offer.id) {
