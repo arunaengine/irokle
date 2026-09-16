@@ -588,6 +588,7 @@ impl Frontier {
 
 /// What an op still needs before it can be sent.
 enum Wait {
+    Unknown,
     Yield,
     Ready,
     Blocked,
@@ -711,7 +712,7 @@ impl Pager<'_> {
                 continue;
             };
             match self.wait_for(&record.op)? {
-                Wait::Yield => {
+                Wait::Yield | Wait::Unknown => {
                     self.records.keep(record);
                     self.active.push(Reverse(head));
                     self.ended = true;
@@ -1010,7 +1011,7 @@ impl Pager<'_> {
         Ok(true)
     }
 
-    fn scan_ancestors(&mut self, scan: &mut DependencyScan) -> Result<bool> {
+    fn unknown_ancestors(&mut self, scan: &mut DependencyScan) -> Result<bool> {
         while let Some(mut frame) = scan.ancestry.pop() {
             if !self.scope.unknown(&frame.actor)
                 && (self.scope.holds_prefix(&frame.actor, frame.seq)
@@ -1084,104 +1085,125 @@ impl Pager<'_> {
     }
 
     fn wait_for(&mut self, op: &Op) -> Result<Wait> {
-        let mut unknown = false;
-        let mut waits = None;
-        let after = self.checked.get(&op.id).and_then(|scan| scan.after);
-        let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        let mut scan = self.checked.remove(&op.id).unwrap_or_default();
+        if scan.revision != self.revision {
+            scan.checked = None;
+            scan.revision = self.revision;
+        }
+        loop {
+            let start = scan
+                .checked
+                .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+            let next = scan
+                .needed
+                .range((start, std::ops::Bound::Unbounded))
+                .next()
+                .map(|(actor, needed)| (*actor, *needed));
+            let Some((actor, (seq, generation))) = next else {
+                break;
+            };
+            if !self.slice.actor() {
+                self.checked.insert(op.id, scan);
+                return Ok(Wait::Yield);
+            }
+            if let Some(known) = self.scope.known_prefix(&actor) {
+                self.observe(actor, known.min(seq));
+            }
+            if self.scope.unknown(&actor) {
+                if !self.position(actor, generation)? {
+                    self.checked.insert(op.id, scan);
+                    return Ok(Wait::Unknown);
+                }
+            } else if self.scope.holds_prefix(&actor, seq) || self.covered.get(&actor) >= seq {
+                scan.needed.remove(&actor);
+            } else {
+                self.checked.insert(op.id, scan);
+                return Ok(Wait::Position(actor, seq));
+            }
+            scan.checked = Some(actor);
+        }
+        if !self.unknown_ancestors(&mut scan)? {
+            self.checked.insert(op.id, scan);
+            return Ok(Wait::Yield);
+        }
+        let start = scan
+            .after
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
         for dep in op
             .signed
             .body
             .deps
             .range((start, std::ops::Bound::Unbounded))
         {
-            if self.scope.informed() && self.exhausted() {
+            if self.exhausted() || !self.slice.edge() {
+                self.checked.insert(op.id, scan);
                 return Ok(Wait::Yield);
             }
-            self.work.edges.fetch_add(1, Ordering::Relaxed);
-            if self.blocked.contains(dep) {
+            if self.blocked.contains(dep)
+                || self
+                    .repair
+                    .as_ref()
+                    .is_some_and(|repair| repair.contains(dep))
+            {
                 return Ok(Wait::Blocked);
             }
             if self.sent.contains(dep) {
+                scan.after = Some(*dep);
                 continue;
             }
-            self.visit();
-            let position = self
-                .read
-                .get_header(dep)?
-                .map(|meta| (meta.actor_id, meta.actor_seq, meta.generation));
-            let Some((dep_actor, dep_seq, dep_generation)) = position else {
+            if !self.visit() {
+                self.checked.insert(op.id, scan);
+                return Ok(Wait::Yield);
+            }
+            let Some(meta) = self.read.get_header(dep)? else {
+                self.slice.reserve(256)?;
                 self.missing.insert(*dep);
                 return Ok(Wait::Blocked);
             };
-            if let Some(known) = self.scope.known_prefix(&dep_actor)
+            if let Some(known) = self.scope.known_prefix(&meta.actor_id)
                 && known > 0
             {
-                self.covered.observe(dep_actor, known.min(dep_seq));
+                self.observe(meta.actor_id, known.min(meta.actor_seq));
             }
-            if self.scope.holds_prefix(&dep_actor, dep_seq) {
-                self.covered.observe(dep_actor, dep_seq);
-                self.checked.entry(op.id).or_default().after = Some(*dep);
-                continue;
-            }
-            // Omitted from the request is not held: the requester names it next.
-            if self.scope.unknown(&dep_actor) {
-                need(&mut self.positions, dep_actor, dep_generation);
-                self.unknown_ancestors(*dep)?;
-                unknown = true;
-            } else if waits.is_none() && self.covered.get(&dep_actor) < dep_seq {
-                if self.scope.informed() {
-                    return Ok(Wait::Position(dep_actor, dep_seq));
+            if self.scope.holds_prefix(&meta.actor_id, meta.actor_seq) {
+                self.observe(meta.actor_id, meta.actor_seq);
+            } else if self.scope.unknown(&meta.actor_id) {
+                if !self.demand(&mut scan, &meta)? {
+                    self.checked.insert(op.id, scan);
+                    return Ok(Wait::Unknown);
                 }
-                waits = Some(Wait::Position(dep_actor, dep_seq));
-            } else if self.scope.informed() {
-                self.checked.entry(op.id).or_default().after = Some(*dep);
+                self.slice.reserve(2 * size_of::<Ancestor>())?;
+                scan.ancestry.push(Ancestor {
+                    id: *dep,
+                    actor: meta.actor_id,
+                    seq: meta.actor_seq,
+                    cursor: DependencyCursor::default(),
+                    pending: None,
+                });
+                scan.after = Some(*dep);
+                if !self.unknown_ancestors(&mut scan)? {
+                    self.checked.insert(op.id, scan);
+                    return Ok(Wait::Yield);
+                }
+            } else if self.covered.get(&meta.actor_id) < meta.actor_seq {
+                let waiting = Wait::Position(meta.actor_id, meta.actor_seq);
+                self.checked.insert(op.id, scan);
+                return Ok(waiting);
             }
+            scan.after = Some(*dep);
         }
-        self.checked.remove(&op.id);
-        Ok(match (unknown, waits) {
-            (true, _) => Wait::Blocked,
-            (false, Some(waits)) => waits,
-            (false, None) => Wait::Ready,
-        })
+        if scan.needed.is_empty() {
+            Ok(Wait::Ready)
+        } else {
+            self.checked.insert(op.id, scan);
+            Ok(Wait::Unknown)
+        }
     }
 
     /// Name the unknown actors of `id`'s ancestry too, up to the page's
     /// position limit, so one result names a run of a dependency chain instead
     /// of one link per request. A walk stops at actors the request describes
     /// and at actors already named, so shared ancestry is walked once.
-    fn unknown_ancestors(&mut self, id: OpId) -> Result<()> {
-        let mut queue = vec![id];
-        let mut found = 0;
-        while let Some(next) = queue.pop() {
-            if found >= self.position_limit || self.exhausted() {
-                return Ok(());
-            }
-            self.visit();
-            let Some(meta) = self.read.get_position(&next)? else {
-                continue;
-            };
-            for dep in &meta.deps {
-                self.work.edges.fetch_add(1, Ordering::Relaxed);
-                self.visit();
-                let Some(dep_meta) = self.read.get_header(dep)? else {
-                    continue;
-                };
-                if !self.scope.unknown(&dep_meta.actor_id)
-                    || self
-                        .scope
-                        .holds_prefix(&dep_meta.actor_id, dep_meta.actor_seq)
-                    || self.positions.contains_key(&dep_meta.actor_id)
-                {
-                    continue;
-                }
-                need(&mut self.positions, dep_meta.actor_id, dep_meta.generation);
-                found += 1;
-                queue.push(*dep);
-            }
-        }
-        Ok(())
-    }
-
     /// Park `head` until `dep_actor` reaches `dep_seq`, activating that actor
     /// when it has no head yet. A dependency beyond the goal is ancestry the
     /// goal needs, so the dependency actor's limit rises to cover it.
