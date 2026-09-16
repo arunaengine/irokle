@@ -76,3 +76,7 @@ required-features = ["iroh", "fjall"]
 name = "iroh_runtime_config"
 path = "examples/iroh/runtime_config.rs"
 required-features = ["iroh"]
+
+[[test]]
+name = "iroh_patchbay_sync"
+path = "tests/iroh_patchbay_sync/main.rs"

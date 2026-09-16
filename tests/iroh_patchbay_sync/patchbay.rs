@@ -18,6 +18,7 @@ fn init_patchbay_userns() {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Event)]
+#[irokle(type_id = "iroh_patchbay_sync::support::patchbay::PatchNote")]
 struct PatchNote {
     text: String,
 }
@@ -193,7 +194,7 @@ pub async fn publish_initial_topic(
     peers: impl IntoIterator<Item = PeerId>,
 ) -> TestResult<TopicId> {
     let initial_peers = peers.into_iter().collect::<BTreeSet<_>>();
-    publish_initial_topic_with_config(
+    publish_initial_config(
         peers_dev,
         owner,
         TopicConfig {
@@ -204,7 +205,7 @@ pub async fn publish_initial_topic(
     .await
 }
 
-pub async fn publish_initial_topic_with_config(
+pub async fn publish_initial_config(
     peers_dev: &::patchbay::Device,
     owner: &PatchNode,
     config: TopicConfig,

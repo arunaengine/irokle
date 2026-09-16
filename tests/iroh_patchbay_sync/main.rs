@@ -4,9 +4,13 @@ use std::time::Duration;
 
 use irokle::{ReplicationPolicy, TopicConfig};
 
-mod support;
+mod patchbay;
 
-use support::patchbay::*;
+use patchbay::{
+    PatchLab, TestResult, add_peer, assert_current_members, converge_all, converge_pair,
+    history_texts, isolate, leave, publish, publish_initial_config, publish_initial_topic,
+    raw_heads_len, raw_history_len, remove_peer, restore, sync, sync_topic, topic_missing,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clean_sync() -> TestResult<()> {
@@ -264,7 +268,7 @@ async fn fanout_cap() -> TestResult<()> {
     let env = PatchLab::new().await?;
     let guard = env.lab.test_guard();
     env.whitelist_all()?;
-    let topic_id = publish_initial_topic_with_config(
+    let topic_id = publish_initial_config(
         &env.alice_dev,
         &env.alice,
         TopicConfig {
