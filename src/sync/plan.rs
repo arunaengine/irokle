@@ -310,11 +310,12 @@ impl Pager<'_> {
         }
         let more = self.more
             || self.remainder
-            || self.ended
+            || self.selecting.is_some()
             || !self.active.is_empty()
             || !self.resumable.is_empty()
             || self.suspended.values().any(|waiting| !waiting.is_empty())
             || !self.deferred.is_empty();
+        self.ended &= more;
         let (mut missing, positions) = (self.missing.clone(), self.positions.clone());
         while missing.len() > MAX_PAGE_MISSING {
             missing.pop_last();

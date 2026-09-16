@@ -575,6 +575,70 @@ fn public_page_contract() {
     );
 }
 
+fn exact_credit<S: Storage>(storage: S) {
+    let reference = many_actors(3, 4, 0);
+    let topic = reference.topic_id;
+    let ops = oplog::topological(reference.log.storage(), &topic).unwrap();
+    let log = Oplog::with_storage(storage);
+    log.receive_ops(ops.clone()).unwrap();
+    let source = SyncEngine::new(log.clone(), reference.genesis.signed.body.author);
+    let bytes = ops
+        .iter()
+        .skip(1)
+        .map(|op| postcard::experimental::serialized_size(op).unwrap())
+        .sum();
+    for informed in [false, true] {
+        let receiver = Oplog::new();
+        receiver
+            .receive_ops(vec![reference.genesis.clone()])
+            .unwrap();
+        let requester = SyncEngine::new(receiver.clone(), reference.reader);
+        let request = requester
+            .plan_request(
+                reference.genesis.signed.body.author,
+                &source.summary(topic).unwrap(),
+            )
+            .unwrap();
+        let summary = requester.summary(topic).unwrap();
+        assert_eq!(request.credit.ops, 12);
+        for budget in [
+            PageBudget {
+                ops: 12,
+                bytes: usize::MAX,
+            },
+            PageBudget { ops: 4096, bytes },
+        ] {
+            let page = if informed {
+                source.response_with(reference.reader, &request, budget, &summary)
+            } else {
+                source.response_page(reference.reader, &request, budget)
+            }
+            .unwrap();
+            assert_eq!(page.ops.len(), 12);
+            assert!(!page.more && !page.continued);
+            assert_eq!(source.page_work().kept_bytes, 0);
+            let mut held = BTreeSet::from([reference.genesis.id]);
+            for op in &page.ops {
+                assert!(op.signed.body.deps.is_subset(&held));
+                assert!(held.insert(op.id));
+            }
+            assert_eq!(held, ops.iter().map(|op| op.id).collect());
+        }
+    }
+}
+
+#[test]
+fn memory_exact_credit() {
+    exact_credit(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_exact_credit() {
+    let dir = tempfile::tempdir().unwrap();
+    exact_credit(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
 /// Signed chains of `lens.len()` writers on one genesis, each op depending
 /// only on its predecessor, loaded into `source`. Returns the genesis and the
 /// chains in order.
