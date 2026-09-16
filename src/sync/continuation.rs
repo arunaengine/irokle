@@ -33,7 +33,7 @@ pub(super) struct Continuation {
     pub(super) local: ActorClock,
     pub(super) goal: ActorClock,
     pub(super) frontier: Frontier,
-    pub(super) clocks: ClockClaim,
+    pub(super) clocks: Arc<ClockClaim>,
     used: Instant,
 }
 
@@ -43,7 +43,7 @@ impl Continuation {
         local: ActorClock,
         goal: ActorClock,
         frontier: Frontier,
-        clocks: ClockClaim,
+        clocks: Arc<ClockClaim>,
         summary: Option<&SyncSummary>,
     ) -> Self {
         Self {
@@ -267,6 +267,25 @@ impl Continuations {
         super::records::Records::new(Arc::clone(&self.records))
     }
 
+    pub(super) fn captured(
+        &self,
+        key: (PeerId, TopicId),
+    ) -> Option<(ActorClock, usize, Arc<ClockClaim>)> {
+        self.entries.get(&key).map(|kept| {
+            let clocks = kept
+                .local
+                .len()
+                .saturating_add(kept.goal.len())
+                .saturating_add(kept.frontier.clock().len())
+                .saturating_add(kept.frontier.offer_floor().len());
+            let work = clocks
+                .saturating_mul(2)
+                .saturating_add(kept.named.len().saturating_mul(8))
+                .saturating_add(kept.frontier.offer_count().saturating_mul(8));
+            (kept.local.clone(), work, Arc::clone(&kept.clocks))
+        })
+    }
+
     /// The plan kept for the requesting peer's topic, when `request` on `view`
     /// may go on from it. A kept plan the request does not continue is dropped.
     pub(super) fn take(
@@ -362,6 +381,78 @@ fn peer_scope(summary: &SyncSummary, genesis: OpId) -> ((bool, Option<u64>), Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_lease_survives() {
+        let mut plans = Continuations::new(1);
+        let mut clock = ActorClock::new();
+        clock.observe(ActorId::from_bytes([1; 32]), 1);
+        let mut allocation = None;
+        clock
+            .visit_allocations(|node| {
+                allocation = Some(node);
+                Ok(false)
+            })
+            .unwrap();
+        let allocation = allocation.unwrap();
+        let key = (PeerId::from_bytes([2; 32]), TopicId::from_bytes([3; 32]));
+        let view = RequestView {
+            genesis: OpId::from_bytes([4; 32]),
+            epoch: 1,
+            member: true,
+            clock: clock.clone(),
+        };
+        let request = SyncRequest {
+            topic_id: key.1,
+            known: Default::default(),
+            wants: Default::default(),
+            actor_range_hints: Vec::new(),
+            genesis: Some(view.genesis),
+            credit: Default::default(),
+            window: Default::default(),
+        };
+        let frontier = Frontier::new(
+            &clock,
+            &super::super::ActorScope::whole(),
+            1,
+            plans.records(),
+        );
+        let claim = Arc::new(plans.reserve_clocks(1).unwrap());
+        plans
+            .keep(
+                key,
+                Continuation::new(
+                    (&view, &request),
+                    clock.clone(),
+                    clock.clone(),
+                    frontier,
+                    claim,
+                    None,
+                ),
+            )
+            .unwrap();
+        let pool = Arc::clone(&plans.clocks);
+        let held = pool.load(Ordering::Acquire);
+        assert!(held > 0);
+        drop((view, clock));
+        let plans = Arc::new(std::sync::Mutex::new(plans));
+        let captured = plans.lock().unwrap().captured(key).unwrap();
+        let writer = Arc::clone(&plans);
+        std::thread::spawn(move || writer.lock().unwrap().entries.clear())
+            .join()
+            .unwrap();
+        assert!(
+            allocation.alive(),
+            "the caller still owns its captured root"
+        );
+        assert_eq!(pool.load(Ordering::Acquire), held);
+        let (root, _, lease) = captured;
+        drop(root);
+        assert!(!allocation.alive());
+        assert_eq!(pool.load(Ordering::Acquire), held);
+        drop(lease);
+        assert_eq!(pool.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn clock_claims_release() {
