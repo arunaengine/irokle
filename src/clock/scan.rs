@@ -25,12 +25,12 @@ struct Checked {
     len: u64,
     level: u8,
     bitmap: u16,
-    children: Vec<[u8; 32]>,
+    children: std::ops::Range<usize>,
 }
 
 pub(crate) struct ClockScan {
     nodes: Option<HashMap<[u8; 32], Checked>>,
-    buffers: usize,
+    children: Vec<[u8; 32]>,
     limit: usize,
     complete: bool,
     fallback: ClockCache,
@@ -40,7 +40,7 @@ impl Default for ClockScan {
     fn default() -> Self {
         Self {
             nodes: Some(HashMap::new()),
-            buffers: 0,
+            children: Vec::new(),
             limit: CACHE_BYTES,
             complete: false,
             fallback: ClockCache::default(),
@@ -96,13 +96,21 @@ impl ClockScan {
                 (key, len, level, bitmap, children)
             }
         };
-        let buffers = self.buffers.saturating_add(children.len() * 32 + 32);
+        let needed = self.children.len() + children.len();
+        let capacity = if needed > self.children.capacity() {
+            needed.max(self.children.capacity() * 2).max(4)
+        } else {
+            self.children.capacity()
+        };
+        let buffers = capacity.saturating_mul(3 * 32).saturating_add(32);
         if Self::bound(nodes.len() + 1, buffers) > self.limit {
             // Drop collected records before the existing bounded cache is used.
             self.nodes = None;
-            self.buffers = 0;
+            self.children = Vec::new();
             return Ok(());
         }
+        let start = self.children.len();
+        self.children.extend_from_slice(children);
         nodes.insert(
             *hash,
             Checked {
@@ -110,10 +118,9 @@ impl ClockScan {
                 len,
                 level,
                 bitmap,
-                children: children.to_vec(),
+                children: start..self.children.len(),
             },
         );
-        self.buffers = buffers;
         Ok(())
     }
 
@@ -130,7 +137,7 @@ impl ClockScan {
         if !self.complete {
             for node in nodes.values().filter(|node| node.level < 64) {
                 let (mut bitmap, mut len, mut previous) = (0_u16, 0_u64, None);
-                for hash in &node.children {
+                for hash in &self.children[node.children.clone()] {
                     let child = nodes.get(hash).ok_or_else(corrupt)?;
                     if child.level <= node.level
                         || first_difference(&child.key, &node.key).is_some_and(|at| at < node.level)
@@ -161,7 +168,7 @@ impl ClockScan {
     pub(crate) fn bytes(&self) -> usize {
         self.nodes.as_ref().map_or_else(
             || self.fallback.bytes(),
-            |nodes| Self::bound(nodes.len(), self.buffers),
+            |nodes| Self::bound(nodes.len(), self.children.capacity() * 3 * 32 + 32),
         )
     }
 }

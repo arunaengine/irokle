@@ -2377,8 +2377,8 @@ impl FjallStorage {
         if header.topic_id != *topic {
             return Err(Error::TopicMismatch);
         }
-        if let StoredClock::Nodes(root) = clock_tail(tail)? {
-            cache.validate(&root, |hash| {
+        if let Some(root) = validation_root(tail)? {
+            cache.validate(root, |hash| {
                 Ok(
                     fjall::Readable::get(tx, records, clock_node_key(topic, hash))?
                         .map(|bytes| bytes.to_vec()),
@@ -2547,6 +2547,35 @@ fn clock_tail(bytes: &[u8]) -> Result<StoredClock> {
     let (_, rest): (bool, _) = postcard::take_from_bytes(rest)?;
     skip_ids(rest)?;
     Ok(clock)
+}
+
+fn validation_root(bytes: &[u8]) -> Result<Option<&[u8; 32]>> {
+    let invalid = || Error::Storage("invalid stored clock encoding".into());
+    let (kind, mut rest): (u32, _) = postcard::take_from_bytes(bytes)?;
+    let root = match kind {
+        0 => {
+            let (count, tail): (usize, _) = postcard::take_from_bytes(rest)?;
+            rest = tail;
+            if count > rest.len() / 33 {
+                return Err(invalid());
+            }
+            for _ in 0..count {
+                rest = rest.get(32..).ok_or_else(invalid)?;
+                let (_, tail): (u64, _) = postcard::take_from_bytes(rest)?;
+                rest = tail;
+            }
+            None
+        }
+        1 => {
+            let (root, tail) = rest.split_first_chunk::<32>().ok_or_else(invalid)?;
+            rest = tail;
+            Some(root)
+        }
+        _ => return Err(invalid()),
+    };
+    let (_, rest): (bool, _) = postcard::take_from_bytes(rest)?;
+    skip_ids(rest)?;
+    Ok(root)
 }
 
 #[cfg(feature = "fjall")]
@@ -2814,6 +2843,39 @@ fn clear_satisfied_tx(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn root_matches_clock() {
+        use super::*;
+        for count in [0_u32, 1, 31, 32, 33, 257] {
+            let mut clock = ActorClock::new();
+            for index in 0..count {
+                clock.observe(ActorId::hash(index.to_le_bytes()), u64::from(index));
+            }
+            for stored in [StoredClock::Inline(clock), StoredClock::Nodes([9; 32])] {
+                for ready in [false, true] {
+                    let missing = [OpId::hash(b"missing")]
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                    let bytes = postcard::to_allocvec(&(&stored, ready, &missing)).unwrap();
+                    let expected = match &stored {
+                        StoredClock::Inline(_) => None,
+                        StoredClock::Nodes(root) => Some(root),
+                    };
+                    assert_eq!(validation_root(&bytes).unwrap(), expected);
+                    assert!(clock_tail(&bytes).is_ok());
+                    for end in 0..bytes.len() {
+                        assert!(validation_root(&bytes[..end]).is_err());
+                    }
+                    let mut invalid = bytes.clone();
+                    invalid[postcard::experimental::serialized_size(&stored).unwrap()] = 2;
+                    assert!(validation_root(&invalid).is_err());
+                    assert!(clock_tail(&invalid).is_err());
+                }
+            }
+        }
+        assert!(validation_root(&[2, 0, 0]).is_err());
+    }
+
     #[test]
     fn header_matches_fields() {
         use super::*;
