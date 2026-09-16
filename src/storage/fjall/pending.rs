@@ -8,7 +8,8 @@ use crate::{Error, Op, OpId, PeerId, Result, TopicId};
 
 use super::store::FjallStorage;
 use super::super::{
-    MAX_PENDING_MISSING_DEPS, MAX_PENDING_WAITERS_PER_DEP, MAX_REJECTED_PER_TOPIC, OpMeta,
+    MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS, MAX_PENDING_WAITERS_PER_DEP as MAX_WAITERS,
+    MAX_REJECTED_PER_TOPIC as MAX_REJECTED, OpMeta,
     PendingRecord, PendingUsage, check_pending_quota, pending_op_bytes,
 };
 
@@ -148,7 +149,7 @@ impl FjallStorage {
             .map(|record| record.missing.clone())
             .unwrap_or_default();
         for dep in meta.missing_deps.difference(&previous) {
-            if Self::tx_waiter_count(tx, records, dep, 1)? >= MAX_PENDING_WAITERS_PER_DEP as u64 {
+            if Self::tx_waiter_count(tx, records, dep, 1)? >= MAX_WAITERS as u64 {
                 return Err(Error::Storage("pending waiter quota exceeded".into()));
             }
             Self::tx_put(
@@ -204,7 +205,7 @@ impl FjallStorage {
 
     /// Drop a buffered op and refund its stored charge. Underflow is an error:
     /// the counters no longer describe the records.
-    pub(super) fn tx_remove_pending_op(tx: &mut Tx, records: &Records, op_id: &OpId) -> Result<()> {
+    pub(super) fn remove_pending(tx: &mut Tx, records: &Records, op_id: &OpId) -> Result<()> {
         let Some(record) = Self::tx_pending_record(tx, records, op_id)? else {
             return Ok(());
         };
@@ -279,7 +280,7 @@ impl FjallStorage {
     pub(super) fn tx_purge_waiters(tx: &mut Tx, records: &Records, dep_id: &OpId) -> Result<usize> {
         let closure = Self::tx_waiter_closure(tx, records, dep_id)?;
         for op_id in &closure {
-            Self::tx_remove_pending_op(tx, records, op_id)?;
+            Self::remove_pending(tx, records, op_id)?;
         }
         Ok(closure.len())
     }
@@ -297,7 +298,7 @@ impl FjallStorage {
         let (mut oldest, mut next): (u64, u64) =
             Self::tx_get(tx, records, range_key.as_slice())?.unwrap_or_default();
         for id in &subtree {
-            Self::tx_remove_pending_op(tx, records, id)?;
+            Self::remove_pending(tx, records, id)?;
             let marker = key(&[REJECTED, topic_id.as_ref(), id.as_ref()]);
             if fjall::Readable::contains_key(tx, records, marker.as_slice())? {
                 continue;
@@ -311,7 +312,7 @@ impl FjallStorage {
             )?;
             next += 1;
         }
-        while next - oldest > MAX_REJECTED_PER_TOPIC as u64 {
+        while next - oldest > MAX_REJECTED as u64 {
             let order_key = key(&[REJECTED_ORDER, topic_id.as_ref(), &oldest.to_be_bytes()]);
             if let Some(dropped) = Self::tx_get::<OpId>(tx, records, order_key.as_slice())? {
                 tx.remove(
@@ -337,7 +338,7 @@ impl FjallStorage {
             ids.push(id_at(item.key()?.as_ref(), BY_TOPIC.len() + TopicId::LEN)?);
         }
         for op_id in ids {
-            Self::tx_remove_pending_op(tx, records, &op_id)?;
+            Self::remove_pending(tx, records, &op_id)?;
         }
         for prefix in [REJECTED, REJECTED_ORDER] {
             Self::tx_remove_prefix(tx, records, &key(&[prefix, topic_id.as_ref()]))?;
@@ -480,7 +481,7 @@ impl FjallStorage {
         if meta.topic_id != op.signed.body.topic_id || meta.id != op.id {
             return Err(Error::TopicMismatch);
         }
-        if meta.missing_deps.len() > MAX_PENDING_MISSING_DEPS {
+        if meta.missing_deps.len() > MAX_MISSING_DEPS {
             return Err(Error::Storage(
                 "pending op has too many missing deps".into(),
             ));

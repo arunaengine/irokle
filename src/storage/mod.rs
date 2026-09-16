@@ -11,11 +11,9 @@ use crate::{
 pub const MAX_PENDING_OPS_TOTAL: usize = 4096;
 pub const MAX_PENDING_OPS_PER_SOURCE: usize = 1024;
 pub const MAX_PENDING_WAITERS_PER_DEP: usize = 1024;
-/// Serialized bytes of buffered pending operations a store may hold, in total
-/// and per authenticated source. A count limit alone does not bound memory: one
-/// operation may be megabytes, so the count budget multiplied by the frame
-/// limit is far larger than any node should buffer. Enforced in core, because
-/// buffering happens with or without a transport feature.
+/// Buffered operations have total and per-source byte limits. Counts alone do
+/// not bound memory when one operation is large, so core enforces these limits
+/// for every backend.
 pub const MAX_PENDING_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 pub const MAX_PENDING_BYTES_PER_SOURCE: usize = 16 * 1024 * 1024;
 pub const MAX_PENDING_MISSING_DEPS: usize = 128;
@@ -25,10 +23,8 @@ pub const MAX_PENDING_OPS_PER_TOPIC: usize = 2048;
 pub const MAX_PENDING_BYTES_PER_TOPIC: usize = 32 * 1024 * 1024;
 /// Rejected op ids a topic remembers, oldest dropped first.
 pub const MAX_REJECTED_PER_TOPIC: usize = 4096;
-/// Eviction records a store may hold unacknowledged. A healthy consumer
-/// acknowledges each record as soon as it owns the payloads durably, so this
-/// only bounds a store whose consumer stopped draining; the reset that would
-/// exceed it is refused rather than discarding a payload nothing else holds.
+/// Unacknowledged eviction records are bounded. Refuse overflow so a reset does
+/// not discard payloads while no other durable owner exists.
 pub const MAX_PENDING_EVICTIONS: usize = 1024;
 
 
@@ -144,11 +140,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {
         Ok(self.get_meta(id)?.as_ref().map(OpPosition::from))
     }
-    /// Whether `id` is stored completely enough to stand as a dependency. The
-    /// DAG is traversed through metadata and served from op records, so either
-    /// half alone is a hole to refill, never a resolved edge. This is the one
-    /// predicate every caller must use; backends override it to read both keys
-    /// from a single snapshot.
+    /// A dependency is complete only when both its operation and metadata exist.
+    /// Backends must check both from one snapshot so callers never traverse a
+    /// half-stored edge.
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
         Ok(self.get_op(id)?.is_some() && self.get_meta(id)?.is_some())
     }
@@ -210,18 +204,13 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// actively pulled instead of stranding its dependents forever.
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
-    /// Atomically drop every pending op that transitively waits on `dep_id`.
-    /// Genesis tie-break resolution uses this for a genesis that will never be
-    /// admitted here; a partial walk would strand waiters holding pending quota
-    /// against a dependency that can never arrive. Returns the number removed.
-    /// Required rather than defaulted: a composition of single removals is
-    /// correct but not atomic, and a backend must not inherit that silently.
+    /// Atomically remove every pending dependent of `dep_id`. Genesis resolution
+    /// uses this when the dependency cannot arrive; partial removal would strand
+    /// waiters and retain quota for impossible work.
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize>;
-    /// Atomically drop a permanently invalid pending `op_id` and every pending
-    /// op transitively waiting on it, or nothing at all once `op_id` is no
-    /// longer buffered, so a concurrent admission keeps its waiters. Required
-    /// rather than defaulted for the same atomicity reason as above; the count
-    /// returned includes `op_id`.
+    /// Atomically remove an invalid pending subtree, or do nothing when its root
+    /// is gone. The returned count includes the root and preserves concurrent
+    /// admissions.
     fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>>;
@@ -234,17 +223,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
         expected_genesis: Option<OpId>,
     ) -> Result<()>;
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>>;
-    /// Atomically persist `ack` and clear any obligations satisfied by it.
-    /// Backends must perform both writes in one durable operation so a crash
-    /// between them cannot leave the ack visible while obligations remain,
-    /// or vice-versa. Returns the number of cleared obligations.
-    ///
-    /// The topic's current identity and membership must be read in that same
-    /// operation and the write conditioned on them, so evidence validated
-    /// before a concurrent reset or peer removal cannot still commit. Evidence
-    /// naming another incarnation is refused with
-    /// [`crate::Error::StaleIncarnation`]; a removed peer's with
-    /// [`crate::Error::NotTopicMember`].
+    /// Persist `ack` and clear satisfied obligations atomically. Read current
+    /// branch and membership in that operation; stale branches and removed peers
+    /// must not clear obligations.
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize>;
     /// Apply acks in order as [`Storage::apply_peer_ack`] would, one result per ack, so one
     /// uncertifiable ack neither commits nor discards the rest. Backend failures use the outer
@@ -269,12 +250,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// every start of a transport gets an epoch no earlier start used.
     fn next_attempt_epoch(&self) -> Result<u64>;
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()>;
-    /// Atomically fold `update` into the status of `peer_id` on `topic_id` and
-    /// return the result. Backends must read, apply and write in one lock or
-    /// transaction: two outcomes recorded at once would otherwise each miss the
-    /// other's counter increment and the later writer's state would win.
-    /// Required rather than defaulted: a composition of a read and a blind
-    /// write is not atomic, and a backend must not inherit that silently.
+    /// Fold `update` atomically into one peer status and return the result.
+    /// Concurrent updates must preserve counter increments and the newest state.
     fn update_sync_status(
         &self,
         peer_id: &PeerId,
@@ -296,40 +273,14 @@ pub trait Storage: Clone + Send + Sync + 'static {
         expected_genesis: Option<OpId>,
     ) -> Result<usize>;
 
-    /// Atomically remove every local record for `topic_id`: topic/genesis
-    /// registration, all ops and their metadata, actor indexes/tips, heads,
-    /// fingerprint, max generation, the topic's actor clock, buffered pending
-    /// ops targeting the topic, and every peer's stored acks, sync
-    /// obligations, and sync statuses for the topic. Used by genesis tie-break
-    /// resolution to adopt a winning foreign genesis; a partial reset would
-    /// leave stale actor tips or acks that keep sync clocks diverging, so
-    /// backends must clear all per-topic keyspaces. Returns the number of
-    /// admitted ops removed.
+    /// Atomically remove every topic record, index, clock, pending op, ack,
+    /// obligation, and status. Partial reset leaves stale frontier evidence and
+    /// prevents convergence.
     fn reset_topic(&self, topic_id: &TopicId) -> Result<usize>;
 
-    /// Atomically verify that the current topic state is exactly
-    /// `expected_topic_state`, then [`Storage::reset_topic`] and apply `batch`
-    /// in one durable operation. Genesis tie-break adoption uses this to
-    /// discard the local chain and install the winning foreign genesis with no
-    /// crash window between the two: a crash either leaves the whole local
-    /// chain or the fully installed winner, never an empty topic. The expected
-    /// state check prevents a stale resolver from overwriting a smaller genesis
-    /// admitted by another facade. `batch` must be built against a fresh topic
-    /// (empty `expected_heads`, `None` `expected_topic_state`). Returns the
-    /// number of admitted ops the reset removed. A rejected `batch` must leave
-    /// the local chain exactly as it was. Required rather than defaulted: a
-    /// reset followed by a separate admission is not atomic, and a backend must
-    /// not inherit that silently.
-    ///
-    /// `eviction` describes the payloads this reset discards. When it carries
-    /// any, backends must journal it under [`TopicEviction::key`] in this same
-    /// transaction: the reset is the moment those payloads stop existing
-    /// anywhere else, so a record written afterwards would leave a crash window
-    /// that loses acknowledged writes. The record is released by
-    /// [`Storage::clear_eviction`], never by the reset itself. A reset that
-    /// would push the store past [`MAX_PENDING_EVICTIONS`] outstanding records
-    /// must be refused with [`crate::Error::EvictionJournalFull`], leaving the
-    /// local chain in place.
+    /// Verify `expected_topic_state`, reset the topic, and admit `batch` in one
+    /// durable operation. Genesis adoption then leaves either the old chain or
+    /// the complete winner, and stale resolvers cannot overwrite newer state.
     fn reset_topic_and_admit(
         &self,
         topic_id: &TopicId,
@@ -348,10 +299,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// only remaining copy of the payloads its reset removed.
     fn pending_evictions(&self) -> Result<Vec<TopicEviction>>;
 
-    /// Release the journalled eviction named by `key`. The consumer calls this
-    /// only once it durably owns the payloads, so a crash before that point
-    /// leaves the record for the next restart. Releasing an absent key is not
-    /// an error: acknowledgement is idempotent.
+    /// Release `key` after the consumer durably owns its payloads. An absent key
+    /// is accepted because acknowledgement is idempotent and crash recovery
+    /// may repeat it.
     fn clear_eviction(&self, key: &EvictionKey) -> Result<()>;
 
     /// Whether `peer_id` holds `op_id` on the branch that currently stores it. Required:
@@ -369,11 +319,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn staging_limits(&self) -> StagingLimits;
     /// Every provisional bootstrap namespace, read at one moment.
     fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>>;
-    /// The namespace of `source` for `topic_id`, opened empty for `genesis` when
-    /// the source has none. An existing namespace is returned unchanged, whatever
-    /// genesis it holds. Refuses an active topic with
-    /// [`crate::Error::AdmissionConflict`] and a namespace past the count limits
-    /// with [`crate::Error::StagingCapacity`].
+    /// Open `source`'s namespace for `topic_id`, empty at `genesis` when absent.
+    /// Existing namespaces remain unchanged; active or over-limit namespaces
+    /// return an admission or staging capacity error.
     fn open_provisional(
         &self,
         source: PeerId,
@@ -381,25 +329,17 @@ pub trait Storage: Clone + Send + Sync + 'static {
         genesis: OpId,
         now_ms: u64,
     ) -> Result<ProvisionalTopic>;
-    /// The store holding the history of `provisional`, or `None` once its
-    /// session ended. It sees only that namespace. Each of its reads checks that
-    /// the session is still registered and each write, in the transaction that
-    /// commits it, that the session still stages; otherwise
-    /// [`crate::Error::StaleIncarnation`] before any effect. A write past the
-    /// namespace, total or source byte limit is refused with
-    /// [`crate::Error::StagingCapacity`].
+    /// Return the namespace store for `provisional`, or `None` after its session
+    /// ends. Reads and writes recheck the session before effects and enforce the
+    /// namespace, total, and source byte limits.
     fn provisional_store(&self, provisional: &ProvisionalTopic) -> Result<Option<Self>>;
     /// Serialized op bytes this store holds, admitted and buffered.
     fn stored_bytes(&self) -> Result<u64>;
     /// Record a write to the namespace while its session is current.
     fn touch_provisional(&self, provisional: &ProvisionalTopic, now_ms: u64) -> Result<()>;
-    /// Make the history of `provisional` the active topic. The first step
-    /// claims the topic's one activation for this session, which refuses a
-    /// claim of another session with [`crate::Error::AdmissionConflict`], and
-    /// freezes the namespace at `expected`. Nothing of the history is visible
-    /// to a read of the store until one transaction installs the state, heads,
-    /// clock and `effects` and ends every namespace of the topic. An
-    /// interrupted activation resumes when called again.
+    /// Activate `provisional` after claiming its topic and freezing `expected`.
+    /// Publication installs state, heads, clock, and `effects` atomically; an
+    /// interrupted activation remains hidden and resumes on the next call.
     fn activate_provisional(
         &self,
         provisional: &ProvisionalTopic,

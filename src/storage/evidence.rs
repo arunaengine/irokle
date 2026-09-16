@@ -12,10 +12,9 @@ use super::{OpPosition, TopicState};
 pub struct PeerAck {
     pub peer_id: PeerId,
     pub topic_id: TopicId,
-    /// Genesis of the incarnation this evidence was signed against. `None` is
-    /// a record migrated from a schema that did not identify its branch; it is
-    /// retained but certifies nothing, because genesis replacement reuses the
-    /// same actor ids and sequence numbers on the new branch.
+    /// Genesis this evidence certifies. Missing genesis is legacy data that
+    /// remains stored but certifies nothing because branch replacement reuses
+    /// actor sequence numbers.
     #[serde(default)]
     pub genesis: Option<OpId>,
     pub heads: BTreeSet<OpId>,
@@ -107,10 +106,9 @@ pub struct SyncPeerStatus {
     /// Newest attempt identity, `(epoch, sequence)`, whose outcome set the
     /// state, error and pending gauge.
     pub latest_attempt: Option<(u64, u64)>,
-    /// The newest identities already counted, so a repeat of one of them
-    /// counts nothing. Bounded by `MAX_RECENT_ATTEMPTS`. An older identity
-    /// counts: the recorder counts each attempt once, see the transport's
-    /// live attempts.
+    /// Attempt identities already counted, bounded by `MAX_RECENT_ATTEMPTS`.
+    /// Repeats count nothing; older identities still count once when recorded
+    /// by a live attempt.
     pub recent_attempts: Vec<(u64, u64)>,
 }
 
@@ -350,10 +348,8 @@ pub(crate) enum AckCommit {
     Retain,
 }
 
-/// How to commit `ack` given `state`, which backends must read in the same
-/// transaction that writes it. Evidence proves something about one branch and
-/// one member, so a replaced genesis or a removed peer makes it uncertifiable
-/// rather than merely stale, and only a matching branch may clear obligations.
+/// Commit `ack` only when its branch and member match the transaction state.
+/// Replaced branches and removed peers cannot clear obligations.
 pub(crate) fn ack_commit(state: Option<&TopicState>, ack: &PeerAck) -> Result<AckCommit> {
     let Some(state) = state else {
         return Ok(AckCommit::Retain);
@@ -381,10 +377,8 @@ fn same_incarnation(existing: &PeerAck, incoming: &PeerAck) -> bool {
         && existing.genesis == incoming.genesis
 }
 
-/// The ack to store once `incoming` is not covered by `existing`. Clock
-/// components the stored ack already proved are kept, so evidence that is
-/// merely incomparable adds to the record instead of regressing it. The stored
-/// frontier follows the newer ack: its clock still carries the older heads.
+/// Merge same-branch clocks without regressing the incoming frontier. Evidence
+/// from another branch remains separate and cannot clear obligations.
 pub(crate) fn merged_peer_ack(existing: &PeerAck, incoming: &PeerAck) -> PeerAck {
     let mut merged = incoming.clone();
     if same_incarnation(existing, incoming) {

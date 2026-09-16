@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 use crate::topic::ReplicationPolicy;
 use crate::{ActorClock, ActorId, Op, OpId, PeerId, Result, TopicId};
 use super::{
-    MAX_PENDING_OPS_TOTAL, MAX_PENDING_BYTES_PER_TOPIC,
-    MAX_PENDING_BYTES_PER_SOURCE, MAX_PENDING_BYTES_TOTAL, MAX_PENDING_MISSING_DEPS,
-    MAX_PENDING_OPS_PER_SOURCE, MAX_PENDING_OPS_PER_TOPIC, MAX_PENDING_WAITERS_PER_DEP,
-    MAX_REJECTED_PER_TOPIC, PeerAck, SyncObligation,
+    MAX_PENDING_BYTES_PER_SOURCE as MAX_SOURCE_BYTES, MAX_PENDING_BYTES_PER_TOPIC as MAX_TOPIC_BYTES,
+    MAX_PENDING_BYTES_TOTAL as MAX_TOTAL_BYTES, MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS,
+    MAX_PENDING_OPS_PER_SOURCE as MAX_SOURCE_OPS, MAX_PENDING_OPS_PER_TOPIC as MAX_TOPIC_OPS,
+    MAX_PENDING_OPS_TOTAL as MAX_TOTAL_OPS, MAX_PENDING_WAITERS_PER_DEP as MAX_WAITERS,
+    MAX_REJECTED_PER_TOPIC as MAX_REJECTED, PeerAck, SyncObligation,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,33 +344,30 @@ pub(crate) fn check_pending_quota(
     charge: u64,
 ) -> Result<()> {
     let refuse = |message: &str| Err(crate::Error::Storage(message.into()));
-    if total.ops >= MAX_PENDING_OPS_TOTAL as u64 {
+    if total.ops >= MAX_TOTAL_OPS as u64 {
         return refuse("pending op buffer is full");
     }
-    if total.bytes + charge > MAX_PENDING_BYTES_TOTAL as u64 {
+    if total.bytes + charge > MAX_TOTAL_BYTES as u64 {
         return refuse("pending byte budget is full");
     }
-    if source.ops >= MAX_PENDING_OPS_PER_SOURCE as u64 {
+    if source.ops >= MAX_SOURCE_OPS as u64 {
         return refuse("pending op source quota exceeded");
     }
-    if source.bytes + charge > MAX_PENDING_BYTES_PER_SOURCE as u64 {
+    if source.bytes + charge > MAX_SOURCE_BYTES as u64 {
         return refuse("pending byte quota exceeded for source");
     }
-    if topic.ops >= MAX_PENDING_OPS_PER_TOPIC as u64 {
+    if topic.ops >= MAX_TOPIC_OPS as u64 {
         return refuse("pending op topic quota exceeded");
     }
-    if topic.bytes + charge > MAX_PENDING_BYTES_PER_TOPIC as u64 {
+    if topic.bytes + charge > MAX_TOPIC_BYTES as u64 {
         return refuse("pending byte quota exceeded for topic");
     }
     Ok(())
 }
 
-/// Reject a batch whose entry depends on an op that is not stored completely,
-/// checked against the same transaction that will write it. `stored_dep` must
-/// apply the [`Storage::dep_resolvable`] predicate inside that transaction.
-/// Enforcing this at the durability boundary is what keeps every admission path
-/// (batch admission, admission retry, genesis reset) from committing a dangling
-/// DAG edge.
+/// Reject an entry whose dependency is incomplete in the same transaction that
+/// writes it. This keeps admission, retries, and genesis reset from committing
+/// dangling DAG edges.
 pub(crate) fn ensure_deps_resolvable(
     entries: &[(Op, OpMeta)],
     mut stored_dep: impl FnMut(&OpId) -> Result<bool>,

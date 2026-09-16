@@ -77,7 +77,7 @@ const EVICTION_PREFIX: &[u8] = b"ev";
 #[cfg(feature = "fjall")]
 const SEALED_TOPIC_PREFIX: &[u8] = b"se";
 #[cfg(feature = "fjall")]
-const FJALL_SCHEMA_VERSION_KEY: &[u8] = b"sv";
+const SCHEMA_VERSION_KEY: &[u8] = b"sv";
 /// Where an unfinished schema 7 upgrade continues, see [`ClockMigration`].
 const CLOCK_MIGRATION: &[u8] = b"sm";
 /// Metadata records one step of the schema 7 upgrade rewrites at most.
@@ -100,7 +100,7 @@ const OBLIGATION_KEY_LEN: usize = 2 + TopicId::LEN + PeerId::LEN + 1;
 #[cfg(feature = "fjall")]
 const PENDING_BYTES_KEY: &[u8] = b"pb";
 #[cfg(feature = "fjall")]
-const PENDING_SOURCE_BYTES_PREFIX: &[u8] = b"pq";
+const SOURCE_BYTES_PREFIX: &[u8] = b"pq";
 /// Pending payload records, keyed on `po<op id>`.
 #[cfg(feature = "fjall")]
 const PENDING_OP_PREFIX: &[u8] = b"po";
@@ -179,11 +179,8 @@ impl FjallStorage {
         Self::open_with_persist_mode(path, fjall::PersistMode::SyncAll)
     }
 
-    /// Open Fjall storage with an explicit transaction persist mode.
-    ///
-    /// `SyncAll` preserves the historical fully durable behavior. `Buffer`
-    /// avoids a foreground fsync on every Irokle transaction and is useful when
-    /// callers provide their own durability boundary.
+    /// Open Fjall with an explicit persist mode. `SyncAll` preserves existing
+    /// durability; `Buffer` lets callers place the durability boundary.
     pub fn open_with_persist_mode(
         path: impl AsRef<Path>,
         persist_mode: fjall::PersistMode,
@@ -349,63 +346,53 @@ impl FjallStorage {
     /// Upgrade to the current schema, stopping after `steps` steps of the
     /// schema 7 rewrite, as a crash between two of them would.
     fn upgrade_schema(&self, steps: usize) -> Result<()> {
-        match self.get::<u32>(FJALL_SCHEMA_VERSION_KEY)? {
+        match self.get::<u32>(SCHEMA_VERSION_KEY)? {
             Some(FJALL_SCHEMA_VERSION) => self.finish_clock_migration(steps),
             Some(1) => {
-                self.migrate_to_schema_two()?;
-                self.migrate_to_schema_three()?;
-                self.migrate_to_schema_four()?;
-                self.migrate_to_schema_five()?;
-                self.migrate_to_schema_six()?;
-                self.migrate_to_schema_seven(steps)
+                self.migrate_schema_two()?;
+                self.migrate_schema_three()?;
+                self.migrate_schema_four()?;
+                self.migrate_schema_five()?;
+                self.migrate_schema_six()?;
+                self.migrate_schema_seven(steps)
             }
             Some(2) => {
-                self.migrate_to_schema_three()?;
-                self.migrate_to_schema_four()?;
-                self.migrate_to_schema_five()?;
-                self.migrate_to_schema_six()?;
-                self.migrate_to_schema_seven(steps)
+                self.migrate_schema_three()?;
+                self.migrate_schema_four()?;
+                self.migrate_schema_five()?;
+                self.migrate_schema_six()?;
+                self.migrate_schema_seven(steps)
             }
             Some(3) => {
-                self.migrate_to_schema_four()?;
-                self.migrate_to_schema_five()?;
-                self.migrate_to_schema_six()?;
-                self.migrate_to_schema_seven(steps)
+                self.migrate_schema_four()?;
+                self.migrate_schema_five()?;
+                self.migrate_schema_six()?;
+                self.migrate_schema_seven(steps)
             }
             Some(4) => {
-                self.migrate_to_schema_five()?;
-                self.migrate_to_schema_six()?;
-                self.migrate_to_schema_seven(steps)
+                self.migrate_schema_five()?;
+                self.migrate_schema_six()?;
+                self.migrate_schema_seven(steps)
             }
             Some(5) => {
-                self.migrate_to_schema_six()?;
-                self.migrate_to_schema_seven(steps)
+                self.migrate_schema_six()?;
+                self.migrate_schema_seven(steps)
             }
-            Some(6) => self.migrate_to_schema_seven(steps),
+            Some(6) => self.migrate_schema_seven(steps),
             Some(version) => Err(Error::Storage(format!(
                 "unsupported fjall schema version {version}"
             ))),
-            None => self.put(FJALL_SCHEMA_VERSION_KEY, &FJALL_SCHEMA_VERSION),
+            None => self.put(SCHEMA_VERSION_KEY, &FJALL_SCHEMA_VERSION),
         }
     }
 
-    /// Upgrade a schema 1 database. Two things change:
-    ///
-    /// Acknowledgements move into the current layout, which names the
-    /// incarnation each one certifies. Their branch was never recorded, so they
-    /// migrate as uncertified: the records and their clocks are preserved, but
-    /// they prove nothing until the peer acknowledges the current branch.
-    ///
-    /// Buffered pending payloads gain byte counters, seeded by measuring the
-    /// records already stored so the budgets describe the whole pool rather
-    /// than only what arrives afterwards.
-    ///
-    /// One transaction carries every rewrite and the version bump, so an
-    /// interrupted upgrade reopens at schema 1 and retries from the start.
-    fn migrate_to_schema_two(&self) -> Result<()> {
+    /// Upgrade schema 1 atomically: preserve uncertified acks, seed pending byte
+    /// counters, and bump the version only after all rewrites. Reopen retries the
+    /// transaction if interrupted.
+    fn migrate_schema_two(&self) -> Result<()> {
         self.transaction(|tx| {
             // A concurrent facade may have finished the upgrade already.
-            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(1) {
+            if Self::tx_get::<u32>(tx, &self.records, SCHEMA_VERSION_KEY)? != Some(1) {
                 return Ok(());
             }
             let mut migrated = Vec::new();
@@ -447,12 +434,12 @@ impl FjallStorage {
                 Self::tx_put(
                     tx,
                     &self.records,
-                    [PENDING_SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat(),
+                    [SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat(),
                     &bytes,
                 )?;
             }
 
-            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &2_u32)?;
+            Self::tx_put(tx, &self.records, SCHEMA_VERSION_KEY, &2_u32)?;
             Ok(())
         })
     }
@@ -460,9 +447,9 @@ impl FjallStorage {
     /// Upgrade schema 2 in one transaction that rechecks the version. Acks and
     /// obligations move to topic-first keys; a legacy clock becomes a clock
     /// target, ids alone a repair want, and a record with neither is dropped.
-    fn migrate_to_schema_three(&self) -> Result<()> {
+    fn migrate_schema_three(&self) -> Result<()> {
         self.transaction(|tx| {
-            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(2) {
+            if Self::tx_get::<u32>(tx, &self.records, SCHEMA_VERSION_KEY)? != Some(2) {
                 return Ok(());
             }
             let mut acks = Vec::new();
@@ -487,7 +474,7 @@ impl FjallStorage {
             let mut legacy_keys = Vec::new();
             for item in fjall::Readable::prefix(tx, &self.records, OBLIGATION_PREFIX) {
                 let (key, value) = item.into_inner()?;
-                if Self::is_op_record_key(key.as_ref()) {
+                if Self::is_record_key(key.as_ref()) {
                     continue;
                 }
                 legacy_keys.push(key.to_vec());
@@ -532,7 +519,7 @@ impl FjallStorage {
                 total_bytes += bytes;
                 *source_bytes.entry(source_peer).or_default() += bytes;
             }
-            Self::tx_remove_prefix(tx, &self.records, PENDING_SOURCE_BYTES_PREFIX)?;
+            Self::tx_remove_prefix(tx, &self.records, SOURCE_BYTES_PREFIX)?;
             tx.remove(&self.records, PENDING_BYTES_KEY)?;
             if total_bytes > 0 {
                 Self::tx_put(tx, &self.records, PENDING_BYTES_KEY, &total_bytes)?;
@@ -541,12 +528,12 @@ impl FjallStorage {
                 Self::tx_put(
                     tx,
                     &self.records,
-                    [PENDING_SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat(),
+                    [SOURCE_BYTES_PREFIX, source_peer.as_ref()].concat(),
                     &bytes,
                 )?;
             }
 
-            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &3_u32)?;
+            Self::tx_put(tx, &self.records, SCHEMA_VERSION_KEY, &3_u32)?;
             Ok(())
         })
     }
@@ -554,9 +541,9 @@ impl FjallStorage {
     /// Upgrade schema 3 in one transaction that rechecks the version: each
     /// buffered op splits into a small record and its payload, with topic,
     /// waiter and ready indexes and usage counters rebuilt from the records.
-    fn migrate_to_schema_four(&self) -> Result<()> {
+    fn migrate_schema_four(&self) -> Result<()> {
         self.transaction(|tx| {
-            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(3) {
+            if Self::tx_get::<u32>(tx, &self.records, SCHEMA_VERSION_KEY)? != Some(3) {
                 return Ok(());
             }
             let mut legacy = Vec::new();
@@ -572,7 +559,7 @@ impl FjallStorage {
                 PENDING_OP_PREFIX,
                 b"pn",
                 PENDING_BYTES_KEY,
-                PENDING_SOURCE_BYTES_PREFIX,
+                SOURCE_BYTES_PREFIX,
                 b"ps",
                 b"pw",
                 b"wn",
@@ -594,40 +581,36 @@ impl FjallStorage {
                 }
                 Self::tx_import_pending(tx, &self.records, source_peer, &op, missing)?;
             }
-            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &4_u32)?;
+            Self::tx_put(tx, &self.records, SCHEMA_VERSION_KEY, &4_u32)?;
             Ok(())
         })
     }
 
-    /// Upgrade a schema 4 database. Its bootstrap staging named neither the
-    /// branch nor a session, so no receipt can be tied to it: those unscoped
-    /// records are discarded as unacknowledged provisional state, never
-    /// assigned to a branch from current data. Active topics, evidence,
-    /// obligations and the eviction journal are untouched.
-    fn migrate_to_schema_five(&self) -> Result<()> {
+    /// Upgrade schema 4 by discarding unscoped provisional records that cannot
+    /// be tied to a branch or session. Active topics, evidence, obligations, and
+    /// eviction records remain unchanged.
+    fn migrate_schema_five(&self) -> Result<()> {
         self.transaction(|tx| {
-            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(4) {
+            if Self::tx_get::<u32>(tx, &self.records, SCHEMA_VERSION_KEY)? != Some(4) {
                 return Ok(());
             }
             for prefix in [b"bm".as_slice(), b"bo".as_slice()] {
                 Self::tx_remove_prefix(tx, &self.records, prefix)?;
             }
-            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &5_u32)?;
+            Self::tx_put(tx, &self.records, SCHEMA_VERSION_KEY, &5_u32)?;
             Ok(())
         })
     }
 
-    /// Upgrade a schema 5 database. Namespace records gain a revision and the
-    /// bytes their keyspace holds, measured from its stored counters. An
-    /// interrupted activation keeps its claim and its copies, which the root
-    /// reads now hide until it completes.
-    fn migrate_to_schema_six(&self) -> Result<()> {
+    /// Upgrade schema 5 with namespace revision and byte accounting. An
+    /// interrupted activation retains its claim and copies until completion.
+    fn migrate_schema_six(&self) -> Result<()> {
         self.transaction(|tx| {
-            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(5) {
+            if Self::tx_get::<u32>(tx, &self.records, SCHEMA_VERSION_KEY)? != Some(5) {
                 return Ok(());
             }
             self.tx_migrate_namespaces(tx)?;
-            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &6_u32)?;
+            Self::tx_put(tx, &self.records, SCHEMA_VERSION_KEY, &6_u32)?;
             Ok(())
         })
     }
@@ -663,17 +646,12 @@ impl FjallStorage {
         Ok(())
     }
 
-    /// Upgrade a schema 6 database. Stored metadata names its observed clock
-    /// by the hash of a trie node instead of holding every entry, so a clock
-    /// one position ahead of another shares all but a path of nodes with it.
-    /// The version moves to 7 with a cursor first, which an older binary
-    /// refuses; bounded steps then rewrite the records of the main keyspace
-    /// and of every slot keyspace, and the step that removes the cursor
-    /// completes the layout. Opening a store continues a step sequence an
-    /// interruption left.
-    fn migrate_to_schema_seven(&self, steps: usize) -> Result<()> {
+    /// Upgrade schema 6 to the shared clock-node layout. A cursor marks the
+    /// bounded rewrite across the main and slot keyspaces so reopening resumes
+    /// an interrupted step.
+    fn migrate_schema_seven(&self, steps: usize) -> Result<()> {
         self.transaction(|tx| {
-            if Self::tx_get::<u32>(tx, &self.records, FJALL_SCHEMA_VERSION_KEY)? != Some(6) {
+            if Self::tx_get::<u32>(tx, &self.records, SCHEMA_VERSION_KEY)? != Some(6) {
                 return Ok(());
             }
             Self::tx_put(
@@ -683,7 +661,7 @@ impl FjallStorage {
                 &ClockMigration::default(),
             )?;
             self.tx_charge_clearing(tx)?;
-            Self::tx_put(tx, &self.records, FJALL_SCHEMA_VERSION_KEY, &7_u32)?;
+            Self::tx_put(tx, &self.records, SCHEMA_VERSION_KEY, &7_u32)?;
             Ok(())
         })?;
         self.finish_clock_migration(steps)
@@ -694,7 +672,7 @@ impl FjallStorage {
         let mut limit = MIGRATION_RECORDS;
         for _ in 0..steps {
             let more = loop {
-                match self.transaction(|tx| self.tx_clock_migration_step(tx, limit)) {
+                match self.transaction(|tx| self.clock_migration_step(tx, limit)) {
                     Err(Error::StorageBuffer { .. }) if limit > 1 => {
                         limit = limit.div_ceil(2);
                     }
@@ -710,7 +688,7 @@ impl FjallStorage {
 
     /// Rewrite the next bounded run of legacy metadata records, or move the
     /// cursor to the next keyspace, or remove it. False once none is left.
-    fn tx_clock_migration_step(&self, tx: &mut Transaction, limit: usize) -> Result<bool> {
+    fn clock_migration_step(&self, tx: &mut Transaction, limit: usize) -> Result<bool> {
         let Some(cursor) = Self::tx_get::<ClockMigration>(tx, &self.records, CLOCK_MIGRATION)?
         else {
             return Ok(false);
@@ -923,7 +901,7 @@ impl FjallStorage {
     }
 
     // An op id beginning with `b` makes its `o<id>` key match the `ob` scan prefix.
-    fn is_op_record_key(key: &[u8]) -> bool {
+    fn is_record_key(key: &[u8]) -> bool {
         key.len() == b"o".len() + OpId::LEN && key.starts_with(b"o")
     }
 
@@ -1038,7 +1016,7 @@ impl FjallStorage {
         Ok(ack_commit(state.as_ref(), ack))
     }
 
-    fn tx_apply_peer_ack(
+    fn apply_ack_tx(
         tx: &mut Transaction,
         records: &fjall::OptimisticTxKeyspace,
         ack: &PeerAck,
@@ -1063,7 +1041,7 @@ impl FjallStorage {
         clear_satisfied_tx(tx, records, &effective_ack)
     }
 
-    fn op_id_from_key(key: &[u8], offset: usize) -> Result<OpId> {
+    fn id_from_key(key: &[u8], offset: usize) -> Result<OpId> {
         let bytes = key
             .get(offset..offset + OpId::LEN)
             .ok_or_else(|| Error::Storage("corrupt fjall op id index key".into()))?;
@@ -1292,7 +1270,7 @@ impl FjallStorage {
                 // Admission drops the buffered copy through the same funnel as
                 // every other removal, so the pending counts and byte budgets
                 // are released in exactly one place.
-                Self::tx_remove_pending_op(tx, &self.records, &op.id)?;
+                Self::remove_pending(tx, &self.records, &op.id)?;
                 Self::tx_settle_waiters(tx, &self.records, &op.id)?;
                 clock.observe(meta.actor_id, meta.actor_seq);
                 max_generation = max_generation.max(meta.generation);
@@ -1501,7 +1479,7 @@ impl FjallStorage {
         let mut out = BTreeSet::new();
         for item in fjall::Readable::prefix(tx, records, prefix) {
             let (key, _) = item.into_inner()?;
-            out.insert(Self::op_id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
+            out.insert(Self::id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
         }
         Ok(out)
     }
@@ -1559,7 +1537,7 @@ impl FjallStorage {
         let mut op_ids = Vec::new();
         for item in fjall::Readable::prefix(tx, &self.records, to_prefix) {
             let (key, _) = item.into_inner()?;
-            op_ids.push(Self::op_id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
+            op_ids.push(Self::id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
         }
         let removed = op_ids.len();
         for op_id in &op_ids {
@@ -1781,7 +1759,7 @@ impl Storage for FjallStorage {
         let mut out = Vec::new();
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
             let (key, _) = item.into_inner()?;
-            let id = Self::op_id_from_key(key.as_ref(), 2 + TopicId::LEN)?;
+            let id = Self::id_from_key(key.as_ref(), 2 + TopicId::LEN)?;
             let value = fjall::Readable::get(&read_tx, &self.records, Self::key_id(b"o", &id))?
                 .ok_or_else(|| Error::Storage(format!("missing op indexed for topic: {id}")))?;
             out.push(postcard::from_bytes(value.as_ref())?);
@@ -1804,7 +1782,7 @@ impl Storage for FjallStorage {
         let mut out = BTreeSet::new();
         for item in fjall::Readable::prefix(&read_tx, &self.records, prefix) {
             let (key, _) = item.into_inner()?;
-            out.insert(Self::op_id_from_key(key.as_ref(), 2 + OpId::LEN)?);
+            out.insert(Self::id_from_key(key.as_ref(), 2 + OpId::LEN)?);
         }
         if self.namespace.is_some() || out.is_empty() {
             return Ok(out);
@@ -1994,7 +1972,7 @@ impl Storage for FjallStorage {
         Self::read_pending_missing(&self.snapshot()?, &self.records, topic_id)
     }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
-        self.transaction(|tx| Self::tx_remove_pending_op(tx, &self.records, op_id))
+        self.transaction(|tx| Self::remove_pending(tx, &self.records, op_id))
     }
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
         self.transaction(|tx| Self::tx_purge_waiters(tx, &self.records, dep_id))
@@ -2046,7 +2024,7 @@ impl Storage for FjallStorage {
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {
         self.transaction(|tx| {
             let commit = Self::tx_ack_commit(tx, &self.records, &ack)??;
-            Self::tx_apply_peer_ack(tx, &self.records, &ack, commit)
+            Self::apply_ack_tx(tx, &self.records, &ack, commit)
         })
     }
 
@@ -2061,7 +2039,7 @@ impl Storage for FjallStorage {
                     // A backend failure after this ack's writes were staged
                     // aborts the transaction, so none of the batch commits.
                     Ok(commit) => {
-                        let cleared = Self::tx_apply_peer_ack(tx, &self.records, ack, commit)?;
+                        let cleared = Self::apply_ack_tx(tx, &self.records, ack, commit)?;
                         results.push(Ok(cleared));
                     }
                     Err(rejected) => results.push(Err(rejected)),
@@ -3058,7 +3036,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn obligation_scans_skip_op_collision() {
+    fn obligation_scan_collision() {
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path()).unwrap();
         let mut op_id = [0_u8; OpId::LEN];

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! The provisional namespace registry of `MemoryStorage` and the checked lock
-//! every store operation takes: a namespace view reads and writes only while
-//! the registry still holds its session.
+//! Provisional namespace registry and checked locks for `MemoryStorage`.
+//! Namespace views validate their session before reads and writes.
 
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
@@ -14,7 +13,7 @@ use super::super::{
     check_namespaces, merged_obligation,
 };
 use super::{
-    MemoryInner, MemoryStorage, MetadataPlan, ObligationKind, memory_topic_state_locked,
+    MemoryInner, MemoryStorage, MetadataPlan, ObligationKind, topic_state_locked,
     put_obligation_locked,
 };
 
@@ -260,7 +259,7 @@ impl MemoryStorage {
             .position(|(key, _)| *key == (provisional.source, topic_id))
             .ok_or(Error::StaleIncarnation)?;
         let staged = &locked[position];
-        if memory_topic_state_locked(staged, &topic_id).as_ref() != Some(expected) {
+        if topic_state_locked(staged, &topic_id).as_ref() != Some(expected) {
             return Err(Error::AdmissionConflict);
         }
         let copy_bytes = staged

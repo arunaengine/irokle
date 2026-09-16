@@ -10,7 +10,8 @@ use crate::{
 
 use super::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
-    MAX_PENDING_MISSING_DEPS, MAX_PENDING_WAITERS_PER_DEP, MAX_REJECTED_PER_TOPIC,
+    MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS, MAX_PENDING_WAITERS_PER_DEP as MAX_WAITERS,
+    MAX_REJECTED_PER_TOPIC as MAX_REJECTED,
     ObligationTarget, OpMeta, OpPosition, PeerAck, PendingRecord, PendingUsage, ProvisionalTopic,
     SnapshotRead, StagingLimits, StagingQuota, Storage, StorageCounters, SyncObligation,
     SyncPeerStatus, SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers,
@@ -381,7 +382,7 @@ impl Storage for MemoryStorage {
         if meta.topic_id != topic_id || meta.id != op.id {
             return Err(Error::TopicMismatch);
         }
-        if meta.missing_deps.len() > MAX_PENDING_MISSING_DEPS {
+        if meta.missing_deps.len() > MAX_MISSING_DEPS {
             return Err(Error::Storage(
                 "pending op has too many missing deps".into(),
             ));
@@ -425,7 +426,7 @@ impl Storage for MemoryStorage {
                 .is_some_and(|missing| missing.contains(dep));
             if !already
                 && inner.pending_waiters.get(dep).map_or(0, BTreeSet::len)
-                    >= MAX_PENDING_WAITERS_PER_DEP
+                    >= MAX_WAITERS
             {
                 return Err(Error::Storage("pending waiter quota exceeded".into()));
             }
@@ -557,7 +558,7 @@ impl Storage for MemoryStorage {
         reservation.reserve(
             &inner,
             MetadataKey::Rejected(topic_id),
-            4096 + MAX_REJECTED_PER_TOPIC as u64 * 256,
+            4096 + MAX_REJECTED as u64 * 256,
         )?;
         reservation.commit(&mut inner);
         for id in &subtree {
@@ -569,7 +570,7 @@ impl Storage for MemoryStorage {
                 rejected.order.push_back(*id);
             }
         }
-        while rejected.order.len() > MAX_REJECTED_PER_TOPIC {
+        while rejected.order.len() > MAX_REJECTED {
             if let Some(oldest) = rejected.order.pop_front() {
                 rejected.ids.remove(&oldest);
             }
@@ -617,14 +618,14 @@ impl Storage for MemoryStorage {
 
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {
         let mut inner = self.lock()?;
-        apply_peer_ack_locked(&mut inner, ack)
+        apply_ack_locked(&mut inner, ack)
     }
 
     fn apply_peer_acks(&self, acks: Vec<PeerAck>) -> Result<Vec<Result<usize>>> {
         let mut inner = self.lock()?;
         Ok(acks
             .into_iter()
-            .map(|ack| apply_peer_ack_locked(&mut inner, ack))
+            .map(|ack| apply_ack_locked(&mut inner, ack))
             .collect())
     }
 
@@ -784,7 +785,7 @@ impl Storage for MemoryStorage {
         if inner.sealed_topics.contains(topic_id) {
             return Err(Error::TopicSealed);
         }
-        if memory_topic_state_locked(&inner, topic_id).as_ref() != Some(expected_topic_state) {
+        if topic_state_locked(&inner, topic_id).as_ref() != Some(expected_topic_state) {
             return Err(Error::AdmissionConflict);
         }
         // Stage both steps on a copy and swap only once the winner is admitted:
@@ -1059,7 +1060,7 @@ fn topic_view_locked(
     topic_id: &TopicId,
     peer_id: Option<&PeerId>,
 ) -> Result<Option<TopicView>> {
-    let Some(state) = memory_topic_state_locked(inner, topic_id) else {
+    let Some(state) = topic_state_locked(inner, topic_id) else {
         return Ok(None);
     };
     let clock = inner.actor_clock.get(topic_id).cloned().unwrap_or_default();
@@ -1116,7 +1117,7 @@ fn admit_batch_locked(
     {
         return Err(Error::AdmissionConflict);
     }
-    if memory_topic_state_locked(inner, &batch.topic_id) != batch.expected_topic_state {
+    if topic_state_locked(inner, &batch.topic_id) != batch.expected_topic_state {
         return Err(Error::AdmissionConflict);
     }
     validate_heads(&batch, |meta| {
@@ -1432,7 +1433,7 @@ fn own_payload(payload: &mut crate::TopicPayload) {
     }
 }
 
-fn apply_peer_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> Result<usize> {
+fn apply_ack_locked(inner: &mut MemoryInner, ack: PeerAck) -> Result<usize> {
     let commit = ack_commit(inner.topics.get(&ack.topic_id), &ack)?;
     let key = (ack.peer_id, ack.topic_id);
     let entries = ack.clock.len() + inner.peer_acks.get(&key).map_or(0, |old| old.clock.len());
@@ -1652,7 +1653,7 @@ fn remove_pending_locked(inner: &mut MemoryInner, op_id: &OpId) -> Result<()> {
     Ok(())
 }
 
-fn memory_topic_state_locked(inner: &MemoryInner, topic_id: &TopicId) -> Option<TopicState> {
+fn topic_state_locked(inner: &MemoryInner, topic_id: &TopicId) -> Option<TopicState> {
     inner.topics.get(topic_id).cloned().map(|mut state| {
         state.heads = inner.heads.get(topic_id).cloned().unwrap_or_default();
         state
