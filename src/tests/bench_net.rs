@@ -54,7 +54,7 @@ struct Run {
 fn report(name: &str, params: &str, runs: Vec<Run>) {
     for (rep, run) in runs.iter().enumerate() {
         eprintln!(
-            "bench_sample name={name} {params} rep={rep} ms={:.3} completed={}",
+            "bench_sample name={name} {params} rep={rep} ms={:.6} completed={}",
             run.ms, run.done
         );
     }
@@ -215,7 +215,7 @@ async fn pull_until<S: Store>(
 async fn many_topics<S: Store>(topics: usize, ops: usize) -> Run {
     let dir = tempfile::tempdir().unwrap();
     let lookup = MemoryLookup::new();
-    let alice_endpoint = bind(&lookup, None, None).await;
+    let alice_endpoint = bind(&lookup, Some(iroh::SecretKey::from_bytes(&[60; 32])), None).await;
     let alice = S::builder(dir.path(), "alice")
         .with_iroh_secret_key(alice_endpoint.secret_key())
         .with_write_concern(WriteConcern::Local)
@@ -224,7 +224,7 @@ async fn many_topics<S: Store>(topics: usize, ops: usize) -> Run {
     let bob = S::builder(dir.path(), "bob")
         .with_peer_whitelist([alice.peer_id()])
         .with_iroh_runtime_config(runtime())
-        .with_net(bind(&lookup, None, None).await)
+        .with_net(bind(&lookup, Some(iroh::SecretKey::from_bytes(&[61; 32])), None).await)
         .build()
         .unwrap();
     let bob_endpoint = bob.endpoint().unwrap().clone();
@@ -233,11 +233,16 @@ async fn many_topics<S: Store>(topics: usize, ops: usize) -> Run {
 
     let mut goal = Vec::new();
     for index in 0..topics {
-        let config = TopicConfig {
-            initial_peers: [bob.peer_id()].into(),
-            ..TopicConfig::default()
-        };
-        let topic = alice.create_topic::<Note>(config).unwrap();
+        let topic_id = TopicId::hash(format!("bench-small-topics/{index}"));
+        oplog::Oplog::with_storage(alice.storage().clone())
+            .create_topic_genesis(
+                topic_id,
+                actor_id_for(topic_id, alice.peer_id()),
+                TopicGenesis::new(Note::TYPE_ID, [alice.peer_id(), bob.peer_id()]),
+                alice.signer(),
+            )
+            .unwrap();
+        let topic = alice.open_topic::<Note>(topic_id).unwrap();
         let mut last = None;
         for event in 1..ops {
             let text = format!("{index}-{event}");
@@ -251,12 +256,17 @@ async fn many_topics<S: Store>(topics: usize, ops: usize) -> Run {
             alice.storage().actor_clock(&topic.id()).unwrap(),
         ));
     }
+    super::bench::fixture(
+        "small_topics",
+        alice.storage(),
+        goal.iter().map(|(topic, _)| *topic),
+    );
     let net =
         Arc::new(net::IrohNet::new_with_config(alice_endpoint, alice.clone(), runtime()).unwrap());
     let sent = (sent_bytes(net.endpoint()), sent_bytes(&bob_endpoint));
     let attempts = (alice.storage().attempts(), bob.storage().attempts());
 
-    let started = Instant::now();
+    let started = super::bench::Interval::new::<S>("small_topics");
     net.start_accept_loop().unwrap();
     net.start_configured_resync_loop().unwrap();
     let done = wait_until(CAP, || {
@@ -265,7 +275,7 @@ async fn many_topics<S: Store>(topics: usize, ops: usize) -> Run {
             && alice.storage().all_sync_obligations().unwrap().is_empty()
     })
     .await;
-    let ms = millis(started);
+    let ms = started.millis();
     let mut values = vec![
         ("streams", net.outbound_sync_streams()),
         ("alice_sent_bytes", sent_bytes(net.endpoint()) - sent.0),
@@ -275,6 +285,17 @@ async fn many_topics<S: Store>(topics: usize, ops: usize) -> Run {
         ("alice_tx_attempts", alice.storage(), attempts.0),
         ("bob_tx_attempts", bob.storage(), attempts.1),
     ]));
+    for (lane, names) in net.lane_times().iter().zip([
+        ["control_jobs", "control_wait_us", "control_run_us"],
+        ["bulk_jobs", "bulk_wait_us", "bulk_run_us"],
+    ]) {
+        use std::sync::atomic::Ordering;
+        values.extend(names.into_iter().zip([
+            lane.jobs.load(Ordering::Relaxed),
+            lane.waited_max_micros.load(Ordering::Relaxed),
+            lane.ran_max_micros.load(Ordering::Relaxed),
+        ]));
+    }
     net.shutdown().await;
     bob.shutdown_iroh().await;
     Run { ms, done, values }

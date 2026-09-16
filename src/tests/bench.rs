@@ -16,13 +16,9 @@ use crate::{EvictionKey, SyncPeerStatus, TopicEviction, TopicInfo};
 
 const REPS: usize = 3;
 
-/// Storage reads seen at the `Storage` trait boundary, the same definition on
-/// every revision measured.
+/// Explicit facade walks, alongside the backend's native read counters.
 #[derive(Default)]
 struct Reads {
-    ops: AtomicU64,
-    metas: AtomicU64,
-    index: AtomicU64,
     walks: AtomicU64,
 }
 
@@ -32,7 +28,7 @@ struct Counting<S> {
     reads: Arc<Reads>,
 }
 
-impl<S> Counting<S> {
+impl<S: PayloadReads> Counting<S> {
     fn new(inner: S) -> Self {
         Self {
             inner,
@@ -41,8 +37,8 @@ impl<S> Counting<S> {
     }
 
     fn snapshot(&self) -> [u64; 4] {
-        let reads = &self.reads;
-        [&reads.ops, &reads.metas, &reads.index, &reads.walks].map(|c| c.load(Ordering::Relaxed))
+        let [ops, metas, index] = self.inner.read_counts();
+        [ops, metas, index, self.reads.walks.load(Ordering::Relaxed)]
     }
 }
 
@@ -58,67 +54,17 @@ macro_rules! forward {
     };
 }
 
-/// A snapshot of the wrapped store counted like its live reads.
-struct CountingSnapshot<'a> {
-    read: &'a dyn SnapshotRead,
-    reads: &'a Reads,
-}
-
-impl SnapshotRead for CountingSnapshot<'_> {
-    fn topic_view(
-        &self,
-        topic: &TopicId,
-        peer: Option<&PeerId>,
-    ) -> Result<Option<TopicView>, Error> {
-        self.read.topic_view(topic, peer)
-    }
-    fn get_op(&self, id: &OpId) -> Result<Option<Op>, Error> {
-        add(&self.reads.ops, 1);
-        self.read.get_op(id)
-    }
-    fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>, Error> {
-        add(&self.reads.metas, 1);
-        self.read.get_meta(id)
-    }
-    fn dep_resolvable(&self, id: &OpId) -> Result<bool, Error> {
-        self.read.dep_resolvable(id)
-    }
-    fn actor_range(
-        &self,
-        topic: &TopicId,
-        actor: &ActorId,
-        after: u64,
-        limit: usize,
-    ) -> Result<Vec<(u64, OpId)>, Error> {
-        let range = self.read.actor_range(topic, actor, after, limit)?;
-        add(&self.reads.index, range.len());
-        Ok(range)
-    }
-    fn list_op_ids(&self, topic: &TopicId) -> Result<BTreeSet<OpId>, Error> {
-        let ids = self.read.list_op_ids(topic)?;
-        add(&self.reads.walks, ids.len());
-        Ok(ids)
-    }
-}
-
-impl<S: Storage> Storage for Counting<S> {
+impl<S: Storage + PayloadReads> Storage for Counting<S> {
     fn read_snapshot<R>(
         &self,
         read: impl FnOnce(&dyn SnapshotRead) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        self.inner.read_snapshot(|inner| {
-            read(&CountingSnapshot {
-                read: inner,
-                reads: &self.reads,
-            })
-        })
+        self.inner.read_snapshot(read)
     }
     fn get_op(&self, id: &OpId) -> Result<Option<Op>, Error> {
-        add(&self.reads.ops, 1);
         self.inner.get_op(id)
     }
     fn get_meta(&self, id: &OpId) -> Result<Option<OpMeta>, Error> {
-        add(&self.reads.metas, 1);
         self.inner.get_meta(id)
     }
     fn actor_index(
@@ -127,7 +73,6 @@ impl<S: Storage> Storage for Counting<S> {
         actor: &ActorId,
         seq: u64,
     ) -> Result<Option<OpId>, Error> {
-        add(&self.reads.index, 1);
         self.inner.actor_index(topic, actor, seq)
     }
     fn actor_range(
@@ -138,7 +83,6 @@ impl<S: Storage> Storage for Counting<S> {
         limit: usize,
     ) -> Result<Vec<(u64, OpId)>, Error> {
         let range = self.inner.actor_range(topic, actor, after, limit)?;
-        add(&self.reads.index, range.len());
         Ok(range)
     }
     fn children(&self, id: &OpId) -> Result<BTreeSet<OpId>, Error> {
@@ -228,12 +172,17 @@ impl<S: Storage> Storage for Counting<S> {
 
 /// Buffered payloads a backend decoded, where the revision can count them.
 trait PayloadReads {
+    fn read_counts(&self) -> [u64; 3];
     fn payload_reads(&self) -> Option<u64>;
     /// Write transactions attempted; each Fjall attempt requests a disk sync.
     fn transaction_attempts(&self) -> u64;
 }
 
 impl PayloadReads for MemoryStorage {
+    fn read_counts(&self) -> [u64; 3] {
+        let counts = self.counters();
+        [counts.op_reads, counts.meta_reads, counts.index_reads]
+    }
     fn payload_reads(&self) -> Option<u64> {
         Some(self.counters().pending_payload_reads)
     }
@@ -243,6 +192,10 @@ impl PayloadReads for MemoryStorage {
 }
 
 impl PayloadReads for FjallStorage {
+    fn read_counts(&self) -> [u64; 3] {
+        let counts = self.counters();
+        [counts.op_reads, counts.meta_reads, counts.index_reads]
+    }
     fn payload_reads(&self) -> Option<u64> {
         Some(self.counters().pending_payload_reads)
     }
@@ -256,8 +209,71 @@ struct Sample {
     counters: Vec<(&'static str, u64)>,
 }
 
+pub(super) fn fixture<S: Storage>(name: &str, storage: &S, topics: impl Iterator<Item = TopicId>) {
+    let mut hash = blake3::Hasher::new();
+    for topic in topics {
+        hash.update(topic.as_ref());
+        for id in storage.list_op_ids(&topic).unwrap() {
+            hash.update(&postcard::to_allocvec(&storage.get_op(&id).unwrap().unwrap()).unwrap());
+        }
+    }
+    eprintln!("bench_fixture name={name} blake3={}", hash.finalize());
+}
+
 fn millis(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
+}
+
+pub(super) struct Interval {
+    started: Instant,
+    #[cfg(unix)]
+    profile: Option<std::os::unix::net::UnixStream>,
+}
+
+impl Interval {
+    pub(super) fn new<S>(phase: &str) -> Self {
+        #[cfg(unix)]
+        let profile = std::env::var_os("IROKLE_BENCH_PROFILE").and_then(|path| {
+            use std::io::{Read, Write};
+            let backend = if std::any::type_name::<S>().contains("FjallStorage") {
+                "fjall"
+            } else {
+                "memory"
+            };
+            if std::env::var("IROKLE_BENCH_PHASE").ok().as_deref()
+                != Some(&format!("{phase}/{backend}"))
+            {
+                return None;
+            }
+            let mut stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(300)))
+                .unwrap();
+            stream.write_all(b"R").unwrap();
+            let mut reply = [0];
+            stream.read_exact(&mut reply).unwrap();
+            assert_eq!(reply, *b"S");
+            Some(stream)
+        });
+        Self {
+            started: Instant::now(),
+            #[cfg(unix)]
+            profile,
+        }
+    }
+
+    pub(super) fn millis(mut self) -> f64 {
+        let elapsed = millis(self.started);
+        #[cfg(unix)]
+        if let Some(stream) = &mut self.profile {
+            use std::io::{Read, Write};
+            stream.write_all(b"D").unwrap();
+            let mut reply = [0];
+            stream.read_exact(&mut reply).unwrap();
+            assert_eq!(reply, *b"E");
+        }
+        elapsed
+    }
 }
 
 /// Reads between two snapshots, named for the report line.
@@ -271,7 +287,7 @@ fn read_delta(before: [u64; 4], after: [u64; 4]) -> Vec<(&'static str, u64)> {
 fn report(name: &str, params: &str, samples: Vec<Sample>) {
     for (rep, sample) in samples.iter().enumerate() {
         eprintln!(
-            "bench_sample name={name} {params} rep={rep} ms={:.3}",
+            "bench_sample name={name} {params} rep={rep} ms={:.6}",
             sample.ms
         );
     }
@@ -524,29 +540,36 @@ fn unrelated_pool() {
 
 /// One page as a requester asks for it from the responder's summary. Only the
 /// responder's work is timed and counted.
-fn serve_page<S: Storage>(
+fn serve_page<S: Storage + PayloadReads>(
     responder: &SyncEngine<Counting<S>>,
     requester: &SyncEngine<MemoryStorage>,
     storage: &Counting<S>,
     topic_id: TopicId,
     (author, reader): (PeerId, PeerId),
-) -> (Vec<Op>, f64, [u64; 4]) {
+) -> (Vec<Op>, f64, [u64; 4], u64) {
     let summary = responder.summary(topic_id).unwrap();
+    let build = Interval::new::<S>("request");
     let mut request = requester.plan_request(author, &summary).unwrap();
     // Range hints only: a wanted head beyond one page yields a non-causal page.
     request.wants.clear();
+    let request_ns = (build.millis() * 1_000_000.0) as u64;
     let before = storage.snapshot();
-    let started = Instant::now();
+    let started = Interval::new::<S>("page");
     let page = responder
         .response_page(reader, &request, PageBudget::from_credit(request.credit))
         .unwrap();
-    let ms = millis(started);
+    let ms = started.millis();
     let after = storage.snapshot();
-    (page.ops, ms, std::array::from_fn(|i| after[i] - before[i]))
+    (
+        page.ops,
+        ms,
+        std::array::from_fn(|i| after[i] - before[i]),
+        request_ns,
+    )
 }
 
 /// A requester holding only the genesis catches up page by page.
-fn catch_up<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
+fn catch_up<S: Storage + PayloadReads>(storage: Counting<S>, len: usize) -> Sample {
     let (author, reader) = (signer(7), signer(8).peer_id());
     let ops = signed_chain(&author, &format!("bench-chain-{len}"), &[reader], len, note);
     let topic_id = ops[0].signed.body.topic_id;
@@ -558,6 +581,7 @@ fn catch_up<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
     let local = storage.actor_clock(&topic_id).unwrap();
 
     let (mut ms, mut pages, mut reads) = (0.0, 0, [0; 4]);
+    let (mut request_ns, mut admission_ns) = (0, 0);
     while !log
         .storage()
         .actor_clock(&topic_id)
@@ -566,14 +590,21 @@ fn catch_up<S: Storage>(storage: Counting<S>, len: usize) -> Sample {
     {
         assert!(pages < 64, "catch-up stopped advancing");
         let peers = (author.peer_id(), reader);
-        let (page, page_ms, page_reads) =
+        let (page, page_ms, page_reads, build_ns) =
             serve_page(&responder, &requester, &storage, topic_id, peers);
         ms += page_ms;
+        request_ns += build_ns;
         reads = std::array::from_fn(|i| reads[i] + page_reads[i]);
+        let admission = Interval::new::<MemoryStorage>("admission");
         log.receive_ops(page).unwrap();
+        admission_ns += (admission.millis() * 1_000_000.0) as u64;
         pages += 1;
     }
-    let mut counters = vec![("pages", pages)];
+    let mut counters = vec![
+        ("pages", pages),
+        ("request_ns", request_ns),
+        ("admission_ns", admission_ns),
+    ];
     counters.extend(read_delta([0; 4], reads));
     Sample { ms, counters }
 }
@@ -593,11 +624,12 @@ fn chain_catch_up() {
 }
 
 /// Serving one new op to a peer that holds the whole earlier history.
-fn steady_page<S: Storage>(storage: Counting<S>) -> Vec<Sample> {
+fn steady_page<S: Storage + PayloadReads>(storage: Counting<S>) -> Vec<Sample> {
     let (author, reader) = (signer(9), signer(10).peer_id());
     let mut ops = signed_chain(&author, "bench-steady", &[reader], 16384, note);
     let topic_id = ops[0].signed.body.topic_id;
     load(&storage, &ops);
+    fixture("steady_page", &storage, std::iter::once(topic_id));
     let peer_log = Oplog::new();
     load(peer_log.storage(), &ops);
     let requester = SyncEngine::new(peer_log.clone(), reader);
@@ -608,14 +640,16 @@ fn steady_page<S: Storage>(storage: Counting<S>) -> Vec<Sample> {
             let op = next_op(&author, ops.last().unwrap(), note(16384 + index));
             log.receive_ops(vec![op.clone()]).unwrap();
             let peers = (author.peer_id(), reader);
-            let (page, ms, reads) = serve_page(&responder, &requester, &storage, topic_id, peers);
+            let (page, ms, reads, request_ns) =
+                serve_page(&responder, &requester, &storage, topic_id, peers);
             assert_eq!(page, vec![op.clone()]);
+            let admission = Interval::new::<MemoryStorage>("admission");
             peer_log.receive_ops(page).unwrap();
+            let admission_ns = (admission.millis() * 1_000_000.0) as u64;
             ops.push(op);
-            Sample {
-                ms,
-                counters: read_delta([0; 4], reads),
-            }
+            let mut counters = read_delta([0; 4], reads);
+            counters.extend([("request_ns", request_ns), ("admission_ns", admission_ns)]);
+            Sample { ms, counters }
         })
         .collect()
 }
@@ -633,7 +667,7 @@ fn steady_catch_up() {
 
 /// A joining writer's event on an old op, admitted through a fresh facade
 /// (cold) and then a second writer's event on the same op (warm).
-fn projection<S: Storage>(storage: Counting<S>) -> (Vec<Sample>, Vec<Sample>) {
+fn projection<S: Storage + PayloadReads>(storage: Counting<S>) -> (Vec<Sample>, Vec<Sample>) {
     let owner = signer(41);
     let writers = (0..2 * REPS as u8)
         .map(|i| signer(42 + i))
@@ -700,22 +734,23 @@ fn membership_projection() {
 
 /// A reader holding only the genesis pages through `source` with the default
 /// credit. The walk is timed; reads are the responder's.
-fn walk_pages<S: Storage>(
+fn walk_pages<S: Storage + PayloadReads>(
     source: &super::pages::Source<Counting<S>>,
     storage: &Counting<S>,
 ) -> Sample {
     let before = storage.snapshot();
-    let started = Instant::now();
+    let started = Interval::new::<S>("window");
     let pages = super::pages::page_through(source, crate::sync::SyncCredit::default());
-    let ms = millis(started);
+    let ms = started.millis();
     let mut counters = vec![("pages", pages as u64)];
     counters.extend(read_delta(before, storage.snapshot()));
     Sample { ms, counters }
 }
 
 /// Writers beyond the page actor window, one of them a dependency of the rest.
-fn window_walk<S: Storage>(storage: Counting<S>) -> Sample {
+fn window_walk<S: Storage + PayloadReads>(storage: Counting<S>) -> Sample {
     let source = super::pages::late_dependency(storage.clone(), 4097);
+    fixture("window_pages", &storage, std::iter::once(source.topic_id));
     walk_pages(&source, &storage)
 }
 
@@ -728,7 +763,7 @@ fn window_progress() {
 
 /// A reader that lost `lost` consecutive op records of an 8192-op chain repairs
 /// them from explicit wants, page by page. Only the responder's reads count.
-fn repair_walk<S: Storage>(storage: Counting<S>, lost: usize) -> Sample {
+fn repair_walk<S: Storage + PayloadReads>(storage: Counting<S>, lost: usize) -> Sample {
     let reader_id = signer(60).peer_id();
     let (genesis, chains) = super::pages::independent_chains(&Oplog::new(), reader_id, &[8192]);
     load(&storage, std::slice::from_ref(&genesis));
@@ -893,13 +928,23 @@ fn many_sessions<S: Storage + PayloadReads>(storage: Counting<S>) -> Sample {
                 ..NodeConfig::default()
             })
             .unwrap();
-            let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
+            let topic_id = TopicId::hash(format!("bench-sessions/{index}"));
+            Oplog::with_storage(source.storage().clone())
+                .create_topic_genesis(
+                    topic_id,
+                    actor_id_for(topic_id, source.peer_id()),
+                    TopicGenesis::new(Note::TYPE_ID, [source.peer_id()]),
+                    source.signer(),
+                )
+                .unwrap();
+            let topic = source.open_topic::<Note>(topic_id).unwrap();
             for event in 0..128 {
                 let text = format!("{event}");
                 topic.publish(Note { text }).unwrap();
             }
             topic.add_peer(reader.peer_id()).unwrap();
             let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+            fixture("sessions", source.storage(), std::iter::once(topic.id()));
             let data = SyncData {
                 topic_id: topic.id(),
                 ops: ops[..64].to_vec(),
@@ -908,11 +953,11 @@ fn many_sessions<S: Storage + PayloadReads>(storage: Counting<S>) -> Sample {
         })
         .collect::<Vec<_>>();
     let (before, attempts) = (storage.snapshot(), storage.inner.transaction_attempts());
-    let started = Instant::now();
+    let started = Interval::new::<S>("sessions");
     for (source, data) in fragments {
         reader.receive_sync_outcome(source, data).unwrap();
     }
-    let ms = millis(started);
+    let ms = started.millis();
     let mut counters = read_delta(before, storage.snapshot());
     counters.push((
         "tx_attempts",
