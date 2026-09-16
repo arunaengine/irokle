@@ -11,8 +11,10 @@ use crate::sync::SyncMessage;
 #[cfg(any(feature = "iroh", test))]
 use crate::{Op, TopicId};
 
+#[path = "frame.rs"]
 mod frame;
 #[cfg(feature = "iroh")]
+#[path = "iroh/mod.rs"]
 mod iroh;
 
 #[cfg(any(feature = "iroh", test))]

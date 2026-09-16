@@ -3925,11 +3925,11 @@ fn other(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Erro
 }
 
 #[cfg(test)]
-#[path = "../../tests/scheduler.rs"]
+#[path = "../tests/scheduler.rs"]
 mod scheduler_tests;
 
 #[cfg(test)]
-#[path = "../../tests/budget.rs"]
+#[path = "../tests/budget.rs"]
 mod budget_tests;
 
 #[cfg(test)]
