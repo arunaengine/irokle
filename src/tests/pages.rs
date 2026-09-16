@@ -172,7 +172,7 @@ fn pages_stay_causal() {
 /// Large ops roll over the byte budget: each page stays within it, reports the
 /// rest, and the pages together carry every op exactly once.
 #[test]
-fn pages_roll_over_bytes() {
+fn page_bytes_rollover() {
     let source = many_actors(2, 6, 256 * 1024);
     let reader = Oplog::new();
     reader.receive_ops(vec![source.genesis.clone()]).unwrap();
@@ -332,10 +332,9 @@ fn one_op_cheap() {
     assert!(reads <= 12, "one new op cost {reads} reads");
 }
 
-/// A want for a head far beyond the reader's clock cannot be served by one
-/// repair walk. Forward ranges still advance on every page, what is sent is
-/// admissible, and the pull completes; the same fixture without the far want
-/// is the positive control and takes the same number of pages.
+/// A head far beyond the reader's clock cannot be served by one repair walk.
+/// Forward ranges advance on every page, sent data is admissible, and the pull completes.
+/// The fixture without the far want is a positive control with the same page count.
 #[test]
 fn repair_walk_causal() {
     let source = many_actors(1, 6000, 0);
@@ -510,7 +509,7 @@ fn window_admits_dependency() {
 /// The same deferred dependency window on a durable store.
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_window_admits_dependency() {
+fn fjall_dependency_window() {
     let dir = tempfile::tempdir().unwrap();
     let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
     let source = late_dependency(storage, 4097);
@@ -709,10 +708,9 @@ pub(super) fn independent_chains(
     (genesis, chains)
 }
 
-/// A behind-only pull of a long chain, a deep repair of a record the reader
-/// lost, and a hole no peer can serve, in one topic: every page before the
-/// goal carries data, the long chain and the repair complete, and only the
-/// unavailable record is left, reported unresolved, with nothing more to serve.
+/// One topic combines a long behind pull, a deep repair, and an unservable hole.
+/// Pages before the goal carry data; the long chain and repair complete.
+/// Only the unavailable record remains unresolved, with nothing more to serve.
 #[test]
 fn mixed_repair_pull() {
     let reader_id = Ed25519Signer::from_bytes(&[250; 32]).peer_id();

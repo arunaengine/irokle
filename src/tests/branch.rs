@@ -152,7 +152,7 @@ fn fjall_bound_admission() {
 /// An ack is built while a reset replaces the branch it started reading. It
 /// must not pair the old genesis with the new branch's clock, which would prove
 /// an old-branch position the member never held.
-fn assert_ack_keeps_branch<S: Storage>(inner: S, isolation: Isolation) {
+fn assert_ack_branch<S: Storage>(inner: S, isolation: Isolation) {
     let branches = branches(150);
     let topic_id = branches.topic_id;
     let author = branches.author.peer_id();
@@ -209,14 +209,14 @@ fn assert_ack_keeps_branch<S: Storage>(inner: S, isolation: Isolation) {
 
 #[test]
 fn ack_keeps_branch() {
-    assert_ack_keeps_branch(MemoryStorage::new(), Isolation::Blocks);
+    assert_ack_branch(MemoryStorage::new(), Isolation::Blocks);
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_ack_keeps_branch() {
+fn fjall_ack_branch() {
     let dir = tempfile::tempdir().unwrap();
-    assert_ack_keeps_branch(
+    assert_ack_branch(
         crate::storage::FjallStorage::open(dir.path()).unwrap(),
         Isolation::Commits,
     );
@@ -343,7 +343,7 @@ fn forward_keeps_branch() {
 
 /// The data epoch moves with every reset of a topic and never with an append,
 /// so caches keyed by genesis and epoch expire exactly when data is discarded.
-fn assert_epoch_tracks_resets<S: Storage>(storage: S) {
+fn assert_reset_epoch<S: Storage>(storage: S) {
     let branches = branches(180);
     let topic_id = branches.topic_id;
     let log = Oplog::with_storage(storage.clone());
@@ -379,15 +379,15 @@ fn assert_epoch_tracks_resets<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_epoch_tracks_resets() {
-    assert_epoch_tracks_resets(MemoryStorage::new());
+fn memory_reset_epoch() {
+    assert_reset_epoch(MemoryStorage::new());
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_epoch_tracks_resets() {
+fn fjall_reset_epoch() {
     let dir = tempfile::tempdir().unwrap();
-    assert_epoch_tracks_resets(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    assert_reset_epoch(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Obligation ids resolved against one branch must not be written once a reset
@@ -436,7 +436,7 @@ fn obligation_keeps_branch() {
 
 /// Sync state is dropped only for a peer that is still absent from the branch
 /// the caller judged, never for a member of a replacement branch.
-fn assert_clear_keeps_branch<S: Storage>(storage: S) {
+fn assert_clear_branch<S: Storage>(storage: S) {
     let branches = branches(200);
     let topic_id = branches.topic_id;
     let third = branches.third.peer_id();
@@ -482,15 +482,15 @@ fn assert_clear_keeps_branch<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_clear_keeps_branch() {
-    assert_clear_keeps_branch(MemoryStorage::new());
+fn memory_clear_branch() {
+    assert_clear_branch(MemoryStorage::new());
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_clear_keeps_branch() {
+fn fjall_clear_branch() {
     let dir = tempfile::tempdir().unwrap();
-    assert_clear_keeps_branch(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    assert_clear_branch(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Events beyond the first: the author's next old-branch event, its new-branch
@@ -554,11 +554,9 @@ fn paused<S: Storage, T: Send + 'static>(
     handle
 }
 
-/// A reset commits while an ack, forwarding effects, a page plan and a pending
-/// drain are paused. No old-branch work proves or owes anything on the new
-/// branch, the eviction names exactly the discarded records, usage stays exact.
-/// Under [`Isolation::Blocks`] a reset cannot commit while a snapshot read is
-/// paused, so the ack and page pauses run only on a store that isolates them.
+/// Replace a branch while ack, forwarding, paging and pending work pause.
+/// Old work cannot prove or owe; eviction and byte accounting remain exact.
+/// [`Isolation::Blocks`] isolates snapshot, ack and page pauses.
 fn assert_reset_pauses<S: Storage>(
     inner: S,
     isolation: Isolation,

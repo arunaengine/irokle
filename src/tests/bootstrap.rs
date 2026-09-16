@@ -387,7 +387,7 @@ fn fjall_competing_genesis() {
 /// that stores nothing; idle namespaces expire and free their slot; bytes past
 /// the source limit are refused before any admission.
 fn staging_quota<S: Storage>(storage: S) {
-    use crate::storage::{MAX_STAGED_SESSIONS, MAX_STAGED_SESSIONS_PER_SOURCE};
+    use crate::storage::MAX_STAGED_SESSIONS;
     let genesis_of_topic = |seed: u8| {
         let source = node(seed);
         let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
@@ -396,7 +396,7 @@ fn staging_quota<S: Storage>(storage: S) {
     };
     let bob = bob_node(storage.clone());
     let (crowded_source, _, _) = genesis_of_topic(0);
-    for index in 0..MAX_STAGED_SESSIONS_PER_SOURCE {
+    for index in 0..crate::storage::MAX_STAGED_SESSIONS_PER_SOURCE {
         let (_, topic_id, ops) = genesis_of_topic(index as u8 + 1);
         staged(receive(&bob, crowded_source, topic_id, &ops));
     }
@@ -417,7 +417,7 @@ fn staging_quota<S: Storage>(storage: S) {
             .unwrap()
             .is_none()
     );
-    for index in MAX_STAGED_SESSIONS_PER_SOURCE..MAX_STAGED_SESSIONS {
+    for index in crate::storage::MAX_STAGED_SESSIONS_PER_SOURCE..MAX_STAGED_SESSIONS {
         let (_, topic_id, ops) = genesis_of_topic(index as u8 + 1);
         let owner = PeerId::hash(format!("quota-source-{}", index / 8).as_bytes());
         staged(receive(&bob, owner, topic_id, &ops));

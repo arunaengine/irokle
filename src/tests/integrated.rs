@@ -87,10 +87,8 @@ mod fjall {
     use super::*;
     use crate::storage::{AdmissionEffects, FjallStorage, Hook};
 
-    /// A slot cleared for one session while the next session takes it and
-    /// stages up to the total limit beside another topic, and a view of the
-    /// cleared session writes: the late clearing pass deletes nothing of the
-    /// new session, the view fails as stale, and every byte count stays exact.
+    /// Clearing beside staging at the total limit must preserve the new session.
+    /// Its stale view fails, and all byte counts remain exact.
     #[test]
     fn reclaim_beside_pressure() {
         let dir = tempfile::tempdir().unwrap();
@@ -145,11 +143,9 @@ mod fjall {
         assert_bytes_exact(&reopened);
     }
 
-    /// Two facades activate one session while its slot keeps its records, a
-    /// view retained from staging writes, and a reader holds a snapshot opened
-    /// before publication. The paused activation writes nothing when it
-    /// resumes, the view fails, the reader never sees the topic, and a reopen
-    /// holds exactly the published topic and its append.
+    /// Paused activation retains records while staging and prepublication views live.
+    /// Resume writes nothing; the stale view fails and the reader sees no topic.
+    /// Reopen sees exactly the published topic and append.
     #[test]
     fn activations_beside_reader() {
         let dir = tempfile::tempdir().unwrap();

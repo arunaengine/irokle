@@ -1,7 +1,7 @@
 use super::support::*;
 
 #[test]
-fn introduced_peer_can_reject() {
+fn introduced_peer_rejects() {
     let alice = node(89);
     let bob = node(90);
     let topic = alice
@@ -44,7 +44,7 @@ fn introduced_peer_can_reject() {
 }
 
 #[test]
-fn late_peer_accepts_batch() {
+fn late_peer_batch() {
     let alice = node(107);
     let bob = node(108);
     let charlie = node(109);
@@ -96,7 +96,7 @@ fn late_peer_accepts_batch() {
 }
 
 #[test]
-fn controls_converge_any_order() {
+fn controls_any_order() {
     let alice = node(21);
     let bob = node(22);
     let target = PeerId::hash(b"target-peer");
@@ -226,7 +226,7 @@ fn cannot_backdate_join() {
 }
 
 #[test]
-fn accepts_event_before_remove() {
+fn event_before_remove() {
     let alice = node(15);
     let bob = node(16);
     let topic = alice
@@ -259,7 +259,7 @@ fn accepts_event_before_remove() {
 }
 
 #[test]
-fn rejects_wrong_actor_id() {
+fn rejects_wrong_actor() {
     let alice = node(17);
     let bob_signer = Ed25519Signer::from_bytes(&[18; 32]);
     let topic = alice

@@ -682,12 +682,11 @@ async fn serve_within(
     result
 }
 
-/// A reply is budgeted in framed wire bytes: raw operations that fit the share
-/// are cut once their frame prefix, tag, topic and count bytes do not, at the
-/// exact fit, one byte under it, across the count width change at 128 and the
-/// message split at 256 operations.
+/// Reply limits include frame prefixes, tags, topics and operation counts.
+/// Check exact fit and one byte under, including count width 128 and split 256.
+/// Raw operation bytes can fit while their framed response exceeds the share.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reply_fits_framed_bytes() {
+async fn reply_frame_bytes() {
     let raw = |keep: usize| {
         move |ops: &[Op]| {
             ops[..keep]
@@ -788,7 +787,7 @@ async fn large_topics_progress() {
 /// exchange: small topics finish at once, a long one pages until its budget
 /// and reports `WouldBlock` instead of failing, and repeating finishes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn topics_now_page_together() {
+async fn topics_page_together() {
     let runtime = net::IrohRuntimeConfig::default();
     let alice = peer(bind(None).await, runtime, StreamLimits::default());
     let bob = peer(bind(None).await, runtime, StreamLimits::default());

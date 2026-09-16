@@ -21,7 +21,7 @@ async fn builder_sets_net() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test]
-async fn builder_sets_runtime_config() {
+async fn builder_runtime_config() {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -44,7 +44,7 @@ async fn builder_sets_runtime_config() {
 
 #[cfg(feature = "iroh")]
 #[test]
-fn runtime_defaults_use_dirty_sync_and_daily_sweep() {
+fn runtime_default_intervals() {
     let runtime = net::IrohRuntimeConfig::default();
 
     assert_eq!(runtime.resync_interval, std::time::Duration::from_secs(5));
@@ -68,7 +68,7 @@ fn runtime_defaults_use_dirty_sync_and_daily_sweep() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resync_runs_without_auto_accept_and_without_obligations() {
+async fn resync_unaccepted() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -120,7 +120,7 @@ async fn resync_runs_without_auto_accept_and_without_obligations() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn iroh_defaults_to_async_replication() {
+async fn iroh_async_replication() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -156,7 +156,7 @@ async fn iroh_defaults_to_async_replication() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test]
-async fn resync_and_accept_loops_start_once() {
+async fn resync_accept_once() {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -245,7 +245,7 @@ async fn builder_selects_fjall() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sync_now_records_ack() {
+async fn sync_now_ack() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
         .bind()
@@ -314,7 +314,7 @@ async fn sync_now_records_ack() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_replication_records_scheduled_status() {
+async fn async_status_scheduled() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -364,7 +364,7 @@ async fn async_replication_records_scheduled_status() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_replication_schedules_genesis_and_control_obligations() {
+async fn async_obligation_schedule() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -417,7 +417,7 @@ async fn async_replication_schedules_genesis_and_control_obligations() {
 
 #[cfg(all(feature = "iroh", feature = "fjall"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_replication_persists_genesis_obligation_with_fjall() {
+async fn fjall_genesis_obligation() {
     let dir = tempfile::tempdir().unwrap();
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
@@ -460,7 +460,7 @@ async fn async_replication_persists_genesis_obligation_with_fjall() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn open_hides_non_member_summary() {
+async fn open_hides_outsider() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -491,7 +491,7 @@ async fn open_hides_non_member_summary() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn former_member_can_confirm_matching_fingerprint() {
+async fn former_member_fingerprint() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -669,7 +669,7 @@ async fn whitelist_controls_bootstrap() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handle_messages_accepts_ack_heads_that_arrive_before_data() {
+async fn ack_before_data() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -760,7 +760,7 @@ async fn handle_messages_accepts_ack_heads_that_arrive_before_data() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn batched_resync_drains_topic_backlog_with_few_streams() {
+async fn resync_backlog_bound() {
     const TOPICS: usize = 1000;
     let lookup = iroh::address_lookup::memory::MemoryLookup::new();
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -838,7 +838,7 @@ async fn batched_resync_drains_topic_backlog_with_few_streams() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn genesis_tiebreak_eviction_reaches_sink_via_builder_net() {
+async fn genesis_eviction_sink() {
     use crate::TopicEviction;
 
     let topic_id = TopicId::hash(b"iroh-genesis-fork-topic");
@@ -1006,7 +1006,7 @@ pub(super) async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr 
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bad_ack_spares_other_topics() {
+async fn bad_ack_isolated() {
     // A rejected ack must not discard the other acks batched into the same
     // stream, or their obligations never clear and the peer resends forever.
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -1892,12 +1892,12 @@ async fn pull_fills_hole(bob_fjall: bool) {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn memory_pull_fills_hole() {
+async fn memory_pull_hole() {
     pull_fills_hole(false).await;
 }
 
 #[cfg(all(feature = "iroh", feature = "fjall"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fjall_pull_fills_hole() {
+async fn fjall_pull_hole() {
     pull_fills_hole(true).await;
 }

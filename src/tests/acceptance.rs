@@ -191,11 +191,7 @@ async fn races_beside_topic() {
         &storage,
         (GatePoint::View(replaced), 0),
         Isolation::Commits,
-        move || {
-            serving
-                .handle_messages(member_id, messages)
-                .unwrap()
-        },
+        move || serving.handle_messages(member_id, messages).unwrap(),
         move || super::branch::reset_to_new(&writer, &branches),
     );
     assert_eq!(genesis_of(&storage, &replaced), Some(new_genesis));

@@ -152,10 +152,8 @@ async fn late_invite_faults() {
         "work owed to the unreachable replica stays outstanding"
     );
     assert!(carol.topic_unresolved(topic_id).unwrap().is_empty());
-    // Obligations keep their peer: the replica's still names what was written
-    // while it was the target, while the member that caught up owes nothing
-    // once its ack is applied. Writes after the replica ran out of retries go to
-    // the member instead, so which later writes it is owed depends on timing.
+    // Obligations keep their peer: the replica names writes made while targeted.
+    // The caught-up member owes nothing after its ack; later writes depend on retry timing.
     let last = oplog::topological(alice.storage(), &topic_id)
         .unwrap()
         .pop()

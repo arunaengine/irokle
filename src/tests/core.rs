@@ -1,7 +1,7 @@
 use super::support::*;
 
 #[test]
-fn op_id_rejects_tamper() {
+fn rejects_tampered_id() {
     let signer = Ed25519Signer::from_bytes(&[1; 32]);
     let topic_id = TopicId::hash(b"topic");
     let body = OpBody {
@@ -23,7 +23,7 @@ fn op_id_rejects_tamper() {
 }
 
 #[test]
-fn actor_chain_links_ops() {
+fn actor_chain_links() {
     let irokle = node(2);
     let topic = irokle.create_topic::<Note>(TopicConfig::default()).unwrap();
     topic.publish(Note { text: "one".into() }).unwrap();
@@ -37,7 +37,7 @@ fn actor_chain_links_ops() {
 }
 
 #[test]
-fn cloned_node_serializes_actor() {
+fn clones_serialize_actor() {
     let irokle = node(44);
     let topic = irokle.create_topic::<Note>(TopicConfig::default()).unwrap();
     let topic_id = topic.id();
@@ -77,7 +77,7 @@ fn cloned_node_serializes_actor() {
 }
 
 #[test]
-fn builder_uses_signer_storage() {
+fn builder_keeps_inputs() {
     let signer = Ed25519Signer::from_bytes(&[77; 32]);
     let irokle = Irokle::builder()
         .with_storage(MemoryStorage::new())
@@ -90,7 +90,7 @@ fn builder_uses_signer_storage() {
 }
 
 #[test]
-fn topic_type_mismatch_on_open() {
+fn topic_open_mismatch() {
     let irokle = node(3);
     let topic = irokle.create_topic::<Note>(TopicConfig::default()).unwrap();
     let err = match irokle.open_topic::<Other>(topic.id()) {
@@ -101,7 +101,7 @@ fn topic_type_mismatch_on_open() {
 }
 
 #[test]
-fn dag_query_honors_limit() {
+fn dag_respects_limit() {
     let alice = node(46);
     let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
     let first = topic.publish(Note { text: "one".into() }).unwrap();
@@ -135,7 +135,7 @@ fn dag_query_honors_limit() {
 }
 
 #[test]
-fn event_envelope_checks_type() {
+fn envelope_checks_type() {
     let envelope = EventEnvelope {
         type_id: "x".into(),
         payload: Bytes::new(),
@@ -147,7 +147,7 @@ fn event_envelope_checks_type() {
 }
 
 #[test]
-fn create_topic_with_event_matches_two_call_path() {
+fn topic_event_equivalent() {
     let signer = Ed25519Signer::from_bytes(&[71; 32]);
     let topic_id = TopicId::hash(b"combined-create");
     let actor_id = actor_id_for(topic_id, signer.peer_id());
@@ -208,7 +208,7 @@ fn create_topic_with_event_matches_two_call_path() {
 }
 
 #[test]
-fn create_topic_with_event_surfaces_genesis_race() {
+fn topic_event_race() {
     let signer = Ed25519Signer::from_bytes(&[72; 32]);
     let topic_id = TopicId::hash(b"combined-race");
     let actor_id = actor_id_for(topic_id, signer.peer_id());
@@ -241,7 +241,7 @@ fn create_topic_with_event_surfaces_genesis_race() {
 }
 
 #[test]
-fn event_rejects_type_mismatch() {
+fn event_type_mismatch() {
     let alice = node(90);
     let bob_signer = Ed25519Signer::from_bytes(&[91; 32]);
     let topic = alice
@@ -273,11 +273,9 @@ fn event_rejects_type_mismatch() {
     ));
 }
 
-/// A buffered op whose signed generation cannot match its dependency is invalid
-/// for good once that dependency arrives: the generation is signed and the
-/// dependency's is fixed. It must be rejected with its descendants rather than
-/// staying eligible for revalidation on every later receipt, and an independent
-/// waiter on the same dependency must survive.
+/// A signed generation cannot match a dependency with a different generation.
+/// Once known, reject the op and descendants instead of revalidating it repeatedly.
+/// Keep an independent waiter on that dependency.
 fn assert_rejects_impossible<S: Storage>(storage: S) {
     let alice = Irokle::with_storage(
         storage,
@@ -548,7 +546,7 @@ fn retry_reuses_signatures() {
 /// A genesis created with its first event and retried after a lost commit
 /// signs and checks each of the two ops once.
 #[test]
-fn genesis_retry_signs_once() {
+fn genesis_retry_once() {
     let signer = CountingSigner {
         inner: Ed25519Signer::from_bytes(&[63; 32]),
         signs: Default::default(),

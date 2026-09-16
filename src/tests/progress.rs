@@ -146,11 +146,9 @@ fn window_chain_boundary() {
     }
 }
 
-/// A reader whose clock covers a chain but lost the records of more positions
-/// than one page carries asks only explicit wants. Pages serve the oldest wants
-/// first, whatever order their ids sort in, so every page carries data. The lost
-/// run is chosen so the largest id is its top op, which a walk in id order
-/// starts from.
+/// A reader whose clock covers a chain but lost more positions than one page carries asks
+/// for explicit wants. Pages serve oldest wants first, regardless of id order; the lost run
+/// makes its largest id the top op, which an id-order walk starts from.
 fn assert_hole_chain<S: Corrupt>(reader_store: S) {
     let reader_id = Ed25519Signer::from_bytes(&[250; 32]).peer_id();
     let source_log = Oplog::new();

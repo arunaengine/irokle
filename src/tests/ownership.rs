@@ -726,11 +726,9 @@ pub(super) mod fjall {
         }
     }
 
-    /// Bytes of an ended session stay charged while its slot clears. While
-    /// deletion fails, views of two facades over one store keep admitting into
-    /// the namespaces still open, before and after a reopen, and staged plus
-    /// clearing bytes never pass the total; once deletion works the charge goes
-    /// with its slot and the refused history stages.
+    /// Ended-session bytes remain charged while a slot clears. Across failed deletion and
+    /// reopen, two facades keep admitting into open namespaces while staged plus clearing bytes
+    /// stay within the total; successful deletion releases the slot and refused history stages.
     #[test]
     fn fjall_clearing_charged() {
         let histories = (0..3)

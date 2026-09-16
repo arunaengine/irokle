@@ -73,7 +73,7 @@ fn buffered<S: Storage>(storage: &S, topic_id: &TopicId, op: &Op) -> bool {
 /// A member's op names as predecessor an id that later arrives as another
 /// actor's op. Once that content is known the edge is impossible, so the op
 /// and its descendant go while a valid op waiting on the same id is admitted.
-fn assert_rejects_foreign_prev<S: Storage>(storage: S) {
+fn assert_foreign_prev<S: Storage>(storage: S) {
     let m = members(210);
     let d = event_op(&m.carol, m.topic_id, 1, None, &[&m.genesis], "d");
     let bob_first = event_op(&m.bob, m.topic_id, 1, None, &[&m.genesis], "b1");
@@ -109,15 +109,15 @@ fn assert_rejects_foreign_prev<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_rejects_foreign_prev() {
-    assert_rejects_foreign_prev(MemoryStorage::new());
+fn memory_foreign_prev() {
+    assert_foreign_prev(MemoryStorage::new());
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_rejects_foreign_prev() {
+fn fjall_foreign_prev() {
     let dir = tempfile::tempdir().unwrap();
-    assert_rejects_foreign_prev(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    assert_foreign_prev(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// A predecessor of the right actor but the wrong sequence is just as final.
@@ -545,7 +545,7 @@ fn fjall_exact_accounting() {
 /// healthy topic still admits data and clears work by ack, and every counter
 /// returns exactly after rejection, expiry and reset.
 #[test]
-fn saturated_pools_serve_healthy() {
+fn saturated_pools_healthy() {
     let storage = MemoryStorage::new();
     let busy = [members(2), members(6)];
     let healthy = members(10);
@@ -762,11 +762,9 @@ fn fjall_drains_complete() {
     assert_drains_complete(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
-/// Ready ops retained by a retryable write fault stay in the ready index while
-/// one receive releases a long chain one op at a time, each readied behind the
-/// drain cursor half the time. The receive admits the whole chain however many
-/// visits the retained ops cost, and reconciling afterwards stops instead of
-/// spinning on work that cannot be admitted yet.
+/// Write faults keep ready ops indexed while one receive releases a long chain.
+/// Retained visits permit admission; reconciliation stops without spinning.
+/// Work blocked from admission is not retried.
 fn assert_retained_drain<S: Storage>(inner: S) {
     // Enough retained visits that one visit window holds a few passes only.
     const RETAINED: usize = 511;

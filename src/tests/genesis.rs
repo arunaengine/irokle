@@ -132,13 +132,13 @@ async fn converge(same_author: bool, start: Option<bool>, events: usize) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn same_author_either_start() {
+async fn same_author_start() {
     converge(true, Some(true), 3).await;
     converge(true, Some(false), 3).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn other_author_either_start() {
+async fn other_author_start() {
     converge(false, Some(true), 3).await;
     converge(false, Some(false), 3).await;
 }
@@ -160,7 +160,7 @@ async fn long_branch_converges() {
 /// resets it: both keep their branch, nothing is evicted, and the sync reports
 /// an error instead of completion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unauthorized_branch_keeps_local() {
+async fn unauthorized_branch_local() {
     let (a, b) = (side().await, side().await);
     let topic_id = TopicId::hash(b"branch-unauthorized");
     let a_author = Ed25519Signer::from_bytes(&[203; 32]);

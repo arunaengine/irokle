@@ -82,7 +82,7 @@ fn memory_clears_satisfied() {
     assert_clears_satisfied(MemoryStorage::new());
 }
 
-fn assert_stale_ack_ignored<S: Storage>(storage: S) {
+fn assert_stale_ack<S: Storage>(storage: S) {
     let ack_signer = Ed25519Signer::from_bytes(&[96; 32]);
     let peer = ack_signer.peer_id();
     let alice = Irokle::with_storage(storage.clone(), NodeConfig::default()).unwrap();
@@ -137,12 +137,12 @@ fn assert_stale_ack_ignored<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_ignores_stale_ack() {
-    assert_stale_ack_ignored(MemoryStorage::new());
+fn memory_keeps_newest() {
+    assert_stale_ack(MemoryStorage::new());
 }
 
 #[test]
-fn unsigned_ack_keeps_obligation() {
+fn unsigned_keeps_obligation() {
     let alice = node(47);
     let bob = node(48);
     let topic = alice
@@ -496,7 +496,7 @@ fn batch_ack_fixture<S: Storage>(
     (irokle, acks, topics, peer)
 }
 
-fn assert_batch_acks_match_loop<S: Storage>(loop_storage: S, batch_storage: S) {
+fn assert_batch_matches<S: Storage>(loop_storage: S, batch_storage: S) {
     let (loop_node, acks, topics, peer) = batch_ack_fixture(loop_storage);
     let (batch_node, batch_acks, _, _) = batch_ack_fixture(batch_storage);
     assert_eq!(acks, batch_acks);
@@ -534,12 +534,12 @@ fn assert_batch_acks_match_loop<S: Storage>(loop_storage: S, batch_storage: S) {
 }
 
 #[test]
-fn memory_batch_acks_match_loop() {
-    assert_batch_acks_match_loop(MemoryStorage::new(), MemoryStorage::new());
+fn memory_batch_matches() {
+    assert_batch_matches(MemoryStorage::new(), MemoryStorage::new());
 }
 
 #[test]
-fn batch_acks_isolate_bad_ack() {
+fn bad_ack_isolated() {
     let (irokle, mut acks, topics, peer) = batch_ack_fixture(MemoryStorage::new());
     acks[1].signature = None;
 
@@ -595,10 +595,10 @@ fn batch_acks_isolate_bad_ack() {
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_batch_acks_match_loop() {
+fn fjall_batch_matches() {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
-    assert_batch_acks_match_loop(
+    assert_batch_matches(
         crate_storage::FjallStorage::open(dir_a.path()).unwrap(),
         crate_storage::FjallStorage::open(dir_b.path()).unwrap(),
     );
@@ -614,10 +614,10 @@ fn fjall_clears_satisfied() {
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_ignores_stale_ack() {
+fn fjall_keeps_newest() {
     let dir = tempfile::tempdir().unwrap();
     let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_stale_ack_ignored(storage);
+    assert_stale_ack(storage);
 }
 
 #[cfg(feature = "fjall")]
@@ -817,7 +817,7 @@ fn legacy_ack_rejected() {
 
 /// A batch reports one verdict per acknowledgement: a record naming a replaced
 /// branch is refused on its own without discarding the valid ones beside it.
-fn assert_batch_isolates_stale<S: Storage>(storage: S) {
+fn assert_stale_batch<S: Storage>(storage: S) {
     let (irokle, mut acks, topics, peer) = batch_ack_fixture(storage);
     let ack_signer = Ed25519Signer::from_bytes(&[88; 32]);
     acks[1].genesis = Some(OpId::hash(b"some-other-branch"));
@@ -843,15 +843,15 @@ fn assert_batch_isolates_stale<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_batch_isolates_stale() {
-    assert_batch_isolates_stale(MemoryStorage::new());
+fn memory_stale_batch() {
+    assert_stale_batch(MemoryStorage::new());
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_batch_isolates_stale() {
+fn fjall_stale_batch() {
     let dir = tempfile::tempdir().unwrap();
-    assert_batch_isolates_stale(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    assert_stale_batch(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Evidence proving an earlier frontier of the current branch stays valid while
@@ -1117,7 +1117,7 @@ fn fjall_migrates_legacy() {
 /// failed, and the caller is told the ack was not applied.
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_batch_rolls_back() {
+fn fjall_batch_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let (acks, topics, peer) = {
         let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
