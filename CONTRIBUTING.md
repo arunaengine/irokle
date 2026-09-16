@@ -7,6 +7,8 @@ In any case please also acknowledge our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Developer Contributions Guidance
 
+Follow the canonical [repository style and structure policy](STYLE.md) for all owned source, tests, assets, and tooling.
+
 Please make sure that all contributions compile and do not produce any errors. These commands match CI:
 
 ```bash
