@@ -600,6 +600,11 @@ enum Wait {
 /// but carries nothing names a missing record or an operation that is too
 /// large, so a caller never repeats an identical empty page silently.
 struct Pager<'a> {
+    revision: u64,
+    repair: Option<super::repair::Repair>,
+    pending: VecDeque<HeadScan>,
+    updates: VecDeque<Update>,
+    slice: Slice,
     read: &'a dyn SnapshotRead,
     topic_id: &'a TopicId,
     local: &'a ActorClock,
@@ -611,10 +616,6 @@ struct Pager<'a> {
     /// Positions one page result names at most.
     position_limit: usize,
     work: &'a PageWork,
-    /// Storage reads this slice made, and the most it may make.
-    visits: usize,
-    scanned: usize,
-    visit_limit: usize,
     ended: bool,
     active: BinaryHeap<Reverse<RangeHead>>,
     selecting: Option<BinaryHeap<RangeHead>>,
@@ -645,13 +646,12 @@ impl Pager<'_> {
     }
 
     /// Count one storage read of this slice.
-    fn visit(&mut self) {
-        self.visits += 1;
-        self.work.visits.fetch_add(1, Ordering::Relaxed);
+    fn visit(&mut self) -> bool {
+        self.slice.read()
     }
 
     fn exhausted(&self) -> bool {
-        self.visits + self.scanned >= self.visit_limit
+        self.slice.exhausted()
     }
 
     /// Plan one slice. A fresh plan starts from the actors behind; a resumed one
@@ -768,7 +768,7 @@ impl Pager<'_> {
             Frontier {
                 repair: None,
                 evictable: false,
-                revision: 0,
+                revision: self.revision,
                 offered: Vec::new(),
                 offer_positions: BTreeSet::new(),
                 offer_missing: BTreeSet::new(),
@@ -776,8 +776,8 @@ impl Pager<'_> {
                 replay: 0,
                 replaying: false,
                 fresh: false,
-                pending: VecDeque::new(),
-                updates: VecDeque::new(),
+                pending: self.pending,
+                updates: self.updates,
                 active: self.active,
                 selecting: self.selecting,
                 remainder: self.remainder,
@@ -870,7 +870,7 @@ impl Pager<'_> {
     }
 
     fn scan(&mut self) {
-        self.scanned += 1;
+        self.slice.scanned += 1;
         self.work.actors.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -883,7 +883,7 @@ impl Pager<'_> {
                     self.active.push(Reverse(head));
                 }
                 // Finish inventory before spending a fresh slice on its selected page.
-                self.ended = self.scanned > 0;
+                self.ended = self.slice.scanned > 0;
                 return Ok(());
             };
             self.scan();
@@ -1131,6 +1131,11 @@ impl<S: Storage> SyncEngine<S> {
         budget: PageBudget,
     ) -> Result<PlannedSlice> {
         let pager = Pager {
+            revision: 0,
+            repair: None,
+            pending: VecDeque::new(),
+            updates: VecDeque::new(),
+            slice: Slice::new(std::sync::Arc::clone(&self.work), self.page_visits, 0)?,
             read,
             topic_id,
             local,
@@ -1140,9 +1145,6 @@ impl<S: Storage> SyncEngine<S> {
             window: self.page_actors,
             position_limit: self.page_positions,
             work: &self.work,
-            visits: 0,
-            scanned: 0,
-            visit_limit: self.page_visits,
             ended: false,
             active: BinaryHeap::new(),
             selecting: (scope.informed() && scope.named.len() > self.page_actors)
@@ -1175,6 +1177,11 @@ impl<S: Storage> SyncEngine<S> {
     ) -> Result<PlannedSlice> {
         const SENT: BTreeSet<OpId> = BTreeSet::new();
         let pager = Pager {
+            revision: frontier.revision,
+            repair: frontier.repair,
+            pending: frontier.pending,
+            updates: frontier.updates,
+            slice: Slice::new(std::sync::Arc::clone(&self.work), self.page_visits, 0)?,
             read,
             topic_id,
             local,
@@ -1184,9 +1191,6 @@ impl<S: Storage> SyncEngine<S> {
             window: self.page_actors,
             position_limit: self.page_positions,
             work: &self.work,
-            visits: 0,
-            scanned: 0,
-            visit_limit: self.page_visits,
             ended: false,
             active: frontier.active,
             selecting: frontier.selecting,
