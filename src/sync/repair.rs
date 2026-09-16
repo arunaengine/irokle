@@ -1,14 +1,216 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Retained explicit-hole repair: requested ids a store holds, served oldest
-//! generation first once their dependencies are held or sent.
+//! Explicit repair roots ordered by lightweight headers, with retained edge cursors.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound::{Excluded, Unbounded};
 
 use crate::storage::{SnapshotRead, Storage};
 use crate::{ActorClock, ActorId, Op, OpId, Result, TopicId};
 
+use super::plan::Slice;
 use super::request::need;
-use super::{ActorScope, PageBudget, SyncEngine};
+use super::SyncEngine;
+use super::records::{LoadError, Records};
+use super::space::tree_bytes;
+use super::{ActorScope, MAX_PAGE_MISSING, PageBudget, SyncRequest};
+
+#[derive(Clone, Copy, Default)]
+struct Scan {
+    after: Option<OpId>,
+    waiting: Option<(ActorId, u64, u64)>,
+}
+
+pub(super) struct Repair {
+    expected: BTreeSet<OpId>,
+    remaining: BTreeSet<OpId>,
+    emitted: BTreeSet<OpId>,
+    missing: BTreeSet<OpId>,
+    missing_after: Option<OpId>,
+    ordered: BTreeSet<(u64, OpId)>,
+    scans: BTreeMap<OpId, Scan>,
+    prepared: bool,
+    preparing: Option<OpId>,
+    prepared_after: Option<OpId>,
+    after: Option<(u64, OpId)>,
+    selected: Option<(u64, OpId)>,
+}
+
+pub(super) struct RepairView<'a> {
+    pub(super) read: &'a dyn SnapshotRead,
+    pub(super) topic_id: &'a TopicId,
+    pub(super) peer: &'a ActorClock,
+    pub(super) scope: &'a ActorScope<'a>,
+}
+
+#[derive(Default)]
+pub(super) struct RepairPage {
+    pub(super) unsent: BTreeSet<OpId>,
+    pub(super) ops: Vec<Op>,
+    pub(super) missing: BTreeSet<OpId>,
+    pub(super) too_large: Option<OpId>,
+    pub(super) positions: BTreeMap<ActorId, u64>,
+    pub(super) continued: bool,
+}
+
+impl Repair {
+    pub(super) fn new(wants: &BTreeSet<OpId>, slice: &mut Slice) -> Result<Self> {
+        // Input copying is admission work bounded by MAX_REQUEST_ITEMS, independent of reads.
+        slice.reserve(
+            2 * tree_bytes::<OpId, ()>(wants.len())
+                + 2 * tree_bytes::<OpId, ()>(0)
+                + tree_bytes::<(u64, OpId), ()>(0)
+                + tree_bytes::<OpId, Scan>(0),
+        )?;
+        Ok(Self {
+            expected: wants.clone(),
+            remaining: wants.clone(),
+            emitted: BTreeSet::new(),
+            missing: BTreeSet::new(),
+            missing_after: None,
+            ordered: BTreeSet::new(),
+            scans: BTreeMap::new(),
+            prepared: false,
+            preparing: None,
+            prepared_after: None,
+            after: None,
+            selected: None,
+        })
+    }
+
+    fn advance(&mut self, generation: u64, id: OpId) {
+        self.after = Some((generation, id));
+        self.selected = None;
+    }
+
+    fn prepare(&mut self, view: &RepairView<'_>, slice: &mut Slice) -> Result<bool> {
+        while !self.prepared {
+            let id = match self.preparing {
+                Some(id) => id,
+                None => {
+                    let start = self.prepared_after.map_or(Unbounded, Excluded);
+                    let Some(&id) = self.expected.range((start, Unbounded)).next() else {
+                        self.prepared = true;
+                        break;
+                    };
+                    if !slice.actor() {
+                        return Ok(false);
+                    }
+                    self.preparing = Some(id);
+                    id
+                }
+            };
+            if !slice.read() {
+                return Ok(false);
+            }
+            match view.read.get_header(&id)? {
+                Some(header) if header.topic_id == *view.topic_id => {
+                    let root = (header.generation, id);
+                    reserve_set(&self.ordered, &root, slice)?;
+                    self.ordered.insert(root);
+                }
+                _ => self.mark_missing(id, slice)?,
+            }
+            self.prepared_after = Some(id);
+            self.preparing = None;
+        }
+        Ok(true)
+    }
+
+    fn save_scan(&mut self, id: OpId, scan: Scan, slice: &mut Slice) -> Result<()> {
+        if !self.scans.contains_key(&id) {
+            let count = self.scans.len();
+            slice.reserve(tree_bytes::<OpId, Scan>(count + 1) - tree_bytes::<OpId, Scan>(count))?;
+        }
+        self.scans.insert(id, scan);
+        Ok(())
+    }
+
+    fn mark_missing(&mut self, id: OpId, slice: &mut Slice) -> Result<()> {
+        reserve_set(&self.missing, &id, slice)?;
+        self.missing.insert(id);
+        self.remaining.remove(&id);
+        Ok(())
+    }
+
+    pub(super) fn confirms(&mut self, request: &SyncRequest) -> bool {
+        if !request.wants.is_subset(&self.expected)
+            || !self
+                .expected
+                .difference(&request.wants)
+                .all(|id| self.emitted.contains(id))
+        {
+            return false;
+        }
+        self.expected.retain(|id| request.wants.contains(id));
+        self.emitted.retain(|id| request.wants.contains(id));
+        true
+    }
+
+    pub(super) fn offered(&self) -> bool {
+        !self.emitted.is_empty()
+    }
+
+    pub(super) fn admit(&mut self, ops: &[Op], slice: &mut Slice) -> Result<()> {
+        for op in ops {
+            if self.remaining.contains(&op.id) {
+                reserve_set(&self.emitted, &op.id, slice)?;
+                self.emitted.insert(op.id);
+                self.remaining.remove(&op.id);
+                self.ordered.remove(&(op.signed.body.generation, op.id));
+                self.scans.remove(&op.id);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn contains(&self, id: &OpId) -> bool {
+        self.remaining.contains(id) || (self.expected.contains(id) && self.missing.contains(id))
+    }
+
+    pub(super) fn pending(&self) -> bool {
+        !self.remaining.is_empty() || self.missing_after.is_some()
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        tree_bytes::<OpId, ()>(self.expected.len())
+            + tree_bytes::<OpId, ()>(self.remaining.len())
+            + tree_bytes::<OpId, ()>(self.emitted.len())
+            + tree_bytes::<OpId, ()>(self.missing.len())
+            + tree_bytes::<(u64, OpId), ()>(self.ordered.len())
+            + tree_bytes::<OpId, Scan>(self.scans.len())
+    }
+}
+
+fn holds(view: &RepairView<'_>, actor: &ActorId, seq: u64) -> bool {
+    view.scope.holds_prefix(actor, seq)
+        || (!view.scope.unknown(actor) && view.peer.get(actor) >= seq)
+}
+
+fn position(
+    page: &mut RepairPage,
+    actor: ActorId,
+    generation: u64,
+    limit: usize,
+    slice: &mut Slice,
+) -> Result<bool> {
+    if !page.positions.contains_key(&actor) {
+        let count = page.positions.len();
+        if count >= limit {
+            return Ok(false);
+        }
+        slice.reserve(tree_bytes::<ActorId, u64>(count + 1) - tree_bytes::<ActorId, u64>(count))?;
+    }
+    super::request::need(&mut page.positions, actor, generation);
+    Ok(true)
+}
+
+fn reserve_set<T: Ord>(set: &BTreeSet<T>, value: &T, slice: &mut Slice) -> Result<()> {
+    if !set.contains(value) {
+        let count = set.len();
+        slice.reserve(tree_bytes::<T, ()>(count + 1) - tree_bytes::<T, ()>(count))?;
+    }
+    Ok(())
+}
 
 impl<S: Storage> SyncEngine<S> {
     /// Requested repair ids this store holds, oldest generation first. An id
@@ -86,17 +288,4 @@ impl<S: Storage> SyncEngine<S> {
         }
         Ok(page)
     }
-}
-
-/// What the repair part of a page carried and left.
-#[derive(Default)]
-pub(super) struct RepairPage {
-    pub(super) ops: Vec<Op>,
-    /// Held wants not carried, whose dependents must wait.
-    pub(super) unsent: BTreeSet<OpId>,
-    pub(super) missing: BTreeSet<OpId>,
-    pub(super) too_large: Option<OpId>,
-    /// Actors the request did not describe whose positions a want needed,
-    /// with the lowest generation needing each.
-    pub(super) positions: BTreeMap<ActorId, u64>,
 }
