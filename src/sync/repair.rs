@@ -385,3 +385,7 @@ fn reserve_set<T: Ord>(set: &BTreeSet<T>, value: &T, slice: &mut Slice) -> Resul
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "repair_tests.rs"]
+mod tests;
