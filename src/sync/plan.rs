@@ -703,13 +703,42 @@ impl Pager<'_> {
                 break;
             };
             let (_, actor_id, seq, id, limit) = head;
-            if !self.records.contains(&id) {
-                self.visit();
+            if let Some(known) = self.scope.known_prefix(&actor_id) {
+                self.observe(actor_id, known.min(limit));
             }
-            let Some(record) = self.records.take(self.read, &id)? else {
-                self.missing.insert(id);
-                self.block(actor_id, id);
+            let held = self.covered.get(&actor_id);
+            if held >= seq {
+                if !self.slice.actor() {
+                    self.active.push(Reverse(head));
+                    self.ended = true;
+                    break;
+                }
+                self.wake(actor_id, held);
+                if held < limit {
+                    self.activate(actor_id, held, limit)?;
+                } else {
+                    self.reach(actor_id, limit)?;
+                }
                 continue;
+            }
+            if !self.records.contains(&id) && !self.visit() {
+                self.active.push(Reverse(head));
+                self.ended = true;
+                break;
+            }
+            let record = match self.records.take_slice(self.read, &id, &mut self.slice) {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    self.missing.insert(id);
+                    self.block(actor_id, id);
+                    continue;
+                }
+                Err(super::records::LoadError::Yield) => {
+                    self.active.push(Reverse(head));
+                    self.ended = true;
+                    break;
+                }
+                Err(super::records::LoadError::Failed(error)) => return Err(error),
             };
             match self.wait_for(&record.op)? {
                 Wait::Yield | Wait::Unknown => {
@@ -729,8 +758,7 @@ impl Pager<'_> {
                     continue;
                 }
             }
-            let op = record.into_op();
-            let size = postcard::experimental::serialized_size(&op)?;
+            let size = postcard::experimental::serialized_size(&record.op)?;
             if size > MAX_PAGE_BYTES {
                 return Err(Error::Storage("operation exceeds sync page budget".into()));
             }
@@ -739,14 +767,15 @@ impl Pager<'_> {
                     too_large = Some(id);
                 }
                 self.active.push(Reverse(head));
+                self.records.keep(record);
                 self.ended = true;
                 self.more = true;
                 break;
             }
             bytes += size;
-            self.covered.observe(actor_id, seq);
+            self.observe(actor_id, seq);
             self.blocked.remove(&id);
-            ops.push(op);
+            ops.push(record.into_op());
             self.wake(actor_id, seq);
             if seq < limit {
                 self.activate(actor_id, seq, limit)?;
@@ -754,11 +783,18 @@ impl Pager<'_> {
                 self.reach(actor_id, limit)?;
             }
         }
+        if let Some(repair) = &mut self.repair {
+            repair.admit(&ops, &mut self.slice)?;
+        }
         let more = self.more
             || self.remainder
             || self.selecting.is_some()
             || !self.active.is_empty()
             || !self.pending.is_empty()
+            || self
+                .repair
+                .as_ref()
+                .is_some_and(super::repair::Repair::pending)
             || !self.resumable.is_empty()
             || self.suspended.values().any(|waiting| !waiting.is_empty())
             || !self.deferred.is_empty();
@@ -767,14 +803,18 @@ impl Pager<'_> {
         while missing.len() > MAX_PAGE_MISSING {
             missing.pop_last();
         }
-        let frontier = (self.ended
-            && (ops.is_empty() || (self.scope.informed() && !self.remainder))
+        let frontier = ((self.ended
+            || self
+                .repair
+                .as_ref()
+                .is_some_and(super::repair::Repair::pending))
+            && (ops.is_empty() || !self.remainder)
             && too_large.is_none())
         .then(|| {
             self.work.ended.fetch_add(1, Ordering::Relaxed);
             Frontier {
-                repair: None,
-                evictable: false,
+                repair: self.repair,
+                evictable: !ops.is_empty(),
                 revision: self.revision,
                 offered: Vec::new(),
                 offer_positions: BTreeSet::new(),
@@ -1472,21 +1512,23 @@ impl<S: Storage> SyncEngine<S> {
 
     /// One more slice of the kept plan `frontier`, against the clocks it
     /// planned on and a request with the same scope.
-    pub(super) fn resume_page(
+    pub(super) fn resume_slice(
         &self,
         read: &dyn SnapshotRead,
         topic_id: &TopicId,
         (local, goal, frontier): (&ActorClock, &ActorClock, Frontier),
-        scope: &ActorScope<'_>,
+        (scope, position_limit): (&ActorScope<'_>, usize),
         budget: PageBudget,
+        slice: Slice,
     ) -> Result<PlannedSlice> {
         const SENT: BTreeSet<OpId> = BTreeSet::new();
+        let fresh = frontier.fresh;
         let pager = Pager {
             revision: frontier.revision,
             repair: frontier.repair,
             pending: frontier.pending,
             updates: frontier.updates,
-            slice: Slice::new(std::sync::Arc::clone(&self.work), self.page_visits, 0)?,
+            slice,
             read,
             topic_id,
             local,
@@ -1494,7 +1536,7 @@ impl<S: Storage> SyncEngine<S> {
             scope,
             sent: &SENT,
             window: self.page_actors,
-            position_limit: self.page_positions,
+            position_limit,
             work: &self.work,
             ended: false,
             active: frontier.active,
@@ -1512,6 +1554,18 @@ impl<S: Storage> SyncEngine<S> {
             checked: frontier.checked,
             records: frontier.records,
         };
-        pager.plan(budget, false)
+        pager.plan(budget, fresh)
+    }
+
+    pub(super) fn resume_page(
+        &self,
+        read: &dyn SnapshotRead,
+        topic_id: &TopicId,
+        (local, goal, frontier): (&ActorClock, &ActorClock, Frontier),
+        scope: &ActorScope<'_>,
+        budget: PageBudget,
+    ) -> Result<PlannedSlice> {
+        let slice = Slice::new(std::sync::Arc::clone(&self.work), self.page_visits, 0)?;
+        self.resume_slice(read, topic_id, (local, goal, frontier), (scope, self.page_positions), budget, slice)
     }
 }
