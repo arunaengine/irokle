@@ -36,14 +36,25 @@ generations the hole scan read, and a want without a stored position is unknown.
 
 The hole scan reads a topic's whole history and is not sliced. It lists every
 operation id the topic stores, reads each one's position and full record, and
-checks each dependency edge, so its reads and memory grow with stored history. Admission never creates a hole,
-so an oplog that found a topic whole does not scan it again on the same branch
-and data epoch. While a topic has a hole, each summary, fingerprint, request
-plan and negotiation of it scans again: until repair fills the hole, and without
-end if no peer holds it. Slicing the scan needs a ranged topic listing in
-`SnapshotRead` and a fingerprint for partly scanned topics, both public contract
-changes. Services therefore assume damaged topics are rare and accept one history
-scan per planning call while a topic has a hole.
+checks each dependency edge, so its reads and memory grow with stored history.
+Admission never creates a hole, so an oplog that found a topic whole does not
+scan it again on the same branch and data epoch. While a topic has a hole, each
+summary, fingerprint, request plan and negotiation of it scans again: until
+repair fills the hole, and without end if no peer holds it. Slicing the scan
+needs a ranged topic listing in `SnapshotRead` and a fingerprint for partly
+scanned topics, both public contract changes. Services therefore assume damaged
+topics are rare and accept one history scan per planning call while a topic has a
+hole.
+
+Planning work that grows with a peer's summary is bounded by its frame. Iroh
+decodes each message from one frame of at most 16 MiB, where a head takes 32
+bytes, a clock entry at least 33 and a tip at least 65. A received summary thus
+names at most 524,288 heads, 508,400 clock entries or 258,111 tips, and all of
+them together fit those 16 MiB. Head checks stay within the slice. The tip loop,
+the search for actors behind and request range building are linear in these
+entries, and the filter of actors left out doubles in size at most 20 times up to
+its 1 MiB limit. Page plans share the peer clock rather than copy it. A summary a
+caller builds in process has no such bound.
 
 Fjall admits each authorization or clock record against a raw envelope just under
 16 MiB before decoding. Its underlying read can allocate an oversized corrupt
