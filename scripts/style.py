@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tokenize
 
-from style_tokens import Comment, Name, rust_names, rust_tokens, rust_wildcards, terms
+from style_tokens import Comment, Name, Scan, rust_names, rust_tokens, rust_wildcards, terms
 
 
 def main():
@@ -41,12 +41,52 @@ def main():
 
 
 
+def check(root, rules):
+    """Return all automated policy violations for one repository tree."""
+    files = owned_files(root)
+    paths = [file.relative_to(root).as_posix() for file in files]
+    issues = layout_issues(paths, rules)
+    for file in files:
+        issues.extend(file_issues(root, file, rules))
+    return apply_exceptions(issues, rules)
+
+
+def load_rules(path):
+    """Load and validate the reviewable policy data."""
+    rules = json.loads(path.read_text())
+    needed = {"maintained_extensions", "source_extensions", "required_roots", "small_domains",
+              "generic_prefixes", "skip_paths", "exceptions", "macro_inputs", "test_paths"}
+    missing = needed - rules.keys()
+    if missing:
+        raise ValueError(f"missing rule keys: {sorted(missing)}")
+    for entry in [*rules["small_domains"], *rules["skip_paths"], *rules["exceptions"]]:
+        if not entry.get("reason") or not entry.get("source"):
+            raise ValueError(f"exception lacks reason or source: {entry}")
+    for entry in rules["small_domains"]:
+        if len(entry.get("members", [])) < 3 or len(entry["members"]) != len(set(entry["members"])):
+            raise ValueError(f"small domain needs at least three exact members: {entry}")
+    for entry in rules["exceptions"]:
+        if not {"path", "rule", "name", "kind"} <= entry.keys():
+            raise ValueError(f"symbol exception is not exact: {entry}")
+    for entry in rules["skip_paths"]:
+        if ("path" in entry) == ("prefix" in entry) or not entry.get("rules"):
+            raise ValueError(f"path exception is not narrow: {entry}")
+        if not set(entry["rules"]) <= {"content", "layout"}:
+            raise ValueError(f"unknown path exception rule: {entry}")
+    modes = {entry.get("mode") for entry in rules["macro_inputs"].values()}
+    if not modes <= {"single_type", "function_list"}:
+        raise ValueError(f"unsupported macro modes: {sorted(modes)}")
+    return rules
+
+
+
 @dataclass(frozen=True, order=True)
 class Issue:
     path: str
     line: int
     rule: str
     name: str
+    kind: str
     detail: str
 
 
@@ -67,6 +107,10 @@ class PythonNames(ast.NodeVisitor):
 
     def visit_AsyncFunctionDef(self, node):
         self.visit_FunctionDef(node)
+
+    def visit_Lambda(self, node):
+        self.args(node.args)
+        self.generic_visit(node)
 
     def visit_ClassDef(self, node):
         self.add("type", node.name, node.lineno)
@@ -119,7 +163,7 @@ def python_scan(source):
     try:
         tree = ast.parse(source)
     except SyntaxError as error:
-        return [], [], [], [(error.lineno or 1, error.msg)]
+        return Scan([], [], [], [(error.lineno or 1, error.msg)])
     visitor = PythonNames()
     visitor.visit(tree)
     comments = []
@@ -129,7 +173,7 @@ def python_scan(source):
                         if item.type == tokenize.COMMENT
                         and not (item.start == (1, 0) and item.string.startswith("#!")))
     except tokenize.TokenError as error:
-        return visitor.names, comments, [], [(error.args[1][0], error.args[0])]
+        return Scan(visitor.names, comments, [], [(error.args[1][0], error.args[0])])
     for node in ast.walk(tree):
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             body = node.body
@@ -138,10 +182,10 @@ def python_scan(source):
                 comments.append(Comment(body[0].lineno, body[0].end_lineno or body[0].lineno))
     wildcards = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
                  and any(alias.name == "*" for alias in node.names)]
-    return visitor.names, comments, wildcards, []
+    return Scan(visitor.names, comments, wildcards, [])
 
 
-def shell_subs(source):
+def shell_substitutions(source):
     """Extract active simple command substitutions without reading quoted prose."""
     bodies, errors, index, quote = [], [], 0, None
     while index < len(source):
@@ -186,8 +230,8 @@ def shell_subs(source):
 def shell_scan(source):
     """Inspect declared names in the supported shell subset."""
     names, comments, errors, clean = [], [], [], []
-    substitutions, sub_errors = shell_subs(source)
-    errors.extend(sub_errors)
+    substitutions, substitution_errors = shell_substitutions(source)
+    errors.extend(substitution_errors)
     for number, line in enumerate(source.splitlines(), 1):
         quote, escaped, output = None, False, []
         for char in line:
@@ -242,35 +286,7 @@ def shell_scan(source):
                 found = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^]]+\])?(?:=|$)", word)
                 if found:
                     names.append(Name("variable", found.group(1), number))
-    return names, comments, [], errors
-
-
-def load_rules(path):
-    """Load and validate the reviewable policy data."""
-    rules = json.loads(path.read_text())
-    needed = {"maintained_extensions", "source_extensions", "required_roots", "small_domains",
-              "generic_prefixes", "skip_paths", "exceptions", "macro_inputs", "test_paths"}
-    missing = needed - rules.keys()
-    if missing:
-        raise ValueError(f"missing rule keys: {sorted(missing)}")
-    for entry in [*rules["small_domains"], *rules["skip_paths"], *rules["exceptions"]]:
-        if not entry.get("reason") or not entry.get("source"):
-            raise ValueError(f"exception lacks reason or source: {entry}")
-    for entry in rules["small_domains"]:
-        if len(entry.get("members", [])) < 3 or len(entry["members"]) != len(set(entry["members"])):
-            raise ValueError(f"small domain needs at least three exact members: {entry}")
-    for entry in rules["exceptions"]:
-        if not {"path", "rule", "name", "kind"} <= entry.keys():
-            raise ValueError(f"symbol exception is not exact: {entry}")
-    for entry in rules["skip_paths"]:
-        if ("path" in entry) == ("prefix" in entry) or not entry.get("rules"):
-            raise ValueError(f"path exception is not narrow: {entry}")
-        if not set(entry["rules"]) <= {"content", "layout"}:
-            raise ValueError(f"unknown path exception rule: {entry}")
-    modes = {entry.get("mode") for entry in rules["macro_inputs"].values()}
-    if not modes <= {"single_type", "function_list"}:
-        raise ValueError(f"unsupported macro modes: {sorted(modes)}")
-    return rules
+    return Scan(names, comments, [], errors)
 
 
 def owned_files(root):
@@ -307,7 +323,7 @@ def test_path(path, rules):
 
 
 def comment_issues(path, comments, source):
-    """Reject physical comment blocks longer than three lines."""
+    """Reject logical comment blocks with more than three physical lines."""
     if not comments:
         return []
     ordered = sorted(set(comments), key=lambda item: (item.line, item.end))
@@ -324,7 +340,7 @@ def comment_issues(path, comments, source):
             start, end = comment.line, comment.end
             count = comment.end - comment.line + 1
     blocks.append((start, end, count))
-    return [Issue(path, start, "comment_lines", "comment", f"logical comment uses {count} source lines")
+    return [Issue(path, start, "comment_lines", "comment", "comment", f"logical comment uses {count} source lines")
             for start, _, count in blocks if count > 3]
 
 
@@ -335,38 +351,41 @@ def file_issues(root, file, rules):
     if suffix not in rules["source_extensions"] or skipped(path, rules, "content"):
         return []
     if file.is_symlink():
-        return [Issue(path, 1, "syntax", "symlink", "maintained source symlink needs an exact exception")]
+        return [Issue(path, 1, "syntax", "symlink", "file",
+                      "maintained source symlink needs an exact exception")]
     try:
         source = file.read_text()
     except (OSError, UnicodeError) as error:
-        return [Issue(path, 1, "syntax", "file", str(error))]
+        return [Issue(path, 1, "syntax", "file", "file", str(error))]
     names, comments, wildcards, errors = [], [], [], []
     if suffix == ".rs":
         tokens, comments, errors = rust_tokens(source)
-        found, balance = rust_names(tokens, rules["macro_inputs"])
-        names, errors = found, [*errors, *balance]
+        found, name_errors = rust_names(tokens, rules["macro_inputs"])
+        names, errors = found, [*errors, *name_errors]
         wildcards = rust_wildcards(tokens)
     elif suffix == ".py":
-        names, comments, wildcards, errors = python_scan(source)
+        scan = python_scan(source)
+        names, comments, wildcards, errors = scan.names, scan.comments, scan.wildcards, scan.errors
     elif suffix == ".sh":
         syntax = subprocess.run(["bash", "-n", str(file)], capture_output=True, text=True)
-        names, comments, wildcards, errors = shell_scan(source)
+        scan = shell_scan(source)
+        names, comments, wildcards, errors = scan.names, scan.comments, scan.wildcards, scan.errors
         if syntax.returncode:
             errors.append((1, syntax.stderr.strip() or "bash rejected source"))
-    issues = [Issue(path, line, "syntax", "source", detail) for line, detail in errors]
+    issues = [Issue(path, line, "syntax", "source", "source", detail) for line, detail in errors]
     seen = set()
     for name in names:
         if (name.line, name.text) in seen:
             continue
         seen.add((name.line, name.text))
         if not name.text.isascii() or not terms(name.text):
-            issues.append(Issue(path, name.line, "name_syntax", name.text,
+            issues.append(Issue(path, name.line, "name_syntax", name.text, name.kind,
                                 f"{name.kind} needs reviewed term boundaries"))
         elif len(terms(name.text)) > 3:
-            issues.append(Issue(path, name.line, "name_terms", name.text,
+            issues.append(Issue(path, name.line, "name_terms", name.text, name.kind,
                                 f"{name.kind} has {len(terms(name.text))} terms"))
     if not test_path(path, rules):
-        issues.extend(Issue(path, line, "wildcard_import", "*", "production import must be explicit")
+        issues.extend(Issue(path, line, "wildcard_import", "*", "import", "production import must be explicit")
                       for line in wildcards)
     lines = source.splitlines()
     notices = set(rules.get("mandatory_notices", []))
@@ -389,16 +408,16 @@ def layout_issues(paths, rules):
     extensions = set(rules["maintained_extensions"])
     visible = [path for path in paths if not skipped(path, rules, "layout")]
     maintained = [path for path in visible if Path(path).suffix.lower() in extensions]
-    issues = [Issue(path, 1, "unsupported_asset", Path(path).name,
+    issues = [Issue(path, 1, "unsupported_asset", Path(path).name, "asset",
                     "owned file type is not classified by style rules")
               for path in visible if Path(path).suffix.lower() not in extensions]
     for path in maintained:
         stem = stem_name(path)
         if stem != "mod" and (not stem.isascii() or not terms(stem)):
-            issues.append(Issue(path, 1, "name_syntax", stem,
+            issues.append(Issue(path, 1, "name_syntax", stem, "file",
                                 "source filename needs reviewed term boundaries"))
         elif stem != "mod" and len(terms(stem)) > 3:
-            issues.append(Issue(path, 1, "file_terms", stem,
+            issues.append(Issue(path, 1, "file_terms", stem, "file",
                                 f"source filename has {len(terms(stem))} terms"))
     folders = {}
     for path in maintained:
@@ -414,7 +433,7 @@ def layout_issues(paths, rules):
         domain = domains.get(folder)
         valid_domain = domain is not None and {Path(path).name for path in direct} == set(domain["members"])
         if domain is not None and not valid_domain:
-            issues.append(Issue(folder, 1, "domain_members", Path(folder).name,
+            issues.append(Issue(folder, 1, "domain_members", Path(folder).name, "folder",
                                 "small domain does not match its reviewed member set"))
         prefixes = {}
         for path in direct:
@@ -425,13 +444,13 @@ def layout_issues(paths, rules):
                     prefixes.setdefault(prefix, []).append(path)
         for prefix, grouped in sorted(prefixes.items()):
             if len(grouped) >= 3:
-                issues.append(Issue(folder, 1, "shared_prefix", prefix,
+                issues.append(Issue(folder, 1, "shared_prefix", prefix, "folder",
                                     f"{len(grouped)} sibling files require a {prefix} domain"))
         if folder not in required and not valid_domain and len(direct) < 5:
-            issues.append(Issue(folder, 1, "folder_size", Path(folder).name,
+            issues.append(Issue(folder, 1, "folder_size", Path(folder).name, "folder",
                                 f"optional folder has {len(direct)} direct maintained files"))
     for folder in domains.keys() - folders.keys():
-        issues.append(Issue(folder, 1, "domain_members", Path(folder).name,
+        issues.append(Issue(folder, 1, "domain_members", Path(folder).name, "folder",
                             "reviewed small domain is absent"))
     return issues
 
@@ -444,26 +463,16 @@ def apply_exceptions(issues, rules):
     for issue in issues:
         match = next((index for index, entry in enumerate(entries)
                       if issue.path == entry["path"] and issue.rule == entry["rule"]
-                      and issue.name == entry["name"] and issue.detail.startswith(entry["kind"])), None)
+                      and issue.name == entry["name"] and issue.kind == entry["kind"]), None)
         if match is None:
             kept.append(issue)
         else:
             used.add(match)
     for index, entry in enumerate(entries):
         if index not in used:
-            kept.append(Issue(entry["path"], 1, "stale_exception", entry["name"],
+            kept.append(Issue(entry["path"], 1, "stale_exception", entry["name"], entry["kind"],
                               "reviewed exception does not match a current violation"))
     return sorted(set(kept))
-
-
-def check(root, rules):
-    """Return all automated policy violations for one repository tree."""
-    files = owned_files(root)
-    paths = [file.relative_to(root).as_posix() for file in files]
-    issues = layout_issues(paths, rules)
-    for file in files:
-        issues.extend(file_issues(root, file, rules))
-    return apply_exceptions(issues, rules)
 
 
 

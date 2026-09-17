@@ -129,8 +129,8 @@ class StyleTests(unittest.TestCase):
             id_type!(GeneratedTypeNameHere);
         """
         tokens, _, errors = rust_tokens(source)
-        names, balance = rust_names(tokens, {"id_type": {"mode": "single_type"}})
-        self.assertEqual(errors + balance, [])
+        names, name_errors = rust_names(tokens, {"id_type": {"mode": "single_type"}})
+        self.assertEqual(errors + name_errors, [])
         found = {name.text for name in names}
         expected = {"FourTermImportName", "FOUR_TERM_LIMIT_NAME", "LongGenericParameterName",
                     "LongFunctionGenericName", "LongTypeNameHere", "LongVariantNameHere",
@@ -143,30 +143,30 @@ class StyleTests(unittest.TestCase):
         source = "forward!(long_generated_method_name(long_argument_name_here: usize) -> usize;);"
         tokens, _, errors = rust_tokens(source)
         rules = {"forward": {"mode": "function_list"}}
-        names, balance = rust_names(tokens, rules)
-        self.assertEqual(errors + balance, [])
+        names, name_errors = rust_names(tokens, rules)
+        self.assertEqual(errors + name_errors, [])
         self.assertTrue({"long_generated_method_name", "long_argument_name_here"}
                         <= {name.text for name in names})
 
     def test_unknown_macro(self):
         tokens, _, errors = rust_tokens("macro_rules! owned { () => {}; } owned!();")
-        names, balance = rust_names(tokens, {})
+        names, name_errors = rust_names(tokens, {})
         self.assertTrue(names)
         self.assertEqual(errors, [])
-        self.assertTrue(balance)
+        self.assertTrue(name_errors)
 
     def test_literal_ignored(self):
         source = 'fn good() { let okay = "fn four_term_name_here() {}"; }\n'
         tokens, _, errors = rust_tokens(source)
-        names, balance = rust_names(tokens)
-        self.assertEqual(errors + balance, [])
+        names, name_errors = rust_names(tokens)
+        self.assertEqual(errors + name_errors, [])
         self.assertNotIn("four_term_name_here", {name.text for name in names})
 
     def test_nested_fields(self):
         source = "struct Record { good: Vec<Vec<u8>>, long_field_name_here: usize }"
         tokens, _, errors = rust_tokens(source)
-        names, balance = rust_names(tokens)
-        self.assertEqual(errors + balance, [])
+        names, name_errors = rust_names(tokens)
+        self.assertEqual(errors + name_errors, [])
         self.assertIn("long_field_name_here", {name.text for name in names})
 
     def test_external_exception(self):
@@ -177,6 +177,15 @@ class StyleTests(unittest.TestCase):
         self.assertNotIn("name_terms", self.issue_rules(exceptions=[entry]))
         self.write("src/lib.rs", "fn short_name() {}\n")
         self.assertIn("stale_exception", self.issue_rules(exceptions=[entry]))
+
+    def test_wrong_kind(self):
+        self.write("src/lib.rs", "fn four_term_name_here() {}\n")
+        for kind in ("", "fun"):
+            entry = {"path": "src/lib.rs", "rule": "name_terms", "name": "four_term_name_here",
+                     "kind": kind, "reason": "Wrong kind.", "source": "fixture"}
+            rules = self.issue_rules(exceptions=[entry])
+            self.assertIn("name_terms", rules)
+            self.assertIn("stale_exception", rules)
 
     def test_comment_fragments(self):
         self.write("src/lib.rs", "// one\n// two\n// three\n// four\nfn good() {}\n")
@@ -201,27 +210,29 @@ class StyleTests(unittest.TestCase):
 
     def test_python_syntax(self):
         source = '''"fn four_term_name_here()"\nclass FourTermTypeName:\n    long_field_name_here = 1\ndef long_function_name_here(long_parameter_name_here):\n    long_local_name_here = 1\n'''
-        names, comments, wildcards, errors = style.python_scan(source)
-        self.assertEqual((len(comments), wildcards, errors), (1, [], []))
-        found = {name.text for name in names}
+        scan = style.python_scan(source)
+        self.assertEqual((len(scan.comments), scan.wildcards, scan.errors), (1, [], []))
+        found = {name.text for name in scan.names}
         self.assertNotIn("four_term_name_here", found)
         self.assertIn("long_parameter_name_here", found)
         self.assertIn("long_local_name_here", found)
 
+    def test_lambda_parameters(self):
+        source = "callback = lambda long_lambda_parameter_here: long_lambda_parameter_here\n"
+        scan = style.python_scan(source)
+        self.assertEqual(scan.errors, [])
+        self.assertIn("long_lambda_parameter_here", {name.text for name in scan.names})
+
     def test_shell_syntax(self):
         source = "LONG_ENV_NAME_HERE=value tool\nexport first_long_name_here=x second_long_name_here=y\n"
-        names, _, _, errors = style.shell_scan(source)
-        self.assertEqual(errors, [])
+        scan = style.shell_scan(source)
+        self.assertEqual(scan.errors, [])
         self.assertTrue({"LONG_ENV_NAME_HERE", "first_long_name_here", "second_long_name_here"}
-                        <= {name.text for name in names})
-        _, _, _, errors = style.shell_scan("tool <<EOF\nvalue\nEOF\n")
-        self.assertTrue(errors)
-        _, _, _, errors = style.shell_scan("case x in y) ;; esac\n")
-        self.assertTrue(errors)
-        _, _, _, errors = style.shell_scan("value=$(long_name_here=value; echo x)\n")
-        self.assertTrue(errors)
-        _, _, _, errors = style.shell_scan("value='case x in y) ;; esac'\n")
-        self.assertEqual(errors, [])
+                        <= {name.text for name in scan.names})
+        self.assertTrue(style.shell_scan("tool <<EOF\nvalue\nEOF\n").errors)
+        self.assertTrue(style.shell_scan("case x in y) ;; esac\n").errors)
+        self.assertTrue(style.shell_scan("value=$(long_name_here=value; echo x)\n").errors)
+        self.assertEqual(style.shell_scan("value='case x in y) ;; esac'\n").errors, [])
 
     def test_wildcard_scope(self):
         source = "use super::*;\n#[cfg(test)] mod tests { use super::*; }\n"
@@ -239,13 +250,12 @@ class StyleTests(unittest.TestCase):
     def test_shell_functions(self):
         for declaration in ("four_term_name_here() { :; }",
                             "  function four-term-name-here { :; }"):
-            names, _, _, errors = style.shell_scan(declaration)
-            self.assertEqual(errors, [])
+            scan = style.shell_scan(declaration)
+            self.assertEqual(scan.errors, [])
             self.assertTrue(any(name.kind == "function" and len(terms(name.text)) == 4
-                                for name in names))
+                                for name in scan.names))
         for source in ("  case x in y) ;; esac", "  eval 'function value() {}'"):
-            _, _, _, errors = style.shell_scan(source)
-            self.assertTrue(errors)
+            self.assertTrue(style.shell_scan(source).errors)
 
     def test_cfg_imports(self):
         cases = {

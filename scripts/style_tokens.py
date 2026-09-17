@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Token and syntax helpers for the repository style gate."""
 
 from dataclasses import dataclass
@@ -24,6 +23,14 @@ class Name:
 class Comment:
     line: int
     end: int
+
+
+@dataclass(frozen=True)
+class Scan:
+    names: list
+    comments: list
+    wildcards: list
+    errors: list
 
 
 RUST_WORDS = {
