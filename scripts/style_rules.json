@@ -633,8 +633,7 @@
     "src/iroh/session_tests.rs",
     "src/iroh/exchange_tests.rs",
     "src/storage/pressure_tests.rs",
-    "src/sync/preparation_tests.rs",
-    "src/sync/page_tests.rs",
+    "src/sync/tests.rs",
     "src/sync/repair_tests.rs"
   ],
   "mandatory_notices": [

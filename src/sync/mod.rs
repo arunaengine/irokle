@@ -1224,7 +1224,4 @@ fn remote_contains(remote: &SyncSummary, id: &OpId, meta: &crate::storage::OpPos
 }
 
 #[cfg(test)]
-mod page_tests;
-
-#[cfg(test)]
-mod preparation_tests;
+mod tests;
