@@ -205,7 +205,7 @@ impl FjallStorage {
 
     /// Drop a buffered op and refund its stored charge. Underflow is an error:
     /// the counters no longer describe the records.
-    pub(super) fn remove_pending(tx: &mut Tx, records: &Records, op_id: &OpId) -> Result<()> {
+    pub(super) fn tx_remove_pending(tx: &mut Tx, records: &Records, op_id: &OpId) -> Result<()> {
         let Some(record) = Self::tx_pending_record(tx, records, op_id)? else {
             return Ok(());
         };
@@ -280,7 +280,7 @@ impl FjallStorage {
     pub(super) fn tx_purge_waiters(tx: &mut Tx, records: &Records, dep_id: &OpId) -> Result<usize> {
         let closure = Self::tx_waiter_closure(tx, records, dep_id)?;
         for op_id in &closure {
-            Self::remove_pending(tx, records, op_id)?;
+            Self::tx_remove_pending(tx, records, op_id)?;
         }
         Ok(closure.len())
     }
@@ -298,7 +298,7 @@ impl FjallStorage {
         let (mut oldest, mut next): (u64, u64) =
             Self::tx_get(tx, records, range_key.as_slice())?.unwrap_or_default();
         for id in &subtree {
-            Self::remove_pending(tx, records, id)?;
+            Self::tx_remove_pending(tx, records, id)?;
             let marker = key(&[REJECTED, topic_id.as_ref(), id.as_ref()]);
             if fjall::Readable::contains_key(tx, records, marker.as_slice())? {
                 continue;
@@ -338,7 +338,7 @@ impl FjallStorage {
             ids.push(id_at(item.key()?.as_ref(), BY_TOPIC.len() + TopicId::LEN)?);
         }
         for op_id in ids {
-            Self::remove_pending(tx, records, &op_id)?;
+            Self::tx_remove_pending(tx, records, &op_id)?;
         }
         for prefix in [REJECTED, REJECTED_ORDER] {
             Self::tx_remove_prefix(tx, records, &key(&[prefix, topic_id.as_ref()]))?;

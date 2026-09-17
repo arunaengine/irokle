@@ -179,6 +179,8 @@ impl FjallStorage {
         Self::open_with_persist_mode(path, fjall::PersistMode::SyncAll)
     }
 
+    /// Open Fjall storage with an explicit transaction persist mode.
+    ///
     #[doc = include_str!("../contracts/persist_mode.md")]
     pub fn open_with_persist_mode(
         path: impl AsRef<Path>,
@@ -385,6 +387,8 @@ impl FjallStorage {
         }
     }
 
+    /// Upgrade a schema 1 database.
+    ///
     #[doc = include_str!("../contracts/schema_two.md")]
     fn migrate_schema_two(&self) -> Result<()> {
         self.transaction(|tx| {
@@ -471,7 +475,7 @@ impl FjallStorage {
             let mut legacy_keys = Vec::new();
             for item in fjall::Readable::prefix(tx, &self.records, OBLIGATION_PREFIX) {
                 let (key, value) = item.into_inner()?;
-                if Self::is_record_key(key.as_ref()) {
+                if Self::is_op_key(key.as_ref()) {
                     continue;
                 }
                 legacy_keys.push(key.to_vec());
@@ -643,6 +647,8 @@ impl FjallStorage {
         Ok(())
     }
 
+    /// Upgrade a schema 6 database.
+    ///
     #[doc = include_str!("../contracts/schema_seven.md")]
     fn migrate_schema_seven(&self, steps: usize) -> Result<()> {
         self.transaction(|tx| {
@@ -667,7 +673,7 @@ impl FjallStorage {
         let mut limit = MIGRATION_RECORDS;
         for _ in 0..steps {
             let more = loop {
-                match self.transaction(|tx| self.clock_migration_step(tx, limit)) {
+                match self.transaction(|tx| self.tx_migration_step(tx, limit)) {
                     Err(Error::StorageBuffer { .. }) if limit > 1 => {
                         limit = limit.div_ceil(2);
                     }
@@ -683,7 +689,7 @@ impl FjallStorage {
 
     /// Rewrite the next bounded run of legacy metadata records, or move the
     /// cursor to the next keyspace, or remove it. False once none is left.
-    fn clock_migration_step(&self, tx: &mut Transaction, limit: usize) -> Result<bool> {
+    fn tx_migration_step(&self, tx: &mut Transaction, limit: usize) -> Result<bool> {
         let Some(cursor) = Self::tx_get::<ClockMigration>(tx, &self.records, CLOCK_MIGRATION)?
         else {
             return Ok(false);
@@ -896,7 +902,7 @@ impl FjallStorage {
     }
 
     // An op id beginning with `b` makes its `o<id>` key match the `ob` scan prefix.
-    fn is_record_key(key: &[u8]) -> bool {
+    fn is_op_key(key: &[u8]) -> bool {
         key.len() == b"o".len() + OpId::LEN && key.starts_with(b"o")
     }
 
@@ -1011,7 +1017,7 @@ impl FjallStorage {
         Ok(ack_commit(state.as_ref(), ack))
     }
 
-    fn apply_ack_tx(
+    fn tx_apply_ack(
         tx: &mut Transaction,
         records: &fjall::OptimisticTxKeyspace,
         ack: &PeerAck,
@@ -1265,7 +1271,7 @@ impl FjallStorage {
                 // Admission drops the buffered copy through the same funnel as
                 // every other removal, so the pending counts and byte budgets
                 // are released in exactly one place.
-                Self::remove_pending(tx, &self.records, &op.id)?;
+                Self::tx_remove_pending(tx, &self.records, &op.id)?;
                 Self::tx_settle_waiters(tx, &self.records, &op.id)?;
                 clock.observe(meta.actor_id, meta.actor_seq);
                 max_generation = max_generation.max(meta.generation);
@@ -1967,7 +1973,7 @@ impl Storage for FjallStorage {
         Self::read_pending_missing(&self.snapshot()?, &self.records, topic_id)
     }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
-        self.transaction(|tx| Self::remove_pending(tx, &self.records, op_id))
+        self.transaction(|tx| Self::tx_remove_pending(tx, &self.records, op_id))
     }
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
         self.transaction(|tx| Self::tx_purge_waiters(tx, &self.records, dep_id))
@@ -2019,7 +2025,7 @@ impl Storage for FjallStorage {
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize> {
         self.transaction(|tx| {
             let commit = Self::tx_ack_commit(tx, &self.records, &ack)??;
-            Self::apply_ack_tx(tx, &self.records, &ack, commit)
+            Self::tx_apply_ack(tx, &self.records, &ack, commit)
         })
     }
 
@@ -2034,7 +2040,7 @@ impl Storage for FjallStorage {
                     // A backend failure after this ack's writes were staged
                     // aborts the transaction, so none of the batch commits.
                     Ok(commit) => {
-                        let cleared = Self::apply_ack_tx(tx, &self.records, ack, commit)?;
+                        let cleared = Self::tx_apply_ack(tx, &self.records, ack, commit)?;
                         results.push(Ok(cleared));
                     }
                     Err(rejected) => results.push(Err(rejected)),
@@ -3249,7 +3255,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn obligation_scan_collision() {
+    fn scan_skips_collision() {
         let dir = tempfile::tempdir().unwrap();
         let storage = FjallStorage::open(dir.path()).unwrap();
         let mut op_id = [0_u8; OpId::LEN];
