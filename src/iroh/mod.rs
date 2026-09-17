@@ -622,21 +622,23 @@ impl<S: Storage> SharedNet<S> {
         self.note_outcome(peer_id, [Ok(())]);
     }
 
-    /// Feed one attempt's outcomes to peer health. Blocked, reconcile and rejected results are
-    /// skipped: local limits, a store to reopen or refused data never show a peer is unreachable.
-    /// If selection changes, the peer's queued topics are rechecked now for an alternate.
+    /// Feed one attempt's outcomes to peer health: any answer counts as reached, otherwise any
+    /// unreachable failure counts once. If selection changes, the peer's queued topics are
+    /// rechecked now for an alternate.
     fn note_outcome<'a>(
         &self,
         peer_id: PeerId,
         results: impl IntoIterator<Item = std::result::Result<(), &'a io::Error>>,
     ) {
-        let results = results.into_iter().filter(|result| {
-            matches!(
-                exchange_state(*result, false),
-                ExchangeState::Complete | ExchangeState::Retryable
-            )
-        });
-        if !self.node.note_peer_outcome(peer_id, results) {
+        let mut reached = false;
+        let mut unreachable = false;
+        for result in results {
+            match result {
+                Ok(()) => reached = true,
+                Err(error) => unreachable |= is_unreachable(error),
+            }
+        }
+        if !self.node.note_peer_outcome(peer_id, reached, unreachable) {
             return;
         }
         for topic_id in self
@@ -3893,6 +3895,17 @@ fn exchange_state(result: std::result::Result<(), &io::Error>, advanced: bool) -
     }
 }
 
+/// Whether a failure shows its peer could not be reached. Only a retryable failure outside
+/// invalid data or input does; local limits, a store to reopen, refused data and failures
+/// the peer reported leave peer health unchanged.
+fn is_unreachable(error: &io::Error) -> bool {
+    exchange_state(Err(error), false) == ExchangeState::Retryable
+        && !matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput
+        )
+}
+
 fn attempt_outcome(
     result: std::result::Result<(), &io::Error>,
     advanced: bool,
@@ -3994,6 +4007,93 @@ mod tests {
         );
         assert_eq!(exchange_state(Ok(()), false), ExchangeState::Complete);
         assert_eq!(exchange_state(Ok(()), true), ExchangeState::Advancing);
+    }
+
+    /// Only a retryable failure outside invalid data or input demotes a peer, under every
+    /// typed cause and error kind, and a copied error keeps that decision.
+    #[test]
+    fn health_decisions() {
+        use crate::net::SharedError;
+        use io::ErrorKind::{
+            ConnectionRefused, InvalidData, InvalidInput, Other, OutOfMemory, TimedOut, WouldBlock,
+        };
+        let kinds = [
+            InvalidData,
+            InvalidInput,
+            WouldBlock,
+            OutOfMemory,
+            TimedOut,
+            ConnectionRefused,
+            Other,
+        ];
+        let never = [false; 7];
+        let untyped = [false, false, false, false, true, true, true];
+        let retryable = [false, false, true, true, true, true, true];
+        let typed = |cause: crate::Error| Some(SharedError::new(cause));
+        let storage = || crate::Error::Storage("backend failed".into());
+        let capacity = || crate::Error::SyncCapacity("credit".into());
+        let rows = [
+            (None, untyped),
+            (typed(crate::Error::TopicNotFound), untyped),
+            (
+                Some(SharedError::new(RemoteFailure(
+                    crate::sync::SyncFailureCode::Request,
+                ))),
+                retryable,
+            ),
+            (Some(SharedError::new(NoProgress)), never),
+            (typed(capacity()), never),
+            (
+                typed(crate::Error::MemoryPressure {
+                    domain: crate::storage::MemoryDomain::Workspace,
+                    required: 2,
+                    limit: 1,
+                }),
+                never,
+            ),
+            (
+                typed(crate::Error::StagingCapacity("staging".into())),
+                never,
+            ),
+            (typed(crate::Error::EvictionJournalFull), never),
+            (typed(storage()), retryable),
+            (typed(crate::Error::AdmissionConflict), retryable),
+            (typed(crate::Error::Shared(Arc::new(storage()))), retryable),
+            (typed(crate::Error::Shared(Arc::new(capacity()))), never),
+        ];
+        #[cfg(feature = "fjall")]
+        let rows = rows.into_iter().chain([
+            (typed(crate::Error::StoragePressure("disk".into())), never),
+            (
+                typed(crate::Error::StorageBuffer {
+                    required: 2,
+                    limit: 1,
+                }),
+                never,
+            ),
+            (
+                typed(crate::Error::ReopenRequired(fjall::Error::Poisoned)),
+                never,
+            ),
+            (
+                typed(crate::Error::Fjall(fjall::Error::Poisoned)),
+                retryable,
+            ),
+            (
+                typed(crate::Error::StorageProbe(io::Error::other("probe"))),
+                retryable,
+            ),
+        ]);
+        for (cause, expected) in rows {
+            for (kind, expected) in kinds.into_iter().zip(expected) {
+                let error = match &cause {
+                    Some(cause) => io::Error::new(kind, cause.clone()),
+                    None => io::Error::new(kind, "untyped failure"),
+                };
+                assert_eq!(is_unreachable(&error), expected, "{error:?}");
+                assert_eq!(is_unreachable(&clone_error(&error)), expected, "{error:?}");
+            }
+        }
     }
 
     #[test]

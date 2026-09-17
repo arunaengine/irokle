@@ -1890,30 +1890,27 @@ fn health_selects_alternate() {
     assert_eq!(alice.sync_peers(topic.id(), &state), vec![preferred]);
 }
 
-/// A refused exchange is topic-local: it must not demote a peer that is
-/// reachable, while a transport failure must, once per attempt however many
-/// topics the attempt carried.
+/// An attempt neither reached nor unreachable, such as a refused exchange, must
+/// not demote a peer; an unreachable attempt adds one failure, and reaching the
+/// peer clears them even when other topics of that attempt failed.
 #[cfg(feature = "iroh")]
 #[test]
 fn refusal_keeps_health() {
     let alice = node(155);
     let bob = node(156);
-    let refused = std::io::Error::new(std::io::ErrorKind::InvalidData, "unsupported sync protocol");
     for _ in 0..node::PEER_FAILURE_LIMIT {
-        alice.note_peer_outcome(bob.peer_id(), [Err(&refused)]);
+        assert!(!alice.note_peer_outcome(bob.peer_id(), false, false));
     }
     assert_eq!(alice.peer_health().failures(&bob.peer_id()), 0);
 
-    let unreachable = std::io::Error::new(std::io::ErrorKind::TimedOut, "iroh connect timed out");
-    let topics = vec![Err(&unreachable); 300];
-    assert!(alice.note_peer_outcome(bob.peer_id(), topics));
+    assert!(alice.note_peer_outcome(bob.peer_id(), false, true));
     assert_eq!(
         alice.peer_health().failures(&bob.peer_id()),
         1,
         "one failed connection is one health failure"
     );
 
-    assert!(alice.note_peer_outcome(bob.peer_id(), [Ok(())]));
+    assert!(alice.note_peer_outcome(bob.peer_id(), true, true));
     assert_eq!(alice.peer_health().failures(&bob.peer_id()), 0);
 }
 

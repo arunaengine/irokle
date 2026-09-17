@@ -35,16 +35,6 @@ use crate::{
 
 static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
 
-/// Whether a failed attempt says the peer could not be reached, rather than
-/// that one exchange was refused. Protocol rejections are topic-local, so they
-/// must not demote a peer that answers other topics fine.
-#[cfg(feature = "iroh")]
-fn is_unreachable(error: &std::io::Error) -> bool {
-    !matches!(
-        error.kind(),
-        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
-    )
-}
 const SHARED_OVERLAP: usize = 2;
 #[cfg(feature = "iroh")]
 const SYNC_TOPIC_CONCURRENCY: usize = 8;
@@ -1057,23 +1047,16 @@ impl<S: Storage> Irokle<S> {
         Ok(counts)
     }
 
-    /// Record one attempt's reachability, once per attempt however many topics
-    /// it served. Only reachability failures demote a peer: a refused exchange
-    /// says nothing about other topics. Returns whether selection changed.
+    /// Record one attempt's reachability, however many topics it served. Reaching the peer
+    /// clears its failures; otherwise an unreachable result, as classed by the transport,
+    /// adds one. Returns whether selection changed.
     #[cfg(feature = "iroh")]
-    pub(crate) fn note_peer_outcome<'a>(
+    pub(crate) fn note_peer_outcome(
         &self,
         peer_id: PeerId,
-        results: impl IntoIterator<Item = std::result::Result<(), &'a std::io::Error>>,
+        reached: bool,
+        unreachable: bool,
     ) -> bool {
-        let mut reached = false;
-        let mut unreachable = false;
-        for result in results {
-            match result {
-                Ok(()) => reached = true,
-                Err(error) => unreachable |= is_unreachable(error),
-            }
-        }
         if reached {
             self.peer_health.record_success(&peer_id)
         } else if unreachable {
