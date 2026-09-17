@@ -226,7 +226,7 @@ impl<S: super::Storage> Oplog<S> {
                 Err(Error::AdmissionConflict) => continue,
                 // Validation reads the store op by op, so a commit landing meanwhile can
                 // skip ops the store now holds and fake a gap; moved heads retry it.
-                Err(err) if is_local_race(&err) && heads()? != before => continue,
+                Err(err) if is_admission_race(&err) && heads()? != before => continue,
                 Ok(accepted) => return Ok((accepted, eviction)),
                 Err(err) => return Err(err),
             }
@@ -984,7 +984,10 @@ pub(super) fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
     }
 }
 
-pub(super) fn is_local_race(err: &Error) -> bool {
+/// Failures a concurrent commit can cause by moving topic state mid-attempt.
+/// Retry only when state moved: for a locally built op these failures imply it,
+/// while a received batch must check that its topic heads changed.
+pub(super) fn is_admission_race(err: &Error) -> bool {
     // A generation mismatch here is a concurrent admission advancing
     // max_generation between the heads read and op validation, not immutable
     // invalidity: the retry recomputes the generation from fresh state.
