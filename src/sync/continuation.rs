@@ -67,9 +67,10 @@ impl Continuation {
         }
     }
 
-    /// Resume only with the same branch/session and confirmed positions.
-    /// Without a full summary, require the original window and confirmed named prefixes.
-    fn resumes(
+    /// Resume only with the same branch/session and confirmed positions, applying the confirmation
+    /// to the frontier and repair state. Without a full summary, require the original window and
+    /// confirmed named prefixes.
+    fn resume(
         &mut self,
         view: &RequestView,
         request: &SyncRequest,
@@ -132,7 +133,7 @@ impl Continuation {
                 .frontier
                 .repair
                 .as_mut()
-                .is_none_or(|repair| repair.confirms(request))
+                .is_none_or(|repair| repair.confirm(request))
         {
             return false;
         }
@@ -298,7 +299,7 @@ impl Continuations {
         if self.entries.is_empty() {
             self.entries = BTreeMap::new();
         }
-        kept.resumes(view, request, summary).then_some(kept)
+        kept.resume(view, request, summary).then_some(kept)
     }
 
     /// Idle plans expire; a data-producing plan may yield its slot to another goal.

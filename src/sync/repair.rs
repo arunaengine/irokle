@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Explicit repair roots ordered by lightweight headers, with retained edge cursors.
+//! Serves explicitly wanted records lowest generation first, keeping each root's dependency scan
+//! position between slices.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
@@ -15,7 +16,15 @@ use super::{ActorScope, MAX_PAGE_MISSING, PageBudget, SyncRequest};
 #[derive(Clone, Copy, Default)]
 struct Scan {
     after: Option<OpId>,
-    waiting: Option<(ActorId, u64, u64)>,
+    waiting: Option<Waiting>,
+}
+
+/// The dependency a root waits for: its actor, sequence and generation.
+#[derive(Clone, Copy)]
+struct Waiting {
+    actor: ActorId,
+    seq: u64,
+    generation: u64,
 }
 
 pub(super) struct Repair {
@@ -133,7 +142,12 @@ impl Repair {
                 continue;
             }
             let mut scan = self.scans.get(&id).copied().unwrap_or_default();
-            if let Some((actor, seq, required)) = scan.waiting {
+            if let Some(Waiting {
+                actor,
+                seq,
+                generation: required,
+            }) = scan.waiting
+            {
                 if !slice.actor() {
                     page.continued = true;
                     break;
@@ -143,7 +157,7 @@ impl Repair {
                     self.save_scan(id, scan, slice)?;
                 } else {
                     if view.scope.unknown(&actor)
-                        && !position(&mut page, actor, required, position_limit, slice)?
+                        && !need_position(&mut page, actor, required, position_limit, slice)?
                     {
                         break;
                     }
@@ -198,7 +212,7 @@ impl Repair {
                 };
                 if !holds(&view, &meta.actor_id, meta.actor_seq) {
                     if view.scope.unknown(&meta.actor_id)
-                        && !position(
+                        && !need_position(
                             &mut page,
                             meta.actor_id,
                             meta.generation,
@@ -209,7 +223,11 @@ impl Repair {
                         ready = false;
                         break;
                     }
-                    scan.waiting = Some((meta.actor_id, meta.actor_seq, meta.generation));
+                    scan.waiting = Some(Waiting {
+                        actor: meta.actor_id,
+                        seq: meta.actor_seq,
+                        generation: meta.generation,
+                    });
                     scan.after = Some(*dep);
                     self.advance(generation, id);
                     ready = false;
@@ -326,7 +344,9 @@ impl Repair {
         Ok(())
     }
 
-    pub(super) fn confirms(&mut self, request: &SyncRequest) -> bool {
+    /// Accept `request` when its wants are a subset of this repair's and every dropped want was
+    /// sent, then forget the dropped wants.
+    pub(super) fn confirm(&mut self, request: &SyncRequest) -> bool {
         if !request.wants.is_subset(&self.expected)
             || !self
                 .expected
@@ -380,7 +400,7 @@ fn holds(view: &RepairView<'_>, actor: &ActorId, seq: u64) -> bool {
         || (!view.scope.unknown(actor) && view.peer.get(actor) >= seq)
 }
 
-fn position(
+fn need_position(
     page: &mut RepairPage,
     actor: ActorId,
     generation: u64,
