@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print the required serial check manifest for the capped checks.sh runner."""
+"""Print the required serial check manifest; run it through checks.sh under guard.py."""
 
 import json
 import sys
@@ -8,6 +8,11 @@ import sys
 def main():
     print(json.dumps(cases(), indent=2))
 
+
+
+def cargo_subcommand(args):
+    """Return the cargo subcommand, skipping a leading toolchain override."""
+    return next(arg for arg in args if not arg.startswith("+"))
 
 
 def cases():
@@ -35,7 +40,7 @@ def cases():
     commands.extend((f"{name}-1.95", ["+1.95.0", *args]) for name, args in commands[:9])
     commands.append(("contracts", ["test", "--locked", "--all-features", "--test", "contracts"]))
     result = [{"label": name,
-               "argv": (["env", "RUSTDOCFLAGS=-D warnings"] if name.startswith("doc") else [])
+               "argv": (["env", "RUSTDOCFLAGS=-D warnings"] if cargo_subcommand(args) == "doc" else [])
                        + ["cargo", *args], "timeout": 7200}
               for name, args in commands]
     result.insert(0, {"label": "style", "timeout": 120,
