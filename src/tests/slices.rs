@@ -46,7 +46,7 @@ fn page_slices<S: Storage>(source: &Source<S>) -> (usize, usize) {
             "page {pages} exceeded its work slice"
         );
         assert!(after.edges - before.edges <= VISITS as u64);
-        assert!(after.auth_reads - before.auth_reads <= 16);
+        assert!(after.authorization_reads - before.authorization_reads <= 16);
         assert!(after.decoded - before.decoded <= crate::sync::MAX_PAGE_BYTES as u64);
         assert!(page.more || !page.continued);
         if page.ops.is_empty() {
@@ -104,7 +104,7 @@ fn fjall_slices_resume() {
 /// A slice that sent nothing and cannot keep its plan fails its request
 /// instead of reporting an empty page to be repeated forever.
 #[test]
-fn slice_kept_refused() {
+fn unkept_slice_refused() {
     let mut source = reverse_chain(MemoryStorage::new(), 40);
     source.engine = source.engine.clone().with_page_actors(2);
     let responder = source.engine.clone().with_page_visits(VISITS, 0);

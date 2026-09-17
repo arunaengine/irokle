@@ -15,8 +15,9 @@ pub(super) const MAX_CONTINUATION_BYTES: usize = 4 * 1024 * 1024;
 /// through twice the actor window activates every actor before it sends.
 const MAX_WORKSPACE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Work page plans performed: storage reads, dependency edges examined, slices
-/// that ended on their read budget, and plans resumed from a kept frontier.
+/// Work sync planning performed: storage reads, actor items, remote tips and dependency edges;
+/// slices that kept a frontier or replayed without data, and plans resumed; decoded bytes,
+/// preparation units, authorization reads and captured raw bytes.
 #[derive(Debug, Default)]
 pub(crate) struct PageWork {
     visits: AtomicU64,
@@ -27,7 +28,7 @@ pub(crate) struct PageWork {
     resumed: AtomicU64,
     decoded: AtomicU64,
     preparation: AtomicU64,
-    auth_reads: AtomicU64,
+    authorization_reads: AtomicU64,
     captured: AtomicU64,
 }
 
@@ -44,7 +45,7 @@ pub(crate) struct PageWorkSnapshot {
     /// Encoded upper-bound bytes admitted for decoding, including failed loads.
     pub(crate) decoded: u64,
     pub(crate) preparation: u64,
-    pub(crate) auth_reads: u64,
+    pub(crate) authorization_reads: u64,
     pub(crate) captured: u64,
     pub(crate) kept_bytes: u64,
 }
@@ -73,7 +74,7 @@ impl PageWork {
             resumed: self.resumed.load(Ordering::Relaxed),
             decoded: self.decoded.load(Ordering::Relaxed),
             preparation: self.preparation.load(Ordering::Relaxed),
-            auth_reads: self.auth_reads.load(Ordering::Relaxed),
+            authorization_reads: self.authorization_reads.load(Ordering::Relaxed),
             captured: self.captured.load(Ordering::Relaxed),
             kept_bytes: kept_bytes as u64,
         }
@@ -91,8 +92,8 @@ pub(super) struct Slice {
     decode_limit: usize,
     preparation: usize,
     input_units: usize,
-    prep_bytes: usize,
-    auth_reads: usize,
+    preparation_bytes: usize,
+    authorization_reads: usize,
     captured: usize,
 }
 
@@ -113,8 +114,8 @@ impl Slice {
             decode_limit: MAX_PAGE_BYTES,
             preparation: 0,
             input_units: 0,
-            prep_bytes: 0,
-            auth_reads: 0,
+            preparation_bytes: 0,
+            authorization_reads: 0,
             captured: 0,
         };
         slice.reserve(workspace)?;
@@ -165,7 +166,7 @@ impl Slice {
 
     pub(super) fn prepare(&mut self, units: usize, bytes: usize) -> Result<()> {
         let units = self.preparation.saturating_add(units);
-        let bytes = self.prep_bytes.saturating_add(bytes);
+        let bytes = self.preparation_bytes.saturating_add(bytes);
         if units > 16 * MAX_PAGE_VISITS || bytes > 128 * 1024 * 1024 {
             return Err(Error::SyncCapacity(
                 "request preparation exceeds its entry or memory envelope; reduce the actor window or wants".into(),
@@ -175,13 +176,13 @@ impl Slice {
             .preparation
             .fetch_add((units - self.preparation) as u64, Ordering::Relaxed);
         self.preparation = units;
-        self.prep_bytes = bytes;
+        self.preparation_bytes = bytes;
         Ok(())
     }
 
     pub(super) fn prepare_input(&mut self, units: usize, bytes: usize, limit: usize) -> Result<()> {
         let units = self.input_units.saturating_add(units);
-        let bytes = self.prep_bytes.saturating_add(bytes);
+        let bytes = self.preparation_bytes.saturating_add(bytes);
         if units > limit || bytes > 128 * 1024 * 1024 {
             return Err(Error::SyncCapacity(
                 "request input exceeds its work or memory limit; reduce wants, hints or filter bytes".into(),
@@ -191,18 +192,20 @@ impl Slice {
             .preparation
             .fetch_add((units - self.input_units) as u64, Ordering::Relaxed);
         self.input_units = units;
-        self.prep_bytes = bytes;
+        self.preparation_bytes = bytes;
         Ok(())
     }
 
-    pub(super) fn auth_read(&mut self) -> Result<()> {
-        if self.auth_reads >= 16 {
+    pub(super) fn authorization_read(&mut self) -> Result<()> {
+        if self.authorization_reads >= 16 {
             return Err(Error::SyncCapacity(
                 "request authorization exceeds its metadata envelope".into(),
             ));
         }
-        self.auth_reads += 1;
-        self.work.auth_reads.fetch_add(1, Ordering::Relaxed);
+        self.authorization_reads += 1;
+        self.work
+            .authorization_reads
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

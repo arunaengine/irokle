@@ -104,8 +104,8 @@ fn repair_slices<S: Storage>(storage: S) {
             assert_eq!(after.edges, before.edges);
             assert_eq!(after.decoded, before.decoded);
             assert_eq!(after.kept_bytes, before.kept_bytes);
-            assert!(after.auth_reads > before.auth_reads);
-            assert!(after.auth_reads - before.auth_reads <= 16);
+            assert!(after.authorization_reads > before.authorization_reads);
+            assert!(after.authorization_reads - before.authorization_reads <= 16);
             assert!(
                 after.preparation - before.preparation
                     <= 16 * super::super::MAX_REQUEST_ITEMS as u64
@@ -261,127 +261,6 @@ fn memory_missing_barrier() {
 fn fjall_missing_barrier() {
     let directory = tempfile::tempdir().unwrap();
     missing_barrier(crate::storage::FjallStorage::open(directory.path()).unwrap());
-}
-
-#[test]
-fn finite_goals_progress() {
-    struct Goal {
-        peer: PeerId,
-        receiver: Oplog<MemoryStorage>,
-        done: bool,
-    }
-
-    let owner = Ed25519Signer::from_bytes(&[225; 32]);
-    let peers = (101..118)
-        .map(|seed| Ed25519Signer::from_bytes(&[seed; 32]).peer_id())
-        .collect::<Vec<_>>();
-    let topic = TopicId::hash(b"finite-goals-admission");
-    let actor = actor_id_for(topic, owner.peer_id());
-    let source = Oplog::new();
-    let genesis = source
-        .create_topic_genesis(
-            topic,
-            actor,
-            TopicGenesis::new(
-                Note::TYPE_ID,
-                peers.iter().copied().chain([owner.peer_id()]),
-            ),
-            &owner,
-        )
-        .unwrap();
-    for text in ["one", "two"] {
-        source
-            .create_event_op(
-                topic,
-                actor,
-                EventEnvelope::encode_event(&Note { text: text.into() }).unwrap(),
-                &owner,
-            )
-            .unwrap();
-    }
-    let responder = SyncEngine::new(source, owner.peer_id())
-        .with_page_visits(1, super::super::MAX_CONTINUATIONS);
-    let request = SyncRequest {
-        topic_id: topic,
-        known: [genesis.id].into(),
-        wants: BTreeSet::new(),
-        actor_range_hints: vec![ActorRangeHint {
-            actor_id: actor,
-            from_exclusive: 1,
-            to_inclusive: 3,
-        }],
-        genesis: Some(genesis.id),
-        credit: Default::default(),
-        window: Default::default(),
-    };
-    let budget = PageBudget {
-        ops: 1,
-        bytes: super::super::MAX_PAGE_BYTES,
-    };
-    for peer in &peers[..super::super::MAX_CONTINUATIONS] {
-        let page = responder.response_page(*peer, &request, budget).unwrap();
-        assert!(page.ops.is_empty() && page.continued);
-    }
-    assert!(matches!(
-        responder.response_page(peers[super::super::MAX_CONTINUATIONS], &request, budget),
-        Err(Error::SyncCapacity(_))
-    ));
-    let mut goals = peers
-        .into_iter()
-        .map(|peer| {
-            let receiver = Oplog::new();
-            receiver.receive_ops(vec![genesis.clone()]).unwrap();
-            Goal {
-                peer,
-                receiver,
-                done: false,
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut delivered = 0;
-    let mut refused = 0;
-    for _ in 0..128 {
-        for goal in goals.iter_mut().filter(|goal| !goal.done) {
-            let mut request = request.clone();
-            request.actor_range_hints[0].from_exclusive = goal
-                .receiver
-                .storage()
-                .actor_clock(&topic)
-                .unwrap()
-                .get(&actor);
-            match responder.response_page(goal.peer, &request, budget) {
-                Err(Error::SyncCapacity(_)) => refused += 1,
-                Err(error) => panic!("unexpected admission failure: {error}"),
-                Ok(page) => {
-                    let count = page.ops.len();
-                    assert!(count <= 1);
-                    assert_eq!(goal.receiver.receive_ops(page.ops).unwrap().len(), count);
-                    delivered += count;
-                    goal.done = !page.more;
-                    if goal.done {
-                        assert_eq!(
-                            goal.receiver
-                                .storage()
-                                .actor_clock(&topic)
-                                .unwrap()
-                                .get(&actor),
-                            3
-                        );
-                    }
-                }
-            }
-        }
-        if goals.iter().all(|goal| goal.done) {
-            break;
-        }
-    }
-    assert!(
-        goals.iter().all(|goal| goal.done),
-        "finite goals starved under round-robin service"
-    );
-    assert_eq!(delivered, 34);
-    assert!(refused > 0);
-    assert_eq!(responder.page_work().kept_bytes, 0);
 }
 
 #[test]

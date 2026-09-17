@@ -21,12 +21,6 @@ mod space;
 mod types;
 
 #[cfg(test)]
-mod page_tests;
-
-#[cfg(test)]
-mod preparation_tests;
-
-#[cfg(test)]
 pub(crate) use continuation::MAX_CONTINUATIONS;
 use continuation::{Continuation, Continuations};
 pub use request::RequestKnowledge;
@@ -45,9 +39,9 @@ const ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/2";
 #[doc = include_str!("protocol.md")]
 pub const SYNC_PROTOCOL: &str = "irokle/sync/5";
 
-/// Maximum sequences a single `ActorRangeHint` may span. Caps `actor_ranges` hints and
-/// `plan_response_data` work for peer input, so a malicious peer cannot make us walk
-/// unbounded sequence ranges.
+/// Maximum sequences a single `ActorRangeHint` may span. Hints built by `request_ranges` stay
+/// within it, and every response clamps peer hints to it, so a malicious peer cannot make us
+/// walk unbounded sequence ranges.
 pub const MAX_ACTOR_RANGE_HINT_SPAN: u64 = 65_536;
 /// Wants and range hints one request may carry together.
 const MAX_REQUEST_ITEMS: usize = 65_536;
@@ -64,6 +58,10 @@ pub(crate) const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PAGE_ACTORS: usize = 4096;
 /// Records one page names as missing, at most.
 pub const MAX_PAGE_MISSING: usize = 256;
+/// Raw and workspace bytes a response charges, with one authorization read, before it opens its
+/// own snapshot. Fjall's two record envelopes stop 1024 bytes short of the capture limit, which
+/// leaves room for this charge and the epoch record.
+const SNAPSHOT_OPEN_BYTES: usize = 512;
 
 /// A queued range position: generation, actor, sequence, id and range limit.
 type RangeHead = (u64, ActorId, u64, OpId, u64);
@@ -689,8 +687,8 @@ impl<S: Storage> SyncEngine<S> {
         budget: PageBudget,
     ) -> Result<PlannedPage> {
         let mut slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
-        slice.auth_read()?;
-        slice.capture(0, 512, 512)?;
+        slice.authorization_read()?;
+        slice.capture(0, SNAPSHOT_OPEN_BYTES, SNAPSHOT_OPEN_BYTES)?;
         self.oplog
             .storage()
             .read_snapshot(|read| self.response_known(read, peer_id, request, budget, None, slice))
@@ -718,8 +716,8 @@ impl<S: Storage> SyncEngine<S> {
         summary: &SyncSummary,
     ) -> Result<PlannedPage> {
         let mut slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
-        slice.auth_read()?;
-        slice.capture(0, 512, 512)?;
+        slice.authorization_read()?;
+        slice.capture(0, SNAPSHOT_OPEN_BYTES, SNAPSHOT_OPEN_BYTES)?;
         self.oplog.storage().read_snapshot(|read| {
             self.response_known(read, peer_id, request, budget, Some(summary), slice)
         })
@@ -1138,7 +1136,7 @@ impl<S: Storage> SyncEngine<S> {
 fn reserve_snapshot(slice: &mut slice::Slice, charge: SnapshotCharge) -> Result<()> {
     match charge {
         SnapshotCharge::Read { bytes } => {
-            slice.auth_read()?;
+            slice.authorization_read()?;
             slice.capture(0, bytes, 0)
         }
         SnapshotCharge::Members(entries) => slice.prepare(entries, 0),
@@ -1221,3 +1219,9 @@ fn remote_contains(remote: &SyncSummary, id: &OpId, meta: &crate::storage::OpPos
             || remote.actor_tips.get(&meta.actor_id) == Some(&(meta.actor_seq, *id))
             || remote.actor_clock.get(&meta.actor_id) >= meta.actor_seq)
 }
+
+#[cfg(test)]
+mod page_tests;
+
+#[cfg(test)]
+mod preparation_tests;

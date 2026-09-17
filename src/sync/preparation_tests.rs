@@ -95,7 +95,7 @@ fn capture_progress<S: Storage>(store: S, counters: fn(&S) -> crate::storage::Co
             let after = engine.page_work();
             assert!(after.visits - work.visits <= 1);
             assert!(after.edges - work.edges <= 1);
-            assert!(after.auth_reads - work.auth_reads <= 16);
+            assert!(after.authorization_reads - work.authorization_reads <= 16);
             assert!(after.preparation - work.preparation <= (16 * MAX_REQUEST_ITEMS) as u64);
             assert!(after.captured - work.captured <= MAX_PAGE_BYTES as u64);
             assert!(counters(&store).meta_reads > before.meta_reads);
