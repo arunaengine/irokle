@@ -480,6 +480,65 @@ fn fjall_selection_bounded() {
     );
 }
 
+/// A request naming only some of a hole chain names its oldest holes, even when their ids sort
+/// past the reads one negotiation slice holds, so every page admits what it carries.
+fn assert_holes_ordered<S: Corrupt>(reader_store: S) {
+    const VISITS: usize = 16;
+    const HOLES: usize = 64;
+    let reader_id = Ed25519Signer::from_bytes(&[250; 32]).peer_id();
+    let source_log = Oplog::new();
+    let (genesis, chains) = independent_chains(&source_log, reader_id, &[160]);
+    let chain = &chains[0];
+    // The oldest hole's id sorts after at least a slice of the other holes.
+    let start = (1..chain.len() - HOLES)
+        .find(|start| {
+            let lost = &chain[*start..*start + HOLES];
+            lost.iter().filter(|op| op.id < lost[0].id).count() >= VISITS
+        })
+        .expect("a run whose oldest id sorts late");
+    let reader = Oplog::with_storage(reader_store.clone());
+    reader.receive_ops(vec![genesis]).unwrap();
+    reader.receive_ops(chain.clone()).unwrap();
+    for op in &chain[start..start + HOLES] {
+        reader_store.drop_op_record(&op.id);
+    }
+    reader.recheck_topics().unwrap();
+    let topic_id = chain[0].signed.body.topic_id;
+    let owner = Ed25519Signer::from_bytes(&[244; 32]).peer_id();
+    let source = SyncEngine::new(source_log, owner);
+    let summary = source.summary(topic_id).unwrap();
+    let reader_engine = SyncEngine::new(reader.clone(), reader_id)
+        .with_page_visits(VISITS, 16)
+        .with_request_items(8);
+    let mut holes = HOLES;
+    for round in 0.. {
+        let request = reader_engine.plan_request(owner, &summary).unwrap();
+        if request.wants.is_empty() && request.actor_range_hints.is_empty() {
+            break;
+        }
+        assert!(round < HOLES, "the hole chain did not finish");
+        let budget = PageBudget::from_credit(request.credit);
+        let page = source.response_page(reader_id, &request, budget).unwrap();
+        reader.receive_ops(page.ops).unwrap();
+        let left = reader.topic_unresolved(&topic_id).unwrap().len();
+        assert!(left < holes, "round {round} repaired none of {holes} holes");
+        holes = left;
+    }
+    assert_eq!(holes, 0);
+}
+
+#[test]
+fn memory_holes_ordered() {
+    assert_holes_ordered(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_holes_ordered() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_holes_ordered(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
 /// A request accepted on one genesis is refused as stale once a reset replaced
 /// the branch between two pages, rather than served from the new branch.
 #[test]

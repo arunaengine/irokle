@@ -143,20 +143,24 @@ fn view_key(view: &TopicView) -> (OpId, u64) {
     (view.state.genesis, view.epoch)
 }
 
-/// Ids a topic's stored records reference without resolving them.
-fn scan_holes_in(read: &dyn SnapshotRead, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
-    let mut holes = BTreeSet::new();
+/// Ids a topic's stored records reference without resolving them, with the generation of each
+/// one whose position is stored.
+fn scan_holes_in(
+    read: &dyn SnapshotRead,
+    topic_id: &TopicId,
+) -> Result<BTreeMap<OpId, Option<u64>>> {
+    let mut holes = BTreeMap::new();
     for id in read.list_op_ids(topic_id)? {
         let Some(meta) = read.get_position(&id)? else {
-            holes.insert(id);
+            holes.insert(id, None);
             continue;
         };
         if read.get_op(&id)?.is_none() {
-            holes.insert(id);
+            holes.insert(id, Some(meta.generation));
         }
         for dep in &meta.deps {
             if !read.dep_resolvable(dep)? {
-                holes.insert(*dep);
+                holes.entry(*dep).or_insert(None);
             }
         }
     }
@@ -223,7 +227,7 @@ impl<S: Storage> Oplog<S> {
         self.storage
             .read_snapshot(|read| match read.topic_view(topic_id, None)? {
                 Some(view) => self.unresolved_in(read, &view),
-                None => scan_holes_in(read, topic_id),
+                None => Ok(scan_holes_in(read, topic_id)?.into_keys().collect()),
             })
     }
 
@@ -241,7 +245,7 @@ impl<S: Storage> Oplog<S> {
                 Some(current) => self.unresolved_in(read, &current),
                 None => {
                     let mut unresolved = view.pending_missing.clone();
-                    unresolved.extend(scan_holes_in(read, &view.state.topic_id)?);
+                    unresolved.extend(scan_holes_in(read, &view.state.topic_id)?.into_keys());
                     Ok(unresolved)
                 }
             }
@@ -255,8 +259,21 @@ impl<S: Storage> Oplog<S> {
         read: &dyn SnapshotRead,
         view: &TopicView,
     ) -> Result<BTreeSet<OpId>> {
+        Ok(self.holes_in(read, view)?.into_keys().collect())
+    }
+
+    /// [`Self::unresolved_in`] with the generation of each id whose position the scan read.
+    pub(crate) fn holes_in(
+        &self,
+        read: &dyn SnapshotRead,
+        view: &TopicView,
+    ) -> Result<BTreeMap<OpId, Option<u64>>> {
         let topic_id = view.state.topic_id;
-        let mut unresolved = view.pending_missing.clone();
+        let mut unresolved = view
+            .pending_missing
+            .iter()
+            .map(|id| (*id, None))
+            .collect::<BTreeMap<_, _>>();
         if self.whole_topics()?.get(&topic_id) == Some(&view_key(view)) {
             return Ok(unresolved);
         }

@@ -431,7 +431,7 @@ impl<S: Storage> SyncEngine<S> {
         }
         // A hole moves neither heads nor the clock, so a matching fingerprint
         // does not prove we are whole; keep negotiating until it is repaired.
-        let unresolved = self.oplog.unresolved_in(read, &view)?;
+        let unresolved = self.oplog.holes_in(read, &view)?;
         if unresolved.is_empty() && view.fingerprint == remote.fingerprint {
             return Ok(SyncPlan {
                 topic_id: remote.topic_id,
@@ -480,7 +480,7 @@ impl<S: Storage> SyncEngine<S> {
         // instead of deferring their dependents forever.
         let repair = dangling
             .into_iter()
-            .chain(unresolved)
+            .chain(unresolved.keys().copied())
             .collect::<BTreeSet<_>>();
         if !repair.is_empty() {
             tracing::debug!(
@@ -516,16 +516,11 @@ impl<S: Storage> SyncEngine<S> {
             .saturating_sub(reserved)
             .min(repair::Repair::root_limit());
         let need = if need.len() > limit {
-            // Known ancestors must precede descendants across repair windows. A header past
-            // the slice's reads counts as unknown, so its root may follow in a later window.
+            // Known ancestors must precede descendants across repair windows. The hole scan
+            // read every stored position's generation, so ordering reads no headers.
             let mut ordered = BTreeSet::new();
             for id in need {
-                let header = if slice.charge_read() {
-                    read.get_header(&id)?
-                } else {
-                    None
-                };
-                let generation = header.map(|header| header.generation);
+                let generation = unresolved.get(&id).copied().flatten();
                 ordered.insert((generation.is_none(), generation, id));
                 if ordered.len() > limit {
                     ordered.pop_last();
