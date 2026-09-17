@@ -58,9 +58,9 @@ pub(crate) const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PAGE_ACTORS: usize = 4096;
 /// Records one page names as missing, at most.
 pub const MAX_PAGE_MISSING: usize = 256;
-/// Raw and workspace bytes a response charges, with one authorization read, before it opens its
-/// own snapshot. Fjall's two record envelopes stop 1024 bytes short of the capture limit, which
-/// leaves room for this charge and the epoch record.
+/// Raw and workspace bytes, with one authorization read, that every response charges for its
+/// snapshot, also when a caller opened it. Fjall's two record envelopes stop 1024 bytes short
+/// of the capture limit, which leaves room for this charge and the epoch record.
 const SNAPSHOT_OPEN_BYTES: usize = 512;
 
 /// A queued range position: generation, actor, sequence, id and range limit.
@@ -686,12 +686,9 @@ impl<S: Storage> SyncEngine<S> {
         request: &SyncRequest,
         budget: PageBudget,
     ) -> Result<PlannedPage> {
-        let mut slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
-        slice.charge_authorization()?;
-        slice.charge_capture(0, SNAPSHOT_OPEN_BYTES, SNAPSHOT_OPEN_BYTES)?;
         self.oplog
             .storage()
-            .read_snapshot(|read| self.response_known(read, peer_id, request, budget, None, slice))
+            .read_snapshot(|read| self.response_known(read, peer_id, request, budget, None))
     }
 
     /// [`Self::response_page`] over a snapshot the caller already holds.
@@ -703,8 +700,7 @@ impl<S: Storage> SyncEngine<S> {
         request: &SyncRequest,
         budget: PageBudget,
     ) -> Result<PlannedPage> {
-        let slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
-        self.response_known(read, peer_id, request, budget, None, slice)
+        self.response_known(read, peer_id, request, budget, None)
     }
 
     /// Serve using the authenticated peer's current summary, never as an ACK.
@@ -715,11 +711,8 @@ impl<S: Storage> SyncEngine<S> {
         budget: PageBudget,
         summary: &SyncSummary,
     ) -> Result<PlannedPage> {
-        let mut slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
-        slice.charge_authorization()?;
-        slice.charge_capture(0, SNAPSHOT_OPEN_BYTES, SNAPSHOT_OPEN_BYTES)?;
         self.oplog.storage().read_snapshot(|read| {
-            self.response_known(read, peer_id, request, budget, Some(summary), slice)
+            self.response_known(read, peer_id, request, budget, Some(summary))
         })
     }
 
@@ -730,10 +723,13 @@ impl<S: Storage> SyncEngine<S> {
         request: &SyncRequest,
         budget: PageBudget,
         summary: Option<&SyncSummary>,
-        mut slice: slice::Slice,
     ) -> Result<PlannedPage> {
         // Every local root drops before this active reservation, including on errors.
         let mut clocks = None;
+        // Every entry point admits its snapshot here, whether it opened it or a caller did.
+        let mut slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
+        slice.charge_authorization()?;
+        slice.charge_capture(0, SNAPSHOT_OPEN_BYTES, SNAPSHOT_OPEN_BYTES)?;
         let empty = PlannedPage::default();
         let filter = request.window.behind.as_ref();
         if request
