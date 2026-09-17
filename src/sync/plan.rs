@@ -793,7 +793,7 @@ impl Pager<'_> {
                 self.observe(actor, known.min(seq));
             }
             if self.scope.unknown(&actor) {
-                if !self.position(actor, generation)? {
+                if !self.need_position(actor, generation)? {
                     self.checked.insert(op.id, scan);
                     return Ok(Wait::Unknown);
                 }
@@ -890,7 +890,7 @@ impl Pager<'_> {
         }
     }
 
-    fn position(&mut self, actor: ActorId, generation: u64) -> Result<bool> {
+    fn need_position(&mut self, actor: ActorId, generation: u64) -> Result<bool> {
         if !self.positions.contains_key(&actor) {
             if self.positions.len() >= self.position_limit {
                 return Ok(false);
@@ -908,7 +908,7 @@ impl Pager<'_> {
             }
             self.slice.reserve(256)?;
         }
-        if !self.position(meta.actor_id, meta.generation)? {
+        if !self.need_position(meta.actor_id, meta.generation)? {
             return Ok(false);
         }
         scan.needed
