@@ -1015,7 +1015,15 @@ impl<S: Storage> SharedNet<S> {
             ExchangeState::Complete | ExchangeState::Advancing => self
                 .resync_scheduler
                 .complete_dirty(claim.settle(), runtime.resync_interval),
-            ExchangeState::Rejected | ExchangeState::Reconcile => {
+            ExchangeState::Rejected => {
+                self.resync_scheduler.complete_failed(
+                    claim.settle(),
+                    runtime.resync_max_backoff,
+                    runtime.resync_max_backoff,
+                );
+            }
+            #[cfg(feature = "fjall")]
+            ExchangeState::Reconcile => {
                 self.resync_scheduler.complete_failed(
                     claim.settle(),
                     runtime.resync_max_backoff,
@@ -3825,6 +3833,7 @@ enum ExchangeState {
     Blocked,
     Retryable,
     Rejected,
+    #[cfg(feature = "fjall")]
     Reconcile,
 }
 
@@ -3882,9 +3891,9 @@ fn attempt_outcome(
         Ok(()) if advanced => crate::AttemptOutcome::Advanced,
         Ok(()) => crate::AttemptOutcome::Complete,
         Err(error) => match exchange_state(Err(error), advanced) {
-            ExchangeState::Blocked | ExchangeState::Reconcile => {
-                crate::AttemptOutcome::Blocked(error.to_string())
-            }
+            ExchangeState::Blocked => crate::AttemptOutcome::Blocked(error.to_string()),
+            #[cfg(feature = "fjall")]
+            ExchangeState::Reconcile => crate::AttemptOutcome::Blocked(error.to_string()),
             _ => crate::AttemptOutcome::Failed(error.to_string()),
         },
     }

@@ -697,6 +697,7 @@ impl<S: Storage> SyncEngine<S> {
     }
 
     /// [`Self::response_page`] over a snapshot the caller already holds.
+    #[cfg(feature = "iroh")]
     pub(crate) fn response_in(
         &self,
         read: &dyn SnapshotRead,
