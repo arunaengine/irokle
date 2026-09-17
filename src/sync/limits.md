@@ -28,6 +28,10 @@ requests that exceed an admission envelope return `Error::SyncCapacity`; callers
 must reduce the request or supply a backend with the required bounded operations.
 Larger output credit does not increase traversal or workspace allowances.
 
+A negotiation plans its push page and its request in one slice. Remote heads it
+has no reads left to check wait for a later request, and a want whose header it
+could not read is ordered as unknown.
+
 Fjall admits each authorization or clock record against a raw envelope just under
 16 MiB before decoding. Its underlying read can allocate an oversized corrupt
 value before returning its length. The envelope bounds admitted records and

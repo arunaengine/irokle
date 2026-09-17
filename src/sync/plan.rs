@@ -107,7 +107,7 @@ struct Pager<'a> {
     repair: Option<super::repair::Repair>,
     pending: VecDeque<HeadScan>,
     updates: VecDeque<Update>,
-    slice: Slice,
+    slice: &'a mut Slice,
     read: &'a dyn SnapshotRead,
     topic_id: &'a TopicId,
     local: &'a ActorClock,
@@ -142,8 +142,8 @@ struct Pager<'a> {
 
 impl<S: Storage> SyncEngine<S> {
     /// Next causal page for `peer`, merging forward ranges by generation so dependencies come
-    /// first. Work grows with the page and actors behind, not history the peer holds; one slice
-    /// reads at most the engine's visit budget. See [`Pager`].
+    /// first. Work grows with the page and actors behind, not history the peer holds; `slice`
+    /// bounds the reads. See [`Pager`].
     pub(super) fn plan_page(
         &self,
         read: &dyn SnapshotRead,
@@ -151,7 +151,7 @@ impl<S: Storage> SyncEngine<S> {
         (local, peer, goal): (&ActorClock, &ActorClock, Option<&ActorClock>),
         (scope, sent): (&ActorScope<'_>, &BTreeSet<OpId>),
         excluded: &BTreeSet<OpId>,
-        budget: PageBudget,
+        (budget, slice): (PageBudget, &mut Slice),
     ) -> Result<PlannedSlice> {
         let mut frontier = Frontier::new(
             peer,
@@ -160,7 +160,6 @@ impl<S: Storage> SyncEngine<S> {
             self.continuations().records(),
         );
         frontier.blocked = excluded.clone();
-        let slice = Slice::new(std::sync::Arc::clone(&self.work), self.page_visits, 0)?;
         self.pager(
             read,
             topic_id,
@@ -180,7 +179,7 @@ impl<S: Storage> SyncEngine<S> {
         (local, goal, frontier): (&ActorClock, &ActorClock, Frontier),
         (scope, position_limit): (&ActorScope<'_>, usize),
         budget: PageBudget,
-        slice: Slice,
+        slice: &mut Slice,
     ) -> Result<PlannedSlice> {
         const SENT: BTreeSet<OpId> = BTreeSet::new();
         let fresh = frontier.fresh;
@@ -201,7 +200,7 @@ impl<S: Storage> SyncEngine<S> {
         topic_id: &'a TopicId,
         (local, goal, frontier): (&'a ActorClock, Option<&'a ActorClock>, Frontier),
         (scope, sent, position_limit): (&'a ActorScope<'a>, &'a BTreeSet<OpId>, usize),
-        slice: Slice,
+        slice: &'a mut Slice,
     ) -> Pager<'a> {
         Pager {
             revision: frontier.revision,
@@ -642,7 +641,7 @@ impl Pager<'_> {
                 self.ended = true;
                 break;
             }
-            let record = match self.records.take(self.read, &id, &mut self.slice) {
+            let record = match self.records.take(self.read, &id, self.slice) {
                 Ok(Some(record)) => record,
                 Ok(None) => {
                     self.missing.insert(id);
@@ -700,7 +699,7 @@ impl Pager<'_> {
             }
         }
         if let Some(repair) = &mut self.repair {
-            repair.admit(&ops, &mut self.slice)?;
+            repair.admit(&ops, self.slice)?;
         }
         let more = self.more
             || self.remainder

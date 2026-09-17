@@ -405,6 +405,81 @@ fn fjall_wants_fit() {
     assert_wants_fit(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
+/// A negotiation checks remote heads and orders wants within one page slice shared with its
+/// push. A summary naming more heads than that slice reads still yields a request the
+/// responder serves, and heads past the slice wait for a later request.
+fn assert_selection_bounded<S: Storage>(store: S, counters: fn(&S) -> crate::CounterSnapshot) {
+    const VISITS: usize = 256;
+    let reader_id = Ed25519Signer::from_bytes(&[250; 32]).peer_id();
+    let (genesis, chains) = independent_chains(&Oplog::new(), reader_id, &[3, 200]);
+    let topic_id = genesis.signed.body.topic_id;
+    let owner = Ed25519Signer::from_bytes(&[244; 32]).peer_id();
+    let source_log = Oplog::new();
+    source_log.receive_ops(vec![genesis.clone()]).unwrap();
+    source_log.receive_ops(chains[0].clone()).unwrap();
+    let source = SyncEngine::new(source_log.clone(), owner);
+    let reader = Oplog::with_storage(store.clone());
+    reader.receive_ops(vec![genesis]).unwrap();
+    reader.receive_ops(chains[1].clone()).unwrap();
+    let reader_engine = SyncEngine::new(reader.clone(), reader_id)
+        .with_page_visits(VISITS, 16)
+        .with_request_items(64);
+    let mut summary: SyncSummary = source.summary(topic_id).unwrap();
+    summary.heads = (0..4 * VISITS as u32)
+        .map(|index| OpId::hash(index.to_le_bytes()))
+        .collect();
+    // The whole-topic check scans history once and is cached, so it stays out of the count.
+    reader_engine.summary(topic_id).unwrap();
+    let before = counters(&store);
+    let request = reader_engine.plan_request(owner, &summary).unwrap();
+    let reads = counters(&store).meta_reads - before.meta_reads;
+    assert!(
+        reads <= VISITS as u64,
+        "request selection read {reads} headers"
+    );
+    assert_eq!(reader_engine.page_work().visits, VISITS as u64);
+    assert!(request.wants.len() + request.actor_range_hints.len() <= 64);
+    assert!(!request.wants.is_empty() && request.wants.is_subset(&summary.heads));
+    let budget = PageBudget::from_credit(request.credit);
+    let mut missing = BTreeSet::new();
+    for _ in 0..4 {
+        let page = source
+            .response_page(reader_id, &request, budget)
+            .expect("a cut request is served");
+        missing.extend(page.missing);
+        reader.receive_ops(page.ops).unwrap();
+        if !page.more {
+            break;
+        }
+    }
+    assert_eq!(missing, request.wants);
+    let held = reader.storage().actor_clock(&topic_id).unwrap();
+    assert!(held.dominates(&source_log.storage().actor_clock(&topic_id).unwrap()));
+
+    let work = reader_engine.page_work();
+    let push = PageBudget::from_credit(SyncCredit::default());
+    let (plan, more) = reader_engine.negotiate_page(owner, &summary, push).unwrap();
+    let after = reader_engine.page_work();
+    assert!(!plan.send.is_empty() && more);
+    assert!(after.visits + after.actors - work.visits - work.actors <= VISITS as u64);
+    assert!(plan.need.len() + plan.actor_range_hints.len() <= 64);
+}
+
+#[test]
+fn memory_selection_bounded() {
+    assert_selection_bounded(MemoryStorage::new(), MemoryStorage::counters);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_selection_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_selection_bounded(
+        crate::storage::FjallStorage::open(dir.path()).unwrap(),
+        crate::storage::FjallStorage::counters,
+    );
+}
+
 /// A request accepted on one genesis is refused as stale once a reset replaced
 /// the branch between two pages, rather than served from the new branch.
 #[test]

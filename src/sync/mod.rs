@@ -375,6 +375,8 @@ impl<S: Storage> SyncEngine<S> {
         }
 
         let local_heads = view.state.heads.clone();
+        // The push page and the request's reads below share one slice.
+        let mut slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
         // Another genesis is another sequence namespace, however equal the actor
         // positions look. The smaller genesis wins: its holder offers its branch
         // from the start and the other side asks for that branch from the start.
@@ -419,7 +421,7 @@ impl<S: Storage> SyncEngine<S> {
                         (&view.clock, &empty, None),
                         (&ActorScope::whole(), &BTreeSet::new()),
                         &BTreeSet::new(),
-                        budget,
+                        (budget, &mut slice),
                     )?;
                     *more = page.more;
                     page.ops
@@ -457,7 +459,7 @@ impl<S: Storage> SyncEngine<S> {
                     (&view.clock, &remote.actor_clock, None),
                     (&ActorScope::whole(), &BTreeSet::new()),
                     &BTreeSet::new(),
-                    budget,
+                    (budget, &mut slice),
                 )?;
                 *more = page.more;
                 page.ops
@@ -465,6 +467,10 @@ impl<S: Storage> SyncEngine<S> {
         };
         let mut need = BTreeSet::new();
         for id in &remote.heads {
+            // Heads past the slice's reads wait for a later request.
+            if !slice.charge_read() {
+                break;
+            }
             if !read.dep_resolvable(id)? {
                 need.insert(*id);
             }
@@ -510,10 +516,16 @@ impl<S: Storage> SyncEngine<S> {
             .saturating_sub(reserved)
             .min(repair::Repair::root_limit());
         let need = if need.len() > limit {
-            // Known ancestors must precede descendants across repair windows.
+            // Known ancestors must precede descendants across repair windows. A header past
+            // the slice's reads counts as unknown, so its root may follow in a later window.
             let mut ordered = BTreeSet::new();
             for id in need {
-                let generation = read.get_header(&id)?.map(|header| header.generation);
+                let header = if slice.charge_read() {
+                    read.get_header(&id)?
+                } else {
+                    None
+                };
+                let generation = header.map(|header| header.generation);
                 ordered.insert((generation.is_none(), generation, id));
                 if ordered.len() > limit {
                     ordered.pop_last();
@@ -994,7 +1006,7 @@ impl<S: Storage> SyncEngine<S> {
             // Find more positions than the page names, so it names the deepest.
             (&scope, self.page_positions),
             rest,
-            slice,
+            &mut slice,
         )?;
         if frontier.as_ref().is_some_and(|frontier| {
             !frontier.replaying
