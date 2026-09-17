@@ -984,26 +984,6 @@ pub(super) fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
     }
 }
 
-/// Failures no later local state can turn into an admission: the signed op
-/// itself is invalid. Discarding a pending op destroys signed work, so a
-/// state dependent failure must never be classified here.
-pub(super) fn is_permanent_rejection(err: &Error) -> bool {
-    #[cfg(feature = "iroh")]
-    if matches!(err, Error::OpTooLarge) {
-        return true;
-    }
-    matches!(
-        err,
-        Error::InvalidSignature
-            | Error::InvalidPublicKey
-            | Error::WrongSigner
-            | Error::ActorAuthorMismatch
-            | Error::TopicMismatch
-            | Error::GenerationMismatch { .. }
-            | Error::RejectedOp(_)
-    )
-}
-
 pub(super) fn is_local_race(err: &Error) -> bool {
     // A generation mismatch here is a concurrent admission advancing
     // max_generation between the heads read and op validation, not immutable

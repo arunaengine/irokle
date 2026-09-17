@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::storage::{OpMeta, TopicState};
 use crate::{Error, Op, OpId, Result, TopicPayload, actor_id_for};
 
-use super::admission::{checked_next, is_permanent_rejection};
+use super::admission::checked_next;
 use super::{BatchOverlay, OpAdmission, Oplog};
 use crate::storage::MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS;
 
@@ -235,4 +235,24 @@ pub(super) fn pending_meta_for(op: &Op, missing_deps: BTreeSet<crate::OpId>) -> 
         ready: false,
         missing_deps,
     }
+}
+
+/// Failures no later local state can turn into an admission: the signed op
+/// itself is invalid. Discarding a pending op destroys signed work, so a
+/// state dependent failure must never be classified here.
+fn is_permanent_rejection(err: &Error) -> bool {
+    #[cfg(feature = "iroh")]
+    if matches!(err, Error::OpTooLarge) {
+        return true;
+    }
+    matches!(
+        err,
+        Error::InvalidSignature
+            | Error::InvalidPublicKey
+            | Error::WrongSigner
+            | Error::ActorAuthorMismatch
+            | Error::TopicMismatch
+            | Error::GenerationMismatch { .. }
+            | Error::RejectedOp(_)
+    )
 }
