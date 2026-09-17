@@ -186,9 +186,9 @@ impl<'a> ActorScope<'a> {
     }
 }
 
-/// Build at most `items` hints and a window: name all fitting actors and hold them all; otherwise
-/// name `knowledge` positions newest first, then a run behind the cursor, holding it and filtering
-/// omitted actors. Spans share [`MAX_RANGE_SPAN`]; overflow actors get zero-span hints.
+/// Build at most `items` hints and a window. If all actors the requester is behind on fit, name
+/// them and hold every actor; otherwise name `knowledge` positions newest first, then actors behind
+/// after `knowledge.after`, filtering others. Past the shared [`MAX_RANGE_SPAN`], hints span zero.
 pub(crate) fn request_ranges(
     local: &ActorClock,
     remote: &ActorClock,

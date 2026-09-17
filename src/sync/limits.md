@@ -8,15 +8,15 @@ Output credit counts operations and serialized bytes independently of planning w
 | --- | --- |
 | Traversal | 65,536 combined record/header/index visits and actor or waiter work items per slice |
 | Dependencies | 65,536 examined edges per slice |
-| Traversal workspace | 8 MiB of conservative allocation charges per slice, 4 MiB retained per kept plan |
-| Payload decoding | 32 MiB of admitted encoded upper-bound bytes per slice |
+| Traversal workspace | 8 MiB of estimated allocation bytes per slice, and 4 MiB per kept plan |
+| Payload decoding | 32 MiB per slice of encoded bytes admitted for decoding, counted at their upper bound |
 | Snapshot authorization | 16 metadata read admissions per request |
 | Snapshot capture | 32 MiB of admitted raw metadata envelopes per request |
 | Preparation | 1,048,576 conservative entry units and 128 MiB of scratch allocation charges |
 | Request bookkeeping | At most 1,083,392 weighted entry units, sharing the scratch allowance |
 | Captured clocks | 128 MiB per reservation and 256 MiB across shared reservations |
 | Record cache | 64 MiB per cache and 256 MiB across live record reservations |
-| Retained goals | 16 per engine, with a 60-second idle lifetime |
+| Retained goals | 16 per engine and 1 per Iroh session planner (`Continuations::fork`), with a 60-second idle lifetime |
 
 Input bookkeeping charges 16 units per hint and eight per explicit want, plus
 space for bounded page offers and missing requirements. These are conservative
@@ -35,23 +35,28 @@ subsequent decoding, not arbitrary backend allocations for unsupported records.
 
 Progress assumes finite admitted goals, fair repeated service, sufficient output
 credit for the next operation, available dependencies, successful delivery and
-confirmation, and available execution and byte capacity. Callers must release returned owners when they no longer need
-them. Sustained overload or permanently held capacity has no finite latency bound.
+confirmation, and available execution and byte capacity. Callers must drop
+returned values that hold reserved capacity once they no longer need them.
+Sustained overload or permanently held capacity has no finite latency bound.
 
 Continuations are server-owned and volatile. Resume them within their idle
 lifetime on the same engine. Engine loss or expiry requires replanning; branch
 replacement invalidates the old goal. Empty advancing plans are protected from
 slot eviction; plans that have offered data may give up their slot. Unconfirmed
-offers are replayed while their continuation remains available. A full protected registry reports capacity instead of empty success.
+offers are replayed while their continuation remains available. When every plan
+slot is protected, keeping another plan returns `Error::SyncCapacity` instead of
+an empty page.
 
-`more` requests another page; `continued` identifies a retained no-data slice.
-`positions` requires requester position information, and `missing` reports
-unavailable records separately from advancing work. `too_large` identifies a
-local output allowance blocker. A false `more` flag alone does not certify that
+`more` asks for another page. `continued` marks a slice that sent no data but
+kept its plan. `positions` lists actors the requester must name with their
+positions in its next request, and `missing` reports unavailable records
+separately from advancing work. `too_large` names an operation that alone
+exceeds the page's byte budget. A false `more` flag alone does not certify that
 unavailable records were received. High-level sync checks its complete goal.
 
-Returned page output and planner caches have separate ownership. Iroh consuming
-responses retain a shared whole-batch lease until the last original item drops.
-Internal transfers acquire their destination reservation before refunding the
-source. Cancellation does not release reservations held by a started storage job;
-joined completion does. An uncertain commit requires reopening and reconciliation.
+Returned page output and planner caches have separate ownership. Items taken
+from consumed Iroh responses share their batch's byte charge, which stays held
+until the iterator and every item it yielded are dropped. Internal transfers
+acquire their destination reservation before refunding the source. Cancellation
+does not release reservations held by a started storage job; joined completion
+does. An uncertain commit requires reopening and reconciliation.

@@ -59,7 +59,7 @@ pub struct ActorWindow {
     pub after: Option<ActorId>,
     pub through: Option<ActorId>,
     /// The actors outside the interval the requester is behind on, when their
-    /// filter fits [`MAX_FILTER_BYTES`](super::MAX_FILTER_BYTES).
+    /// filter fits [`MAX_ACTOR_FILTER_BYTES`](super::MAX_ACTOR_FILTER_BYTES).
     pub behind: Option<ActorFilter>,
 }
 
@@ -192,8 +192,8 @@ pub struct SyncPage {
 }
 
 /// Staged data progress for a topic the receiver does not hold, never an acknowledgement.
-/// It certifies no state and clears no obligation, and names its branch and staging session so
-/// replaced or expired receipts cannot count as current progress.
+/// It certifies no state and clears no obligation, and names its branch and staging session so a
+/// receipt from a replaced or expired staging session cannot count as current progress.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncReceipt {
     pub topic_id: TopicId,
@@ -234,8 +234,8 @@ pub struct SyncAck {
     pub topic_id: TopicId,
     pub peer_id: PeerId,
     /// Genesis of the certified incarnation. Because this is signed, a proof cannot move to a
-    /// replaced branch. `None` is from a pre-contract peer or incoherent sender and certifies
-    /// nothing.
+    /// replaced branch. `None` is from a peer that predates this contract or a sender that could
+    /// not read a coherent view, and certifies nothing.
     #[serde(default)]
     pub genesis: Option<OpId>,
     pub accepted: BTreeSet<OpId>,
