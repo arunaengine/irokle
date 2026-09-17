@@ -511,6 +511,20 @@ impl<S: Storage> Oplog<S> {
         Ok(op)
     }
 
+    /// Admit every buffered op whose dependencies resolved, in finite passes.
+    pub fn reconcile_pending_ops(&self) -> Result<BTreeSet<crate::OpId>> {
+        let mut accepted = BTreeSet::new();
+        loop {
+            let pass = self.receive_ops_admission(None, Vec::new(), &BTreeSet::new(), None)?;
+            // A pass that admitted nothing met only retained ops; repeating it now spins.
+            let progressed = !pass.accepted.is_empty();
+            accepted.extend(pass.accepted);
+            if !pass.ready_remaining || !progressed {
+                return Ok(accepted);
+            }
+        }
+    }
+
     fn admit_with_retry(
         &self,
         source_peer: Option<crate::PeerId>,
