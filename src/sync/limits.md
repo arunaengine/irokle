@@ -29,7 +29,9 @@ must reduce the request or supply a backend with the required bounded operations
 Larger output credit does not increase traversal or workspace allowances.
 
 A negotiation plans its push page and its request in one slice. Remote heads it
-has no reads left to check wait for a later request. Wants are ordered by the
+has no reads left to check stay unchecked, which hides no work: a head ahead of
+the local clock is reached through actor ranges, and one at or behind it is held,
+a hole the history scan finds, or a fork no page admits. Wants are ordered by the
 generations the hole scan read, and a want without a stored position is unknown.
 
 Fjall admits each authorization or clock record against a raw envelope just under

@@ -469,7 +469,8 @@ impl<S: Storage> SyncEngine<S> {
         };
         let mut need = BTreeSet::new();
         for id in &remote.heads {
-            // Heads past the slice's reads wait for a later request.
+            // Heads past the slice hide no work: one ahead of this clock is reached by ranges,
+            // and one at or behind it is held, a hole the scan above found, or a fork.
             if !slice.charge_read() {
                 break;
             }
