@@ -34,6 +34,17 @@ the local clock is reached through actor ranges, and one at or behind it is held
 a hole the history scan finds, or a fork no page admits. Wants are ordered by the
 generations the hole scan read, and a want without a stored position is unknown.
 
+The hole scan reads a topic's whole history and is not sliced. It lists every
+operation id the topic stores, reads each one's position and full record, and
+checks each dependency edge, so its reads and memory grow with stored history. Admission never creates a hole,
+so an oplog that found a topic whole does not scan it again on the same branch
+and data epoch. While a topic has a hole, each summary, fingerprint, request
+plan and negotiation of it scans again: until repair fills the hole, and without
+end if no peer holds it. Slicing the scan needs a ranged topic listing in
+`SnapshotRead` and a fingerprint for partly scanned topics, both public contract
+changes. Services therefore assume damaged topics are rare and accept one history
+scan per planning call while a topic has a hole.
+
 Fjall admits each authorization or clock record against a raw envelope just under
 16 MiB before decoding. Its underlying read can allocate an oversized corrupt
 value before returning its length. The envelope bounds admitted records and
