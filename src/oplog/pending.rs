@@ -2,15 +2,25 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::storage::TopicState;
+use crate::storage::{OpMeta, TopicState};
 use crate::{Error, Op, OpId, Result, TopicPayload, actor_id_for};
 
 use super::admission::{checked_next, is_permanent_rejection};
-use super::{
-    Admitted, BatchOverlay, MAX_DRAIN_OPS, OpAdmission, Oplog, PendingVerdict, READY_SLICE,
-    ReceiveEffects, StoredOp, admission_failure,
-};
+use super::{Admitted, BatchOverlay, OpAdmission, Oplog, ReceiveEffects, admission_failure};
 use crate::storage::MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS;
+
+/// Buffered ops one admission call visits without admitting any, and how many
+/// it reads at once. A window that admits something starts another.
+const MAX_DRAIN_OPS: usize = 4096;
+const READY_SLICE: usize = 256;
+
+/// What happens to a buffered op whose admission failed.
+enum PendingVerdict {
+    /// The failure is a property of immutable records: drop the op's subtree.
+    Reject,
+    /// A later arrival can still resolve it: keep the record.
+    Retain,
+}
 
 impl<S: super::Storage> Oplog<S> {
     /// Admit every buffered op whose dependencies resolved, in finite passes.
@@ -96,9 +106,9 @@ impl<S: super::Storage> Oplog<S> {
                 } else {
                     Vec::new()
                 };
-                // Pending ops re-queued from storage are not in verified; they
+                // Pending ops re-queued from storage are not in `verified`; they
                 // get re-verified during admission like before.
-                let (batch_accepted, batch_eviction) = match self.admit_batch(
+                let (batch_accepted, batch_eviction) = match self.admit_with_retry(
                     batch_source_peer,
                     ops,
                     verified,
@@ -147,7 +157,7 @@ impl<S: super::Storage> Oplog<S> {
         }
     }
 
-    /// Whether a buffered op that failed admission with error can never be
+    /// Whether a buffered op that failed admission with `error` can never be
     /// admitted on this branch. Only immutable facts reject: its own signed
     /// content and the stored records of its dependencies and actor slots.
     fn pending_verdict(&self, op: &Op, error: &Error) -> Result<PendingVerdict> {
@@ -170,7 +180,7 @@ impl<S: super::Storage> Oplog<S> {
         })
     }
 
-    /// Whether the op actor position contradicts stored records: a known
+    /// Whether the op's actor position contradicts stored records: a known
     /// predecessor of another actor or sequence, or a slot before it that a
     /// different admitted op already holds.
     fn position_impossible(&self, op: &Op) -> Result<bool> {
@@ -194,7 +204,7 @@ impl<S: super::Storage> Oplog<S> {
             .is_some_and(|holder| holder != prev))
     }
 
-    /// The admitted op holding seq of the op actor, if it is not the op.
+    /// The admitted op holding `seq` of the op's actor, if it is not the op.
     fn slot_taken(&self, op: &Op, seq: u64) -> Result<Option<OpId>> {
         let body = &op.signed.body;
         let Some(holder) = self
@@ -204,12 +214,6 @@ impl<S: super::Storage> Oplog<S> {
             return Ok(None);
         };
         Ok((holder != op.id && self.storage.dep_resolvable(&holder)?).then_some(holder))
-    }
-
-    pub(super) fn purge_losing_pending(&self, losing_genesis: OpId) -> Result<()> {
-        self.storage
-            .purge_pending_waiters(&losing_genesis)
-            .map(drop)
     }
 
     pub(super) fn missing_deps_projected(
@@ -279,8 +283,8 @@ impl<S: super::Storage> Oplog<S> {
                 if body.deps.is_empty() || body.generation == 0 {
                     return Err(Error::InvalidOpId);
                 }
-                // Latest membership says nothing about the op causal frontier,
-                // which is unknown while a dependency is missing; the source
+                // Latest membership says nothing about the op's causal frontier,
+                // which is unknown while a dependency is missing; the source's
                 // pending quota bounds what an unproven author can buffer.
                 if let Some(state) = state {
                     super::admission::ensure_event_type(&state.event_type_id, &envelope.type_id)?;
@@ -353,25 +357,21 @@ impl<S: super::Storage> Oplog<S> {
         }
         Ok(OpAdmission::Admit)
     }
+}
 
-    pub(super) fn stored_op_state(&self, op: &Op) -> Result<StoredOp> {
-        let has_op = self.storage.get_op(&op.id)?.is_some();
-        let has_meta = self.storage.get_position(&op.id)?.is_some();
-        if has_op && has_meta {
-            return Ok(StoredOp::Complete);
-        }
-        if has_op || has_meta {
-            return Ok(StoredOp::Repair);
-        }
-        let body = &op.signed.body;
-        if self
-            .storage
-            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            == Some(op.id)
-            || !self.storage.children(&op.id)?.is_empty()
-        {
-            return Ok(StoredOp::Repair);
-        }
-        Ok(StoredOp::Absent)
+pub(super) fn pending_meta_for(op: &Op, missing_deps: BTreeSet<crate::OpId>) -> OpMeta {
+    let body = &op.signed.body;
+    OpMeta {
+        id: op.id,
+        topic_id: body.topic_id,
+        author: body.author,
+        actor_id: body.actor_id,
+        actor_seq: body.actor_seq,
+        actor_prev: body.actor_prev,
+        deps: body.deps.clone(),
+        generation: body.generation,
+        observed_clock: crate::ActorClock::new(),
+        ready: false,
+        missing_deps,
     }
 }

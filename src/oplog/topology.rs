@@ -22,6 +22,8 @@ pub(crate) fn topological_entries<S: Storage>(
     })
 }
 
+/// Order the ops named by `ids` oldest-first.
+///
 #[doc = include_str!("contracts/topological_subset.md")]
 pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) -> Result<Vec<Op>> {
     Ok(topological_subset_entries(storage, ids)?

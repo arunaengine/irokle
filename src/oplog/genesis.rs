@@ -8,7 +8,7 @@ use crate::{
     TopicId, TopicPayload,
 };
 
-use super::admission::{checked_next, heads_after, is_admission_race};
+use super::admission::{checked_next, heads_after, is_local_race};
 use super::{
     AdmittedBatch, BatchOverlay, GenesisResolution, MAX_ADMISSION_RETRIES, OpAdmission, Oplog,
     ResetPlan, TopicEviction, conflict_pause,
@@ -20,27 +20,6 @@ pub(crate) fn is_structural_genesis(op: &Op) -> bool {
         && body.actor_seq == 1
         && body.actor_prev.is_none()
         && body.deps.is_empty()
-}
-
-fn without_descendants(ops: Vec<Op>, rejected: OpId) -> Vec<Op> {
-    let mut children = BTreeMap::<OpId, Vec<OpId>>::new();
-    for op in &ops {
-        for dep in &op.signed.body.deps {
-            children.entry(*dep).or_default().push(op.id);
-        }
-    }
-    let mut rejected_ids = BTreeSet::from([rejected]);
-    let mut pending = VecDeque::from([rejected]);
-    while let Some(id) = pending.pop_front() {
-        for child in children.remove(&id).unwrap_or_default() {
-            if rejected_ids.insert(child) {
-                pending.push_back(child);
-            }
-        }
-    }
-    ops.into_iter()
-        .filter(|op| !rejected_ids.contains(&op.id))
-        .collect()
 }
 
 impl<S: super::Storage> Oplog<S> {
@@ -83,6 +62,8 @@ impl<S: super::Storage> Oplog<S> {
         .map(|(op, _)| op)
     }
 
+    /// Create a topic and its first event as one atomic admission.
+    ///
     #[doc = include_str!("contracts/create_genesis_event.md")]
     pub fn create_topic_genesis_with_event(
         &self,
@@ -126,7 +107,7 @@ impl<S: super::Storage> Oplog<S> {
                 &mut signed,
                 &effects,
             ) {
-                Err(err) if is_admission_race(&err) => continue,
+                Err(err) if is_local_race(&err) => continue,
                 result => return result,
             }
         }
@@ -198,7 +179,7 @@ impl<S: super::Storage> Oplog<S> {
         )
         .map(|(op, _)| op)
     }
-    /// Resolve a valid genesis collision, returning admitted ops, an optional reset
+    /// Resolve a valid genesis collision, returning the ops to admit, an optional reset
     /// plan when the local topic loses, and an optional rejected genesis to purge.
     pub(super) fn resolve_genesis_collision(
         &self,
@@ -337,7 +318,7 @@ impl<S: super::Storage> Oplog<S> {
                 &mut signed,
                 &effects,
             ) {
-                Err(err) if is_admission_race(&err) => continue,
+                Err(err) if is_local_race(&err) => continue,
                 result => return result,
             }
         }
@@ -563,4 +544,25 @@ impl<S: super::Storage> Oplog<S> {
         op.validate()?;
         Ok(op)
     }
+}
+
+fn without_descendants(ops: Vec<Op>, rejected: OpId) -> Vec<Op> {
+    let mut children = BTreeMap::<OpId, Vec<OpId>>::new();
+    for op in &ops {
+        for dep in &op.signed.body.deps {
+            children.entry(*dep).or_default().push(op.id);
+        }
+    }
+    let mut rejected_ids = BTreeSet::from([rejected]);
+    let mut pending = VecDeque::from([rejected]);
+    while let Some(id) = pending.pop_front() {
+        for child in children.remove(&id).unwrap_or_default() {
+            if rejected_ids.insert(child) {
+                pending.push_back(child);
+            }
+        }
+    }
+    ops.into_iter()
+        .filter(|op| !rejected_ids.contains(&op.id))
+        .collect()
 }

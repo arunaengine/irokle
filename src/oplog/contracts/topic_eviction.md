@@ -1,1 +1,6 @@
-Reports ops discarded from a topic's local chain. A genesis tie-break sets `losing_genesis` to the replaced chain's genesis and `winning_genesis` to the foreign one that took its place; a quarantine of ops no head reaches has no second genesis to name, so both fields carry the surviving genesis and equal fields are what tells the two apart. `evicted` holds the discarded non-genesis payloads ordered by `(actor_id, actor_seq)`; re-emission is the embedder's responsibility.
+A genesis tie-break sets `losing_genesis` to the replaced chain's genesis and
+`winning_genesis` to the foreign one that took its place; a quarantine of ops no
+head reaches has no second genesis to name, so both fields carry the surviving
+genesis and equal fields are what tells the two apart. `evicted` holds the
+discarded non-genesis payloads ordered by `(actor_id, actor_seq)`; re-emission
+is the embedder's responsibility.

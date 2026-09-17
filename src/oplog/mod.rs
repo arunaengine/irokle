@@ -21,11 +21,10 @@ mod membership;
 mod pending;
 mod topology;
 
-use admission::{
-    checked_next, ensure_event_type, heads_after, next_actor_position, pending_meta_for,
-};
+use admission::{checked_next, ensure_event_type, heads_after, next_actor_position};
 pub(crate) use genesis::is_structural_genesis;
 use membership::{apply_control, materialize_topic_state, merge_states};
+use pending::pending_meta_for;
 pub(crate) use topology::topological_ids;
 use topology::topological_ops;
 pub(crate) use topology::{subset_in, topological_subset_entries};
@@ -33,10 +32,6 @@ pub use topology::{topological, topological_subset};
 
 /// Attempts one admission job makes; storage writes on this path try once each.
 pub(crate) const MAX_ADMISSION_RETRIES: usize = 64;
-/// Buffered ops one admission call visits without admitting any, and how many
-/// it reads at once. A window that admits something starts another.
-const MAX_DRAIN_OPS: usize = 4096;
-const READY_SLICE: usize = 256;
 const MAX_CACHED_PROJECTIONS: usize = 4096;
 
 #[derive(Default)]
@@ -49,14 +44,6 @@ struct MembershipCache {
 enum OpAdmission {
     Admit,
     Duplicate,
-}
-
-/// What happens to a buffered op whose admission failed.
-enum PendingVerdict {
-    /// The failure is a property of immutable records: drop the op's subtree.
-    Reject,
-    /// A later arrival can still resolve it: keep the record.
-    Retain,
 }
 
 /// How much of an op the local store holds. `Repair` means its id is already in
@@ -121,6 +108,8 @@ pub struct EvictedOp {
     pub payload: TopicPayload,
 }
 
+/// Reports ops discarded from a topic's local chain.
+///
 #[doc = include_str!("contracts/topic_eviction.md")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicEviction {
@@ -131,6 +120,8 @@ pub struct TopicEviction {
 }
 
 impl TopicEviction {
+    /// Identity of this eviction's durable journal record, derived from its content.
+    ///
     #[doc = include_str!("contracts/eviction_key.md")]
     pub fn key(&self) -> EvictionKey {
         let mut hasher = blake3::Hasher::new();
@@ -269,6 +260,8 @@ impl<S: Storage> Oplog<S> {
         }
     }
 
+    /// Holes that keep this topic from being locally complete.
+    ///
     #[doc = include_str!("contracts/topic_unresolved.md")]
     pub fn topic_unresolved(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
         self.storage
@@ -330,6 +323,8 @@ impl<S: Storage> Oplog<S> {
         })
     }
 
+    /// Clear the cache of topics known to be whole.
+    ///
     #[doc = include_str!("contracts/recheck_topics.md")]
     pub fn recheck_topics(&self) -> Result<()> {
         self.whole_topics()?.clear();
@@ -362,6 +357,8 @@ impl<S: Storage> Oplog<S> {
         Ok(orphans)
     }
 
+    /// Repair a topic by discarding the ops outside its head closure.
+    ///
     #[doc = include_str!("contracts/quarantine_orphans.md")]
     pub fn quarantine_orphans(&self, topic_id: &TopicId) -> Result<Option<TopicEviction>> {
         if self.topic_orphans(topic_id)?.is_empty() {
@@ -513,7 +510,7 @@ impl<S: Storage> Oplog<S> {
         Ok(op)
     }
 
-    fn admit_batch(
+    fn admit_with_retry(
         &self,
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
@@ -563,7 +560,8 @@ impl<S: Storage> Oplog<S> {
             };
             let eviction = reset.as_ref().map(|plan| plan.eviction.clone());
             if let Some(losing) = rejected_genesis {
-                self.purge_losing_pending(losing)?;
+                // A losing genesis is never admitted here, so its waiters can never become ready.
+                self.storage.purge_pending_waiters(&losing)?;
             }
             // A won foreign genesis discards the local chain: admit the winner
             // batch against a fresh topic and fold the reset into the same
@@ -878,6 +876,27 @@ impl<S: Storage> Oplog<S> {
         }))
     }
 
+    fn stored_op_state(&self, op: &Op) -> Result<StoredOp> {
+        let has_op = self.storage.get_op(&op.id)?.is_some();
+        let has_meta = self.storage.get_position(&op.id)?.is_some();
+        if has_op && has_meta {
+            return Ok(StoredOp::Complete);
+        }
+        if has_op || has_meta {
+            return Ok(StoredOp::Repair);
+        }
+        let body = &op.signed.body;
+        if self
+            .storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+            == Some(op.id)
+            || !self.storage.children(&op.id)?.is_empty()
+        {
+            return Ok(StoredOp::Repair);
+        }
+        Ok(StoredOp::Absent)
+    }
+
     fn admit_ops_batch(
         &self,
         source_peer: Option<crate::PeerId>,
@@ -924,8 +943,9 @@ impl<S: Storage> Oplog<S> {
             self.storage.put_admitted_batch(batch)?;
         }
 
-        // Buffer pending ops after admission so reset descendants survive; missing dependencies
-        // stay out of admitted entries and cannot be rejected by this ordering.
+        // Buffer pending ops after admission, so a reset cannot wipe the descendants of a
+        // partial winner batch. A pending op's missing deps are never in `entries`, so
+        // ordering after admission cannot spuriously reject it.
         for (op, missing_deps) in pending {
             let source_peer = source_peer.unwrap_or(op.signed.body.author);
             let buffered = self.storage.put_pending_bound(
@@ -1293,8 +1313,8 @@ impl<S: Storage> Oplog<S> {
         Ok(OpAdmission::Admit)
     }
 
-    /// Return the stored actor slot and tip, or `None` during reset. Reset clears
-    /// both in the same transaction, so validation must ignore the old chain.
+    /// Return the stored actor slot, or `None` during reset. Reset clears actor slots
+    /// and tips in the same transaction, so validation must ignore the old chain.
     fn stored_actor_index(&self, body: &OpBody, reset: bool) -> Result<Option<OpId>> {
         if reset {
             return Ok(None);

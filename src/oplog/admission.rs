@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 
-use crate::storage::OpMeta;
 use crate::{Error, Op, Result};
 
 pub(super) fn next_actor_position(
@@ -49,7 +48,7 @@ pub(super) fn is_permanent_rejection(err: &Error) -> bool {
     )
 }
 
-pub(super) fn is_admission_race(err: &Error) -> bool {
+pub(super) fn is_local_race(err: &Error) -> bool {
     // A generation mismatch here is a concurrent admission advancing
     // max_generation between the heads read and op validation, not immutable
     // invalidity: the retry recomputes the generation from fresh state.
@@ -71,21 +70,4 @@ pub(super) fn heads_after(current: &BTreeSet<crate::OpId>, op: &Op) -> BTreeSet<
     }
     heads.insert(op.id);
     heads
-}
-
-pub(super) fn pending_meta_for(op: &Op, missing_deps: BTreeSet<crate::OpId>) -> OpMeta {
-    let body = &op.signed.body;
-    OpMeta {
-        id: op.id,
-        topic_id: body.topic_id,
-        author: body.author,
-        actor_id: body.actor_id,
-        actor_seq: body.actor_seq,
-        actor_prev: body.actor_prev,
-        deps: body.deps.clone(),
-        generation: body.generation,
-        observed_clock: crate::ActorClock::new(),
-        ready: false,
-        missing_deps,
-    }
 }
