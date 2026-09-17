@@ -532,6 +532,65 @@ fn memory_holes_ordered() {
     assert_holes_ordered(MemoryStorage::new());
 }
 
+/// Remote heads past the reads of a negotiation slice hide no work: a head ahead of the local
+/// clock is reached through its actor's range, and a held head that lost its record is a hole
+/// the history scan finds.
+fn assert_heads_reached<S: Corrupt>(reader_store: S) {
+    const VISITS: usize = 4;
+    let reader_id = Ed25519Signer::from_bytes(&[250; 32]).peer_id();
+    let source_log = Oplog::new();
+    let (genesis, mut chains) = independent_chains(&source_log, reader_id, &[3; 11]);
+    let topic_id = genesis.signed.body.topic_id;
+    // The heads of the last two chains sort after every head one slice checks.
+    chains.sort_by_key(|chain| chain[2].id);
+    let reader = Oplog::with_storage(reader_store.clone());
+    reader.receive_ops(vec![genesis]).unwrap();
+    for chain in &chains[..10] {
+        reader.receive_ops(chain.clone()).unwrap();
+    }
+    reader.receive_ops(chains[10][..1].to_vec()).unwrap();
+    let hole = chains[9][2].id;
+    reader_store.drop_op_record(&hole);
+    reader.recheck_topics().unwrap();
+    let owner = Ed25519Signer::from_bytes(&[244; 32]).peer_id();
+    let source = SyncEngine::new(source_log.clone(), owner);
+    let summary = source.summary(topic_id).unwrap();
+    assert_eq!(summary.heads.len(), 11);
+    let reader_engine = SyncEngine::new(reader.clone(), reader_id).with_page_visits(VISITS, 16);
+    let mut request = reader_engine.plan_request(owner, &summary).unwrap();
+    assert_eq!(reader_engine.page_work().visits, VISITS as u64);
+    assert_eq!(request.wants, [hole].into());
+    let behind = chains[10][0].signed.body.actor_id;
+    let hinted = request.actor_range_hints.iter().map(|hint| hint.actor_id);
+    assert_eq!(hinted.collect::<Vec<_>>(), [behind]);
+    for round in 0.. {
+        if request.wants.is_empty() && request.actor_range_hints.is_empty() {
+            break;
+        }
+        assert!(round < 4, "the unchecked heads were not reached");
+        let budget = PageBudget::from_credit(request.credit);
+        let page = source.response_page(reader_id, &request, budget).unwrap();
+        reader.receive_ops(page.ops).unwrap();
+        request = reader_engine.plan_request(owner, &summary).unwrap();
+    }
+    let store = reader.storage();
+    assert!(reader.topic_unresolved(&topic_id).unwrap().is_empty());
+    assert_eq!(store.heads(&topic_id).unwrap(), summary.heads);
+    assert_eq!(store.actor_clock(&topic_id).unwrap(), summary.actor_clock);
+}
+
+#[test]
+fn memory_heads_reached() {
+    assert_heads_reached(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_heads_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_heads_reached(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
 #[cfg(feature = "fjall")]
 #[test]
 fn fjall_holes_ordered() {
