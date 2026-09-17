@@ -122,7 +122,7 @@ impl Slice {
         Ok(slice)
     }
 
-    pub(super) fn read(&mut self) -> bool {
+    pub(super) fn charge_read(&mut self) -> bool {
         if self.visits + self.scanned >= self.limit {
             return false;
         }
@@ -131,7 +131,7 @@ impl Slice {
         true
     }
 
-    pub(super) fn actor(&mut self) -> bool {
+    pub(super) fn charge_actor(&mut self) -> bool {
         if self.visits + self.scanned >= self.limit {
             return false;
         }
@@ -140,7 +140,7 @@ impl Slice {
         true
     }
 
-    pub(super) fn edge(&mut self) -> bool {
+    pub(super) fn charge_edge(&mut self) -> bool {
         if self.edges >= self.limit {
             return false;
         }
@@ -164,7 +164,7 @@ impl Slice {
         Ok(())
     }
 
-    pub(super) fn prepare(&mut self, units: usize, bytes: usize) -> Result<()> {
+    pub(super) fn charge_preparation(&mut self, units: usize, bytes: usize) -> Result<()> {
         let units = self.preparation.saturating_add(units);
         let bytes = self.preparation_bytes.saturating_add(bytes);
         if units > 16 * MAX_PAGE_VISITS || bytes > 128 * 1024 * 1024 {
@@ -180,7 +180,7 @@ impl Slice {
         Ok(())
     }
 
-    pub(super) fn prepare_input(&mut self, units: usize, bytes: usize, limit: usize) -> Result<()> {
+    pub(super) fn charge_input(&mut self, units: usize, bytes: usize, limit: usize) -> Result<()> {
         let units = self.input_units.saturating_add(units);
         let bytes = self.preparation_bytes.saturating_add(bytes);
         if units > limit || bytes > 128 * 1024 * 1024 {
@@ -196,7 +196,7 @@ impl Slice {
         Ok(())
     }
 
-    pub(super) fn authorization_read(&mut self) -> Result<()> {
+    pub(super) fn charge_authorization(&mut self) -> Result<()> {
         if self.authorization_reads >= 16 {
             return Err(Error::SyncCapacity(
                 "request authorization exceeds its metadata envelope".into(),
@@ -209,19 +209,24 @@ impl Slice {
         Ok(())
     }
 
-    pub(super) fn capture(&mut self, entries: usize, raw: usize, bytes: usize) -> Result<()> {
+    pub(super) fn charge_capture(
+        &mut self,
+        entries: usize,
+        raw: usize,
+        bytes: usize,
+    ) -> Result<()> {
         if raw > MAX_PAGE_BYTES.saturating_sub(self.captured) {
             return Err(Error::SyncCapacity(
                 "request snapshot exceeds its encoded metadata envelope".into(),
             ));
         }
-        self.prepare(entries, bytes)?;
+        self.charge_preparation(entries, bytes)?;
         self.captured += raw;
         self.work.captured.fetch_add(raw as u64, Ordering::Relaxed);
         Ok(())
     }
 
-    pub(super) fn decode(&mut self, bytes: usize) -> Result<bool> {
+    pub(super) fn charge_decode(&mut self, bytes: usize) -> Result<bool> {
         if bytes > self.decode_limit {
             return Err(Error::SyncCapacity(format!(
                 "operation decoding needs {bytes} bytes, slice capacity {}",

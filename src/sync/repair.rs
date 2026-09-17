@@ -129,7 +129,7 @@ impl Repair {
                         self.after = None;
                         break;
                     };
-                    if !slice.actor() {
+                    if !slice.charge_actor() {
                         page.continued = true;
                         break;
                     }
@@ -148,7 +148,7 @@ impl Repair {
                 generation: required,
             }) = scan.waiting
             {
-                if !slice.actor() {
+                if !slice.charge_actor() {
                     page.continued = true;
                     break;
                 }
@@ -165,7 +165,7 @@ impl Repair {
                     continue;
                 }
             }
-            if !records.contains(&id) && !slice.read() {
+            if !records.contains(&id) && !slice.charge_read() {
                 page.continued = true;
                 break;
             }
@@ -185,7 +185,7 @@ impl Repair {
             let mut ready = true;
             let start = scan.after.map_or(Unbounded, Excluded);
             for dep in record.op.signed.body.deps.range((start, Unbounded)) {
-                if !slice.edge() {
+                if !slice.charge_edge() {
                     page.continued = true;
                     ready = false;
                     break;
@@ -199,7 +199,7 @@ impl Repair {
                     scan.after = Some(*dep);
                     continue;
                 }
-                if !slice.read() {
+                if !slice.charge_read() {
                     page.continued = true;
                     ready = false;
                     break;
@@ -304,14 +304,14 @@ impl Repair {
                         self.prepared = true;
                         break;
                     };
-                    if !slice.actor() {
+                    if !slice.charge_actor() {
                         return Ok(false);
                     }
                     self.preparing = Some(id);
                     id
                 }
             };
-            if !slice.read() {
+            if !slice.charge_read() {
                 return Ok(false);
             }
             match view.read.get_header(&id)? {

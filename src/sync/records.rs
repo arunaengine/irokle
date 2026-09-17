@@ -102,7 +102,7 @@ impl Records {
                     "operation exceeds page capacity".into(),
                 ));
             }
-            if !slice.decode(bytes)? {
+            if !slice.charge_decode(bytes)? {
                 let marker = Arc::new(Error::SyncCapacity(
                     "slice decode allowance exhausted".into(),
                 ));

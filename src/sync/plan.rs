@@ -470,7 +470,7 @@ impl Pager<'_> {
             }
             let held = self.covered.get(&actor_id);
             if held >= seq {
-                if !self.slice.actor() {
+                if !self.slice.charge_actor() {
                     self.active.push(Reverse(head));
                     self.ended = true;
                     break;
@@ -483,7 +483,7 @@ impl Pager<'_> {
                 }
                 continue;
             }
-            if !self.records.contains(&id) && !self.slice.read() {
+            if !self.records.contains(&id) && !self.slice.charge_read() {
                 self.active.push(Reverse(head));
                 self.ended = true;
                 break;
@@ -631,7 +631,7 @@ impl Pager<'_> {
                 continue;
             }
             if let Some(head) = self.resumable.pop_front() {
-                if !self.slice.actor() {
+                if !self.slice.charge_actor() {
                     self.resumable.push_front(head);
                     break;
                 }
@@ -639,7 +639,7 @@ impl Pager<'_> {
                 self.states.insert(head.1, ActorState::Active);
                 continue;
             }
-            if self.deferred.is_empty() || !self.slice.actor() {
+            if self.deferred.is_empty() || !self.slice.charge_actor() {
                 break;
             }
             let Some((actor, _)) = self.deferred.next() else {
@@ -671,7 +671,7 @@ impl Pager<'_> {
 
     fn head(&mut self, mut scan: HeadScan) -> Result<Option<RangeHead>> {
         if scan.next.is_none() {
-            if !self.slice.read() {
+            if !self.slice.charge_read() {
                 self.pending.push_front(scan);
                 self.ended = true;
                 return Ok(None);
@@ -685,7 +685,7 @@ impl Pager<'_> {
                 return Ok(None);
             }
         }
-        if !self.slice.read() {
+        if !self.slice.charge_read() {
             self.pending.push_front(scan);
             self.ended = true;
             return Ok(None);
@@ -712,7 +712,7 @@ impl Pager<'_> {
         loop {
             if self.pending.is_empty() && self.deferred.is_empty() {
                 while !selected.is_empty() {
-                    if !self.slice.actor() {
+                    if !self.slice.charge_actor() {
                         self.selecting = Some(selected);
                         return Ok(());
                     }
@@ -748,7 +748,7 @@ impl Pager<'_> {
                 }
                 continue;
             }
-            if !self.slice.actor() {
+            if !self.slice.charge_actor() {
                 self.selecting = Some(selected);
                 return Ok(());
             }
@@ -785,7 +785,7 @@ impl Pager<'_> {
             let Some((actor, (seq, generation))) = next else {
                 break;
             };
-            if !self.slice.actor() {
+            if !self.slice.charge_actor() {
                 self.checked.insert(op.id, scan);
                 return Ok(Wait::Yield);
             }
@@ -818,7 +818,7 @@ impl Pager<'_> {
             .deps
             .range((start, std::ops::Bound::Unbounded))
         {
-            if self.slice.exhausted() || !self.slice.edge() {
+            if self.slice.exhausted() || !self.slice.charge_edge() {
                 self.checked.insert(op.id, scan);
                 return Ok(Wait::Yield);
             }
@@ -834,7 +834,7 @@ impl Pager<'_> {
                 scan.after = Some(*dep);
                 continue;
             }
-            if !self.slice.read() {
+            if !self.slice.charge_read() {
                 self.checked.insert(op.id, scan);
                 return Ok(Wait::Yield);
             }
@@ -927,14 +927,14 @@ impl Pager<'_> {
                 && (self.scope.holds_prefix(&frame.actor, frame.seq)
                     || self.covered.get(&frame.actor) >= frame.seq)
             {
-                if !self.slice.actor() {
+                if !self.slice.charge_actor() {
                     scan.ancestry.push(frame);
                     return Ok(false);
                 }
                 continue;
             }
             if frame.pending.is_none() {
-                if !self.slice.read() {
+                if !self.slice.charge_read() {
                     scan.ancestry.push(frame);
                     return Ok(false);
                 }
@@ -951,7 +951,8 @@ impl Pager<'_> {
                 continue;
             };
             if dependency.header.is_none() {
-                if self.slice.exhausted() || !self.slice.edge() || !self.slice.read() {
+                if self.slice.exhausted() || !self.slice.charge_edge() || !self.slice.charge_read()
+                {
                     frame.pending = Some(dependency);
                     scan.ancestry.push(frame);
                     return Ok(false);
@@ -1079,7 +1080,7 @@ impl Pager<'_> {
                         .and_then(|waiting| waiting.get(index))
                         .copied();
                     let Some((needed, head)) = next else { continue };
-                    if !self.slice.actor() {
+                    if !self.slice.charge_actor() {
                         self.updates.push_front(update);
                         self.ended = true;
                         return Ok(());
@@ -1110,7 +1111,7 @@ impl Pager<'_> {
                         .and_then(|waiting| waiting.get(index))
                         .copied();
                     if let Some((needed, _)) = next {
-                        if !self.slice.actor() {
+                        if !self.slice.charge_actor() {
                             self.updates.push_front(update);
                             self.ended = true;
                             return Ok(());
@@ -1155,7 +1156,7 @@ impl Pager<'_> {
                         }
                         continue;
                     };
-                    if !self.slice.actor() {
+                    if !self.slice.charge_actor() {
                         self.updates.push_front(update);
                         self.ended = true;
                         return Ok(());
@@ -1185,7 +1186,7 @@ impl Pager<'_> {
                         .and_then(|waiting| waiting.last())
                         .copied();
                     let Some((_, head)) = next else { continue };
-                    if !self.slice.actor() {
+                    if !self.slice.charge_actor() {
                         self.updates.push_front(update);
                         self.ended = true;
                         return Ok(());
@@ -1308,7 +1309,7 @@ impl<S: Storage> SyncEngine<S> {
         budget: PageBudget,
         slice: &mut Slice,
     ) -> Result<PlannedPage> {
-        slice.prepare(
+        slice.charge_preparation(
             frontier.offer_positions.len() + frontier.offer_missing.len(),
             super::space::tree_bytes::<ActorId, u64>(frontier.offer_positions.len())
                 + super::space::tree_bytes::<OpId, ()>(frontier.offer_missing.len()),
@@ -1325,7 +1326,7 @@ impl<S: Storage> SyncEngine<S> {
                 break;
             }
             if offer.held {
-                if !slice.actor() {
+                if !slice.charge_actor() {
                     break;
                 }
                 if let Some(floor) = &mut frontier.offer_floor {
@@ -1334,7 +1335,7 @@ impl<S: Storage> SyncEngine<S> {
                 frontier.replay += 1;
                 continue;
             }
-            if !frontier.records.contains(&offer.id) && !slice.read() {
+            if !frontier.records.contains(&offer.id) && !slice.charge_read() {
                 break;
             }
             let record = match frontier.records.take(read, &offer.id, slice) {

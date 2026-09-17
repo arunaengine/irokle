@@ -687,8 +687,8 @@ impl<S: Storage> SyncEngine<S> {
         budget: PageBudget,
     ) -> Result<PlannedPage> {
         let mut slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
-        slice.authorization_read()?;
-        slice.capture(0, SNAPSHOT_OPEN_BYTES, SNAPSHOT_OPEN_BYTES)?;
+        slice.charge_authorization()?;
+        slice.charge_capture(0, SNAPSHOT_OPEN_BYTES, SNAPSHOT_OPEN_BYTES)?;
         self.oplog
             .storage()
             .read_snapshot(|read| self.response_known(read, peer_id, request, budget, None, slice))
@@ -716,8 +716,8 @@ impl<S: Storage> SyncEngine<S> {
         summary: &SyncSummary,
     ) -> Result<PlannedPage> {
         let mut slice = slice::Slice::new(Arc::clone(&self.work), self.page_visits, 0)?;
-        slice.authorization_read()?;
-        slice.capture(0, SNAPSHOT_OPEN_BYTES, SNAPSHOT_OPEN_BYTES)?;
+        slice.charge_authorization()?;
+        slice.charge_capture(0, SNAPSHOT_OPEN_BYTES, SNAPSHOT_OPEN_BYTES)?;
         self.oplog.storage().read_snapshot(|read| {
             self.response_known(read, peer_id, request, budget, Some(summary), slice)
         })
@@ -758,7 +758,7 @@ impl<S: Storage> SyncEngine<S> {
             .saturating_add(space::tree_bytes::<ActorId, ()>(hints))
             .saturating_add(space::tree_bytes::<ActorId, Option<u64>>(MAX_PAGE_OPS))
             .saturating_add(filter.map_or(0, |filter| 2 * filter.bits.len()));
-        slice.prepare_input(
+        slice.charge_input(
             input_work,
             input_bytes,
             16 * MAX_REQUEST_ITEMS + 8 * (MAX_PAGE_OPS + MAX_PAGE_MISSING),
@@ -790,7 +790,7 @@ impl<S: Storage> SyncEngine<S> {
             let mut plans = self.continuations();
             if let Some((captured, work, claim)) = plans.captured(key) {
                 clocks = Some(claim);
-                slice.prepare(work, 0)?;
+                slice.charge_preparation(work, 0)?;
                 view.clock = captured;
             }
             plans.take(key, &view, request, summary)
@@ -809,7 +809,7 @@ impl<S: Storage> SyncEngine<S> {
                         } else {
                             [entries; 4]
                         })?;
-                        slice.prepare(entries.saturating_mul(4), 0)?;
+                        slice.charge_preparation(entries.saturating_mul(4), 0)?;
                     }
                     reserve_snapshot(&mut slice, charge)
                 },
@@ -901,7 +901,7 @@ impl<S: Storage> SyncEngine<S> {
             .as_ref()
             .ok_or_else(|| Error::Storage("missing clock reservation".into()))?;
         frontier.evictable = false;
-        slice.prepare(frontier.scan_entries(), 0)?;
+        slice.charge_preparation(frontier.scan_entries(), 0)?;
         slice.reserve(frontier.bytes())?;
         let floor = frontier.offer_floor().clone();
         let mut page = PlannedPage::default();
@@ -1137,12 +1137,14 @@ impl<S: Storage> SyncEngine<S> {
 fn reserve_snapshot(slice: &mut slice::Slice, charge: SnapshotCharge) -> Result<()> {
     match charge {
         SnapshotCharge::Read { bytes } => {
-            slice.authorization_read()?;
-            slice.capture(0, bytes, 0)
+            slice.charge_authorization()?;
+            slice.charge_capture(0, bytes, 0)
         }
-        SnapshotCharge::Members(entries) => slice.prepare(entries, 0),
-        SnapshotCharge::State { entries, workspace } => slice.prepare(entries, workspace),
-        SnapshotCharge::Clock { entries, workspace } => slice.capture(entries, 0, workspace),
+        SnapshotCharge::Members(entries) => slice.charge_preparation(entries, 0),
+        SnapshotCharge::State { entries, workspace } => {
+            slice.charge_preparation(entries, workspace)
+        }
+        SnapshotCharge::Clock { entries, workspace } => slice.charge_capture(entries, 0, workspace),
     }
 }
 
