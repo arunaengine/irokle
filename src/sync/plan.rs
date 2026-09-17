@@ -121,6 +121,230 @@ struct Offered {
     held: bool,
 }
 
+/// Bounded page plan over a snapshot with at most `window` active actors. A head that waits for
+/// another actor's position is suspended outside that set, so waiting heads never fill it.
+struct Pager<'a> {
+    revision: u64,
+    repair: Option<super::repair::Repair>,
+    pending: VecDeque<HeadScan>,
+    updates: VecDeque<Update>,
+    slice: Slice,
+    read: &'a dyn SnapshotRead,
+    topic_id: &'a TopicId,
+    local: &'a ActorClock,
+    goal: Option<&'a ActorClock>,
+    /// Which peer positions the request gave, and ids already sent before this plan.
+    scope: &'a ActorScope<'a>,
+    sent: &'a BTreeSet<OpId>,
+    window: usize,
+    /// Positions one page result names at most.
+    position_limit: usize,
+    work: &'a PageWork,
+    ended: bool,
+    active: BinaryHeap<Reverse<RangeHead>>,
+    selecting: Option<BinaryHeap<RangeHead>>,
+    remainder: bool,
+    /// Actors behind the goal not activated yet, in clock order.
+    deferred: ClockCursor,
+    /// Suspended heads by the actor they wait for, with the position needed.
+    suspended: BTreeMap<ActorId, Vec<(u64, RangeHead)>>,
+    /// Suspended heads whose position was sent, waiting for a free slot.
+    resumable: VecDeque<RangeHead>,
+    states: BTreeMap<ActorId, ActorState>,
+    covered: ActorClock,
+    blocked: BTreeSet<OpId>,
+    missing: BTreeSet<OpId>,
+    /// Actors the request left unknown, with the lowest generation needing each.
+    positions: BTreeMap<ActorId, u64>,
+    more: bool,
+    checked: BTreeMap<OpId, DependencyScan>,
+    records: super::records::Records,
+}
+
+impl<S: Storage> SyncEngine<S> {
+    /// Next causal page for `peer`, merging forward ranges by generation so dependencies come
+    /// first. Work grows with the page and actors behind, not history the peer holds; one slice
+    /// reads at most the engine's visit budget. See [`Pager`].
+    pub(super) fn plan_page(
+        &self,
+        read: &dyn SnapshotRead,
+        topic_id: &TopicId,
+        (local, peer, goal): (&ActorClock, &ActorClock, Option<&ActorClock>),
+        (scope, sent): (&ActorScope<'_>, &BTreeSet<OpId>),
+        excluded: &BTreeSet<OpId>,
+        budget: PageBudget,
+    ) -> Result<PlannedSlice> {
+        let mut frontier = Frontier::new(
+            peer,
+            scope,
+            self.page_actors,
+            self.continuations().records(),
+        );
+        frontier.blocked = excluded.clone();
+        let slice = Slice::new(std::sync::Arc::clone(&self.work), self.page_visits, 0)?;
+        self.pager(
+            read,
+            topic_id,
+            (local, goal, frontier),
+            (scope, sent, self.page_positions),
+            slice,
+        )
+        .plan(budget, true)
+    }
+
+    /// One slice of `frontier`, new from `Frontier::new` or kept from an earlier request with the
+    /// same scope, against the local and goal clocks the plan captured.
+    pub(super) fn resume_page(
+        &self,
+        read: &dyn SnapshotRead,
+        topic_id: &TopicId,
+        (local, goal, frontier): (&ActorClock, &ActorClock, Frontier),
+        (scope, position_limit): (&ActorScope<'_>, usize),
+        budget: PageBudget,
+        slice: Slice,
+    ) -> Result<PlannedSlice> {
+        const SENT: BTreeSet<OpId> = BTreeSet::new();
+        let fresh = frontier.fresh;
+        self.pager(
+            read,
+            topic_id,
+            (local, Some(goal), frontier),
+            (scope, &SENT, position_limit),
+            slice,
+        )
+        .plan(budget, fresh)
+    }
+
+    /// A pager that continues `frontier` in `slice` against the local and goal clocks.
+    fn pager<'a>(
+        &'a self,
+        read: &'a dyn SnapshotRead,
+        topic_id: &'a TopicId,
+        (local, goal, frontier): (&'a ActorClock, Option<&'a ActorClock>, Frontier),
+        (scope, sent, position_limit): (&'a ActorScope<'a>, &'a BTreeSet<OpId>, usize),
+        slice: Slice,
+    ) -> Pager<'a> {
+        Pager {
+            revision: frontier.revision,
+            repair: frontier.repair,
+            pending: frontier.pending,
+            updates: frontier.updates,
+            slice,
+            read,
+            topic_id,
+            local,
+            goal,
+            scope,
+            sent,
+            window: self.page_actors,
+            position_limit,
+            work: &self.work,
+            ended: false,
+            active: frontier.active,
+            selecting: frontier.selecting,
+            remainder: frontier.remainder,
+            deferred: frontier.deferred,
+            suspended: frontier.suspended,
+            resumable: frontier.resumable,
+            states: frontier.states,
+            covered: frontier.covered,
+            blocked: frontier.blocked,
+            missing: frontier.missing,
+            positions: frontier.positions,
+            more: false,
+            checked: frontier.checked,
+            records: frontier.records,
+        }
+    }
+
+    pub(super) fn replay_page(
+        &self,
+        read: &dyn SnapshotRead,
+        topic: &TopicId,
+        frontier: &mut Frontier,
+        budget: PageBudget,
+        slice: &mut Slice,
+    ) -> Result<PlannedPage> {
+        slice.charge_preparation(
+            frontier.offer_positions.len() + frontier.offer_missing.len(),
+            super::space::tree_bytes::<ActorId, u64>(frontier.offer_positions.len())
+                + super::space::tree_bytes::<OpId, ()>(frontier.offer_missing.len()),
+        )?;
+        let mut page = PlannedPage {
+            more: true,
+            missing: frontier.offer_missing.clone(),
+            positions: frontier.offer_positions.clone(),
+            ..PlannedPage::default()
+        };
+        let mut bytes = 0;
+        while let Some(offer) = frontier.offered.get(frontier.replay).copied() {
+            if page.ops.len() >= budget.ops || bytes >= budget.bytes {
+                break;
+            }
+            if offer.held {
+                if !slice.charge_actor() {
+                    break;
+                }
+                if let Some(floor) = &mut frontier.offer_floor {
+                    floor.observe(offer.actor, offer.seq);
+                }
+                frontier.replay += 1;
+                continue;
+            }
+            if !frontier.records.contains(&offer.id) && !slice.charge_read() {
+                break;
+            }
+            let record = match frontier.records.take(read, &offer.id, slice) {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    if page.missing.len() >= MAX_PAGE_MISSING && !page.missing.contains(&offer.id) {
+                        return Err(Error::SyncCapacity(
+                            "offered page missing records exceed result capacity".into(),
+                        ));
+                    }
+                    page.missing.insert(offer.id);
+                    break;
+                }
+                Err(super::records::LoadError::Yield) => break,
+                Err(super::records::LoadError::Failed(error)) => return Err(error),
+            };
+            let body = &record.op.signed.body;
+            if record.op.id != offer.id
+                || body.actor_id != offer.actor
+                || body.actor_seq != offer.seq
+            {
+                return Err(Error::InvalidOpId);
+            }
+            if body.topic_id != *topic {
+                return Err(Error::TopicMismatch);
+            }
+            let size = postcard::experimental::serialized_size(&record.op)?;
+            if size > budget.bytes - bytes {
+                if page.ops.is_empty() {
+                    page.too_large = Some(offer.id);
+                }
+                frontier.records.keep(record);
+                break;
+            }
+            bytes += size;
+            page.ops.push(record.into_op());
+            frontier.replay += 1;
+        }
+        if frontier.replay == frontier.offered.len() {
+            frontier.clear_offer();
+        }
+        page.continued = frontier.replaying
+            && page.ops.is_empty()
+            && page.missing.is_empty()
+            && page.too_large.is_none();
+        frontier.evictable = !page.ops.is_empty();
+        if page.continued {
+            self.work.ended();
+        }
+        Ok(page)
+    }
+}
+
 impl Frontier {
     pub(super) fn new(
         peer: &ActorClock,
@@ -369,46 +593,6 @@ enum Wait {
     Ready,
     Blocked,
     Position(ActorId, u64),
-}
-
-/// Bounded page plan over a snapshot with at most `window` active actors. A head that waits for
-/// another actor's position is suspended outside that set, so waiting heads never fill it.
-struct Pager<'a> {
-    revision: u64,
-    repair: Option<super::repair::Repair>,
-    pending: VecDeque<HeadScan>,
-    updates: VecDeque<Update>,
-    slice: Slice,
-    read: &'a dyn SnapshotRead,
-    topic_id: &'a TopicId,
-    local: &'a ActorClock,
-    goal: Option<&'a ActorClock>,
-    /// Which peer positions the request gave, and ids already sent before this plan.
-    scope: &'a ActorScope<'a>,
-    sent: &'a BTreeSet<OpId>,
-    window: usize,
-    /// Positions one page result names at most.
-    position_limit: usize,
-    work: &'a PageWork,
-    ended: bool,
-    active: BinaryHeap<Reverse<RangeHead>>,
-    selecting: Option<BinaryHeap<RangeHead>>,
-    remainder: bool,
-    /// Actors behind the goal not activated yet, in clock order.
-    deferred: ClockCursor,
-    /// Suspended heads by the actor they wait for, with the position needed.
-    suspended: BTreeMap<ActorId, Vec<(u64, RangeHead)>>,
-    /// Suspended heads whose position was sent, waiting for a free slot.
-    resumable: VecDeque<RangeHead>,
-    states: BTreeMap<ActorId, ActorState>,
-    covered: ActorClock,
-    blocked: BTreeSet<OpId>,
-    missing: BTreeSet<OpId>,
-    /// Actors the request left unknown, with the lowest generation needing each.
-    positions: BTreeMap<ActorId, u64>,
-    more: bool,
-    checked: BTreeMap<OpId, DependencyScan>,
-    records: super::records::Records,
 }
 
 impl Pager<'_> {
@@ -1203,190 +1387,6 @@ impl Pager<'_> {
             }
         }
         Ok(())
-    }
-}
-
-impl<S: Storage> SyncEngine<S> {
-    /// Next causal page for `peer`, merging forward ranges by generation so dependencies come
-    /// first. Work grows with the page and actors behind, not history the peer holds; one slice
-    /// reads at most the engine's visit budget. See [`Pager`].
-    pub(super) fn plan_page(
-        &self,
-        read: &dyn SnapshotRead,
-        topic_id: &TopicId,
-        (local, peer, goal): (&ActorClock, &ActorClock, Option<&ActorClock>),
-        (scope, sent): (&ActorScope<'_>, &BTreeSet<OpId>),
-        excluded: &BTreeSet<OpId>,
-        budget: PageBudget,
-    ) -> Result<PlannedSlice> {
-        let mut frontier = Frontier::new(
-            peer,
-            scope,
-            self.page_actors,
-            self.continuations().records(),
-        );
-        frontier.blocked = excluded.clone();
-        let slice = Slice::new(std::sync::Arc::clone(&self.work), self.page_visits, 0)?;
-        self.pager(
-            read,
-            topic_id,
-            (local, goal, frontier),
-            (scope, sent, self.page_positions),
-            slice,
-        )
-        .plan(budget, true)
-    }
-
-    /// One slice of `frontier`, new from `Frontier::new` or kept from an earlier request with the
-    /// same scope, against the local and goal clocks the plan captured.
-    pub(super) fn resume_page(
-        &self,
-        read: &dyn SnapshotRead,
-        topic_id: &TopicId,
-        (local, goal, frontier): (&ActorClock, &ActorClock, Frontier),
-        (scope, position_limit): (&ActorScope<'_>, usize),
-        budget: PageBudget,
-        slice: Slice,
-    ) -> Result<PlannedSlice> {
-        const SENT: BTreeSet<OpId> = BTreeSet::new();
-        let fresh = frontier.fresh;
-        self.pager(
-            read,
-            topic_id,
-            (local, Some(goal), frontier),
-            (scope, &SENT, position_limit),
-            slice,
-        )
-        .plan(budget, fresh)
-    }
-
-    /// A pager that continues `frontier` in `slice` against the local and goal clocks.
-    fn pager<'a>(
-        &'a self,
-        read: &'a dyn SnapshotRead,
-        topic_id: &'a TopicId,
-        (local, goal, frontier): (&'a ActorClock, Option<&'a ActorClock>, Frontier),
-        (scope, sent, position_limit): (&'a ActorScope<'a>, &'a BTreeSet<OpId>, usize),
-        slice: Slice,
-    ) -> Pager<'a> {
-        Pager {
-            revision: frontier.revision,
-            repair: frontier.repair,
-            pending: frontier.pending,
-            updates: frontier.updates,
-            slice,
-            read,
-            topic_id,
-            local,
-            goal,
-            scope,
-            sent,
-            window: self.page_actors,
-            position_limit,
-            work: &self.work,
-            ended: false,
-            active: frontier.active,
-            selecting: frontier.selecting,
-            remainder: frontier.remainder,
-            deferred: frontier.deferred,
-            suspended: frontier.suspended,
-            resumable: frontier.resumable,
-            states: frontier.states,
-            covered: frontier.covered,
-            blocked: frontier.blocked,
-            missing: frontier.missing,
-            positions: frontier.positions,
-            more: false,
-            checked: frontier.checked,
-            records: frontier.records,
-        }
-    }
-
-    pub(super) fn replay_page(
-        &self,
-        read: &dyn SnapshotRead,
-        topic: &TopicId,
-        frontier: &mut Frontier,
-        budget: PageBudget,
-        slice: &mut Slice,
-    ) -> Result<PlannedPage> {
-        slice.charge_preparation(
-            frontier.offer_positions.len() + frontier.offer_missing.len(),
-            super::space::tree_bytes::<ActorId, u64>(frontier.offer_positions.len())
-                + super::space::tree_bytes::<OpId, ()>(frontier.offer_missing.len()),
-        )?;
-        let mut page = PlannedPage {
-            more: true,
-            missing: frontier.offer_missing.clone(),
-            positions: frontier.offer_positions.clone(),
-            ..PlannedPage::default()
-        };
-        let mut bytes = 0;
-        while let Some(offer) = frontier.offered.get(frontier.replay).copied() {
-            if page.ops.len() >= budget.ops || bytes >= budget.bytes {
-                break;
-            }
-            if offer.held {
-                if !slice.charge_actor() {
-                    break;
-                }
-                if let Some(floor) = &mut frontier.offer_floor {
-                    floor.observe(offer.actor, offer.seq);
-                }
-                frontier.replay += 1;
-                continue;
-            }
-            if !frontier.records.contains(&offer.id) && !slice.charge_read() {
-                break;
-            }
-            let record = match frontier.records.take(read, &offer.id, slice) {
-                Ok(Some(record)) => record,
-                Ok(None) => {
-                    if page.missing.len() >= MAX_PAGE_MISSING && !page.missing.contains(&offer.id) {
-                        return Err(Error::SyncCapacity(
-                            "offered page missing records exceed result capacity".into(),
-                        ));
-                    }
-                    page.missing.insert(offer.id);
-                    break;
-                }
-                Err(super::records::LoadError::Yield) => break,
-                Err(super::records::LoadError::Failed(error)) => return Err(error),
-            };
-            let body = &record.op.signed.body;
-            if record.op.id != offer.id
-                || body.actor_id != offer.actor
-                || body.actor_seq != offer.seq
-            {
-                return Err(Error::InvalidOpId);
-            }
-            if body.topic_id != *topic {
-                return Err(Error::TopicMismatch);
-            }
-            let size = postcard::experimental::serialized_size(&record.op)?;
-            if size > budget.bytes - bytes {
-                if page.ops.is_empty() {
-                    page.too_large = Some(offer.id);
-                }
-                frontier.records.keep(record);
-                break;
-            }
-            bytes += size;
-            page.ops.push(record.into_op());
-            frontier.replay += 1;
-        }
-        if frontier.replay == frontier.offered.len() {
-            frontier.clear_offer();
-        }
-        page.continued = frontier.replaying
-            && page.ops.is_empty()
-            && page.missing.is_empty()
-            && page.too_large.is_none();
-        frontier.evictable = !page.ops.is_empty();
-        if page.continued {
-            self.work.ended();
-        }
-        Ok(page)
     }
 }
 
