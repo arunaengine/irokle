@@ -8,10 +8,8 @@ use crate::{
     TopicId, TopicPayload, actor_id_for,
 };
 
-use super::admission::{
-    checked_next, ensure_event_type, heads_after, is_local_race, next_actor_position,
-};
-use super::membership::materialize_topic_state;
+use super::admission::{checked_next, ensure_event_type, is_local_race, next_actor_position};
+use super::membership::{apply_control, materialize_topic_state};
 use super::{
     AdmittedBatch, BatchOverlay, MAX_ADMISSION_RETRIES, OpAdmission, Oplog, conflict_pause,
 };
@@ -548,6 +546,102 @@ impl<S: super::Storage> Oplog<S> {
         materialize_topic_state(reachable.into_values().collect(), BTreeSet::new())
     }
 
+    fn meta_for(&self, op: &Op) -> Result<OpMeta> {
+        let body = &op.signed.body;
+        let observed_clock = self.clock_from_deps(&body.topic_id, &body.deps)?;
+        Ok(OpMeta {
+            id: op.id,
+            topic_id: body.topic_id,
+            author: body.author,
+            actor_id: body.actor_id,
+            actor_seq: body.actor_seq,
+            actor_prev: body.actor_prev,
+            deps: body.deps.clone(),
+            generation: body.generation,
+            observed_clock,
+            ready: true,
+            missing_deps: BTreeSet::new(),
+        })
+    }
+
+    fn clock_from_deps(
+        &self,
+        topic_id: &TopicId,
+        deps: &BTreeSet<crate::OpId>,
+    ) -> Result<crate::ActorClock> {
+        let mut observed_clock = crate::ActorClock::new();
+        for id in deps {
+            let (meta, clock) = self
+                .storage
+                .get_observation(id)?
+                .ok_or(Error::MissingDependency(*id))?;
+            if meta.topic_id != *topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            observed_clock.merge(&clock);
+            observed_clock.observe(meta.actor_id, meta.actor_seq);
+        }
+
+        Ok(observed_clock)
+    }
+
+    fn commit_admission<F>(
+        &self,
+        op: Op,
+        meta: OpMeta,
+        expected_heads: BTreeSet<crate::OpId>,
+        expected_state: Option<TopicState>,
+        effects: &F,
+    ) -> Result<()>
+    where
+        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
+    {
+        let heads = heads_after(&expected_heads, &op);
+        let topic_state = self.topic_state_after(&op, heads.clone(), expected_state.clone())?;
+        let effective_state = topic_state
+            .as_ref()
+            .or(expected_state.as_ref())
+            .ok_or(Error::TopicNotFound)?;
+        let effects = effects(&op, &meta, effective_state)?;
+        self.storage.put_admitted_batch(AdmittedBatch {
+            topic_id: op.signed.body.topic_id,
+            expected_heads,
+            expected_topic_state: expected_state,
+            entries: vec![(op, meta)],
+            heads,
+            topic_state,
+            effects,
+        })
+    }
+
+    fn topic_state_after(
+        &self,
+        op: &Op,
+        heads: BTreeSet<crate::OpId>,
+        base_state: Option<TopicState>,
+    ) -> Result<Option<TopicState>> {
+        let body = &op.signed.body;
+        match &body.payload {
+            TopicPayload::Genesis(genesis) => Ok(Some(TopicState {
+                topic_id: body.topic_id,
+                event_type_id: genesis.event_type_id.clone(),
+                genesis: op.id,
+                heads,
+                members: genesis.initial_peers.clone(),
+                replication_policy: genesis.replication_policy.clone(),
+                membership_controls: BTreeMap::new(),
+                replication_policy_control: None,
+            })),
+            TopicPayload::Event(_) => Ok(None),
+            TopicPayload::Control(control) => {
+                let mut state = base_state.ok_or(Error::TopicNotFound)?;
+                state.heads = heads;
+                apply_control(&mut state, op, control);
+                Ok(Some(state))
+            }
+        }
+    }
+
     fn ensure_member(&self, topic_id: &TopicId, peer: crate::PeerId) -> Result<()> {
         let state = self
             .storage
@@ -559,4 +653,13 @@ impl<S: super::Storage> Oplog<S> {
             Err(Error::NotTopicMember)
         }
     }
+}
+
+fn heads_after(current: &BTreeSet<crate::OpId>, op: &Op) -> BTreeSet<crate::OpId> {
+    let mut heads = current.clone();
+    for dep in &op.signed.body.deps {
+        heads.remove(dep);
+    }
+    heads.insert(op.id);
+    heads
 }

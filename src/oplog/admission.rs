@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::BTreeSet;
-
-use crate::{Error, Op, Result};
+use crate::{Error, Result};
 
 pub(super) fn next_actor_position(
     tip: Option<(u64, crate::OpId)>,
@@ -61,13 +59,4 @@ pub(super) fn is_local_race(err: &Error) -> bool {
             | Error::InvalidOpId
             | Error::GenerationMismatch { .. }
     )
-}
-
-pub(super) fn heads_after(current: &BTreeSet<crate::OpId>, op: &Op) -> BTreeSet<crate::OpId> {
-    let mut heads = current.clone();
-    for dep in &op.signed.body.deps {
-        heads.remove(dep);
-    }
-    heads.insert(op.id);
-    heads
 }
