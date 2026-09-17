@@ -320,7 +320,7 @@
       "rule": "name_terms",
       "name": "full_sweep_time_of_day",
       "kind": "field",
-      "reason": "Public runtime configuration field and serialized construction API.",
+      "reason": "Public field of the public IrohRuntimeConfig struct.",
       "source": "Reviewed public Rust contract at 6be58d6; public_field"
     },
     {
