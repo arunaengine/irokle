@@ -33,12 +33,21 @@ loop {
         break;
     }
     request.credit = SyncCredit { ops: 4, ..request.credit };
-    let page = alice.response_with(bob.peer_id(), &request, PageBudget::from_credit(request.credit), &bob.sync_summary(topic.id())?)?;
+    let page = alice.response_with(
+        bob.peer_id(),
+        &request,
+        PageBudget::from_credit(request.credit),
+        &bob.sync_summary(topic.id())?,
+    )?;
     assert!(page.ops.len() <= 4);
     let received = !page.ops.is_empty();
     let data = SyncData { topic_id: topic.id(), ops: page.ops };
     bob.receive_sync_outcome(alice.peer_id(), data)?;
-    knowledge.settle(&request.window, (&page.positions, page.continued), (received, summary.actor_clock.iter().count()));
+    knowledge.settle(
+        &request.window,
+        (&page.positions, page.continued),
+        (received, summary.actor_clock.iter().count()),
+    );
     pages += 1;
 }
 assert_eq!(pages, 3);

@@ -54,8 +54,9 @@ impl SyncReadLimits {
     }
 }
 
-/// Messages charged until their batch, consuming iterator and owned items drop.
-/// Borrowed `messages()` and `iter()` retain their existing message interfaces.
+/// Messages of one exchange, charged to the net's byte budget. `messages()` and `iter()`
+/// borrow them. Consuming iteration yields [`SyncResponse`] items; the batch stays charged
+/// until the iterator and every item it yielded are dropped.
 pub struct SyncResponses {
     pub(super) messages: Vec<SyncMessage>,
     pub(super) charges: Vec<Charge>,
@@ -82,7 +83,7 @@ impl SyncResponses {
         (self.messages, self.charges)
     }
 
-    pub(super) fn into_session(
+    pub(super) fn into_session_charge(
         self,
         budget: &Arc<ByteBudget>,
     ) -> io::Result<(Vec<SyncMessage>, Arc<Vec<Charge>>)> {
@@ -92,9 +93,9 @@ impl SyncResponses {
         // Retained replies must not occupy the pool their next exchange needs.
         let held = budget.try_take(Pool::Session, bytes, OwnedClass::Session)?;
         let (messages, charges) = self.into_parts();
-        let lease = Arc::new(vec![held]);
+        let charge = Arc::new(vec![held]);
         drop(charges);
-        Ok((messages, lease))
+        Ok((messages, charge))
     }
 }
 
@@ -110,8 +111,8 @@ impl IntoIterator for SyncResponses {
     }
 }
 
-/// Consuming iterator yielding leased items instead of bare `SyncMessage`s.
-/// The whole batch remains charged until its iterator and final item drop.
+/// Consuming iterator over [`SyncResponses`] that yields [`SyncResponse`] items.
+/// The batch stays charged until the iterator and every item it yielded are dropped.
 pub struct SyncResponsesIter {
     messages: std::vec::IntoIter<SyncMessage>,
     charges: Arc<Vec<Charge>>,
@@ -132,9 +133,9 @@ impl Iterator for SyncResponsesIter {
     }
 }
 
-/// An original returned message holding its batch's shared reservation.
+/// One returned message that keeps its whole batch charged until it is dropped.
 /// Borrow through `AsRef` or dereferencing; caller-created clones and their shared
-/// buffers are outside this reservation. There is no detaching conversion.
+/// buffers are not charged. There is no detaching conversion.
 pub struct SyncResponse {
     message: SyncMessage,
     _charges: Arc<Vec<Charge>>,

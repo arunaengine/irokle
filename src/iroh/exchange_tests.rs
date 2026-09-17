@@ -174,7 +174,7 @@ async fn cancelled_storage_retains() {
         .build()
         .unwrap();
     let net = Arc::new(super::super::IrohNet::new(endpoint, node).unwrap());
-    let (messages, lease) = batch(&net.budget).into_session(&net.budget).unwrap();
+    let (messages, charge) = batch(&net.budget).into_session_charge(&net.budget).unwrap();
     let (started, arrival) = tokio::sync::oneshot::channel();
     let (release, gate) = std::sync::mpsc::channel();
     let (finished, completion) = tokio::sync::oneshot::channel();
@@ -182,7 +182,7 @@ async fn cancelled_storage_retains() {
     let task = tokio::spawn(async move {
         worker
             .run_job(super::super::Lane::Bulk, move |_| {
-                let retained = (messages, lease);
+                let retained = (messages, charge);
                 started.send(()).unwrap();
                 gate.recv_timeout(Duration::from_secs(60)).unwrap();
                 drop(retained);
@@ -224,14 +224,14 @@ async fn cancelled_storage_retains() {
 #[test]
 fn transfer_preserves_ownership() {
     let budget = ByteBudget::new(0, 0);
-    let (messages, lease) = batch(&budget).into_session(&budget).unwrap();
+    let (messages, charge) = batch(&budget).into_session_charge(&budget).unwrap();
     assert_released(&budget);
     assert_eq!(
         budget.owned().current[&OwnedClass::Session],
         reservation() as u64
     );
-    let job = Arc::clone(&lease);
-    drop(lease);
+    let job = Arc::clone(&charge);
+    drop(charge);
     assert_eq!(
         budget.owned().current[&OwnedClass::Session],
         reservation() as u64
@@ -250,7 +250,7 @@ fn transfer_full_fails() {
             OwnedClass::Session,
         )
         .unwrap();
-    let error = batch(&budget).into_session(&budget).err().unwrap();
+    let error = batch(&budget).into_session_charge(&budget).err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
     assert_released(&budget);
 }

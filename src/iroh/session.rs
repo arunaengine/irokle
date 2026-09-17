@@ -17,8 +17,7 @@ use super::{
     peer_from_endpoint,
 };
 
-/// Contain work failures to one topic after validating protocol and peer binding.
-/// Messages without topic-local work remain at the stream boundary.
+/// The per-topic failure to report for `message`, or None when a failure must end the stream.
 fn failure_scope(message: &SyncMessage) -> Option<crate::sync::SyncFailure> {
     let (topic_id, code) = match message {
         SyncMessage::Open(open) => (open.topic_id, crate::sync::SyncFailureCode::Open),
@@ -242,8 +241,8 @@ impl SyncSession {
     }
 
     /// Apply ACKs independently, then share the remaining stream budget among requests.
-    /// Complete page controls precede data allocation, preserving every requirement.
-    /// Return the replies and the pages' retained-byte bound.
+    /// Each page result keeps all missing ids and positions; its size is reserved before
+    /// data fills the rest of the share. Return the replies and the pages' retained-byte bound.
     pub(super) fn finish<S: Storage>(
         &mut self,
         net: &SharedNet<S>,

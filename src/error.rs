@@ -161,7 +161,7 @@ pub enum Error {
 }
 
 impl Error {
-    /// The typed cause beneath shared batch ownership.
+    /// Returns the error inside any `Shared` wrappers.
     pub fn cause(&self) -> &Self {
         let mut cause = self;
         while let Self::Shared(source) = cause {

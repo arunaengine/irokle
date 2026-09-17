@@ -61,7 +61,7 @@ const RESYNC_PROGRESS_TURN: Duration = Duration::ZERO;
 /// Pages one `sync_now` call will fetch while each is really advancing, before
 /// it reports what it reached. Bounds the caller's wait instead of paging on
 /// until the peer stops publishing.
-const MAX_NOW_PAGES: usize = 64;
+const SYNC_NOW_PAGES: usize = 64;
 /// Staging receipts remembered per peer and topic, oldest dropped first.
 const MAX_BOOTSTRAP_RECEIPTS: usize = 1024;
 const RECEIPT_LOG_BYTES: usize = 64 * 1024 * 1024;
@@ -414,6 +414,7 @@ impl<S: Storage> IrohNet<S> {
         Self::new_with_alpns_config_and_sink(endpoint, node, alpns, runtime, None)
     }
 
+    /// Creates the net with an optional sink for genesis tie-break evictions.
     #[doc = include_str!("eviction_sink.md")]
     pub fn new_with_alpns_config_and_sink(
         endpoint: iroh::Endpoint,
@@ -621,9 +622,9 @@ impl<S: Storage> SharedNet<S> {
         self.note_outcome(peer_id, [Ok(())]);
     }
 
-    /// Feed one attempt's outcome to peer health. When that changes which
-    /// peers are selected, the topics queued for the peer are rechecked now, so
-    /// an alternate gets real work without a new publish or a full sweep.
+    /// Feed one attempt's outcomes to peer health. Blocked, reconcile and rejected results are
+    /// skipped: local limits, a store to reopen or refused data never show a peer is unreachable.
+    /// If selection changes, the peer's queued topics are rechecked now for an alternate.
     fn note_outcome<'a>(
         &self,
         peer_id: PeerId,
@@ -1015,6 +1016,7 @@ impl<S: Storage> SharedNet<S> {
             ExchangeState::Complete | ExchangeState::Advancing => self
                 .resync_scheduler
                 .complete_dirty(claim.settle(), runtime.resync_interval),
+            // A quick retry cannot fix invalid data or a store that must be reopened.
             ExchangeState::Rejected => {
                 self.resync_scheduler.complete_failed(
                     claim.settle(),
@@ -1395,6 +1397,7 @@ impl<S: Storage> IrohNet<S> {
             .unwrap_or(Ok(()))
     }
 
+    /// Syncs topics now: each is `Ok` if complete, `WouldBlock` if more is scheduled, or an error.
     #[doc = include_str!("sync_topics.md")]
     pub async fn sync_topics_now(
         &self,
@@ -1444,7 +1447,7 @@ impl<S: Storage> IrohNet<S> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        for _ in 0..MAX_NOW_PAGES {
+        for _ in 0..SYNC_NOW_PAGES {
             if paging.is_empty() {
                 break;
             }
@@ -1822,10 +1825,10 @@ impl<S: Storage> IrohNet<S> {
         if fingerprints.is_empty() {
             return BatchOutcomes::new(outcomes, advanced, settled);
         }
-        let (responses, lease) = match self
+        let (responses, charge) = match self
             .exchange(peer.clone(), &request)
             .await
-            .and_then(|responses| responses.into_session(&self.budget))
+            .and_then(|responses| responses.into_session_charge(&self.budget))
         {
             Ok(responses) => responses,
             Err(error) => {
@@ -1869,7 +1872,7 @@ impl<S: Storage> IrohNet<S> {
         }
         // Two identically damaged stores still match, so the local integrity
         // check decides whether a matching fingerprint counts as synced.
-        let held_lease = Arc::clone(&lease);
+        let held_charge = Arc::clone(&charge);
         let decided = self
             .run_job(Lane::Control, move |shared| {
                 let decided = matching
@@ -1897,11 +1900,11 @@ impl<S: Storage> IrohNet<S> {
                         (topic_id, outcome)
                     })
                     .collect::<Vec<_>>();
-                (decided, held_lease)
+                (decided, held_charge)
             })
             .await;
         let decided = match decided {
-            Ok((decided, _held_lease)) => decided,
+            Ok((decided, _held_charge)) => decided,
             Err(error) => {
                 for topic_id in fingerprints.keys() {
                     outcomes
@@ -1940,12 +1943,12 @@ impl<S: Storage> IrohNet<S> {
                 .collect::<Vec<_>>();
             let taken = std::mem::take(&mut queue);
             let held = carried.take();
-            let held_lease = Arc::clone(&lease);
+            let held_charge = Arc::clone(&charge);
             let planned = self
                 .run_job(Lane::Bulk, move |shared| {
                     (
                         shared.plan_group(remote_peer_id, taken, held, limits),
-                        held_lease,
+                        held_charge,
                     )
                 })
                 .await;
@@ -1955,7 +1958,7 @@ impl<S: Storage> IrohNet<S> {
                 rest,
                 outcomes: planned_outcomes,
             } = match planned {
-                Ok((planned, _held_lease)) => planned,
+                Ok((planned, _held_charge)) => planned,
                 Err(error) => {
                     for topic_id in unplanned {
                         outcomes.insert(topic_id, Err(clone_error(&error)));
@@ -1973,7 +1976,7 @@ impl<S: Storage> IrohNet<S> {
                 peer.clone(),
                 remote_peer_id,
                 group,
-                Arc::clone(&lease),
+                Arc::clone(&charge),
                 &mut outcomes,
                 &mut advanced,
             )
@@ -2434,7 +2437,7 @@ impl<S: Storage> IrohNet<S> {
         peer: iroh::EndpointAddr,
         remote_peer_id: PeerId,
         group: Vec<PlannedTopicSync>,
-        source_lease: Arc<Vec<Charge>>,
+        source_charge: Arc<Vec<Charge>>,
         outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
         advanced: &mut BTreeSet<crate::TopicId>,
     ) {
@@ -2450,7 +2453,7 @@ impl<S: Storage> IrohNet<S> {
         };
         // Progress is measured toward each topic's captured goal only. Bytes
         // moved, repeated ids and unrelated local writes are not progress.
-        let held_lease = Arc::clone(&source_lease);
+        let held_charge = Arc::clone(&source_charge);
         let measured = self
             .run_job(Lane::Control, move |shared| {
                 let measured = group
@@ -2461,11 +2464,11 @@ impl<S: Storage> IrohNet<S> {
                         (planned, before)
                     })
                     .collect::<Vec<_>>();
-                (measured, held_lease)
+                (measured, held_charge)
             })
             .await;
         let measured = match measured {
-            Ok((measured, _held_lease)) => measured,
+            Ok((measured, _held_charge)) => measured,
             Err(error) => {
                 fail_group(outcomes, &error);
                 return;
@@ -2493,10 +2496,10 @@ impl<S: Storage> IrohNet<S> {
             }
             messages.extend(planned.messages);
         }
-        let (responses, lease) = match self
+        let (responses, charge) = match self
             .exchange(peer.clone(), &messages)
             .await
-            .and_then(|responses| responses.into_session(&self.budget))
+            .and_then(|responses| responses.into_session_charge(&self.budget))
         {
             Ok(responses) => responses,
             Err(error) => {
@@ -2510,7 +2513,7 @@ impl<S: Storage> IrohNet<S> {
             .iter()
             .map(|(topic_id, (goal, _))| (*topic_id, goal.genesis))
             .collect::<BTreeMap<_, _>>();
-        let held_lease = Arc::clone(&lease);
+        let held_charge = Arc::clone(&charge);
         let replies = self
             .run_job(Lane::Bulk, move |shared| {
                 let replies = shared.batch_replies(
@@ -2521,7 +2524,7 @@ impl<S: Storage> IrohNet<S> {
                     owed_acks,
                     more,
                 );
-                (replies, held_lease)
+                (replies, held_charge)
             })
             .await;
         let BatchReplies {
@@ -2532,7 +2535,7 @@ impl<S: Storage> IrohNet<S> {
             more,
             unexpected,
         } = match replies {
-            Ok((replies, _held_lease)) => replies,
+            Ok((replies, _held_charge)) => replies,
             Err(error) => {
                 fail_group(outcomes, &error);
                 return;
@@ -2543,15 +2546,15 @@ impl<S: Storage> IrohNet<S> {
             fail_group(outcomes, &error);
             return;
         }
-        let held_lease = Arc::clone(&lease);
+        let held_charge = Arc::clone(&charge);
         let applied = self
             .run_job(Lane::Control, move |shared| {
                 let results = shared.node.apply_sync_acks(&acks);
-                (acks, results, held_lease)
+                (acks, results, held_charge)
             })
             .await;
         match applied {
-            Ok((acks, results, _held_lease)) => {
+            Ok((acks, results, _held_charge)) => {
                 for (ack, result) in acks.iter().zip(results) {
                     if let Err(error) = result {
                         outcomes.insert(ack.topic_id, Err(invalid_data(error)));
@@ -2576,7 +2579,7 @@ impl<S: Storage> IrohNet<S> {
             .iter()
             .map(|(topic_id, _)| *topic_id)
             .collect::<Vec<_>>();
-        let held_lease = Arc::clone(&source_lease);
+        let held_charge = Arc::clone(&source_charge);
         let measured = self
             .run_job(Lane::Control, move |shared| {
                 let measured = goals
@@ -2586,11 +2589,11 @@ impl<S: Storage> IrohNet<S> {
                         (topic_id, goal, before, after)
                     })
                     .collect::<Vec<_>>();
-                (measured, held_lease)
+                (measured, held_charge)
             })
             .await;
         let measured = match measured {
-            Ok((measured, _held_lease)) => measured,
+            Ok((measured, _held_charge)) => measured,
             Err(error) => {
                 for topic_id in goal_topics {
                     outcomes.insert(topic_id, Err(clone_error(&error)));
@@ -2687,14 +2690,14 @@ impl<S: Storage> IrohNet<S> {
                 })
                 .collect::<BTreeSet<_>>();
             let mut acks = Vec::new();
-            let mut held_lease = None;
+            let mut held_charge = None;
             match self
                 .exchange(peer.clone(), &messages)
                 .await
-                .and_then(|responses| responses.into_session(&self.budget))
+                .and_then(|responses| responses.into_session_charge(&self.budget))
             {
-                Ok((responses, lease)) => {
-                    held_lease = Some(lease);
+                Ok((responses, charge)) => {
+                    held_charge = Some(charge);
                     for response in responses {
                         match response {
                             SyncMessage::Summary(summary) if topics.contains(&summary.topic_id) => {
@@ -2734,15 +2737,15 @@ impl<S: Storage> IrohNet<S> {
                 }
             }
             if !acks.is_empty() {
-                let job_lease = held_lease.clone();
+                let job_charge = held_charge.clone();
                 let applied = self
                     .run_job(Lane::Control, move |shared| {
                         let results = shared.node.apply_sync_acks(&acks);
-                        (acks, results, job_lease)
+                        (acks, results, job_charge)
                     })
                     .await;
                 match applied {
-                    Ok((acks, results, _held_lease)) => {
+                    Ok((acks, results, _held_charge)) => {
                         for (ack, result) in acks.iter().zip(results) {
                             if let Err(error) = result {
                                 outcomes.insert(ack.topic_id, Err(invalid_data(error)));
@@ -3823,14 +3826,20 @@ fn message_topic_id(message: &SyncMessage) -> Option<crate::TopicId> {
 /// One topic's result, whether it advanced, and the claim held for it.
 type TopicResult = (crate::TopicId, io::Result<()>, bool, Option<ClaimGuard>);
 
-/// Exchange progress controls retry cadence before errors become status text.
+/// How one attempt ended, which sets its retry delay and its status outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExchangeState {
+    /// The exchange succeeded and owes no further page.
     Complete,
+    /// A page moved the topic toward its goal and more work remains.
     Advancing,
+    /// Local capacity ran short or the exchange made no progress.
     Blocked,
+    /// A transport, peer or storage failure that a later attempt may clear.
     Retryable,
+    /// Invalid data or input without a typed cause.
     Rejected,
+    /// The store must be reopened and its commit outcome verified.
     #[cfg(feature = "fjall")]
     Reconcile,
 }
@@ -5361,7 +5370,7 @@ mod tests {
     /// Evidence migrated without a branch certifies nothing, so a clock it
     /// carries must not mark the target as synchronized.
     #[tokio::test]
-    async fn legacy_ack_sync() {
+    async fn legacy_ack_resyncs() {
         let net = test_net().await;
         let peer_id = peer(90);
         let topic = net

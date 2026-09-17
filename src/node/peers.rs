@@ -159,6 +159,7 @@ pub(crate) fn select_sync_peers(
     select_sync_targets(topic_id, local_peer, state, PeerHealth::empty()).peers
 }
 
+/// Chooses which peers to sync a topic with, within its replication policy and peer health.
 #[doc = include_str!("peer_selection.md")]
 pub(crate) fn select_sync_targets(
     topic_id: TopicId,

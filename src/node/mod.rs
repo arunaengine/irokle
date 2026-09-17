@@ -583,6 +583,7 @@ impl<S: Storage> Irokle<S> {
         self.sync.negotiate_page(peer_id, remote, budget)
     }
 
+    /// Plans a response page for `request` that fits `budget`.
     #[doc = include_str!("response_page.md")]
     pub fn response_page(
         &self,
@@ -641,8 +642,9 @@ impl<S: Storage> Irokle<S> {
         self.receive_sync_data_from_evicting(source_peer_id, data)
     }
 
-    /// Alias for [`Self::receive_sync_data_from`] that exposes genesis tie-break evictions.
-    /// The embedder re-emits discarded payloads under the winning genesis.
+    /// Alias for [`Self::receive_sync_data_from`] with an explicit name for callers that
+    /// handle genesis tie-break evictions. The embedder re-emits discarded payloads under
+    /// the winning genesis; irokle does not re-emit them.
     pub fn receive_sync_data_from_evicting(
         &self,
         source_peer_id: PeerId,

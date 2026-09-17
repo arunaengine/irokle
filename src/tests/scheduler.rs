@@ -172,7 +172,7 @@ async fn paged_pull() -> Paged {
     };
     let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
     let topic_id = shared_topic(&alice, &bob);
-    publish(&bob, topic_id, MAX_NOW_PAGES * 20, 1024);
+    publish(&bob, topic_id, SYNC_NOW_PAGES * 20, 1024);
     let bob_addr = ready_addr(bob_net.endpoint()).await;
     Paged {
         alice,
@@ -206,7 +206,7 @@ async fn budget_schedules_continuation() {
         !pulled.dominates(&target),
         "the budget ended the pull early"
     );
-    assert!(covered(&pulled, &target) > MAX_NOW_PAGES as u64);
+    assert!(covered(&pulled, &target) > SYNC_NOW_PAGES as u64);
     assert_eq!(
         paged
             .net
