@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Bounded forward page planning over one read context: actor ranges merged by
 //! generation, with waiting heads suspended outside the active set.
+//! Kept plans capture offered pages, confirm them on the next request and replay unconfirmed ops.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
@@ -19,28 +20,6 @@ use super::slice::{PageWork, Slice};
 /// A planned page, the actors whose positions it needed by the lowest
 /// generation needing each, and the frontier of a slice that stopped with work left.
 pub(super) type PlannedSlice = (PlannedPage, BTreeMap<ActorId, u64>, Option<Frontier>);
-
-#[derive(Default)]
-struct DependencyScan {
-    after: Option<OpId>,
-    needed: BTreeMap<ActorId, (u64, u64)>,
-    checked: Option<ActorId>,
-    revision: u64,
-    ancestry: Vec<Ancestor>,
-}
-
-struct Ancestor {
-    id: OpId,
-    actor: ActorId,
-    seq: u64,
-    cursor: DependencyCursor,
-    pending: Option<Dependency>,
-}
-
-struct Dependency {
-    id: OpId,
-    header: Option<OpHeader>,
-}
 
 /// How far one actor of a page plan got.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -586,15 +565,6 @@ impl Frontier {
     }
 }
 
-/// What an op still needs before it can be sent.
-enum Wait {
-    Yield,
-    Unknown,
-    Ready,
-    Blocked,
-    Position(ActorId, u64),
-}
-
 impl Pager<'_> {
     /// The highest position of `actor_id` the goal asks for.
     fn limit(&self, actor_id: &ActorId) -> u64 {
@@ -950,7 +920,40 @@ impl Pager<'_> {
             }
         }
     }
+}
 
+/// What an op still needs before it can be sent.
+enum Wait {
+    Yield,
+    Unknown,
+    Ready,
+    Blocked,
+    Position(ActorId, u64),
+}
+
+#[derive(Default)]
+struct DependencyScan {
+    after: Option<OpId>,
+    needed: BTreeMap<ActorId, (u64, u64)>,
+    checked: Option<ActorId>,
+    revision: u64,
+    ancestry: Vec<Ancestor>,
+}
+
+struct Ancestor {
+    id: OpId,
+    actor: ActorId,
+    seq: u64,
+    cursor: DependencyCursor,
+    pending: Option<Dependency>,
+}
+
+struct Dependency {
+    id: OpId,
+    header: Option<OpHeader>,
+}
+
+impl Pager<'_> {
     fn wait_for(&mut self, op: &Op) -> Result<Wait> {
         let mut scan = self.checked.remove(&op.id).unwrap_or_default();
         if scan.revision != self.revision {
