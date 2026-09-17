@@ -3,22 +3,40 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use crate::storage::{AdmissionEffects, AdmittedBatch, TopicState};
-use crate::{Error, Op, Result, TopicPayload};
+use crate::storage::{AdmissionEffects, AdmittedBatch, OpMeta, TopicState};
+use crate::{Error, Op, OpId, Result, TopicPayload, actor_id_for};
 
 use super::membership::apply_control;
 use super::pending::{PendingVerdict, pending_meta_for};
 use super::topology::topological_ops;
 use super::{
-    Admitted, BatchOverlay, BuiltBatch, MAX_ADMISSION_RETRIES, MAX_CACHED_PROJECTIONS,
-    MembershipCache, OpAdmission, Oplog, ReceiveEffects, ResetPlan, StoredOp, TopicEviction,
-    conflict_pause, is_structural_genesis,
+    Admitted, BatchOverlay, MAX_ADMISSION_RETRIES, MAX_CACHED_PROJECTIONS, MembershipCache,
+    OpAdmission, Oplog, ReceiveEffects, ResetPlan, TopicEviction, conflict_pause,
+    is_structural_genesis,
 };
 
 /// Buffered ops one admission call visits without admitting any, and how many
 /// it reads at once. A window that admits something starts another.
 const MAX_DRAIN_OPS: usize = 4096;
 const READY_SLICE: usize = 256;
+
+/// How much of an op the local store holds. `Repair` means its id is already in
+/// the chain but records are incomplete; refilling it is not an append.
+enum StoredOp {
+    Absent,
+    Repair,
+    Complete,
+}
+
+/// A validated admission not yet committed, with what follows its commit.
+struct BuiltBatch {
+    accepted: BTreeSet<OpId>,
+    batch: AdmittedBatch,
+    pending: Vec<(Op, BTreeSet<OpId>)>,
+    projection_epoch: Arc<()>,
+    projections: BTreeMap<OpId, Arc<TopicState>>,
+    projection_tips: BTreeSet<OpId>,
+}
 
 impl<S: super::Storage> Oplog<S> {
     pub(super) fn receive_ops_admission(
@@ -535,6 +553,126 @@ impl<S: super::Storage> Oplog<S> {
             projections,
             projection_tips,
         }))
+    }
+
+    /// Validate a refill of an id the chain already accounts for, once its
+    /// dependencies resolve, and return its metadata. It must match any stored copy.
+    fn validate_repair(
+        &self,
+        op: &Op,
+        state: Option<&TopicState>,
+        overlay_ops: &BTreeMap<OpId, Op>,
+        overlay_meta: &BTreeMap<OpId, OpMeta>,
+        projections: &mut BTreeMap<OpId, Arc<TopicState>>,
+    ) -> Result<OpMeta> {
+        let body = &op.signed.body;
+        if body.actor_id != actor_id_for(body.topic_id, body.author) {
+            return Err(Error::ActorAuthorMismatch);
+        }
+        if self
+            .storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+            .is_some_and(|id| id != op.id)
+        {
+            return Err(Error::ActorFork);
+        }
+        match &body.payload {
+            TopicPayload::Genesis(_) => {
+                if !is_structural_genesis(op) || state.is_some_and(|state| state.genesis != op.id) {
+                    return Err(Error::InvalidGenesis);
+                }
+            }
+            TopicPayload::Event(envelope) => {
+                let state = state.ok_or(Error::TopicNotFound)?;
+                ensure_event_type(&state.event_type_id, &envelope.type_id)?;
+                if !self
+                    .project_membership(
+                        &body.topic_id,
+                        &body.deps,
+                        overlay_ops,
+                        overlay_meta,
+                        projections,
+                    )?
+                    .members
+                    .contains(&body.author)
+                {
+                    return Err(Error::NotTopicMember);
+                }
+            }
+            TopicPayload::Control(_) => {
+                state.ok_or(Error::TopicNotFound)?;
+                if !self
+                    .project_membership(
+                        &body.topic_id,
+                        &body.deps,
+                        overlay_ops,
+                        overlay_meta,
+                        projections,
+                    )?
+                    .members
+                    .contains(&body.author)
+                {
+                    return Err(Error::NotTopicMember);
+                }
+            }
+        }
+        match (body.actor_seq, body.actor_prev) {
+            (1, None) => {}
+            (2.., Some(prev)) if body.deps.contains(&prev) => {
+                let prev_meta = self.header_projected(&prev, overlay_meta)?;
+                if prev_meta.topic_id != body.topic_id
+                    || prev_meta.actor_id != body.actor_id
+                    || checked_next(prev_meta.actor_seq)? != body.actor_seq
+                {
+                    return Err(Error::ActorPrevMismatch);
+                }
+            }
+            _ => return Err(Error::ActorPrevMismatch),
+        }
+        let mut generation = 0;
+        for id in &body.deps {
+            let dep_meta = self.header_projected(id, overlay_meta)?;
+            if dep_meta.topic_id != body.topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            generation = generation.max(checked_next(dep_meta.generation)?);
+        }
+        if body.generation != generation {
+            return Err(Error::GenerationMismatch {
+                expected: generation,
+                actual: body.generation,
+            });
+        }
+        let meta = self.meta_for_projected(op, overlay_meta)?;
+        if self
+            .storage
+            .get_meta(&op.id)?
+            .is_some_and(|stored| stored != meta)
+        {
+            return Err(Error::InvalidOpId);
+        }
+        Ok(meta)
+    }
+
+    fn stored_op_state(&self, op: &Op) -> Result<StoredOp> {
+        let has_op = self.storage.get_op(&op.id)?.is_some();
+        let has_meta = self.storage.get_position(&op.id)?.is_some();
+        if has_op && has_meta {
+            return Ok(StoredOp::Complete);
+        }
+        if has_op || has_meta {
+            return Ok(StoredOp::Repair);
+        }
+        let body = &op.signed.body;
+        if self
+            .storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+            == Some(op.id)
+            || !self.storage.children(&op.id)?.is_empty()
+        {
+            return Ok(StoredOp::Repair);
+        }
+        Ok(StoredOp::Absent)
     }
 }
 
