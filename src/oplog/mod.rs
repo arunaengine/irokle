@@ -600,94 +600,13 @@ impl<S: Storage> Oplog<S> {
             // dependencies can be resolved again.
             if matches!(stored, StoredOp::Repair) {
                 if missing_deps.is_empty() {
-                    let body = &op.signed.body;
-                    if body.actor_id != actor_id_for(body.topic_id, body.author) {
-                        return Err(Error::ActorAuthorMismatch);
-                    }
-                    if self
-                        .storage
-                        .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-                        .is_some_and(|id| id != op.id)
-                    {
-                        return Err(Error::ActorFork);
-                    }
-                    match &body.payload {
-                        TopicPayload::Genesis(_) => {
-                            if !is_structural_genesis(&op)
-                                || state.as_ref().is_some_and(|state| state.genesis != op.id)
-                            {
-                                return Err(Error::InvalidGenesis);
-                            }
-                        }
-                        TopicPayload::Event(envelope) => {
-                            let state = state.as_ref().ok_or(Error::TopicNotFound)?;
-                            ensure_event_type(&state.event_type_id, &envelope.type_id)?;
-                            if !self
-                                .project_membership(
-                                    &body.topic_id,
-                                    &body.deps,
-                                    &overlay_ops,
-                                    &overlay_meta,
-                                    &mut projections,
-                                )?
-                                .members
-                                .contains(&body.author)
-                            {
-                                return Err(Error::NotTopicMember);
-                            }
-                        }
-                        TopicPayload::Control(_) => {
-                            state.as_ref().ok_or(Error::TopicNotFound)?;
-                            if !self
-                                .project_membership(
-                                    &body.topic_id,
-                                    &body.deps,
-                                    &overlay_ops,
-                                    &overlay_meta,
-                                    &mut projections,
-                                )?
-                                .members
-                                .contains(&body.author)
-                            {
-                                return Err(Error::NotTopicMember);
-                            }
-                        }
-                    }
-                    match (body.actor_seq, body.actor_prev) {
-                        (1, None) => {}
-                        (2.., Some(prev)) if body.deps.contains(&prev) => {
-                            let prev_meta = self.header_projected(&prev, &overlay_meta)?;
-                            if prev_meta.topic_id != body.topic_id
-                                || prev_meta.actor_id != body.actor_id
-                                || checked_next(prev_meta.actor_seq)? != body.actor_seq
-                            {
-                                return Err(Error::ActorPrevMismatch);
-                            }
-                        }
-                        _ => return Err(Error::ActorPrevMismatch),
-                    }
-                    let mut generation = 0;
-                    for id in &body.deps {
-                        let dep_meta = self.header_projected(id, &overlay_meta)?;
-                        if dep_meta.topic_id != body.topic_id {
-                            return Err(Error::TopicMismatch);
-                        }
-                        generation = generation.max(checked_next(dep_meta.generation)?);
-                    }
-                    if body.generation != generation {
-                        return Err(Error::GenerationMismatch {
-                            expected: generation,
-                            actual: body.generation,
-                        });
-                    }
-                    let meta = self.meta_for_projected(&op, &overlay_meta)?;
-                    if self
-                        .storage
-                        .get_meta(&op.id)?
-                        .is_some_and(|stored| stored != meta)
-                    {
-                        return Err(Error::InvalidOpId);
-                    }
+                    let meta = self.validate_repair(
+                        &op,
+                        state.as_ref(),
+                        &overlay_ops,
+                        &overlay_meta,
+                        &mut projections,
+                    )?;
                     overlay_meta.insert(op.id, meta);
                     accepted.insert(op.id);
                     admitted.push(op.id);
@@ -801,6 +720,105 @@ impl<S: Storage> Oplog<S> {
             projections,
             projection_tips,
         }))
+    }
+
+    /// Validate a refill of an id the chain already accounts for, once its
+    /// dependencies resolve, and return its metadata. It must match any stored copy.
+    fn validate_repair(
+        &self,
+        op: &Op,
+        state: Option<&TopicState>,
+        overlay_ops: &BTreeMap<OpId, Op>,
+        overlay_meta: &BTreeMap<OpId, OpMeta>,
+        projections: &mut BTreeMap<OpId, Arc<TopicState>>,
+    ) -> Result<OpMeta> {
+        let body = &op.signed.body;
+        if body.actor_id != actor_id_for(body.topic_id, body.author) {
+            return Err(Error::ActorAuthorMismatch);
+        }
+        if self
+            .storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
+            .is_some_and(|id| id != op.id)
+        {
+            return Err(Error::ActorFork);
+        }
+        match &body.payload {
+            TopicPayload::Genesis(_) => {
+                if !is_structural_genesis(op) || state.is_some_and(|state| state.genesis != op.id) {
+                    return Err(Error::InvalidGenesis);
+                }
+            }
+            TopicPayload::Event(envelope) => {
+                let state = state.ok_or(Error::TopicNotFound)?;
+                ensure_event_type(&state.event_type_id, &envelope.type_id)?;
+                if !self
+                    .project_membership(
+                        &body.topic_id,
+                        &body.deps,
+                        overlay_ops,
+                        overlay_meta,
+                        projections,
+                    )?
+                    .members
+                    .contains(&body.author)
+                {
+                    return Err(Error::NotTopicMember);
+                }
+            }
+            TopicPayload::Control(_) => {
+                state.ok_or(Error::TopicNotFound)?;
+                if !self
+                    .project_membership(
+                        &body.topic_id,
+                        &body.deps,
+                        overlay_ops,
+                        overlay_meta,
+                        projections,
+                    )?
+                    .members
+                    .contains(&body.author)
+                {
+                    return Err(Error::NotTopicMember);
+                }
+            }
+        }
+        match (body.actor_seq, body.actor_prev) {
+            (1, None) => {}
+            (2.., Some(prev)) if body.deps.contains(&prev) => {
+                let prev_meta = self.header_projected(&prev, overlay_meta)?;
+                if prev_meta.topic_id != body.topic_id
+                    || prev_meta.actor_id != body.actor_id
+                    || checked_next(prev_meta.actor_seq)? != body.actor_seq
+                {
+                    return Err(Error::ActorPrevMismatch);
+                }
+            }
+            _ => return Err(Error::ActorPrevMismatch),
+        }
+        let mut generation = 0;
+        for id in &body.deps {
+            let dep_meta = self.header_projected(id, overlay_meta)?;
+            if dep_meta.topic_id != body.topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            generation = generation.max(checked_next(dep_meta.generation)?);
+        }
+        if body.generation != generation {
+            return Err(Error::GenerationMismatch {
+                expected: generation,
+                actual: body.generation,
+            });
+        }
+        let meta = self.meta_for_projected(op, overlay_meta)?;
+        if self
+            .storage
+            .get_meta(&op.id)?
+            .is_some_and(|stored| stored != meta)
+        {
+            return Err(Error::InvalidOpId);
+        }
+        Ok(meta)
     }
 
     fn stored_op_state(&self, op: &Op) -> Result<StoredOp> {
