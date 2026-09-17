@@ -1,5 +1,5 @@
 //! Core cost measurements without a transport. Run explicitly and serially:
-//! `cargo test --features fjall,iroh --lib tests::bench -- --ignored --nocapture --test-threads=1`.
+//! `cargo test --features fjall,iroh --lib tests::bench:: -- --ignored --nocapture --test-threads=1`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -375,7 +375,7 @@ fn next_op(author: &Ed25519Signer, prev: &Op, payload: TopicPayload) -> Op {
 }
 
 /// A genesis by `author` with `peers`, then `len` ops from `payload`.
-fn signed_chain(
+pub(super) fn signed_chain(
     author: &Ed25519Signer,
     name: &str,
     peers: &[PeerId],
