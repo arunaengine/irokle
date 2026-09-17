@@ -17,7 +17,7 @@ use super::{
 use super::slice::{PageWork, Slice};
 
 /// A planned page, the actors whose positions it needed by the lowest
-/// generation needing each, and the frontier of a slice that ended empty.
+/// generation needing each, and the frontier of a slice that stopped with work left.
 pub(super) type PlannedSlice = (PlannedPage, BTreeMap<ActorId, u64>, Option<Frontier>);
 
 #[derive(Default)]
@@ -371,9 +371,8 @@ enum Wait {
     Position(ActorId, u64),
 }
 
-/// Bounded page plan over a snapshot with at most `window` active actors. Waiting heads stay
-/// suspended until positions are sent, so waiters do not fill the set; an empty page with more
-/// may retain a plan or report missing/oversized work. `continued` marks a retained no-data slice.
+/// Bounded page plan over a snapshot with at most `window` active actors. A head that waits for
+/// another actor's position is suspended outside that set, so waiting heads never fill it.
 struct Pager<'a> {
     revision: u64,
     repair: Option<super::repair::Repair>,
@@ -420,18 +419,9 @@ impl Pager<'_> {
             .map_or(local_seq, |goal| goal.get(actor_id).min(local_seq))
     }
 
-    /// Count one storage read of this slice.
-    fn visit(&mut self) -> bool {
-        self.slice.read()
-    }
-
-    fn exhausted(&self) -> bool {
-        self.slice.exhausted()
-    }
-
-    /// Plan one slice. A fresh plan starts from actors behind; a resumed plan continues from
-    /// its frontier. Return positions needed by the lowest generation and the frontier if the
-    /// slice reaches its read budget before sending anything.
+    /// Plan one slice, fresh from the actors behind or resumed from its frontier. Return needed
+    /// positions by lowest generation, and the frontier whenever work is left: also after a full
+    /// page or with repair pending, but not after an oversized op or data from a partial window.
     fn plan(mut self, budget: PageBudget, fresh: bool) -> Result<PlannedSlice> {
         if fresh {
             // A zero allowance reads nothing; whether the goal holds more is
@@ -458,7 +448,7 @@ impl Pager<'_> {
         loop {
             // A slice out of reads, or a resumed plan given no allowance, ends
             // here and keeps what it holds.
-            if ops.len() >= budget.ops || bytes >= budget.bytes || self.exhausted() {
+            if ops.len() >= budget.ops || bytes >= budget.bytes || self.slice.exhausted() {
                 self.ended = true;
                 break;
             }
@@ -467,7 +457,7 @@ impl Pager<'_> {
                 break;
             }
             self.fill()?;
-            if self.ended || self.selecting.is_some() || self.exhausted() {
+            if self.ended || self.selecting.is_some() || self.slice.exhausted() {
                 self.ended = true;
                 break;
             }
@@ -493,7 +483,7 @@ impl Pager<'_> {
                 }
                 continue;
             }
-            if !self.records.contains(&id) && !self.visit() {
+            if !self.records.contains(&id) && !self.slice.read() {
                 self.active.push(Reverse(head));
                 self.ended = true;
                 break;
@@ -630,7 +620,7 @@ impl Pager<'_> {
                 return Ok(());
             }
         }
-        while self.active.len() < self.window && !self.exhausted() {
+        while self.active.len() < self.window && !self.slice.exhausted() {
             if let Some(scan) = self.pending.pop_front() {
                 if let Some(head) = self.head(scan)? {
                     self.active.push(Reverse(head));
@@ -681,7 +671,7 @@ impl Pager<'_> {
 
     fn head(&mut self, mut scan: HeadScan) -> Result<Option<RangeHead>> {
         if scan.next.is_none() {
-            if !self.visit() {
+            if !self.slice.read() {
                 self.pending.push_front(scan);
                 self.ended = true;
                 return Ok(None);
@@ -695,7 +685,7 @@ impl Pager<'_> {
                 return Ok(None);
             }
         }
-        if !self.visit() {
+        if !self.slice.read() {
             self.pending.push_front(scan);
             self.ended = true;
             return Ok(None);
@@ -735,7 +725,7 @@ impl Pager<'_> {
                 self.ended = true;
                 return Ok(());
             }
-            if self.exhausted() {
+            if self.slice.exhausted() {
                 self.selecting = Some(selected);
                 return Ok(());
             }
@@ -828,7 +818,7 @@ impl Pager<'_> {
             .deps
             .range((start, std::ops::Bound::Unbounded))
         {
-            if self.exhausted() || !self.slice.edge() {
+            if self.slice.exhausted() || !self.slice.edge() {
                 self.checked.insert(op.id, scan);
                 return Ok(Wait::Yield);
             }
@@ -844,7 +834,7 @@ impl Pager<'_> {
                 scan.after = Some(*dep);
                 continue;
             }
-            if !self.visit() {
+            if !self.slice.read() {
                 self.checked.insert(op.id, scan);
                 return Ok(Wait::Yield);
             }
@@ -944,7 +934,7 @@ impl Pager<'_> {
                 continue;
             }
             if frame.pending.is_none() {
-                if !self.visit() {
+                if !self.slice.read() {
                     scan.ancestry.push(frame);
                     return Ok(false);
                 }
@@ -961,7 +951,7 @@ impl Pager<'_> {
                 continue;
             };
             if dependency.header.is_none() {
-                if self.exhausted() || !self.slice.edge() || !self.visit() {
+                if self.slice.exhausted() || !self.slice.edge() || !self.slice.read() {
                     frame.pending = Some(dependency);
                     scan.ancestry.push(frame);
                     return Ok(false);
@@ -1263,8 +1253,8 @@ impl<S: Storage> SyncEngine<S> {
         pager.plan(budget, true)
     }
 
-    /// One more slice of the kept plan `frontier`, against the clocks it
-    /// planned on and a request with the same scope.
+    /// One slice of `frontier`, new from `Frontier::new` or kept from an earlier request with the
+    /// same scope, against the local and goal clocks the plan captured.
     pub(super) fn resume_page(
         &self,
         read: &dyn SnapshotRead,
