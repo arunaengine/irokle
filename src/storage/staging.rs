@@ -46,6 +46,8 @@ impl StagingLimits {
     };
 }
 
+/// Staged history of a topic not yet held locally, hidden until activation.
+///
 #[doc = include_str!("contracts/provisional_topic.md")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvisionalTopic {

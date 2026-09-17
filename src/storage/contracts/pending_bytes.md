@@ -1,1 +1,5 @@
-Serialized bytes of buffered pending operations a store may hold, in total and per authenticated source. A count limit alone does not bound memory: one operation may be megabytes, so the count budget multiplied by the frame limit is far larger than any node should buffer. Enforced in core, because buffering happens with or without a transport feature.
+Serialized bytes of buffered pending operations a store may hold, in total and
+per authenticated source. A count limit alone does not bound memory: one
+operation may be megabytes, so the count budget multiplied by the frame limit is
+far larger than any node should buffer. Enforced in core, because buffering
+happens with or without a transport feature.

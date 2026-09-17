@@ -1,5 +1,24 @@
-Atomically verify that the current topic state is exactly `expected_topic_state`, then [`Storage::reset_topic`] and apply `batch` in one durable operation. Genesis tie-break adoption uses this to discard the local chain and install the winning foreign genesis with no crash window between the two: a crash either leaves the whole local chain or the fully installed winner, never an empty topic. The expected state check prevents a stale resolver from overwriting a smaller genesis admitted by another facade. `batch` must be built against a fresh topic (empty `expected_heads`, `None` `expected_topic_state`). Returns the number of admitted ops the reset removed. A semantically rejected `batch` must leave the local chain exactly as it was. Required rather than defaulted: a reset followed by a separate admission is not atomic, and a backend must not inherit that silently.
+Atomically verify that the current topic state is exactly
+`expected_topic_state`, then [`Storage::reset_topic`] and apply `batch` in one
+durable operation. Genesis tie-break adoption uses this to discard the local
+chain and install the winning foreign genesis with no crash window between the
+two: a crash either leaves the whole local chain or the fully installed winner,
+never an empty topic. The expected state check prevents a stale resolver from
+overwriting a smaller genesis admitted by another facade. `batch` must be built
+against a fresh topic (empty `expected_heads`, `None` `expected_topic_state`).
+Returns the number of admitted ops the reset removed. A semantically rejected
+`batch` must leave the local chain exactly as it was. Required rather than
+defaulted: a reset followed by a separate admission is not atomic, and a backend
+must not inherit that silently.
 
-`eviction` describes the payloads this reset discards. When it carries any, backends must journal it under [`TopicEviction::key`] in this same transaction: the reset is the moment those payloads stop existing anywhere else, so a record written afterwards would leave a crash window that loses acknowledged writes. The record is released by [`Storage::clear_eviction`], never by the reset itself. A reset that would push the store past [`MAX_PENDING_EVICTIONS`] outstanding records must be refused with [`crate::Error::EvictionJournalFull`], leaving the local chain in place.
+`eviction` describes the payloads this reset discards. When it carries any,
+backends must journal it under [`TopicEviction::key`] in this same transaction:
+the reset is the moment those payloads stop existing anywhere else, so a record
+written afterwards would leave a crash window that loses acknowledged writes.
+The record is released by [`Storage::clear_eviction`], never by the reset
+itself. A reset that would push the store past [`MAX_PENDING_EVICTIONS`]
+outstanding records must be refused with [`crate::Error::EvictionJournalFull`],
+leaving the local chain in place.
 
-A backend commit error does not establish rollback. Reopen and reconcile an uncertain commit before releasing recovery work.
+A backend commit error does not establish rollback. Reopen and reconcile an
+uncertain commit before releasing recovery work.

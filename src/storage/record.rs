@@ -373,9 +373,9 @@ pub(crate) fn check_pending_quota(
     Ok(())
 }
 
-/// Reject an entry whose dependency is incomplete in the same transaction that
-/// writes it. This keeps admission, retries, and genesis reset from committing
-/// dangling DAG edges.
+/// Reject an entry whose dependency is incomplete in the transaction that writes it.
+/// `stored_dep` must apply [`super::Storage::dep_resolvable`] inside that transaction,
+/// so admission, retries, and genesis reset never commit dangling DAG edges.
 pub(crate) fn ensure_deps_resolvable(
     entries: &[(Op, OpMeta)],
     mut stored_dep: impl FnMut(&OpId) -> Result<bool>,

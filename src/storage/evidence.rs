@@ -346,8 +346,9 @@ pub(crate) enum AckCommit {
     Retain,
 }
 
-/// Commit `ack` only when its branch and member match the transaction state.
-/// Replaced branches and removed peers cannot clear obligations.
+/// Decide what `ack` may change, from `state` read in the transaction that writes it.
+/// Without a topic the record is only retained; another branch or a removed peer is
+/// refused.
 pub(crate) fn ack_commit(state: Option<&TopicState>, ack: &PeerAck) -> Result<AckCommit> {
     let Some(state) = state else {
         return Ok(AckCommit::Retain);
@@ -375,8 +376,8 @@ fn same_incarnation(existing: &PeerAck, incoming: &PeerAck) -> bool {
         && existing.genesis == incoming.genesis
 }
 
-/// Merge same-branch clocks without regressing the incoming frontier. Evidence
-/// from another branch remains separate and cannot clear obligations.
+/// Merge the stored clock into `incoming` when both certify the same branch. A
+/// record of another branch is replaced, not merged.
 pub(crate) fn merged_peer_ack(existing: &PeerAck, incoming: &PeerAck) -> PeerAck {
     let mut merged = incoming.clone();
     if same_incarnation(existing, incoming) {

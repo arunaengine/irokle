@@ -183,6 +183,8 @@ impl FjallStorage {
         Ok(StagingQuota::new(limits, others, source))
     }
 
+    /// Empty every slot whose session ended, one bounded transaction at a time, then release it.
+    ///
     #[doc = include_str!("../contracts/reclaim_slots.md")]
     fn reclaim_slots(&self) -> Result<()> {
         let mut clearing = Vec::new();
@@ -507,6 +509,8 @@ impl FjallStorage {
         Ok(())
     }
 
+    /// Claim a topic for activation; only the claiming session may claim it again.
+    ///
     #[doc = include_str!("../contracts/claim_activation.md")]
     fn claim_activation(
         &self,

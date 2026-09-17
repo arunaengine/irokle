@@ -11,6 +11,8 @@ use crate::{
 pub const MAX_PENDING_OPS_TOTAL: usize = 4096;
 pub const MAX_PENDING_OPS_PER_SOURCE: usize = 1024;
 pub const MAX_PENDING_WAITERS_PER_DEP: usize = 1024;
+/// Total byte limit on buffered ops, which core enforces for every backend.
+///
 #[doc = include_str!("contracts/pending_bytes.md")]
 pub const MAX_PENDING_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 pub const MAX_PENDING_BYTES_PER_SOURCE: usize = 16 * 1024 * 1024;
@@ -21,6 +23,8 @@ pub const MAX_PENDING_OPS_PER_TOPIC: usize = 2048;
 pub const MAX_PENDING_BYTES_PER_TOPIC: usize = 32 * 1024 * 1024;
 /// Rejected op ids a topic remembers, oldest dropped first.
 pub const MAX_REJECTED_PER_TOPIC: usize = 4096;
+/// Eviction records a store may hold unacknowledged.
+///
 #[doc = include_str!("contracts/eviction_limit.md")]
 pub const MAX_PENDING_EVICTIONS: usize = 1024;
 
@@ -157,6 +161,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {
         Ok(self.get_meta(id)?.as_ref().map(OpPosition::from))
     }
+    /// Whether `id` is stored completely enough to stand as a dependency.
+    ///
     #[doc = include_str!("contracts/dep_resolvable.md")]
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
         Ok(self.get_op(id)?.is_some() && self.get_meta(id)?.is_some())
@@ -219,8 +225,12 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// actively pulled instead of stranding its dependents forever.
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
+    /// Atomically drop every pending op that transitively waits on `dep_id`.
+    ///
     #[doc = include_str!("contracts/purge_waiters.md")]
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize>;
+    /// Remove an invalid pending subtree in one step.
+    ///
     #[doc = include_str!("contracts/reject_subtree.md")]
     fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
@@ -234,6 +244,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
         expected_genesis: Option<OpId>,
     ) -> Result<()>;
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>>;
+    /// Atomically persist `ack` and clear any obligations satisfied by it.
+    ///
     #[doc = include_str!("contracts/apply_peer_ack.md")]
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize>;
     /// Apply acks in order as [`Storage::apply_peer_ack`] would, one result per ack, so one
@@ -259,6 +271,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// every start of a transport gets an epoch no earlier start used.
     fn next_attempt_epoch(&self) -> Result<u64>;
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()>;
+    /// Atomically fold `update` into the status of `peer_id` on `topic_id` and return the result.
+    ///
     #[doc = include_str!("contracts/update_sync_status.md")]
     fn update_sync_status(
         &self,
@@ -281,9 +295,13 @@ pub trait Storage: Clone + Send + Sync + 'static {
         expected_genesis: Option<OpId>,
     ) -> Result<usize>;
 
+    /// Clear a topic completely, since a partial reset prevents convergence.
+    ///
     #[doc = include_str!("contracts/reset_topic.md")]
     fn reset_topic(&self, topic_id: &TopicId) -> Result<usize>;
 
+    /// Replace the local chain with `batch` in one durable operation, or change nothing.
+    ///
     #[doc = include_str!("contracts/reset_admit.md")]
     fn reset_topic_and_admit(
         &self,
@@ -303,6 +321,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// only remaining copy of the payloads its reset removed.
     fn pending_evictions(&self) -> Result<Vec<TopicEviction>>;
 
+    /// Release the journalled eviction named by `key`.
+    ///
     #[doc = include_str!("contracts/clear_eviction.md")]
     fn clear_eviction(&self, key: &EvictionKey) -> Result<()>;
 
@@ -321,6 +341,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn staging_limits(&self) -> StagingLimits;
     /// Every provisional bootstrap namespace, read at one moment.
     fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>>;
+    /// Open or reuse the staging namespace of `source` for `topic_id`.
+    ///
     #[doc = include_str!("contracts/open_provisional.md")]
     fn open_provisional(
         &self,
@@ -329,12 +351,16 @@ pub trait Storage: Clone + Send + Sync + 'static {
         genesis: OpId,
         now_ms: u64,
     ) -> Result<ProvisionalTopic>;
+    /// The store holding the history of `provisional`, or `None` once its session ended.
+    ///
     #[doc = include_str!("contracts/provisional_store.md")]
     fn provisional_store(&self, provisional: &ProvisionalTopic) -> Result<Option<Self>>;
     /// Serialized op bytes this store holds, admitted and buffered.
     fn stored_bytes(&self) -> Result<u64>;
     /// Record a write to the namespace while its session is current.
     fn touch_provisional(&self, provisional: &ProvisionalTopic, now_ms: u64) -> Result<()>;
+    /// Make the history of `provisional` the active topic.
+    ///
     #[doc = include_str!("contracts/activate_provisional.md")]
     fn activate_provisional(
         &self,
