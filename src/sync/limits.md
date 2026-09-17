@@ -8,7 +8,7 @@ Output credit counts operations and serialized bytes independently of planning w
 | --- | --- |
 | Traversal | 65,536 combined record/header/index visits and actor or waiter work items per slice |
 | Dependencies | 65,536 examined edges per slice |
-| Traversal workspace | 4 MiB of conservative retained allocation charges per plan |
+| Traversal workspace | 8 MiB of conservative allocation charges per slice, 4 MiB retained per kept plan |
 | Payload decoding | 32 MiB of admitted encoded upper-bound bytes per slice |
 | Snapshot authorization | 16 metadata read admissions per request |
 | Snapshot capture | 32 MiB of admitted raw metadata envelopes per request |

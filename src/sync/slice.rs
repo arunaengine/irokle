@@ -11,6 +11,9 @@ use super::MAX_PAGE_BYTES;
 pub(super) const MAX_PAGE_VISITS: usize = 65_536;
 /// Estimated bytes one kept plan may hold.
 pub(super) const MAX_CONTINUATION_BYTES: usize = 4 * 1024 * 1024;
+/// Estimated bytes one slice may plan with. Charges stay until the slice ends, and a chain
+/// through twice the actor window activates every actor before it sends.
+const MAX_WORKSPACE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Work page plans performed: storage reads, dependency edges examined, slices
 /// that ended on their read budget, and plans resumed from a kept frontier.
@@ -151,7 +154,7 @@ impl Slice {
 
     pub(super) fn reserve(&mut self, bytes: usize) -> Result<()> {
         let required = self.workspace.saturating_add(bytes);
-        if required > MAX_CONTINUATION_BYTES {
+        if required > MAX_WORKSPACE_BYTES {
             return Err(Error::SyncCapacity(format!(
                 "planner workspace needs {required} bytes; reduce the request's wants or actor window"
             )));

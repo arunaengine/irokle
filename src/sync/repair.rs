@@ -51,7 +51,7 @@ pub(super) struct RepairPage {
 
 impl Repair {
     pub(super) fn root_limit() -> usize {
-        // Leave a quarter of traversal workspace for independent forward progress.
+        // Leave a quarter of a kept plan's bytes for independent forward progress.
         let limit = super::slice::MAX_CONTINUATION_BYTES * 3 / 4;
         let mut low = 0;
         let mut high = super::MAX_REQUEST_ITEMS;

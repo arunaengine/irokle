@@ -134,6 +134,15 @@ fn chain_work_bounded() {
     );
 }
 
+/// A chain the first slice holds whole before it sends needs more planner bytes
+/// than a kept plan may hold; the slice still serves its page.
+#[test]
+fn deep_chain_served() {
+    let source = reverse_chain(MemoryStorage::new(), 5500);
+    let pages = page_through(&source, SyncCredit::default());
+    assert!(pages <= 2, "5500 chained actors took {pages} pages");
+}
+
 /// The real window boundary: a reverse chain through twice the window and two
 /// more actors. Run explicitly: `cargo test --lib window_chain_boundary -- --ignored`.
 #[test]
