@@ -1219,39 +1219,22 @@ impl<S: Storage> SyncEngine<S> {
         excluded: &BTreeSet<OpId>,
         budget: PageBudget,
     ) -> Result<PlannedSlice> {
-        let pager = Pager {
-            revision: 0,
-            repair: None,
-            pending: VecDeque::new(),
-            updates: VecDeque::new(),
-            slice: Slice::new(std::sync::Arc::clone(&self.work), self.page_visits, 0)?,
+        let mut frontier = Frontier::new(
+            peer,
+            scope,
+            self.page_actors,
+            self.continuations().records(),
+        );
+        frontier.blocked = excluded.clone();
+        let slice = Slice::new(std::sync::Arc::clone(&self.work), self.page_visits, 0)?;
+        self.pager(
             read,
             topic_id,
-            local,
-            goal,
-            scope,
-            sent,
-            window: self.page_actors,
-            position_limit: self.page_positions,
-            work: &self.work,
-            ended: false,
-            active: BinaryHeap::new(),
-            selecting: (scope.informed() && scope.named.len() > self.page_actors)
-                .then(BinaryHeap::new),
-            remainder: false,
-            deferred: ClockCursor::default(),
-            suspended: BTreeMap::new(),
-            resumable: VecDeque::new(),
-            states: BTreeMap::new(),
-            covered: peer.clone(),
-            blocked: excluded.clone(),
-            missing: BTreeSet::new(),
-            positions: BTreeMap::new(),
-            more: false,
-            checked: BTreeMap::new(),
-            records: self.continuations().records(),
-        };
-        pager.plan(budget, true)
+            (local, goal, frontier),
+            (scope, sent, self.page_positions),
+            slice,
+        )
+        .plan(budget, true)
     }
 
     /// One slice of `frontier`, new from `Frontier::new` or kept from an earlier request with the
@@ -1267,7 +1250,26 @@ impl<S: Storage> SyncEngine<S> {
     ) -> Result<PlannedSlice> {
         const SENT: BTreeSet<OpId> = BTreeSet::new();
         let fresh = frontier.fresh;
-        let pager = Pager {
+        self.pager(
+            read,
+            topic_id,
+            (local, Some(goal), frontier),
+            (scope, &SENT, position_limit),
+            slice,
+        )
+        .plan(budget, fresh)
+    }
+
+    /// A pager that continues `frontier` in `slice` against the local and goal clocks.
+    fn pager<'a>(
+        &'a self,
+        read: &'a dyn SnapshotRead,
+        topic_id: &'a TopicId,
+        (local, goal, frontier): (&'a ActorClock, Option<&'a ActorClock>, Frontier),
+        (scope, sent, position_limit): (&'a ActorScope<'a>, &'a BTreeSet<OpId>, usize),
+        slice: Slice,
+    ) -> Pager<'a> {
+        Pager {
             revision: frontier.revision,
             repair: frontier.repair,
             pending: frontier.pending,
@@ -1276,9 +1278,9 @@ impl<S: Storage> SyncEngine<S> {
             read,
             topic_id,
             local,
-            goal: Some(goal),
+            goal,
             scope,
-            sent: &SENT,
+            sent,
             window: self.page_actors,
             position_limit,
             work: &self.work,
@@ -1297,8 +1299,7 @@ impl<S: Storage> SyncEngine<S> {
             more: false,
             checked: frontier.checked,
             records: frontier.records,
-        };
-        pager.plan(budget, fresh)
+        }
     }
 
     pub(super) fn replay_page(
