@@ -1068,7 +1068,7 @@ impl<S: Storage> Irokle<S> {
 
     /// Record how attempt `(epoch, sequence)` ended. The state follows the outcome,
     /// so a partial pull stays `Behind`; Complete and Advanced count as successes,
-    /// Blocked and Failed as failures. Peer health is left to the caller.
+    /// Blocked, ReopenRequired and Failed as failures. Peer health is left to the caller.
     #[cfg(any(feature = "iroh", test))]
     /// Record the outcome of attempt `attempt`. Only its first completion,
     /// `first`, counts or moves the state; a repeat returns the stored status.
@@ -1092,7 +1092,10 @@ impl<S: Storage> Irokle<S> {
         let (state, error) = match outcome {
             crate::AttemptOutcome::Complete => (SyncPeerState::Healthy, None),
             crate::AttemptOutcome::Advanced => (SyncPeerState::Behind, None),
-            crate::AttemptOutcome::Blocked(reason) => (SyncPeerState::Behind, Some(reason.clone())),
+            crate::AttemptOutcome::Blocked(reason)
+            | crate::AttemptOutcome::ReopenRequired(reason) => {
+                (SyncPeerState::Behind, Some(reason.clone()))
+            }
             crate::AttemptOutcome::Failed(reason) => (SyncPeerState::Failed, Some(reason.clone())),
         };
         let advanced = matches!(

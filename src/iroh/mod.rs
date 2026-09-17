@@ -3916,7 +3916,7 @@ fn attempt_outcome(
         Err(error) => match exchange_state(Err(error), advanced) {
             ExchangeState::Blocked => crate::AttemptOutcome::Blocked(error.to_string()),
             #[cfg(feature = "fjall")]
-            ExchangeState::Reconcile => crate::AttemptOutcome::Blocked(error.to_string()),
+            ExchangeState::Reconcile => crate::AttemptOutcome::ReopenRequired(error.to_string()),
             _ => crate::AttemptOutcome::Failed(error.to_string()),
         },
     }
@@ -4210,7 +4210,7 @@ mod tests {
         );
         assert!(matches!(
             attempt_outcome(Err(&copied), false),
-            crate::AttemptOutcome::Blocked(_)
+            crate::AttemptOutcome::ReopenRequired(text) if text.starts_with("storage requires reopen")
         ));
     }
 

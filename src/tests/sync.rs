@@ -2099,6 +2099,11 @@ fn assert_outcome_states<S: Storage>(storage: S) {
             Some("dial failed"),
         ),
         (
+            crate::AttemptOutcome::ReopenRequired("reopen store".into()),
+            crate_storage::SyncPeerState::Behind,
+            Some("reopen store"),
+        ),
+        (
             crate::AttemptOutcome::Complete,
             crate_storage::SyncPeerState::Healthy,
             None,
@@ -2123,7 +2128,7 @@ fn assert_outcome_states<S: Storage>(storage: S) {
         )
         .unwrap();
     assert_eq!(old.state, crate_storage::SyncPeerState::Healthy);
-    assert_eq!((old.successful_attempts, old.failed_attempts), (2, 2));
+    assert_eq!((old.successful_attempts, old.failed_attempts), (2, 3));
 }
 
 #[test]

@@ -86,6 +86,9 @@ pub enum AttemptOutcome {
     Advanced,
     /// Could not move toward the goal, for the given reason.
     Blocked(String),
+    /// The store must be reopened and its commit outcome verified before sync
+    /// can move on, for the given reason. A retry alone cannot clear it.
+    ReopenRequired(String),
     /// The exchange failed, for the given reason.
     Failed(String),
 }
