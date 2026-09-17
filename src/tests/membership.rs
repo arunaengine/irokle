@@ -44,7 +44,7 @@ fn introduced_peer_rejects() {
 }
 
 #[test]
-fn late_peer_batch() {
+fn late_batch_accepted() {
     let alice = node(107);
     let bob = node(108);
     let charlie = node(109);

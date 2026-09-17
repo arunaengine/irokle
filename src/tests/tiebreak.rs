@@ -303,7 +303,7 @@ fn nonmember_no_reset() {
         .unwrap();
 
     // A non-member foreign genesis whose id is smaller than the local one, so
-    // only the membership gate — not id ordering — keeps the local chain.
+    // only the membership gate (not id ordering) keeps the local chain.
     let (foreign_signer, foreign_genesis) = (2..=255_u8)
         .find_map(|seed| {
             let signer = Ed25519Signer::from_bytes(&[seed; 32]);
@@ -681,7 +681,7 @@ fn assert_dag_whole(oplog: &Oplog, topic_id: &TopicId) {
 }
 
 #[test]
-fn reset_stale_dependents() {
+fn reset_defers_dependents() {
     // The reset path reads dep presence before it wipes the topic. An op whose
     // dependency only exists in the chain about to be discarded must be
     // buffered, never admitted against storage that is one step from empty.

@@ -756,7 +756,7 @@ async fn held_attempt_counts() {
 /// pages held at once stay within two stream budgets instead of every topic's
 /// push page, and every topic still reaches the peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn planning_one_group() {
+async fn planning_holds_group() {
     let lookup = Lookup::new();
     let limits = StreamLimits {
         bytes: 256 * 1024,

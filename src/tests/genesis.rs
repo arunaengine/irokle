@@ -160,7 +160,7 @@ async fn long_branch_converges() {
 /// resets it: both keep their branch, nothing is evicted, and the sync reports
 /// an error instead of completion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unauthorized_branch_local() {
+async fn unauthorized_keeps_local() {
     let (a, b) = (side().await, side().await);
     let topic_id = TopicId::hash(b"branch-unauthorized");
     let a_author = Ed25519Signer::from_bytes(&[203; 32]);

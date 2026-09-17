@@ -73,7 +73,7 @@ fn buffered<S: Storage>(storage: &S, topic_id: &TopicId, op: &Op) -> bool {
 /// A member's op names as predecessor an id that later arrives as another
 /// actor's op. Once that content is known the edge is impossible, so the op
 /// and its descendant go while a valid op waiting on the same id is admitted.
-fn assert_foreign_prev<S: Storage>(storage: S) {
+fn assert_rejects_foreign<S: Storage>(storage: S) {
     let m = members(210);
     let d = event_op(&m.carol, m.topic_id, 1, None, &[&m.genesis], "d");
     let bob_first = event_op(&m.bob, m.topic_id, 1, None, &[&m.genesis], "b1");
@@ -109,15 +109,15 @@ fn assert_foreign_prev<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_foreign_prev() {
-    assert_foreign_prev(MemoryStorage::new());
+fn memory_rejects_foreign() {
+    assert_rejects_foreign(MemoryStorage::new());
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_foreign_prev() {
+fn fjall_rejects_foreign() {
     let dir = tempfile::tempdir().unwrap();
-    assert_foreign_prev(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    assert_rejects_foreign(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// A predecessor of the right actor but the wrong sequence is just as final.
@@ -763,8 +763,8 @@ fn fjall_drains_complete() {
 }
 
 /// Write faults keep ready ops indexed while one receive releases a long chain.
-/// Retained visits permit admission; reconciliation stops without spinning.
-/// Work blocked from admission is not retried.
+/// The receive admits the whole chain however many visits retained ops cost.
+/// Reconciliation stops while ops cannot be admitted and admits them once the fault clears.
 fn assert_retained_drain<S: Storage>(inner: S) {
     // Enough retained visits that one visit window holds a few passes only.
     const RETAINED: usize = 511;

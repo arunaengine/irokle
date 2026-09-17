@@ -827,7 +827,7 @@ fn builder_selects_fjall() {
 
 #[cfg(feature = "fjall")]
 #[test]
-fn builder_fjall_db() {
+fn builder_accepts_fjall() {
     let dir = tempfile::tempdir().unwrap();
     let db = fjall::OptimisticTxDatabase::builder(dir.path())
         .open()
@@ -954,7 +954,7 @@ fn seed_pair(topic_id: TopicId, seed: u8) -> [(Op, crate_storage::OpMeta); 2] {
     })
 }
 
-fn assert_dangling_entry<S: Storage>(storage: S) {
+fn assert_rejects_dangling<S: Storage>(storage: S) {
     // The durability boundary must refuse an op whose dependency has no meta,
     // however the caller's pre-transaction reads decided the dep was there.
     let topic_id = TopicId::hash(b"dangling-entry-topic");
@@ -977,11 +977,11 @@ fn assert_dangling_entry<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_dangling_entry() {
-    assert_dangling_entry(MemoryStorage::new());
+fn memory_rejects_dangling() {
+    assert_rejects_dangling(MemoryStorage::new());
 }
 
-fn assert_partial_dep<S: Corrupt>(storage: S, drop_op: bool) {
+fn assert_rejects_partial<S: Corrupt>(storage: S, drop_op: bool) {
     // Half a dependency is a hole, not a resolved edge: neither an op record
     // without metadata nor metadata without its op may let a descendant commit.
     let topic_id = TopicId::hash(b"partial-dep-topic");
@@ -1020,18 +1020,18 @@ fn assert_partial_dep<S: Corrupt>(storage: S, drop_op: bool) {
 }
 
 #[test]
-fn memory_partial_dep() {
-    assert_partial_dep(MemoryStorage::new(), true);
-    assert_partial_dep(MemoryStorage::new(), false);
+fn memory_rejects_partial() {
+    assert_rejects_partial(MemoryStorage::new(), true);
+    assert_rejects_partial(MemoryStorage::new(), false);
 }
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_partial_dep() {
+fn fjall_rejects_partial() {
     let dir = tempfile::tempdir().unwrap();
-    assert_partial_dep(crate_storage::FjallStorage::open(dir.path()).unwrap(), true);
+    assert_rejects_partial(crate_storage::FjallStorage::open(dir.path()).unwrap(), true);
     let dir = tempfile::tempdir().unwrap();
-    assert_partial_dep(
+    assert_rejects_partial(
         crate_storage::FjallStorage::open(dir.path()).unwrap(),
         false,
     );
@@ -1039,9 +1039,9 @@ fn fjall_partial_dep() {
 
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_dangling_entry() {
+fn fjall_rejects_dangling() {
     let dir = tempfile::tempdir().unwrap();
-    assert_dangling_entry(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    assert_rejects_dangling(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 fn assert_waiter_purge<S: Storage>(storage: S) {
@@ -2145,7 +2145,7 @@ fn fjall_attempt_order() {
 /// A status written before attempt identities still reads, and takes one.
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_legacy_status() {
+fn fjall_reads_legacy() {
     let dir = tempfile::tempdir().unwrap();
     let peer = PeerId::hash(b"legacy-status-peer");
     let topic_id = TopicId::hash(b"legacy-status-topic");
@@ -2537,7 +2537,7 @@ fn fjall_upgrade_two() {
 /// schema 2 with nothing half moved, and a future version is refused outright.
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_bad_schema() {
+fn fjall_refuses_schema() {
     use fjall::Readable;
     let dir = tempfile::tempdir().unwrap();
     let peer = PeerId::hash(b"refuse-peer");

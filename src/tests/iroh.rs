@@ -21,7 +21,7 @@ async fn builder_sets_net() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test]
-async fn builder_runtime_config() {
+async fn builder_sets_runtime() {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -120,7 +120,7 @@ async fn resync_unaccepted() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn iroh_async_replication() {
+async fn defaults_async_replication() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -245,7 +245,7 @@ async fn builder_selects_fjall() {
 
 #[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sync_now_ack() {
+async fn sync_now_records() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
         .bind()
