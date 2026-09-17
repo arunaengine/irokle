@@ -348,7 +348,7 @@
       "source": "Reviewed public Rust contract at 6be58d6; public_method"
     },
     {
-      "path": "src/oplog/genesis.rs",
+      "path": "src/oplog/creation.rs",
       "rule": "name_terms",
       "name": "create_topic_genesis_with_event",
       "kind": "function",
