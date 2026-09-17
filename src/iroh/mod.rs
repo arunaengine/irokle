@@ -2607,9 +2607,7 @@ impl<S: Storage> IrohNet<S> {
                     advanced.insert(topic_id);
                     Ok(())
                 }
-                Ok(_) => Err(invalid_data(crate::Error::SyncCapacity(
-                    "sync exchange made no progress".into(),
-                ))),
+                Ok(_) => Err(invalid_data(NoProgress)),
                 Err(error) => Err(error),
             };
             outcomes.insert(topic_id, outcome);
@@ -3852,6 +3850,9 @@ fn exchange_state(result: std::result::Result<(), &io::Error>, advanced: bool) -
         if cause.is::<RemoteFailure>() {
             return ExchangeState::Retryable;
         }
+        if cause.is::<NoProgress>() {
+            return ExchangeState::Blocked;
+        }
         if let Some(cause) = cause.downcast_ref::<crate::Error>() {
             match cause.cause() {
                 crate::Error::SyncCapacity(_)
@@ -3908,6 +3909,11 @@ fn copy_result(result: &io::Result<()>) -> io::Result<()> {
 #[error("peer failed this topic at {0:?}")]
 struct RemoteFailure(crate::sync::SyncFailureCode);
 
+/// The exchange did not move its topic toward the goal; it retries with the normal backoff.
+#[derive(Debug, thiserror::Error)]
+#[error("sync exchange made no progress")]
+struct NoProgress;
+
 fn topic_failed(failure: &crate::sync::SyncFailure) -> io::Error {
     invalid_data(RemoteFailure(failure.code))
 }
@@ -3963,6 +3969,15 @@ mod tests {
             exchange_state(Err(&rejected), false),
             ExchangeState::Rejected
         );
+        let stalled = invalid_data(NoProgress);
+        assert_eq!(stalled.kind(), io::ErrorKind::InvalidData);
+        for error in [&stalled, &clone_error(&stalled)] {
+            assert_eq!(exchange_state(Err(error), false), ExchangeState::Blocked);
+            assert!(matches!(
+                attempt_outcome(Err(error), false),
+                crate::AttemptOutcome::Blocked(text) if text == "sync exchange made no progress"
+            ));
+        }
         let transport = timed_out("no reply");
         assert_eq!(
             exchange_state(Err(&transport), false),
