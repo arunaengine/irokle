@@ -12,7 +12,6 @@ use crate::storage::{
 };
 use crate::{
     ActorId, Error, EvictionKey, Op, OpBody, OpId, PeerId, Result, SignedOp, TopicId, TopicPayload,
-    actor_id_for,
 };
 
 mod admission;
@@ -22,9 +21,7 @@ mod membership;
 mod pending;
 mod topology;
 
-use admission::{checked_next, ensure_event_type, next_actor_position};
 pub(crate) use genesis::is_structural_genesis;
-use membership::{apply_control, materialize_topic_state, merge_states};
 pub(crate) use topology::topological_ids;
 pub(crate) use topology::{subset_in, topological_subset_entries};
 pub use topology::{topological, topological_subset};
@@ -543,144 +540,6 @@ impl<S: Storage> Oplog<S> {
         }
     }
 
-    fn meta_projected<'a>(
-        &self,
-        id: &crate::OpId,
-        overlay_meta: &'a BTreeMap<crate::OpId, OpMeta>,
-    ) -> Result<std::borrow::Cow<'a, OpMeta>> {
-        match overlay_meta.get(id) {
-            Some(meta) => Ok(std::borrow::Cow::Borrowed(meta)),
-            None => self
-                .storage
-                .get_meta(id)?
-                .ok_or(Error::MissingDependency(*id))
-                .map(std::borrow::Cow::Owned),
-        }
-    }
-
-    fn op_projected(
-        &self,
-        id: &crate::OpId,
-        overlay_ops: &BTreeMap<crate::OpId, Op>,
-    ) -> Result<Op> {
-        overlay_ops.get(id).cloned().map(Ok).unwrap_or_else(|| {
-            self.storage
-                .get_op(id)?
-                .ok_or(Error::MissingDependency(*id))
-        })
-    }
-
-    fn validate_op_projected(
-        &self,
-        op: &Op,
-        overlay: &BatchOverlay<'_>,
-        heads: &BTreeSet<crate::OpId>,
-        state: Option<&TopicState>,
-        projections: &mut BTreeMap<OpId, Arc<TopicState>>,
-    ) -> Result<OpAdmission> {
-        let body = &op.signed.body;
-        if body.actor_id != actor_id_for(body.topic_id, body.author) {
-            return Err(Error::ActorAuthorMismatch);
-        }
-        if let Some(prev) = body.actor_prev
-            && !body.deps.contains(&prev)
-        {
-            return Err(Error::ActorPrevMismatch);
-        }
-        if let Some(existing) = self.stored_actor_index(body, overlay.reset)?.or_else(|| {
-            overlay
-                .index
-                .get(&(body.topic_id, body.actor_id, body.actor_seq))
-                .copied()
-        }) {
-            if existing != op.id {
-                return Err(Error::ActorFork);
-            }
-            if self.is_admitted_duplicate(op)? {
-                return Ok(OpAdmission::Duplicate);
-            }
-        }
-        match &body.payload {
-            TopicPayload::Genesis(_) => {
-                if body.actor_seq != 1
-                    || body.actor_prev.is_some()
-                    || !body.deps.is_empty()
-                    || state.is_some()
-                {
-                    return Err(Error::InvalidGenesis);
-                }
-            }
-            TopicPayload::Event(envelope) => {
-                let state = state.ok_or(Error::TopicNotFound)?;
-                ensure_event_type(&state.event_type_id, &envelope.type_id)?;
-                let author_is_member = if body.deps == *heads {
-                    state.members.contains(&body.author)
-                } else {
-                    self.project_membership(
-                        &body.topic_id,
-                        &body.deps,
-                        overlay.ops,
-                        overlay.meta,
-                        projections,
-                    )?
-                    .members
-                    .contains(&body.author)
-                };
-                if !author_is_member {
-                    return Err(Error::NotTopicMember);
-                }
-            }
-            TopicPayload::Control(_) => {
-                let state = state.ok_or(Error::TopicNotFound)?;
-                let author_is_member = if body.deps == *heads {
-                    state.members.contains(&body.author)
-                } else {
-                    self.project_membership(
-                        &body.topic_id,
-                        &body.deps,
-                        overlay.ops,
-                        overlay.meta,
-                        projections,
-                    )?
-                    .members
-                    .contains(&body.author)
-                };
-                if !author_is_member {
-                    return Err(Error::NotTopicMember);
-                }
-            }
-        }
-        let expected = match overlay.tips.get(&(body.topic_id, body.actor_id)).copied() {
-            Some(tip) => Some(tip),
-            None => self.stored_actor_tip(body, overlay.reset)?,
-        };
-        let (expected_seq, expected_prev) = next_actor_position(expected)?;
-        if body.actor_seq != expected_seq {
-            if body.actor_seq < expected_seq && self.is_admitted_duplicate(op)? {
-                return Ok(OpAdmission::Duplicate);
-            }
-            return Err(Error::ActorSeqGap {
-                expected: expected_seq,
-                actual: body.actor_seq,
-            });
-        }
-        if body.actor_prev != expected_prev {
-            return Err(Error::ActorPrevMismatch);
-        }
-        let mut generation = 0;
-        for id in &body.deps {
-            let meta = self.header_projected(id, overlay.meta)?;
-            generation = generation.max(checked_next(meta.generation)?);
-        }
-        if body.generation != generation {
-            return Err(Error::GenerationMismatch {
-                expected: generation,
-                actual: body.generation,
-            });
-        }
-        Ok(OpAdmission::Admit)
-    }
-
     /// Return the stored actor slot, or `None` during reset. Reset clears actor slots
     /// and tips in the same transaction, so validation must ignore the old chain.
     fn stored_actor_index(&self, body: &OpBody, reset: bool) -> Result<Option<OpId>> {
@@ -702,49 +561,5 @@ impl<S: Storage> Oplog<S> {
     /// is a duplicate; half-stored data must remain repairable.
     fn is_admitted_duplicate(&self, op: &Op) -> Result<bool> {
         self.storage.dep_resolvable(&op.id)
-    }
-
-    fn project_membership(
-        &self,
-        topic_id: &TopicId,
-        deps: &BTreeSet<OpId>,
-        overlay_ops: &BTreeMap<OpId, Op>,
-        overlay_meta: &BTreeMap<OpId, OpMeta>,
-        projections: &mut BTreeMap<OpId, Arc<TopicState>>,
-    ) -> Result<Arc<TopicState>> {
-        let mut pending = deps.iter().map(|id| (*id, false)).collect::<Vec<_>>();
-        let mut visiting = BTreeSet::new();
-        while let Some((id, visited)) = pending.pop() {
-            if projections.contains_key(&id) {
-                continue;
-            }
-            let meta = self.meta_projected(&id, overlay_meta)?;
-            if meta.topic_id != *topic_id {
-                return Err(Error::TopicMismatch);
-            }
-            if !visited {
-                if !visiting.insert(id) {
-                    return Err(Error::Storage("cycle in op graph".into()));
-                }
-                pending.push((id, true));
-                pending.extend(meta.deps.iter().map(|dep| (*dep, false)));
-                continue;
-            }
-            let op = self.op_projected(&id, overlay_ops)?;
-            let state = match &op.signed.body.payload {
-                TopicPayload::Genesis(_) => {
-                    Arc::new(materialize_topic_state(vec![op], BTreeSet::new())?)
-                }
-                TopicPayload::Event(_) => merge_states(&meta.deps, projections)?,
-                TopicPayload::Control(control) => {
-                    let mut state = (*merge_states(&meta.deps, projections)?).clone();
-                    apply_control(&mut state, &op, control);
-                    Arc::new(state)
-                }
-            };
-            visiting.remove(&id);
-            projections.insert(id, state);
-        }
-        merge_states(deps, projections)
     }
 }
