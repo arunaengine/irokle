@@ -1172,8 +1172,9 @@ fn stale_dedup_read() {
         .unwrap();
     assert_eq!(accepted.len(), 2);
 
-    // Simulate admission racing dedup: the genesis record is hidden while its actor index is visible.
-    // The second op hides both reads, exercising fork and sequence duplicate paths.
+    // Simulate admission racing dedup: the genesis record is hidden while its
+    // actor index is visible (fork duplicate path). The second op hides both
+    // reads once (sequence duplicate path).
     storage.mid_commit_ops.lock().unwrap().insert(ops[0].id);
     storage.hidden_ops.lock().unwrap().insert(ops[1].id);
     storage.hidden_index.lock().unwrap().insert(ops[1].id);

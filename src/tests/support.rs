@@ -276,9 +276,9 @@ pub(crate) struct AckFault {
     pub(crate) error: Error,
 }
 
-/// Inject stale admission reads and topic-local write failures.
-/// One-shot hidden ops bypass deduplication; permanently hidden bodies model
-/// index visibility before payloads.
+/// Inject stale admission reads, ack faults, and topic-local write failures.
+/// One-shot hidden ops bypass deduplication; permanently hidden bodies model index
+/// visibility before payloads. `ack_fault`/`ack_calls` inject and count ack failures.
 #[derive(Clone)]
 pub(crate) struct StaleReadStorage<S = MemoryStorage> {
     pub(crate) op_reads: Arc<std::sync::atomic::AtomicUsize>,

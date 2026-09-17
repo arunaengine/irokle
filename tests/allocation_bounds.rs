@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! The production clock module in an allocator-instrumented test process.
+//! The production clock, slice, and records modules in an allocator-instrumented test process.
 #![cfg(all(feature = "fjall", target_os = "linux", target_env = "gnu"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
