@@ -51,6 +51,13 @@ class Checks(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(json.loads((self.output / "complete.json").read_text())["status"], "passed")
 
+    def test_terminal_state(self):
+        result, _ = self.run_cases([self.case("one", "print('ok')")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        complete = json.loads((self.output / "complete.json").read_text())["status"]
+        state = json.loads((self.output / "state.json").read_text())
+        self.assertEqual(state["status"], complete)
+
     def test_missing_log(self):
         result, rows = self.run_cases([self.case("missing", "pass", required_logs=["absent.log"])])
         self.assertNotEqual(result.returncode, 0)

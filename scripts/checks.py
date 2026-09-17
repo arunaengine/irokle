@@ -71,6 +71,14 @@ def save(path, value):
         output.write("\n")
 
 
+def replace_json(path, value):
+    temporary = path.parent / f"{path.name}.tmp"
+    with temporary.open("w") as target:
+        json.dump(value, target, indent=2)
+        target.write("\n")
+    os.replace(temporary, path)
+
+
 def validate(cases):
     if not isinstance(cases, list) or not cases:
         raise ValueError("a nonempty check list is required")
@@ -204,6 +212,7 @@ def run(repo, output, cases):
     save(output / "complete.json", {"status": status, "completed": completed,
                                    "expected": len(cases), "signal": interrupted,
                                    "changed_artifacts": changed, "artifacts_sha256": artifacts})
+    replace_json(output / "state.json", {"status": status, "pid": os.getpid()})
     return (128 + interrupted) if interrupted else int(failed)
 
 
