@@ -995,7 +995,8 @@ impl<S: Storage> SyncEngine<S> {
             read,
             &request.topic_id,
             (&captured, &goal, frontier),
-            (&scope, position_limit),
+            // Find more positions than the page names, so it names the deepest.
+            (&scope, self.page_positions),
             rest,
             slice,
         )?;

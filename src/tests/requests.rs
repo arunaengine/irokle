@@ -334,6 +334,33 @@ fn fjall_beyond_windows() {
     });
 }
 
+/// A page that cannot name every unknown ancestor of a chain names the deepest ones, whose
+/// dependents can follow once they are served, not the nearest ones it met first.
+#[test]
+fn names_deepest_positions() {
+    let source = super::progress::reverse_chain(MemoryStorage::new(), 40);
+    let responder = source.engine.clone().with_request_items(3);
+    let reader = Oplog::new();
+    reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+    let summary = responder.summary(source.topic_id).unwrap();
+    let request = SyncEngine::new(reader, source.reader)
+        .with_request_items(3)
+        .plan_request(source.reader, &summary)
+        .unwrap();
+    let budget = PageBudget::from_credit(request.credit);
+    let page = responder
+        .response_page(source.reader, &request, budget)
+        .unwrap();
+    let deepest = oplog::topological(source.log.storage(), &source.topic_id)
+        .unwrap()
+        .into_iter()
+        .filter(|op| matches!(op.signed.body.generation, 1 | 2))
+        .map(|op| op.signed.body.actor_id)
+        .collect::<BTreeSet<_>>();
+    assert!(page.ops.is_empty());
+    assert_eq!(page.positions, deepest);
+}
+
 /// A chain beyond request and knowledge windows is planned in small read slices with one
 /// kept plan and pulled by two readers. A capacity-refused reader retries, another reconnects
 /// midway, and both reach the frontier without sending an op before its dependency.
