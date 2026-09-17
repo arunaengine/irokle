@@ -480,9 +480,7 @@ impl<S: Storage> Oplog<S> {
         }
     }
 
-    /// The batch promoting verified `staged` ops, validated like any admission
-    /// against a fresh topic. `None` until their causally complete part makes
-    /// both `local` and `source` members.
+    /// The stored actor clock of `topic_id`: each actor's admitted position.
     pub fn observed_clock(&self, topic_id: &TopicId) -> Result<crate::ActorClock> {
         self.storage.actor_clock(topic_id)
     }
