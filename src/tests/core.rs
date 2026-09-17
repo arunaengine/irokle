@@ -579,3 +579,34 @@ fn genesis_retry_once() {
     assert_eq!(signer.signs.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(verifications() - before, 2);
 }
+
+/// A commit that lands while a received batch is checked makes it skip ops the
+/// store now holds; the batch retries instead of reporting a false actor gap.
+#[test]
+fn concurrent_commit_retries() {
+    let source = node(64);
+    let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
+    for text in ["one", "two", "three", "four"] {
+        topic.publish(Note { text: text.into() }).unwrap();
+    }
+    let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let receiver = oplog::Oplog::with_storage(storage.clone());
+    receiver.receive_ops(ops[..2].to_vec()).unwrap();
+
+    // The batch pauses at its first read of the fourth op, after the third entered
+    // its overlay, while another receive commits the third and fourth.
+    let writer = oplog::Oplog::with_storage(storage.clone());
+    let (batch, committed) = (ops[2..].to_vec(), ops[2..4].to_vec());
+    let accepted = interleave(
+        &storage,
+        (GatePoint::Meta(ops[3].id), 0),
+        Isolation::Commits,
+        move || receiver.receive_ops(batch),
+        move || {
+            writer.receive_ops(committed).unwrap();
+        },
+    );
+    assert_eq!(accepted.unwrap(), [ops[4].id].into());
+    assert_eq!(storage.heads(&topic.id()).unwrap(), [ops[4].id].into());
+}

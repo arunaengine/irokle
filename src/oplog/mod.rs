@@ -21,7 +21,7 @@ mod membership;
 mod pending;
 mod topology;
 
-use admission::{checked_next, ensure_event_type, heads_after, next_actor_position};
+use admission::{checked_next, ensure_event_type, heads_after, is_local_race, next_actor_position};
 pub(crate) use genesis::is_structural_genesis;
 use membership::{apply_control, materialize_topic_state, merge_states};
 use pending::pending_meta_for;
@@ -540,8 +540,15 @@ impl<S: Storage> Oplog<S> {
             checked.insert(op.id);
         }
         let verified = &checked;
+        let topic_id = ops.first().map(|op| op.signed.body.topic_id);
+        let heads = || {
+            topic_id
+                .map(|topic_id| self.storage.heads(&topic_id))
+                .transpose()
+        };
         for attempt in 0..MAX_ADMISSION_RETRIES {
             conflict_pause(attempt);
+            let before = heads()?;
             if let Some((topic, genesis)) = self.receive_genesis
                 && ops
                     .first()
@@ -568,6 +575,9 @@ impl<S: Storage> Oplog<S> {
             // storage transaction as its admission (`reset_topic_and_admit`).
             match self.admit_ops_batch(source_peer, ops_to_admit, verified, reset, effects) {
                 Err(Error::AdmissionConflict) => continue,
+                // Validation reads the store op by op, so a commit landing meanwhile can
+                // skip ops the store now holds and fake a gap; moved heads retry it.
+                Err(err) if is_local_race(&err) && heads()? != before => continue,
                 Ok(accepted) => return Ok((accepted, eviction)),
                 Err(err) => return Err(err),
             }
