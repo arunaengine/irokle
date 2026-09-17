@@ -100,7 +100,7 @@ def inspect_log(path, case):
     text = path.read_text(errors="replace")
     counts = re.findall(r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.MULTILINE)
     if "tests" in case:
-        matches = re.findall(r"^test (\S+) \.\.\. ok$", text, re.MULTILINE)
+        matches = re.findall(r"^test (\S+) \.\.\. ", text, re.MULTILINE)
         wanted = sorted(case["tests"])
         if sorted(matches) != wanted or counts != [(str(len(wanted)), "0", "0")]:
             return f"exact test cardinality mismatch: expected {wanted}, got {matches}, summaries {counts}"

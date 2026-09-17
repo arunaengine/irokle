@@ -89,6 +89,20 @@ class Checks(unittest.TestCase):
         result, _ = self.run_cases([self.case("extra", code, tests=["tests::wanted"])])
         self.assertNotEqual(result.returncode, 0)
 
+    def test_nocapture_ok(self):
+        code = ("print('test memory_store_bounds ... memory wide=false records=34\\n"
+               "memory wide=true records=34\\nok\\n\\n"
+               "test result: ok. 1 passed; 0 failed; 0 ignored;')")
+        result, _ = self.run_cases([self.case("nocapture", code, tests=["memory_store_bounds"])])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_nocapture_failed(self):
+        code = ("print('test memory_store_bounds ... FAILED\\n\\n"
+               "test result: FAILED. 0 passed; 1 failed; 0 ignored;')")
+        result, rows = self.run_cases([self.case("failed", code, tests=["memory_store_bounds"])])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cardinality", rows[0]["reason"])
+
     def test_killed_child(self):
         code = "import os,signal; os.kill(os.getpid(), signal.SIGKILL)"
         result, rows = self.run_cases([self.case("killed", code)])
