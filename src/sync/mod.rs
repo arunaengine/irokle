@@ -287,14 +287,10 @@ impl<S: Storage> SyncEngine<S> {
     pub fn negotiate(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
         self.oplog.storage().read_snapshot(|read| {
             let knowledge = RequestKnowledge::default();
-            self.negotiate_inner(
-                read,
-                peer_id,
-                remote,
-                SendSet::Closure,
-                &knowledge,
-                &mut false,
-            )
+            let closure = SendSet::Closure;
+            let (plan, _) =
+                self.negotiate_inner(read, peer_id, remote, closure, &knowledge, &mut false)?;
+            Ok(plan)
         })
     }
 
@@ -325,12 +321,14 @@ impl<S: Storage> SyncEngine<S> {
     ) -> Result<(SyncPlan, bool)> {
         let mut more = false;
         let send_set = SendSet::Page(budget);
-        let plan = self.negotiate_inner(read, peer_id, remote, send_set, knowledge, &mut more)?;
+        let (plan, _) =
+            self.negotiate_inner(read, peer_id, remote, send_set, knowledge, &mut more)?;
         Ok((plan, more))
     }
 
     /// Authorization, branch choice and selection all read `read`, so a plan
-    /// never pairs a membership verdict with records of a later commit.
+    /// never pairs a membership verdict with records of a later commit. Also
+    /// returns the local genesis the plan read, if the topic is held.
     fn negotiate_inner(
         &self,
         read: &dyn SnapshotRead,
@@ -339,12 +337,12 @@ impl<S: Storage> SyncEngine<S> {
         send_set: SendSet,
         knowledge: &RequestKnowledge,
         more: &mut bool,
-    ) -> Result<SyncPlan> {
+    ) -> Result<(SyncPlan, Option<OpId>)> {
         // An unknown topic's remote heads are unauthenticated, so they never become
         // `need`. Bootstrap stages pages the inviter pushes or the transport pulls
         // with range hints, which the responder clamps and serves to members only.
         let Some(view) = read.topic_view(&remote.topic_id, None)? else {
-            return Ok(SyncPlan {
+            let plan = SyncPlan {
                 topic_id: remote.topic_id,
                 common: BTreeSet::new(),
                 have: BTreeSet::new(),
@@ -352,10 +350,12 @@ impl<S: Storage> SyncEngine<S> {
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
                 window: ActorWindow::default(),
-            });
+            };
+            return Ok((plan, None));
         };
+        let genesis = Some(view.state.genesis);
         if !view.state.members.contains(&peer_id) {
-            return Ok(SyncPlan {
+            let plan = SyncPlan {
                 topic_id: remote.topic_id,
                 common: BTreeSet::new(),
                 have: view.state.heads,
@@ -363,7 +363,8 @@ impl<S: Storage> SyncEngine<S> {
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
                 window: ActorWindow::default(),
-            });
+            };
+            return Ok((plan, genesis));
         }
         if let Some(remote_type_id) = &remote.event_type_id
             && *remote_type_id != view.state.event_type_id
@@ -397,7 +398,7 @@ impl<S: Storage> SyncEngine<S> {
             if remote_genesis < view.state.genesis {
                 (plan.actor_range_hints, plan.window) =
                     request_ranges(&empty, &remote.actor_clock, self.request_items, knowledge);
-                return Ok(plan);
+                return Ok((plan, genesis));
             }
             plan.send = match send_set {
                 SendSet::Closure => self.missing_closure_in(
@@ -427,13 +428,13 @@ impl<S: Storage> SyncEngine<S> {
                     page.ops
                 }
             };
-            return Ok(plan);
+            return Ok((plan, genesis));
         }
         // A hole moves neither heads nor the clock, so a matching fingerprint
         // does not prove we are whole; keep negotiating until it is repaired.
         let unresolved = self.oplog.holes_in(read, &view)?;
         if unresolved.is_empty() && view.fingerprint == remote.fingerprint {
-            return Ok(SyncPlan {
+            let plan = SyncPlan {
                 topic_id: remote.topic_id,
                 common: local_heads.clone(),
                 have: local_heads,
@@ -441,7 +442,8 @@ impl<S: Storage> SyncEngine<S> {
                 need: BTreeSet::new(),
                 actor_range_hints: Vec::new(),
                 window: ActorWindow::default(),
-            });
+            };
+            return Ok((plan, genesis));
         }
 
         // A page plan needs no walk from the heads: the peer's clock says what
@@ -533,7 +535,7 @@ impl<S: Storage> SyncEngine<S> {
         let items = self.request_items - need.len();
         let (actor_range_hints, window) =
             request_ranges(&view.clock, &remote.actor_clock, items, knowledge);
-        Ok(SyncPlan {
+        let plan = SyncPlan {
             topic_id: remote.topic_id,
             common,
             have: local_heads,
@@ -541,7 +543,8 @@ impl<S: Storage> SyncEngine<S> {
             need,
             actor_range_hints,
             window,
-        })
+        };
+        Ok((plan, genesis))
     }
 
     pub fn find_common_ancestors(&self, remote: &SyncSummary) -> Result<BTreeSet<OpId>> {
@@ -666,11 +669,10 @@ impl<S: Storage> SyncEngine<S> {
         remote: &SyncSummary,
         knowledge: &RequestKnowledge,
     ) -> Result<SyncRequest> {
-        let no_push = PageBudget { ops: 0, bytes: 0 };
-        let (plan, _) = self.negotiate_in(read, peer_id, remote, no_push, knowledge)?;
-        let genesis = read
-            .topic_view(&plan.topic_id, None)?
-            .map(|view| request_genesis(view.state.genesis, remote.genesis));
+        let no_push = SendSet::Page(PageBudget { ops: 0, bytes: 0 });
+        let (plan, genesis) =
+            self.negotiate_inner(read, peer_id, remote, no_push, knowledge, &mut false)?;
+        let genesis = genesis.map(|genesis| request_genesis(genesis, remote.genesis));
         Ok(page_request(plan, genesis))
     }
 
