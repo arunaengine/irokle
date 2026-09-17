@@ -22,10 +22,9 @@ mod membership;
 mod pending;
 mod topology;
 
-use admission::{checked_next, ensure_event_type, is_local_race, next_actor_position};
+use admission::{checked_next, ensure_event_type, next_actor_position};
 pub(crate) use genesis::is_structural_genesis;
 use membership::{apply_control, materialize_topic_state, merge_states};
-use pending::pending_meta_for;
 pub(crate) use topology::topological_ids;
 use topology::topological_ops;
 pub(crate) use topology::{subset_in, topological_subset_entries};
@@ -159,28 +158,6 @@ fn conflict_pause(attempt: usize) {
     let ceiling = 200_u64 << (attempt - 4).min(5);
     let micros = u64::from_le_bytes(jitter) % ceiling;
     std::thread::sleep(std::time::Duration::from_micros(micros));
-}
-
-fn admission_failure(mut admitted: Admitted, error: Error) -> Error {
-    let source = match error {
-        Error::AdmissionCommitted {
-            admitted: partial,
-            source,
-        } => {
-            admitted.accepted.extend(partial.accepted);
-            admitted.evictions.extend(partial.evictions);
-            source
-        }
-        error => Box::new(error),
-    };
-    if admitted.accepted.is_empty() && admitted.evictions.is_empty() {
-        *source
-    } else {
-        Error::AdmissionCommitted {
-            admitted: Box::new(admitted),
-            source,
-        }
-    }
 }
 
 /// Branch and data epoch a whole verdict is recorded under.
@@ -525,81 +502,6 @@ impl<S: Storage> Oplog<S> {
         }
     }
 
-    fn admit_with_retry(
-        &self,
-        source_peer: Option<crate::PeerId>,
-        ops: Vec<Op>,
-        verified: &BTreeSet<crate::OpId>,
-        effects: Option<ReceiveEffects<'_>>,
-    ) -> Result<(BTreeSet<crate::OpId>, Option<TopicEviction>)> {
-        if let Some((topic, genesis)) = self.receive_genesis {
-            for op in ops
-                .iter()
-                .filter(|op| op.signed.body.topic_id == topic && is_structural_genesis(op))
-            {
-                if op.id != genesis {
-                    return Err(Error::StaleIncarnation);
-                }
-            }
-        }
-        let has_genesis = ops.iter().any(is_structural_genesis);
-        // Signatures are immutable, so each is checked once for the whole job
-        // rather than again on every retry.
-        let mut checked = BTreeSet::new();
-        for op in &ops {
-            if !verified.contains(&op.id) {
-                #[cfg(feature = "iroh")]
-                op.validate_frame()?;
-                op.validate()?;
-            }
-            checked.insert(op.id);
-        }
-        let verified = &checked;
-        let topic_id = ops.first().map(|op| op.signed.body.topic_id);
-        let heads = || {
-            topic_id
-                .map(|topic_id| self.storage.heads(&topic_id))
-                .transpose()
-        };
-        for attempt in 0..MAX_ADMISSION_RETRIES {
-            conflict_pause(attempt);
-            let before = heads()?;
-            if let Some((topic, genesis)) = self.receive_genesis
-                && ops
-                    .first()
-                    .is_some_and(|op| op.signed.body.topic_id == topic)
-                && self
-                    .storage
-                    .topic_state(&topic)?
-                    .is_some_and(|state| state.genesis < genesis)
-            {
-                return Err(Error::StaleIncarnation);
-            }
-            let (ops_to_admit, reset, rejected_genesis) = if has_genesis {
-                self.resolve_genesis_collision(ops.clone(), verified)?
-            } else {
-                (ops.clone(), None, None)
-            };
-            let eviction = reset.as_ref().map(|plan| plan.eviction.clone());
-            if let Some(losing) = rejected_genesis {
-                // A losing genesis is never admitted here, so its waiters can never become ready.
-                self.storage.purge_pending_waiters(&losing)?;
-            }
-            // A won foreign genesis discards the local chain: admit the winner
-            // batch against a fresh topic and fold the reset into the same
-            // storage transaction as its admission (`reset_topic_and_admit`).
-            match self.admit_ops_batch(source_peer, ops_to_admit, verified, reset, effects) {
-                Err(Error::AdmissionConflict) => continue,
-                // Validation reads the store op by op, so a commit landing meanwhile can
-                // skip ops the store now holds and fake a gap; moved heads retry it.
-                Err(err) if is_local_race(&err) && heads()? != before => continue,
-                Ok(accepted) => return Ok((accepted, eviction)),
-                Err(err) => return Err(err),
-            }
-        }
-        Err(Error::AdmissionConflict)
-    }
-
     /// Validate `ops` against the stored topic, or against a fresh topic when
     /// `reset`, and build the batch admission would commit, without writing.
     fn build_batch(
@@ -920,107 +822,6 @@ impl<S: Storage> Oplog<S> {
             return Ok(StoredOp::Repair);
         }
         Ok(StoredOp::Absent)
-    }
-
-    fn admit_ops_batch(
-        &self,
-        source_peer: Option<crate::PeerId>,
-        ops: Vec<Op>,
-        verified: &BTreeSet<crate::OpId>,
-        reset_plan: Option<ResetPlan>,
-        receive_effects: Option<ReceiveEffects<'_>>,
-    ) -> Result<BTreeSet<crate::OpId>> {
-        if reset_plan.is_some() {
-            *self.membership_cache()? = MembershipCache::default();
-        }
-        let Some(BuiltBatch {
-            accepted,
-            batch,
-            pending,
-            projection_epoch,
-            projections,
-            projection_tips,
-        }) = self.build_batch(
-            source_peer,
-            ops,
-            verified,
-            reset_plan.is_some(),
-            receive_effects,
-        )?
-        else {
-            return Ok(BTreeSet::new());
-        };
-        let topic_id = batch.topic_id;
-        if let Some(plan) = &reset_plan {
-            // Reset, winner admission, and the record of the discarded payloads
-            // share one storage transaction, so a crash never leaves the topic
-            // empty with the winner uninstalled or the payloads unrecorded.
-            self.storage.reset_topic_and_admit(
-                &topic_id,
-                &plan.expected_state,
-                batch,
-                Some(&plan.eviction),
-            )?;
-            if let Ok(mut cache) = self.membership_cache() {
-                *cache = MembershipCache::default();
-            }
-        } else if !batch.entries.is_empty() {
-            self.storage.put_admitted_batch(batch)?;
-        }
-
-        // Buffer pending ops after admission, so a reset cannot wipe the descendants of a
-        // partial winner batch. A pending op's missing deps are never in `entries`, so
-        // ordering after admission cannot spuriously reject it.
-        for (op, missing_deps) in pending {
-            let source_peer = source_peer.unwrap_or(op.signed.body.author);
-            let buffered = self.storage.put_pending_bound(
-                source_peer,
-                op.clone(),
-                pending_meta_for(&op, missing_deps),
-                self.receive_genesis
-                    .filter(|(topic, _)| *topic == topic_id)
-                    .map(|(_, genesis)| genesis),
-            );
-            // A descendant of a rejected op can never be admitted here.
-            if let Err(Error::RejectedOp(rejected)) = &buffered {
-                tracing::debug!(op_id = %op.id, %rejected, "dropping op behind a rejected op");
-                continue;
-            }
-            buffered.map_err(|error| {
-                admission_failure(
-                    Admitted {
-                        ready_remaining: false,
-                        accepted: accepted.clone(),
-                        evictions: reset_plan
-                            .as_ref()
-                            .map(|plan| plan.eviction.clone())
-                            .into_iter()
-                            .collect(),
-                    },
-                    error,
-                )
-            })?;
-        }
-
-        // A reset or integrity recheck must also invalidate in-flight cache writes.
-        if let Ok(mut cache) = self.membership_cache()
-            && Arc::ptr_eq(&projection_epoch, &cache.epoch)
-        {
-            for id in projection_tips {
-                if let Some(state) = projections.get(&id)
-                    && !cache.states.contains_key(&id)
-                {
-                    if cache.states.len() == MAX_CACHED_PROJECTIONS
-                        && let Some(oldest) = cache.order.pop_front()
-                    {
-                        cache.states.remove(&oldest);
-                    }
-                    cache.states.insert(id, Arc::clone(state));
-                    cache.order.push_back(id);
-                }
-            }
-        }
-        Ok(accepted)
     }
 
     /// The batch promoting verified `staged` ops, validated like any admission
