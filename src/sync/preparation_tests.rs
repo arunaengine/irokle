@@ -150,47 +150,6 @@ fn reopened_capture_reused() {
     );
 }
 
-fn admission_first<S: Storage>(store: S, counters: fn(&S) -> crate::storage::CounterSnapshot) {
-    seed(store.clone());
-    let peer = Ed25519Signer::from_bytes(&[189; 32]).peer_id();
-    for clock in [false, true] {
-        let before = counters(&store);
-        let mut calls = 0;
-        let result = store.read_snapshot(|read| {
-            let mut refuse = |_| {
-                calls += 1;
-                Err(Error::SyncCapacity(
-                    "test preparation admission refused".into(),
-                ))
-            };
-            if clock {
-                read.sync_clock(&topic(false), None, &mut refuse).map(drop)
-            } else {
-                read.sync_identity(&topic(false), &peer, &mut refuse)
-                    .map(drop)
-            }
-        });
-        assert!(matches!(result, Err(Error::SyncCapacity(_))));
-        assert_eq!(calls, 1);
-        assert_eq!(counters(&store).meta_reads, before.meta_reads);
-    }
-}
-
-#[test]
-fn memory_read_admission() {
-    admission_first(MemoryStorage::new(), MemoryStorage::counters);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_read_admission() {
-    let directory = tempfile::tempdir().unwrap();
-    admission_first(
-        crate::FjallStorage::open(directory.path()).unwrap(),
-        crate::FjallStorage::counters,
-    );
-}
-
 fn reset_reauthorizes<S: Storage>(store: S) {
     let signer = Ed25519Signer::from_bytes(&[190; 32]);
     let peer = Ed25519Signer::from_bytes(&[191; 32]).peer_id();
@@ -260,44 +219,4 @@ fn memory_reset_reauthorizes() {
 fn fjall_reset_reauthorizes() {
     let directory = tempfile::tempdir().unwrap();
     reset_reauthorizes(crate::FjallStorage::open(directory.path()).unwrap());
-}
-
-#[test]
-fn unsupported_capture_blocks() {
-    struct Unsupported;
-    impl SnapshotRead for Unsupported {
-        fn topic_view(&self, _: &TopicId, _: Option<&PeerId>) -> Result<Option<TopicView>> {
-            panic!("unbounded topic fallback");
-        }
-        fn get_op(&self, _: &OpId) -> Result<Option<Op>> {
-            panic!("unexpected read");
-        }
-        fn get_meta(&self, _: &OpId) -> Result<Option<crate::storage::OpMeta>> {
-            panic!("unexpected read");
-        }
-        fn dep_resolvable(&self, _: &OpId) -> Result<bool> {
-            panic!("unexpected read");
-        }
-        fn actor_range(
-            &self,
-            _: &TopicId,
-            _: &ActorId,
-            _: u64,
-            _: usize,
-        ) -> Result<Vec<(u64, OpId)>> {
-            panic!("unexpected read");
-        }
-        fn list_op_ids(&self, _: &TopicId) -> Result<BTreeSet<OpId>> {
-            panic!("unexpected read");
-        }
-    }
-    let peer = PeerId::from_bytes([1; 32]);
-    assert!(matches!(
-        Unsupported.sync_identity(&topic(false), &peer, &mut |_| Ok(())),
-        Err(Error::SyncCapacity(_))
-    ));
-    assert!(matches!(
-        Unsupported.sync_clock(&topic(false), None, &mut |_| Ok(())),
-        Err(Error::SyncCapacity(_))
-    ));
 }

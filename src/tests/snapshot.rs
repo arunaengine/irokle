@@ -727,3 +727,86 @@ fn unsupported_dependencies_block() {
     );
     assert!(matches!(result, Err(Error::SyncCapacity(_))));
 }
+
+fn admission_first<S: Storage>(store: S, counters: fn(&S) -> crate::CounterSnapshot) {
+    let source = super::progress::reverse_chain(store.clone(), 4);
+    for clock in [false, true] {
+        let before = counters(&store);
+        let mut calls = 0;
+        let result = store.read_snapshot(|read| {
+            let mut refuse = |_| {
+                calls += 1;
+                Err(Error::SyncCapacity(
+                    "test preparation admission refused".into(),
+                ))
+            };
+            if clock {
+                read.sync_clock(&source.topic_id, None, &mut refuse)
+                    .map(drop)
+            } else {
+                read.sync_identity(&source.topic_id, &source.reader, &mut refuse)
+                    .map(drop)
+            }
+        });
+        assert!(matches!(result, Err(Error::SyncCapacity(_))));
+        assert_eq!(calls, 1);
+        assert_eq!(counters(&store).meta_reads, before.meta_reads);
+    }
+}
+
+#[test]
+fn memory_read_admission() {
+    admission_first(MemoryStorage::new(), MemoryStorage::counters);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_read_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    admission_first(
+        crate::FjallStorage::open(directory.path()).unwrap(),
+        crate::FjallStorage::counters,
+    );
+}
+
+#[test]
+fn unsupported_capture_blocks() {
+    use crate::storage::{SnapshotRead, TopicView};
+    struct Unsupported;
+    impl SnapshotRead for Unsupported {
+        fn topic_view(&self, _: &TopicId, _: Option<&PeerId>) -> crate::Result<Option<TopicView>> {
+            panic!("unbounded topic fallback");
+        }
+        fn get_op(&self, _: &OpId) -> crate::Result<Option<Op>> {
+            panic!("unexpected read");
+        }
+        fn get_meta(&self, _: &OpId) -> crate::Result<Option<crate::storage::OpMeta>> {
+            panic!("unexpected read");
+        }
+        fn dep_resolvable(&self, _: &OpId) -> crate::Result<bool> {
+            panic!("unexpected read");
+        }
+        fn actor_range(
+            &self,
+            _: &TopicId,
+            _: &ActorId,
+            _: u64,
+            _: usize,
+        ) -> crate::Result<Vec<(u64, OpId)>> {
+            panic!("unexpected read");
+        }
+        fn list_op_ids(&self, _: &TopicId) -> crate::Result<BTreeSet<OpId>> {
+            panic!("unexpected read");
+        }
+    }
+    let peer = PeerId::from_bytes([1; 32]);
+    let topic = TopicId::hash(b"capture-bare");
+    assert!(matches!(
+        Unsupported.sync_identity(&topic, &peer, &mut |_| Ok(())),
+        Err(Error::SyncCapacity(_))
+    ));
+    assert!(matches!(
+        Unsupported.sync_clock(&topic, None, &mut |_| Ok(())),
+        Err(Error::SyncCapacity(_))
+    ));
+}
