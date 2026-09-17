@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use crate::storage::{AdmissionEffects, AdmittedBatch, OpMeta, TopicState};
-use crate::{Error, Op, OpId, Result, TopicId, TopicPayload, actor_id_for};
+use crate::{Error, Op, OpBody, OpId, Result, TopicId, TopicPayload, actor_id_for};
 
 use super::membership::{apply_control, materialize_topic_state, merge_states};
 use super::pending::{PendingVerdict, pending_meta_for};
@@ -855,6 +855,86 @@ impl<S: super::Storage> Oplog<S> {
                 .get_op(id)?
                 .ok_or(Error::MissingDependency(*id))
         })
+    }
+
+    pub(super) fn meta_for_projected(
+        &self,
+        op: &Op,
+        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
+    ) -> Result<OpMeta> {
+        let body = &op.signed.body;
+        let mut observed_clock = crate::ActorClock::new();
+        for dep in &body.deps {
+            let (meta, clock) = match overlay_meta.get(dep) {
+                Some(meta) => (
+                    crate::storage::OpHeader::from(meta),
+                    meta.observed_clock.clone(),
+                ),
+                None => self
+                    .storage
+                    .get_observation(dep)?
+                    .ok_or(Error::MissingDependency(*dep))?,
+            };
+            if meta.topic_id != body.topic_id {
+                return Err(Error::TopicMismatch);
+            }
+            observed_clock.merge(&clock);
+            observed_clock.observe(meta.actor_id, meta.actor_seq);
+        }
+        Ok(OpMeta {
+            id: op.id,
+            topic_id: body.topic_id,
+            author: body.author,
+            actor_id: body.actor_id,
+            actor_seq: body.actor_seq,
+            actor_prev: body.actor_prev,
+            deps: body.deps.clone(),
+            generation: body.generation,
+            observed_clock,
+            ready: true,
+            missing_deps: BTreeSet::new(),
+        })
+    }
+
+    pub(super) fn header_projected(
+        &self,
+        id: &OpId,
+        overlay_meta: &BTreeMap<OpId, OpMeta>,
+    ) -> Result<crate::storage::OpHeader> {
+        match overlay_meta.get(id) {
+            Some(meta) => Ok(crate::storage::OpHeader::from(meta)),
+            None => self
+                .storage
+                .get_header(id)?
+                .ok_or(Error::MissingDependency(*id)),
+        }
+    }
+
+    /// Return the stored actor slot, or `None` during reset. Reset clears actor slots
+    /// and tips in the same transaction, so validation must ignore the old chain.
+    pub(super) fn stored_actor_index(&self, body: &OpBody, reset: bool) -> Result<Option<OpId>> {
+        if reset {
+            return Ok(None);
+        }
+        self.storage
+            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)
+    }
+
+    pub(super) fn stored_actor_tip(
+        &self,
+        body: &OpBody,
+        reset: bool,
+    ) -> Result<Option<(u64, OpId)>> {
+        if reset {
+            return Ok(None);
+        }
+        self.storage.actor_tip(&body.topic_id, &body.actor_id)
+    }
+
+    /// Re-read storage after a tip or sequence mismatch. Only a fully stored op
+    /// is a duplicate; half-stored data must remain repairable.
+    pub(super) fn is_admitted_duplicate(&self, op: &Op) -> Result<bool> {
+        self.storage.dep_resolvable(&op.id)
     }
 }
 
