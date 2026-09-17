@@ -532,6 +532,13 @@ fn memory_holes_ordered() {
     assert_holes_ordered(MemoryStorage::new());
 }
 
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_holes_ordered() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_holes_ordered(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
 /// Remote heads past the reads of a negotiation slice hide no work: a head ahead of the local
 /// clock is reached through its actor's range, and a held head that lost its record is a hole
 /// the history scan finds.
@@ -589,13 +596,6 @@ fn memory_heads_reached() {
 fn fjall_heads_reached() {
     let dir = tempfile::tempdir().unwrap();
     assert_heads_reached(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_holes_ordered() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_holes_ordered(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// A request accepted on one genesis is refused as stale once a reset replaced
