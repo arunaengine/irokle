@@ -589,6 +589,7 @@ fn catch_up<S: Storage + PayloadReads>(storage: Counting<S>, len: usize) -> Samp
     let ops = signed_chain(&author, &format!("bench-chain-{len}"), &[reader], len, note);
     let topic_id = ops[0].signed.body.topic_id;
     load(&storage, &ops);
+    fixture("catch_up", &storage, std::iter::once(topic_id));
     let responder = SyncEngine::new(Oplog::with_storage(storage.clone()), author.peer_id());
     let log = Oplog::new();
     log.receive_ops(vec![ops[0].clone()]).unwrap();

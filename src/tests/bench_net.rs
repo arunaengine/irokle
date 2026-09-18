@@ -401,6 +401,9 @@ async fn large_payloads<S: Store>(ops: usize, bytes: usize) -> Run {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measurement, run explicitly"]
 async fn large_payload_pull() {
+    // Fresh keys sign every run's notes, so the parameters identify the fixture.
+    let identity = blake3::hash(b"ops=64 op_bytes=1048576");
+    eprintln!("bench_fixture name=large_payload blake3={identity}");
     for name in [MemoryStorage::NAME, FjallStorage::NAME] {
         let mut runs = Vec::new();
         for _ in 0..REPS {
@@ -698,6 +701,9 @@ async fn held_results(callers: usize, ops: usize) -> Run {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "measurement, run explicitly"]
 async fn retained_results() {
+    // Fresh keys sign every run's notes, so the parameters identify the fixture.
+    let identity = blake3::hash(b"callers=32 cancelled=16 ops=1024 op_bytes=4096");
+    eprintln!("bench_fixture name=held_results blake3={identity}");
     let mut runs = Vec::new();
     for _ in 0..REPS {
         runs.push(held_results(32, 1024).await);
