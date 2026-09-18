@@ -810,8 +810,8 @@ async fn inbound_budget_holds() {
     let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
     let topic_id = shared_topic(&alice, &bob);
     let other = shared_topic(&alice, &bob);
-    let frame = 6 * 1024 * 1024;
-    // Enough data frames to fill bob's data pool, and one slot left for control.
+    // Few frames fill even the raised pool, and one slot is left for control.
+    let frame = 12 * 1024 * 1024;
     let charge = budget::ByteBudget::frame_charge(frame, true);
     let notes = bob_net.budget.capacity(budget::Pool::Data) / charge + 1;
     assert!(notes < MAX_RESYNC_PEERS);
