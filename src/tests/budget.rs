@@ -890,7 +890,7 @@ async fn embedded_input_admitted() {
 /// A served stream refuses a frame past its message cap after it admitted the
 /// pushes before it. Those records stay stored and counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refused_frame_keeps_records() {
+async fn refusal_keeps_records() {
     let lookup = Lookup::new();
     let (alice, net) = client(&lookup, StreamLimits::default()).await;
     let limits = StreamLimits {
