@@ -47,14 +47,22 @@ a work budget finish the scan step by step, each step in its own snapshot, so
 other storage users proceed between steps; an Iroh batch does so in the control
 job that prepares its fingerprints.
 
-A complete verdict is kept per branch and data epoch, holes included, so later
-questions read nothing again. Admission never creates a hole, and appends made
-during a scan do not restart it. When admission receives an operation named as a
-hole, a new one or a copy already stored, and it is resolvable afterwards, it
-leaves the verdict; a verdict without holes is whole. A reset changes the data
-epoch and starts a new scan, `recheck_topics` drops every verdict and scan, and a
-reopened store starts over. Damage written outside Irokle is found only by such a
-new scan. A buffered operation's missing dependency is read fresh from each view.
+A complete verdict is kept per branch and data epoch, holes included. A whole
+verdict needs no further reads: admission never creates a hole, and appends made
+during a scan do not restart it. Kept holes can be filled by any facade of the
+same store, or by a repair a paused step did not see, so every question answered
+from holes checks the next slice of them for presence in its own snapshot, at
+most 65,536 per question, resuming where the last question stopped. A record
+stored on a branch and epoch stays stored there, so any snapshot that shows it
+proves it stored now; the question drops it, and a verdict left without holes is
+whole. A hole an older step found after the repair is dropped the same way on a
+later question. Admission also removes the holes it fills from its own oplog at
+once, only from the branch and epoch that listed them, so a late removal never
+touches a replacement branch. A presence read that fails fails the question and
+changes nothing. A reset changes the data epoch and starts a new scan,
+`recheck_topics` drops every verdict and scan, and a reopened store starts over.
+Damage written outside Irokle is found only by such a new scan. A buffered
+operation's missing dependency is read fresh from each view.
 
 Planning work that grows with a peer's summary is bounded by its frame. Iroh
 decodes each message from one frame of at most 16 MiB, where a head takes 32
