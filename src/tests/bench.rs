@@ -1369,8 +1369,9 @@ fn healthy_during_repair() {
 }
 
 /// A 4096-op topic with one record lost by `damage`: oplog A scans it, and a
-/// separate oplog B repairs the record after A's scan completed, or between two of
-/// A's steps with `overlap`. Timed and counted: A's next complete answer.
+/// separate oplog B repairs the record after A's scan completed, or with `overlap`
+/// after A's first step found the hole and before its last step. Timed and
+/// counted: A's next complete answer.
 fn freshness_round<S: Storage + PayloadReads + Corrupt>(
     storage: Counting<S>,
     damage: Damage,
@@ -1385,7 +1386,7 @@ fn freshness_round<S: Storage + PayloadReads + Corrupt>(
     damage_op(&storage.inner, &lost.id, damage);
     let log = Oplog::with_storage(storage.clone());
     if overlap {
-        log.set_step_reads(1024);
+        log.set_step_reads(6144);
         storage
             .read_snapshot(|read| {
                 let view = read.topic_view(&topic_id, None)?.unwrap();
