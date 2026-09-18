@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::net::frame::MAX_FRAME_LEN;
-use crate::sync::{PageBudget, SyncCredit, SyncMessage};
+use crate::net::frame::{self, MAX_FRAME_LEN};
+use crate::sync::{PageBudget, SyncCredit};
 
 /// Frames up to this size of a kind other than data may use the control
 /// pool, so control exchanges keep flowing while data fills its own pool.
@@ -82,14 +82,15 @@ pub(super) struct JobCount(Arc<ByteBudget>);
 
 impl ByteBudget {
     /// Pools of `data_bytes` for data and results and `session_bytes` for
-    /// sessions. The data pool always fits a largest data frame and half of it a
-    /// largest page, so no single charge can wait forever.
+    /// sessions. They fit the largest legal frame of any kind, a session also its
+    /// message and a reply as large, and half the data pool a largest page.
     pub(super) fn new(data_bytes: usize, session_bytes: usize) -> Arc<Self> {
         let page = PageBudget::from_credit(SyncCredit::default());
-        let least = Self::frame_charge(MAX_FRAME_LEN, true)
+        let least = frame::largest_decode_bound()
             .max(2 * (Self::page_bound(MAX_FRAME_LEN, page.ops) + ENCODE_BYTES));
         let capacity = data_bytes.max(least);
-        let session_capacity = session_bytes.max(Self::held_bound(MAX_FRAME_LEN));
+        let retained = frame::retained_bound(MAX_FRAME_LEN);
+        let session_capacity = session_bytes.max(2 * retained);
         Arc::new(Self {
             data: Arc::new(Semaphore::new(capacity)),
             control: Arc::new(Semaphore::new(CONTROL_POOL_BYTES)),
@@ -107,12 +108,13 @@ impl ByteBudget {
         crate::net::frame_decode_bound(len, if data { DATA_TAG } else { 0 })
     }
 
-    /// Bytes a decoded message of `len` wire bytes and `ops` operations holds.
-    pub(super) fn decoded_bound(len: usize, ops: usize) -> usize {
-        DECODED_FACTOR
-            .saturating_mul(len)
-            .saturating_add(ops.saturating_mul(size_of::<crate::Op>()))
-            .saturating_add(2 * size_of::<SyncMessage>())
+    /// The pool and bytes a served stream charges for an inbound frame of `len`
+    /// wire bytes whose first byte is `tag`. Summaries (2) and receipts (8) use
+    /// the data pool at any size.
+    pub(super) fn inbound(len: usize, tag: u8) -> (Pool, usize) {
+        let data = tag == DATA_TAG;
+        let pool = Self::frame_pool(len, data || tag == 2 || tag == 8);
+        (pool, Self::frame_charge(len, data))
     }
 
     /// Bytes a planned page of `bytes` wire bytes and `ops` operations holds.
@@ -120,11 +122,6 @@ impl ByteBudget {
         DECODED_FACTOR
             .saturating_mul(bytes)
             .saturating_add(ops.saturating_mul(size_of::<crate::Op>()))
-    }
-
-    /// Bytes a retained message of `len` framed wire bytes holds.
-    pub(super) fn held_bound(len: usize) -> usize {
-        Self::decoded_bound(len, 0)
     }
 
     /// Bytes a served reply planning pages for `pages` needs: those pages and
@@ -310,6 +307,7 @@ fn full(pool: Pool) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::SyncMessage;
 
     #[test]
     fn data_tag_matches() {
@@ -341,6 +339,39 @@ mod tests {
         let budget = ByteBudget::new(256 * 1024 * 1024, SESSION_POOL_BYTES);
         assert!(frame <= budget.capacity(Pool::Data));
         assert!(held <= budget.capacity(Pool::Session));
+    }
+
+    /// An idle default budget admits the largest legal frame of every kind on
+    /// the served and the requester side, and a session keeps its message and
+    /// a reply as large.
+    #[test]
+    fn legal_frames_fit() {
+        let limits = super::super::StreamLimits::default();
+        let budget = ByteBudget::new(limits.inbound_bytes, limits.session_bytes);
+        for tag in 0..=u8::MAX {
+            let (served, charge) = ByteBudget::inbound(MAX_FRAME_LEN, tag);
+            let result = ByteBudget::frame_charge(MAX_FRAME_LEN, tag == DATA_TAG);
+            assert_eq!(result, charge);
+            for pool in [served, Pool::Results] {
+                let capacity = budget.capacity(pool);
+                let taken = budget.try_take(pool, charge, OwnedClass::Frames);
+                assert!(taken.is_ok(), "tag {tag}: {charge} of {pool:?} {capacity}");
+            }
+        }
+        let topic_id = crate::TopicId::hash(b"largest");
+        let summary = crate::tests::support::clock_summary(topic_id, None, MAX_FRAME_LEN);
+        let held = crate::net::decoded_message_bound(&summary).unwrap();
+        let capacity = budget.capacity(Pool::Session);
+        let message = budget.try_take(Pool::Session, held, OwnedClass::Session);
+        let reply = budget.try_take(Pool::Session, held, OwnedClass::Session);
+        assert!(
+            message.is_ok() && reply.is_ok(),
+            "{held} twice of {capacity}"
+        );
+        let wire = crate::net::framed_message_len(&summary).unwrap() - 4;
+        assert!(ByteBudget::frame_charge(wire, false) >= held + wire);
+        let data = budget.capacity(Pool::Data);
+        println!("pools data={data} results={data} session={capacity} summary={held}");
     }
 
     #[test]

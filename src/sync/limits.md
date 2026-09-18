@@ -56,6 +56,27 @@ entries, and the filter of actors left out doubles in size at most 20 times up t
 its 1 MiB limit. Page plans share the peer clock rather than copy it. A summary a
 caller builds in process has no such bound.
 
+Every Iroh message kind travels in one frame of at most 16 MiB (16,777,216
+bytes) after a four-byte length prefix. The writer refuses a longer message as
+`InvalidData` before sending it, and the reader refuses a longer prefix before
+charging anything. Before a frame body is read, the frame is charged for its raw
+copy and decoding: four bytes per wire byte plus 2 MiB and the most operations
+for data, 19 bytes per wire byte plus 2 MiB for every other kind. A decoded
+message that a session keeps is charged three bytes per wire byte plus its
+operations or the allocation bound of its clock entries, at most one per 33 bytes.
+
+| Pool | Configured | Raised to at least | Default capacity on 64-bit targets |
+| --- | --- | --- | --- |
+| Data | 256 MiB | The largest frame charge of any kind, and twice a largest page with its encoding buffer | 320,864,800 bytes |
+| Results | 256 MiB | The largest frame charge of any kind | 320,864,800 bytes |
+| Session | 128 MiB | Two largest kept messages: one read and a reply as large | 523,653,184 bytes with `fjall`, 458,577,984 without |
+| Control | 16 MiB | Fixed; frames up to 64 KiB other than data, summaries and receipts | 16 MiB |
+
+Capacities are semaphore permits, not allocated buffers. An idle endpoint admits
+the largest legal frame of every kind in both directions. A stream waits only for
+its first frame; later growth that finds its pool full fails with `OutOfMemory`,
+which is temporary pressure rather than invalid input.
+
 Fjall admits each authorization or clock record against a raw envelope just under
 16 MiB before decoding. Its underlying read can allocate an oversized corrupt
 value before returning its length. The envelope bounds admitted records and

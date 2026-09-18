@@ -981,6 +981,38 @@ pub(crate) fn obligation_covers<S: Storage>(
         })
 }
 
+/// A summary whose actor clock fills a frame of at most `len` payload bytes,
+/// the most clock entries a legal control frame of that size can carry.
+pub(crate) fn clock_summary(
+    topic_id: TopicId,
+    genesis: Option<OpId>,
+    len: usize,
+) -> sync::SyncMessage {
+    let summary = |actor_clock| {
+        sync::SyncMessage::Summary(sync::SyncSummary {
+            topic_id,
+            event_type_id: None,
+            genesis,
+            fingerprint: [0; 32],
+            heads: BTreeSet::new(),
+            actor_clock,
+            actor_tips: Default::default(),
+            staged: None,
+        })
+    };
+    let empty = crate::net::framed_message_len(&summary(ActorClock::new())).unwrap() - 4;
+    // An entry takes an actor id and a one-byte sequence; the count grows to three bytes.
+    let entries = (len - empty - 2) / (ActorId::LEN + 1);
+    let mut bytes = postcard::to_allocvec(&entries).unwrap();
+    for n in 0..entries as u32 {
+        bytes.extend_from_slice(ActorId::hash(n.to_le_bytes()).as_ref());
+        bytes.push(1);
+    }
+    let message = summary(postcard::from_bytes(&bytes).unwrap());
+    assert!(crate::net::framed_message_len(&message).unwrap() - 4 <= len);
+    message
+}
+
 pub(crate) fn node(seed: u8) -> Irokle {
     Irokle::new(NodeConfig {
         signer: Ed25519Signer::from_bytes(&[seed; 32]),

@@ -20,7 +20,7 @@ mod scheduler;
 mod service;
 mod session;
 
-use budget::{ByteBudget, Charge, DATA_TAG, Pool};
+use budget::{ByteBudget, Charge, Pool};
 pub use budget::{OwnedBytes, OwnedClass};
 use exchange::{
     SyncReadLimits, read_frame_body, read_frame_head, read_responses, write_sync_messages,
@@ -50,7 +50,8 @@ const MAX_STREAM_MESSAGES: usize = 4096;
 // reply (which can echo up to two messages per topic) stays under its own cap.
 const MAX_BATCH_MESSAGES: usize = MAX_STREAM_MESSAGES / 2;
 const MAX_STREAM_BYTES: usize = 256 * 1024 * 1024;
-/// Bytes of the data pool, and of the result pool, of a net.
+/// Bytes of the data pool, and of the result pool, of a net. The budget
+/// raises both to fit the largest legal frame, see `src/sync/limits.md`.
 const MAX_INBOUND_BYTES: usize = 256 * 1024 * 1024;
 /// Streams all served connections and embedders may handle at once.
 const MAX_SERVED_STREAMS: usize = 1024;
@@ -3148,9 +3149,7 @@ impl<S: Storage> IrohNet<S> {
             let mut limits = SyncReadLimits::new(self.limits);
             while let Some((len, tag)) = read_frame_head(&mut recv, timeout).await? {
                 let frame_index = limits.observe_frame(len)?;
-                let data = tag == DATA_TAG;
-                let pool = ByteBudget::frame_pool(len, data || tag == 2 || tag == 8);
-                let bytes = ByteBudget::frame_charge(len, data);
+                let (pool, bytes) = ByteBudget::inbound(len, tag);
                 let charge = self.budget.wait(pool, bytes, OwnedClass::Frames).await?;
                 let message = read_frame_body(&mut recv, len, tag, timeout, frame_index).await?;
                 // Messages are handled one job at a time, in stream order. The

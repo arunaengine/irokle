@@ -56,6 +56,26 @@ pub fn frame_decode_bound(bytes: usize, tag: u8) -> usize {
         .saturating_add(2 * size_of::<SyncMessage>())
 }
 
+/// The largest [`frame_decode_bound`] of a legal frame, of any kind up to
+/// [`MAX_FRAME_LEN`]. A pool that fits it can admit every frame a peer may send.
+pub(super) fn largest_decode_bound() -> usize {
+    (0..=u8::MAX)
+        .map(|tag| frame_decode_bound(MAX_FRAME_LEN, tag))
+        .fold(0, usize::max)
+}
+
+/// The largest [`decoded_message_bound`] of a message of `bytes` wire bytes:
+/// every operation a data frame may carry, or a clock entry per 33 bytes.
+pub(super) fn retained_bound(bytes: usize) -> usize {
+    let entries = bytes / (crate::ActorId::LEN + 1);
+    let clocks = crate::ActorClock::allocation_bound(entries);
+    let ops = MAX_SYNC_DATA_OPS_PER_MESSAGE.saturating_mul(size_of::<crate::Op>());
+    bytes
+        .saturating_mul(3)
+        .saturating_add(clocks.max(ops))
+        .saturating_add(2 * size_of::<SyncMessage>())
+}
+
 pub fn encode_sync_message(message: &SyncMessage) -> io::Result<Vec<u8>> {
     postcard::to_allocvec(message).map_err(invalid_data)
 }

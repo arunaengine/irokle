@@ -4,8 +4,9 @@
 use super::scheduler_tests::{Lookup, client, publish, ready_addr, server, shared_topic};
 use super::*;
 use crate::TopicId;
+use crate::net::frame::MAX_FRAME_LEN;
 use crate::sync::{SyncAck, SyncCredit, SyncData, SyncRequest};
-use crate::tests::support::{Gate, GatePoint, StaleReadStorage, genesis_of};
+use crate::tests::support::{Gate, GatePoint, StaleReadStorage, clock_summary, genesis_of};
 
 /// Every pool is back at capacity and no class or job is still counted.
 fn assert_released<S: Storage>(net: &IrohNet<S>) {
@@ -589,4 +590,185 @@ async fn saturated_activation_reopen() {
     assert!(reopened.topic_state(&topic_id).unwrap().is_some());
     assert_eq!(reopened.list_op_ids(&topic_id).unwrap(), expected);
     assert!(reopened.provisional_topics().unwrap().is_empty());
+}
+
+/// An open whose event type pads its frame to exactly `len` payload bytes.
+fn padded_open(node: &Irokle, topic_id: TopicId, len: usize) -> SyncMessage {
+    let mut open = node.sync_open(topic_id);
+    open.event_type_id = Some(String::new());
+    let empty = postcard::experimental::serialized_size(&SyncMessage::Open(open.clone())).unwrap();
+    // The string length grows from one to four varint bytes.
+    open.event_type_id = Some("x".repeat(len - empty - 3));
+    let open = SyncMessage::Open(open);
+    assert_eq!(postcard::experimental::serialized_size(&open).unwrap(), len);
+    open
+}
+
+/// The largest legal control frames reach an idle default responder, one
+/// padded to the wire maximum and one carrying the largest clock. A frame one
+/// byte longer is refused as invalid before anything is charged or sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn largest_frames_served() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let limits = StreamLimits::default();
+    let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
+    let topic_id = shared_topic(&bob, &alice);
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+
+    let open = padded_open(&alice, topic_id, MAX_FRAME_LEN);
+    let replies = net.sync_with(bob_addr.clone(), &[open]).await.unwrap();
+    assert!(replies.iter().any(|reply| matches!(
+        reply,
+        SyncMessage::Summary(summary) if summary.topic_id == topic_id
+    )));
+    drop(replies);
+
+    // The session keeps the whole clock until it replies.
+    let genesis = genesis_of(bob.storage(), &topic_id);
+    let summary = clock_summary(topic_id, genesis, MAX_FRAME_LEN);
+    let held = crate::net::decoded_message_bound(&summary).unwrap() as u64;
+    let messages = [SyncMessage::Open(alice.sync_open(topic_id)), summary];
+    drop(net.sync_with(bob_addr.clone(), &messages).await.unwrap());
+    assert!(bob_net.owned_bytes().peak[&OwnedClass::Session] >= held);
+
+    let open = padded_open(&alice, topic_id, MAX_FRAME_LEN + 1);
+    let error = net
+        .sync_with(bob_addr, &[open])
+        .await
+        .map(drop)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    net.shutdown().await;
+    bob_net.shutdown().await;
+    assert_released(&net);
+    assert_released(&bob_net);
+}
+
+/// A reply of the largest legal control frame is read by an idle default
+/// requester, which keeps it charged until the reply is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn largest_reply_read() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let (_, answering) = client(&lookup, StreamLimits::default()).await;
+    let answering_addr = ready_addr(answering.endpoint()).await;
+    lookup.add_endpoint_info(answering_addr.clone());
+    let topic_id = TopicId::hash(b"largest reply");
+    let reply = clock_summary(topic_id, None, MAX_FRAME_LEN);
+    let answer = tokio::spawn({
+        let endpoint = answering.endpoint().clone();
+        let reply = reply.clone();
+        async move {
+            let connection = endpoint.accept().await.unwrap().await.unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            recv.read_to_end(MAX_FRAME_LEN).await.unwrap();
+            let timeout = Duration::from_secs(120);
+            let limits = StreamLimits::default();
+            write_sync_messages(&mut send, &[reply], timeout, limits, None)
+                .await
+                .unwrap();
+            connection.closed().await;
+        }
+    });
+
+    let open = SyncMessage::Open(alice.sync_open(topic_id));
+    let replies = net.sync_with(answering_addr, &[open]).await.unwrap();
+    assert_eq!(replies.messages(), [reply]);
+    let held = crate::net::decoded_message_bound(&replies.messages()[0]).unwrap();
+    assert_eq!(net.owned_bytes().current[&OwnedClass::Results], held as u64);
+    drop(replies);
+    net.shutdown().await;
+    answer.await.unwrap();
+    answering.shutdown().await;
+    assert_released(&net);
+}
+
+/// Two requesters send the largest frame at once. The responder charges one
+/// at a time, never more than its pool, and serves both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_frames_bounded() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let limits = StreamLimits::default();
+    let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
+    let topic_id = shared_topic(&bob, &alice);
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    let open = padded_open(&alice, topic_id, MAX_FRAME_LEN);
+    let calls = (0..2)
+        .map(|_| {
+            let net = Arc::clone(&net);
+            let addr = bob_addr.clone();
+            let open = open.clone();
+            tokio::spawn(async move { net.sync_with(addr, &[open]).await.map(drop) })
+        })
+        .collect::<Vec<_>>();
+    for call in calls {
+        call.await.unwrap().unwrap();
+    }
+    let peak = bob_net.owned_bytes().peak[&OwnedClass::Frames];
+    let charge = ByteBudget::frame_charge(MAX_FRAME_LEN, false) as u64;
+    assert!(peak >= charge);
+    assert!(peak <= bob_net.budget.capacity(Pool::Data) as u64);
+    net.shutdown().await;
+    bob_net.shutdown().await;
+    assert_released(&net);
+    assert_released(&bob_net);
+}
+
+/// Frames refused while they are read, a body that claims more entries than
+/// it holds and a length above the wire maximum, give back every charged byte,
+/// and the responder goes on serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_frames_released() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let limits = StreamLimits::default();
+    let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    let connection = net
+        .endpoint()
+        .connect(bob_addr.clone(), IROKLE_SYNC_ALPN)
+        .await
+        .unwrap();
+    let malformed = |len: usize| {
+        let mut frame = (len as u32).to_be_bytes().to_vec();
+        // A summary: tag, topic, no event type, no genesis, fingerprint, heads.
+        frame.push(2);
+        frame.extend([7; 32]);
+        frame.extend([0, 0]);
+        frame.extend([0; 32]);
+        frame.extend(postcard::to_allocvec(&(u32::MAX as usize)).unwrap());
+        frame.resize(4 + len, 0);
+        frame
+    };
+    let too_long = (MAX_FRAME_LEN as u32 + 1).to_be_bytes().to_vec();
+    for frame in [malformed(1024 * 1024), malformed(MAX_FRAME_LEN), too_long] {
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        // The responder may stop reading a refused frame before all of it is sent.
+        if send.write_all(&frame).await.is_ok() {
+            let _ = send.finish();
+        }
+        if let Ok(reply) = recv.read_to_end(1024).await {
+            assert!(reply.is_empty());
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while bob_net.served.available_permits() < MAX_SERVED_STREAMS
+            || bob_net.owned_bytes().current.values().sum::<u64>() > 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("refused streams kept their charge");
+    assert_released(&bob_net);
+
+    let topic_id = shared_topic(&alice, &bob);
+    let replies = net.sync_with(bob_addr, &probe(&alice, &[topic_id])).await;
+    assert!(!replies.unwrap().is_empty());
+    net.shutdown().await;
+    bob_net.shutdown().await;
+    assert_released(&net);
+    assert_released(&bob_net);
 }
