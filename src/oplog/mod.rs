@@ -23,6 +23,7 @@ mod pending;
 mod topology;
 
 pub(crate) use genesis::is_structural_genesis;
+use integrity::{Holes, Integrity};
 pub(crate) use topology::topological_ids;
 pub(crate) use topology::{subset_in, topological_subset_entries};
 pub use topology::{topological, topological_subset};
@@ -139,11 +140,6 @@ fn conflict_pause(attempt: usize) {
     std::thread::sleep(std::time::Duration::from_micros(micros));
 }
 
-/// Branch and data epoch a whole verdict is recorded under.
-fn view_key(view: &TopicView) -> (OpId, u64) {
-    (view.state.genesis, view.epoch)
-}
-
 /// Ids a topic's stored records reference without resolving them, with the generation of each
 /// one whose position is stored. Positions and record presence are read, never payloads.
 fn scan_holes_in(read: &dyn SnapshotRead, topic_id: &TopicId) -> Result<integrity::Holes> {
@@ -162,13 +158,18 @@ fn scan_holes_in(read: &dyn SnapshotRead, topic_id: &TopicId) -> Result<integrit
     }
 }
 
+/// Branch and data epoch an integrity verdict is recorded under.
+#[cfg(feature = "iroh")]
+fn view_key(view: &TopicView) -> (OpId, u64) {
+    (view.state.genesis, view.epoch)
+}
+
 #[derive(Clone)]
 pub struct Oplog<S = MemoryStorage> {
     storage: S,
-    // Branch and data epoch each topic was scanned and found whole at. Admission
-    // keeps that invariant, so only a reset or damage from outside irokle can
-    // reintroduce a hole; scanning once per epoch keeps sync off a full scan.
-    whole_topics: Arc<Mutex<BTreeMap<TopicId, (OpId, u64)>>>,
+    // Scans and verdicts per branch and data epoch. Admission never creates a
+    // hole, so only a reset or damage from outside irokle needs a new scan.
+    integrity: Arc<integrity::Inspections>,
     membership_cache: Arc<Mutex<MembershipCache>>,
     receive_genesis: Option<(TopicId, OpId)>,
 }
@@ -189,7 +190,7 @@ impl<S: Storage> Oplog<S> {
     pub fn with_storage(storage: S) -> Self {
         Self {
             storage,
-            whole_topics: Arc::new(Mutex::new(BTreeMap::new())),
+            integrity: Arc::default(),
             membership_cache: Arc::new(Mutex::new(MembershipCache::default())),
             receive_genesis: None,
         }
@@ -209,7 +210,7 @@ impl<S: Storage> Oplog<S> {
     pub(crate) fn sharing_membership<T: Storage>(&self, storage: T) -> Oplog<T> {
         Oplog {
             storage,
-            whole_topics: Arc::new(Mutex::new(BTreeMap::new())),
+            integrity: Arc::default(),
             membership_cache: Arc::clone(&self.membership_cache),
             receive_genesis: self.receive_genesis,
         }
@@ -219,36 +220,38 @@ impl<S: Storage> Oplog<S> {
     ///
     #[doc = include_str!("contracts/topic_unresolved.md")]
     pub fn topic_unresolved(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
-        self.storage
-            .read_snapshot(|read| match read.topic_view(topic_id, None)? {
-                Some(view) => self.unresolved_in(read, &view),
-                None => Ok(scan_holes_in(read, topic_id)?.into_keys().collect()),
-            })
+        let holes = match self.inspect(topic_id)? {
+            Some((view, integrity)) => integrity.unresolved(&view),
+            None => self.stateless_holes(topic_id)?,
+        };
+        Ok(holes.into_keys().collect())
     }
 
-    /// Ids `view`'s topic cannot resolve, scanned in a later snapshot when the
-    /// cache has no verdict. The verdict is recorded only when that snapshot
-    /// still holds the view's branch and epoch.
+    /// Ids `view`'s topic cannot resolve, after its scan completed in later
+    /// snapshots. A reset since `view` scans the new branch or epoch instead.
     #[cfg(feature = "iroh")]
     pub(crate) fn view_unresolved(&self, view: &TopicView) -> Result<BTreeSet<OpId>> {
-        if self.whole_topics()?.get(&view.state.topic_id) == Some(&view_key(view)) {
+        let Some((current, integrity)) = self.inspect(&view.state.topic_id)? else {
             return Ok(view.pending_missing.clone());
+        };
+        let mut unresolved = integrity.unresolved(&current);
+        if view_key(&current) != view_key(view) {
+            unresolved.extend(view.pending_missing.iter().map(|id| (*id, None)));
         }
-        self.storage.read_snapshot(|read| {
-            let current = read.topic_view(&view.state.topic_id, None)?;
-            match current.filter(|current| view_key(current) == view_key(view)) {
-                Some(current) => self.unresolved_in(read, &current),
-                None => {
-                    let mut unresolved = view.pending_missing.clone();
-                    unresolved.extend(scan_holes_in(read, &view.state.topic_id)?.into_keys());
-                    Ok(unresolved)
-                }
-            }
-        })
+        Ok(unresolved.into_keys().collect())
     }
 
-    /// Ids `view`'s topic cannot resolve, where `view` was read from `read`. A
-    /// scan of that same snapshot is recorded as whole under its branch and epoch.
+    /// What is known of `view`'s topic, read from `read`: the verdict, or one
+    /// more bounded step of its scan. `view` must come from `read`.
+    pub(crate) fn integrity_in(
+        &self,
+        read: &dyn SnapshotRead,
+        view: &TopicView,
+    ) -> Result<Integrity> {
+        self.integrity.step(read, view)
+    }
+
+    /// Ids `view`'s topic cannot resolve, where `view` came from `read`.
     pub(crate) fn unresolved_in(
         &self,
         read: &dyn SnapshotRead,
@@ -257,47 +260,98 @@ impl<S: Storage> Oplog<S> {
         Ok(self.holes_in(read, view)?.into_keys().collect())
     }
 
-    /// [`Self::unresolved_in`] with the generation of each id whose position the scan read.
-    pub(crate) fn holes_in(
-        &self,
-        read: &dyn SnapshotRead,
-        view: &TopicView,
-    ) -> Result<BTreeMap<OpId, Option<u64>>> {
-        let topic_id = view.state.topic_id;
-        let mut unresolved = view
-            .pending_missing
-            .iter()
-            .map(|id| (*id, None))
-            .collect::<BTreeMap<_, _>>();
-        if self.whole_topics()?.get(&topic_id) == Some(&view_key(view)) {
-            return Ok(unresolved);
+    /// [`Self::unresolved_in`] with generations; an unfinished scan finishes within `read`.
+    pub(crate) fn holes_in(&self, read: &dyn SnapshotRead, view: &TopicView) -> Result<Holes> {
+        let integrity = self.integrity_in(read, view)?;
+        if integrity.is_complete() {
+            return Ok(integrity.unresolved(view));
         }
-        let holes = scan_holes_in(read, &topic_id)?;
-        if holes.is_empty() {
-            self.whole_topics()?.insert(topic_id, view_key(view));
-        }
-        unresolved.extend(holes);
+        let mut unresolved = Integrity::Unknown.unresolved(view);
+        unresolved.extend(scan_holes_in(read, &view.state.topic_id)?);
         Ok(unresolved)
     }
 
     /// A view of the topic and whether it is whole, both from one snapshot.
     pub(crate) fn whole_view(&self, topic_id: &TopicId) -> Result<Option<(TopicView, bool)>> {
-        self.storage.read_snapshot(|read| {
+        Ok(self.inspect(topic_id)?.map(|(view, integrity)| {
+            let whole = integrity.certifies(&view);
+            (view, whole)
+        }))
+    }
+
+    /// The topic's integrity once its scan is complete, with the view of the
+    /// snapshot that answered. Each step reads its own snapshot.
+    pub(crate) fn inspect(&self, topic_id: &TopicId) -> Result<Option<(TopicView, Integrity)>> {
+        loop {
+            match self.ask(topic_id)? {
+                Some((_, integrity)) if !integrity.is_complete() => {}
+                answer => return Ok(answer),
+            }
+        }
+    }
+
+    /// One integrity question in a fresh snapshot. An unfinished answer returns
+    /// once no step holds the scan, so the next question can step it.
+    fn ask(&self, topic_id: &TopicId) -> Result<Option<(TopicView, Integrity)>> {
+        let answer = self.storage.read_snapshot(|read| {
             let Some(view) = read.topic_view(topic_id, None)? else {
                 return Ok(None);
             };
-            let whole = self.unresolved_in(read, &view)?.is_empty();
-            Ok(Some((view, whole)))
-        })
+            let integrity = self.integrity.step(read, &view)?;
+            Ok(Some((view, integrity)))
+        })?;
+        if answer
+            .as_ref()
+            .is_some_and(|(_, integrity)| !integrity.is_complete())
+        {
+            self.integrity.wait_idle(topic_id)?;
+        }
+        Ok(answer)
     }
 
-    /// Clear the cache of topics known to be whole.
+    /// Holes of a topic without state. There is no branch to keep a verdict
+    /// for, so each call scans what the stored records reference.
+    fn stateless_holes(&self, topic_id: &TopicId) -> Result<Holes> {
+        let mut holes = Holes::new();
+        let mut cursor = integrity::Cursor::default();
+        loop {
+            let step = self.storage.read_snapshot(|read| {
+                integrity::scan_step(read, topic_id, cursor, integrity::STEP_READS)
+            })?;
+            for (id, generation) in step.holes {
+                let known = holes.entry(id).or_insert(generation);
+                *known = known.or(generation);
+            }
+            if step.done {
+                return Ok(holes);
+            }
+            cursor = step.cursor;
+        }
+    }
+
+    /// Clear every integrity verdict and scan, and the membership projections.
     ///
     #[doc = include_str!("contracts/recheck_topics.md")]
     pub fn recheck_topics(&self) -> Result<()> {
-        self.whole_topics()?.clear();
+        self.integrity.clear()?;
         *self.membership_cache()? = MembershipCache::default();
         Ok(())
+    }
+
+    /// Removes the holes of `listed` that are stored now. A resent copy of a
+    /// stored op fills one too, so a hole found by an older snapshot heals.
+    fn fill_holes(&self, listed: Vec<(TopicId, OpId)>) {
+        let mut filled = Vec::new();
+        for (topic_id, id) in listed {
+            match self.storage.dep_resolvable(&id) {
+                Ok(true) => filled.push((topic_id, id)),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%topic_id, %id, %error, "kept a hole unchecked"),
+            }
+        }
+        if let Err(error) = self.integrity.fill(&filled) {
+            tracing::warn!(%error, "kept filled holes in the integrity cache");
+        }
     }
 
     /// Return stored ops unreachable from current heads. Reachability defines
@@ -367,7 +421,6 @@ impl<S: Storage> Oplog<S> {
                 Err(err) => return Err(err),
                 Ok(_) => {}
             }
-            self.whole_topics()?.remove(topic_id);
             tracing::warn!(
                 %topic_id,
                 genesis = %eviction.winning_genesis,
@@ -417,12 +470,6 @@ impl<S: Storage> Oplog<S> {
             state,
             survivors,
         }))
-    }
-
-    fn whole_topics(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<TopicId, (OpId, u64)>>> {
-        self.whole_topics
-            .lock()
-            .map_err(|_| Error::Storage("topic integrity cache lock poisoned".into()))
     }
 
     fn membership_cache(&self) -> Result<std::sync::MutexGuard<'_, MembershipCache>> {

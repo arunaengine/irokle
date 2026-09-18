@@ -245,6 +245,7 @@ impl<S: super::Storage> Oplog<S> {
         if reset_plan.is_some() {
             *self.membership_cache()? = MembershipCache::default();
         }
+        let listed = self.integrity.listed(&ops)?;
         let Some(BuiltBatch {
             accepted,
             batch,
@@ -260,6 +261,7 @@ impl<S: super::Storage> Oplog<S> {
             receive_effects,
         )?
         else {
+            self.fill_holes(listed);
             return Ok(BTreeSet::new());
         };
         let topic_id = batch.topic_id;
@@ -279,6 +281,7 @@ impl<S: super::Storage> Oplog<S> {
         } else if !batch.entries.is_empty() {
             self.storage.put_admitted_batch(batch)?;
         }
+        self.fill_holes(listed);
 
         // Buffer pending ops after admission, so a reset cannot wipe the descendants of a
         // partial winner batch. A pending op's missing deps are never in `entries`, so
