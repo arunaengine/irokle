@@ -186,6 +186,69 @@ fn fjall_warm_cheap() {
     assert_warm_cheap(storage, crate::storage::FjallStorage::counters);
 }
 
+/// A holder's summary, fingerprint, request plan and ack withhold whole-topic
+/// evidence while a record is lost, and give it once a separately built facade over
+/// the same store repairs the record, with no further receive of it by the holder.
+fn assert_evidence_heals<S: Corrupt>(storage: S) {
+    let (holder, source, ops) = whole_topic(&storage, 40);
+    let topic_id = ops[0].signed.body.topic_id;
+    let lost = ops[20].clone();
+    storage.drop_op_record(&lost.id);
+    let remote = source.sync_summary(topic_id).unwrap();
+    let genesis = sync::SyncData {
+        topic_id,
+        ops: vec![ops[0].clone()],
+    };
+    let fingerprint = holder.sync_fingerprint(topic_id).unwrap().fingerprint;
+    assert_ne!(fingerprint, remote.fingerprint);
+    let summary = holder.sync_summary(topic_id).unwrap();
+    assert_ne!(summary.fingerprint, remote.fingerprint);
+    let request = holder.plan_sync_request(source.peer_id(), &remote).unwrap();
+    assert!(request.wants.contains(&lost.id));
+    let (ack, _) = holder
+        .receive_sync_data_from(source.peer_id(), genesis.clone())
+        .unwrap();
+    assert!(ack.heads.is_empty(), "an ack certified an incomplete topic");
+
+    let repairer = Irokle::builder()
+        .with_storage(storage.clone())
+        .with_signer(Ed25519Signer::from_bytes(&[44; 32]))
+        .build()
+        .unwrap();
+    let data = sync::SyncData {
+        topic_id,
+        ops: vec![lost.clone()],
+    };
+    repairer
+        .receive_sync_data_from(source.peer_id(), data)
+        .unwrap();
+    let summary = holder.sync_summary(topic_id).unwrap();
+    assert_eq!(summary.fingerprint, remote.fingerprint);
+    let fingerprint = holder.sync_fingerprint(topic_id).unwrap().fingerprint;
+    assert_eq!(fingerprint, remote.fingerprint);
+    let request = holder.plan_sync_request(source.peer_id(), &remote).unwrap();
+    assert!(
+        !request.wants.contains(&lost.id),
+        "the repaired record is still wanted"
+    );
+    let (ack, _) = holder
+        .receive_sync_data_from(source.peer_id(), genesis)
+        .unwrap();
+    assert_eq!(ack.heads, holder.storage().heads(&topic_id).unwrap());
+}
+
+#[test]
+fn memory_evidence_heals() {
+    assert_evidence_heals(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_evidence_heals() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_evidence_heals(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
 /// An endpoint whose id is the peer id of `Ed25519Signer::from_bytes(&[seed; 32])`.
 #[cfg(feature = "iroh")]
 async fn keyed_endpoint(seed: u8) -> iroh::Endpoint {
