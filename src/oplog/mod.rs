@@ -316,6 +316,11 @@ impl<S: Storage> Oplog<S> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_step_reads(&self, reads: usize) {
+        self.integrity.set_reads(reads);
+    }
+
     /// Return stored ops unreachable from current heads. Reachability defines
     /// the local lineage; replaced-genesis descendants lie outside its frontier.
     fn topic_orphans(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {

@@ -224,6 +224,11 @@ impl Inspections {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_reads(&self, reads: usize) {
+        self.reads.store(reads, Ordering::Relaxed);
+    }
+
     fn topics(&self) -> Result<MutexGuard<'_, BTreeMap<TopicId, Entry>>> {
         self.topics.lock().map_err(|_| poisoned())
     }
