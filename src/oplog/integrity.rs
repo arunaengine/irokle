@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Holes of a topic: ids its stored records reference but cannot resolve. A scan
 //! reads the topic in bounded steps, each in its own snapshot, and resumes where it
-//! stopped. Contract and freshness rules: `src/sync/limits.md`.
+//! stopped; cached holes are checked again on use. Rules: `src/sync/limits.md`.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -24,7 +25,7 @@ pub(crate) enum Integrity {
     Unknown,
     /// A scan is under way and found these holes so far; more may follow.
     Scanning(Holes),
-    /// A complete scan found these holes; admission removes the ones it fills.
+    /// A complete scan found these holes, less those a question has since found stored.
     Incomplete(Holes),
     /// A complete scan found no hole, and admission never creates one.
     Whole,
@@ -85,15 +86,30 @@ pub(crate) struct Step {
     pub(crate) done: bool,
 }
 
+/// Holes found so far, and the last one a question checked again for presence.
+#[derive(Default)]
+struct Found {
+    holes: Holes,
+    checked: Option<OpId>,
+}
+
 enum State {
     Scanning {
         cursor: Cursor,
-        holes: Holes,
+        found: Found,
         /// The claim of the step that reads the topic now, cleared when it ends.
         stepping: Option<u64>,
     },
-    Incomplete(Holes),
+    Incomplete(Found),
     Whole,
+}
+
+/// A hole of a topic as its scan or verdict under one branch and data epoch knew it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Listed {
+    topic_id: TopicId,
+    key: (OpId, u64),
+    pub(crate) id: OpId,
 }
 
 /// A topic's scan or verdict under one branch and data epoch.
@@ -124,8 +140,18 @@ impl Default for Inspections {
 
 impl Inspections {
     /// What is known of `view`'s topic after one step of its scan read from
-    /// `read`, which `view` came from. A scan another step reads now is not read.
+    /// `read`, which `view` came from, and one slice of its cached holes checked
+    /// again there. A scan another step reads now is not read.
     pub(crate) fn step(&self, read: &dyn SnapshotRead, view: &TopicView) -> Result<Integrity> {
+        let integrity = self.advance(read, view)?;
+        if integrity.holes().is_some_and(|holes| !holes.is_empty()) {
+            return self.recheck(read, view);
+        }
+        Ok(integrity)
+    }
+
+    /// One step of the scan, or the verdict when the scan is complete.
+    fn advance(&self, read: &dyn SnapshotRead, view: &TopicView) -> Result<Integrity> {
         let topic_id = view.state.topic_id;
         let key = (view.state.genesis, view.epoch);
         let claim = self.claims.fetch_add(1, Ordering::Relaxed);
@@ -136,23 +162,16 @@ impl Inspections {
                 *entry = Entry::start(key);
             }
             match &mut entry.state {
-                State::Whole => return Ok(Integrity::Whole),
-                State::Incomplete(holes) => return Ok(Integrity::Incomplete(holes.clone())),
                 State::Scanning {
                     cursor,
-                    holes,
-                    stepping: Some(_),
-                } => {
-                    if *cursor == Cursor::default() && holes.is_empty() {
-                        return Ok(Integrity::Unknown);
-                    }
-                    return Ok(Integrity::Scanning(holes.clone()));
-                }
-                State::Scanning {
-                    cursor, stepping, ..
+                    stepping: stepping @ None,
+                    ..
                 } => {
                     *stepping = Some(claim);
                     *cursor
+                }
+                State::Scanning { .. } | State::Incomplete(_) | State::Whole => {
+                    return Ok(entry.answer());
                 }
             }
         };
@@ -164,6 +183,38 @@ impl Inspections {
         };
         let step = scan_step(read, &topic_id, start, self.reads.load(Ordering::Relaxed))?;
         Ok(claim.finish(start, step))
+    }
+
+    /// Checks the next slice of `view`'s cached holes for presence in `read`, at most
+    /// one step's reads, and drops the ones stored. A record stored on a branch and
+    /// epoch stays stored there, so any snapshot that shows it proves it stored now.
+    fn recheck(&self, read: &dyn SnapshotRead, view: &TopicView) -> Result<Integrity> {
+        let topic_id = view.state.topic_id;
+        let key = (view.state.genesis, view.epoch);
+        let reads = self.reads.load(Ordering::Relaxed).max(1);
+        let slice = {
+            let mut topics = self.topics()?;
+            let entry = topics.get_mut(&topic_id).filter(|entry| entry.key == key);
+            match entry.and_then(Entry::found_mut) {
+                Some(found) => found.next(reads),
+                // A reset or recheck replaced the entry after the step answered.
+                None => return Ok(Integrity::Unknown),
+            }
+        };
+        let mut stored = Vec::new();
+        for id in slice {
+            if read.dep_resolvable(&id)? {
+                stored.push(id);
+            }
+        }
+        let mut topics = self.topics()?;
+        let Some(entry) = topics.get_mut(&topic_id).filter(|entry| entry.key == key) else {
+            return Ok(Integrity::Unknown);
+        };
+        for id in &stored {
+            entry.remove(id);
+        }
+        Ok(entry.answer())
     }
 
     /// Waits until no step reads `topic_id`. Steps are bounded, so the cap only
@@ -187,31 +238,37 @@ impl Inspections {
         Ok(())
     }
 
-    /// The ids of `ops` that are holes of their topics now.
+    /// The ids of `ops` that are holes of their topics now, with the branch and
+    /// epoch of the scan or verdict that holds them.
     pub(crate) fn listed<'a>(
         &self,
         ops: impl IntoIterator<Item = &'a crate::Op>,
-    ) -> Result<Vec<(TopicId, OpId)>> {
+    ) -> Result<Vec<Listed>> {
         let topics = self.topics()?;
         Ok(ops
             .into_iter()
-            .map(|op| (op.signed.body.topic_id, op.id))
-            .filter(|(topic_id, id)| {
-                topics
-                    .get(topic_id)
-                    .and_then(Entry::holes)
-                    .is_some_and(|holes| holes.contains_key(id))
+            .filter_map(|op| {
+                let topic_id = op.signed.body.topic_id;
+                let entry = topics.get(&topic_id)?;
+                let listed = Listed {
+                    topic_id,
+                    key: entry.key,
+                    id: op.id,
+                };
+                entry.holes()?.contains_key(&op.id).then_some(listed)
             })
             .collect())
     }
 
-    /// Removes `filled` holes, now stored. Admission never creates a hole, so
-    /// a complete verdict left without one is whole.
-    pub(crate) fn fill(&self, filled: &[(TopicId, OpId)]) -> Result<()> {
+    /// Removes `filled` holes, now stored, from the branch and epoch that listed
+    /// them. Admission never creates a hole, so a complete verdict left without one is whole.
+    pub(crate) fn fill(&self, filled: &[Listed]) -> Result<()> {
         let mut topics = self.topics()?;
-        for (topic_id, id) in filled {
-            if let Some(entry) = topics.get_mut(topic_id) {
-                entry.remove(id);
+        for hole in filled {
+            if let Some(entry) = topics.get_mut(&hole.topic_id)
+                && entry.key == hole.key
+            {
+                entry.remove(&hole.id);
             }
         }
         Ok(())
@@ -240,32 +297,77 @@ impl Entry {
             key,
             state: State::Scanning {
                 cursor: Cursor::default(),
-                holes: Holes::new(),
+                found: Found::default(),
                 stepping: None,
             },
         }
     }
 
+    /// The answer to a question that takes no step.
+    fn answer(&self) -> Integrity {
+        match &self.state {
+            State::Whole => Integrity::Whole,
+            State::Incomplete(found) => Integrity::Incomplete(found.holes.clone()),
+            State::Scanning {
+                cursor,
+                found,
+                stepping,
+            } => {
+                if stepping.is_some() && *cursor == Cursor::default() && found.holes.is_empty() {
+                    return Integrity::Unknown;
+                }
+                Integrity::Scanning(found.holes.clone())
+            }
+        }
+    }
+
+    fn found_mut(&mut self) -> Option<&mut Found> {
+        match &mut self.state {
+            State::Scanning { found, .. } | State::Incomplete(found) => Some(found),
+            State::Whole => None,
+        }
+    }
+
     fn holes(&self) -> Option<&Holes> {
         match &self.state {
-            State::Scanning { holes, .. } | State::Incomplete(holes) => Some(holes),
+            State::Scanning { found, .. } | State::Incomplete(found) => Some(&found.holes),
             State::Whole => None,
         }
     }
 
     fn remove(&mut self, id: &OpId) {
         match &mut self.state {
-            State::Scanning { holes, .. } => {
-                holes.remove(id);
+            State::Scanning { found, .. } => {
+                found.holes.remove(id);
             }
-            State::Incomplete(holes) => {
-                holes.remove(id);
-                if holes.is_empty() {
+            State::Incomplete(found) => {
+                found.holes.remove(id);
+                if found.holes.is_empty() {
                     self.state = State::Whole;
                 }
             }
             State::Whole => {}
         }
+    }
+}
+
+impl Found {
+    /// Up to `reads` cached holes after the last one checked. A shorter slice
+    /// reached the end, so the next question starts from the first hole again.
+    fn next(&mut self, reads: usize) -> Vec<OpId> {
+        let start = self.checked.map_or(Bound::Unbounded, Bound::Excluded);
+        let slice = self
+            .holes
+            .range((start, Bound::Unbounded))
+            .map(|(id, _)| *id)
+            .take(reads)
+            .collect::<Vec<_>>();
+        self.checked = if slice.len() < reads {
+            None
+        } else {
+            slice.last().copied()
+        };
+        slice
     }
 }
 
@@ -292,7 +394,7 @@ impl Claim<'_> {
         };
         let State::Scanning {
             cursor,
-            holes,
+            found,
             stepping,
         } = &mut entry.state
         else {
@@ -303,19 +405,22 @@ impl Claim<'_> {
         }
         *stepping = None;
         *cursor = step.cursor;
+        // A hole found in an older snapshot may be stored now; the question's
+        // recheck of this answer and later ones drop it.
         for (id, generation) in step.holes {
-            let known = holes.entry(id).or_insert(generation);
+            let known = found.holes.entry(id).or_insert(generation);
             *known = known.or(generation);
         }
         if !step.done {
-            return Integrity::Scanning(holes.clone());
+            return Integrity::Scanning(found.holes.clone());
         }
-        let holes = std::mem::take(holes);
-        if holes.is_empty() {
+        let found = std::mem::take(found);
+        if found.holes.is_empty() {
             entry.state = State::Whole;
             return Integrity::Whole;
         }
-        entry.state = State::Incomplete(holes.clone());
+        let holes = found.holes.clone();
+        entry.state = State::Incomplete(found);
         Integrity::Incomplete(holes)
     }
 }

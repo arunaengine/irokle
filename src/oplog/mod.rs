@@ -300,15 +300,15 @@ impl<S: Storage> Oplog<S> {
         Ok(())
     }
 
-    /// Removes the holes of `listed` that are stored now. A resent copy of a
-    /// stored op fills one too, so a hole found by an older snapshot heals.
-    fn fill_holes(&self, listed: Vec<(TopicId, OpId)>) {
+    /// Removes the holes of `listed` that are stored now from this oplog's cache
+    /// at once. Questions check cached holes again anyway, so this is only faster.
+    fn fill_holes(&self, listed: Vec<integrity::Listed>) {
         let mut filled = Vec::new();
-        for (topic_id, id) in listed {
-            match self.storage.dep_resolvable(&id) {
-                Ok(true) => filled.push((topic_id, id)),
+        for hole in listed {
+            match self.storage.dep_resolvable(&hole.id) {
+                Ok(true) => filled.push(hole),
                 Ok(false) => {}
-                Err(error) => tracing::warn!(%topic_id, %id, %error, "kept a hole unchecked"),
+                Err(error) => tracing::warn!(id = %hole.id, %error, "kept a hole unchecked"),
             }
         }
         if let Err(error) = self.integrity.fill(&filled) {

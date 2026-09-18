@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use super::*;
 use crate::MemoryStorage;
-use crate::storage::{CounterSnapshot, Storage};
+use crate::storage::{CounterSnapshot, Storage, TopicState};
 use crate::sync::SyncData;
 use crate::tests::support::{Corrupt, Damage, Irokle, Note, TopicConfig, damage_op, node};
 use crate::{Op, oplog::Oplog};
@@ -87,18 +87,19 @@ fn assert_steps_resume<S: Corrupt>(storage: S, counters: fn(&S) -> CounterSnapsh
     assert!(matches!(ask(&log, &topic_id), Integrity::Incomplete(_)));
     assert_eq!(positions(&storage, counters), again);
 
-    // A repair fills one hole; a copy another handle stored fills the other
-    // once it is received again, without any recheck.
+    // A repair through this oplog fills one hole; a repair another handle
+    // stored is seen by the next question, without receiving it again.
     log.receive_ops(vec![ops[10].clone()]).unwrap();
     let expected = Holes::from([(ops[20].id, None)]);
     assert_eq!(ask(&log, &topic_id), Integrity::Incomplete(expected));
     Oplog::with_storage(storage.clone())
         .receive_ops(vec![ops[20].clone()])
         .unwrap();
-    assert!(matches!(ask(&log, &topic_id), Integrity::Incomplete(_)));
-    log.receive_ops(vec![ops[20].clone()]).unwrap();
     assert_eq!(ask(&log, &topic_id), Integrity::Whole);
     assert!(log.topic_unresolved(&topic_id).unwrap().is_empty());
+    // Receiving the repaired op again changes nothing.
+    log.receive_ops(vec![ops[20].clone()]).unwrap();
+    assert_eq!(ask(&log, &topic_id), Integrity::Whole);
 }
 
 #[test]
@@ -307,15 +308,15 @@ fn saved<S: Storage>(log: &Oplog<S>, topic_id: &TopicId) -> Cursor {
     }
 }
 
-/// Reads of a snapshot that panic at a header read once `left` reads passed.
-#[cfg(feature = "fjall")]
-struct Panicking<'a> {
+/// Reads of a snapshot that panic at a header read once `left` reads passed,
+/// and whose presence checks fail with a storage error when `absent` is set.
+struct Faulty<'a> {
     read: &'a dyn SnapshotRead,
     left: std::cell::Cell<usize>,
+    absent: bool,
 }
 
-#[cfg(feature = "fjall")]
-impl SnapshotRead for Panicking<'_> {
+impl SnapshotRead for Faulty<'_> {
     fn topic_view(
         &self,
         topic_id: &TopicId,
@@ -344,6 +345,9 @@ impl SnapshotRead for Panicking<'_> {
         self.read.dependency_ids(id, cursor, limit)
     }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
+        if self.absent {
+            return Err(Error::Storage("injected presence read failure".into()));
+        }
         self.read.dep_resolvable(id)
     }
     fn actor_range(
@@ -383,7 +387,14 @@ fn panic_releases_claim() {
         log.storage().read_snapshot(|read| {
             let view = read.topic_view(&topic_id, None)?.unwrap();
             let left = std::cell::Cell::new(3);
-            log.integrity_in(&Panicking { read, left }, &view)
+            log.integrity_in(
+                &Faulty {
+                    read,
+                    left,
+                    absent: false,
+                },
+                &view,
+            )
         })
     }));
     assert!(panicked.is_err());
@@ -452,6 +463,8 @@ fn reopen_scans_again() {
 struct Fixed {
     listed: BTreeMap<OpId, Option<(u64, Vec<OpId>)>>,
     stored: BTreeSet<OpId>,
+    /// Presence checks answered.
+    checks: std::cell::Cell<usize>,
 }
 
 impl SnapshotRead for Fixed {
@@ -490,6 +503,7 @@ impl SnapshotRead for Fixed {
         }))
     }
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
+        self.checks.set(self.checks.get() + 1);
         Ok(self.stored.contains(id))
     }
     fn actor_range(
@@ -519,6 +533,7 @@ fn tail_ids_scanned() {
             (last, Some((3, vec![id(10)]))),
         ]),
         stored: BTreeSet::from([first, id(10), id(11)]),
+        checks: Default::default(),
     };
     let topic_id = TopicId::hash(b"fixed");
     let step = scan_step(&fixed, &topic_id, Cursor::default(), 4).unwrap();
@@ -527,4 +542,231 @@ fn tail_ids_scanned() {
     let step = scan_step(&fixed, &topic_id, step.cursor, 4).unwrap();
     assert!(step.done);
     assert_eq!(step.holes, Holes::from([(last, Some(3))]));
+}
+
+/// Facade A finds one lost record; a separately built facade B over a clone of
+/// the store repairs it. A's next question sees the repair, without receiving the
+/// op again or a recheck, and receiving it again later changes nothing.
+fn assert_repair_visible<S: Corrupt>(storage: S, damage: Damage) {
+    let (log, topic_id, ops) = seeded(&storage, 12, 13);
+    let lost = &ops[6];
+    damage_op(&storage, &lost.id, damage);
+    assert_eq!(
+        log.topic_unresolved(&topic_id).unwrap(),
+        BTreeSet::from([lost.id])
+    );
+    Oplog::with_storage(storage.clone())
+        .receive_ops(vec![lost.clone()])
+        .unwrap();
+    assert!(storage.dep_resolvable(&lost.id).unwrap());
+    let unresolved = log.topic_unresolved(&topic_id).unwrap();
+    assert!(unresolved.is_empty(), "A kept {unresolved:?} missing");
+    log.receive_ops(vec![lost.clone()]).unwrap();
+    assert!(log.topic_unresolved(&topic_id).unwrap().is_empty());
+}
+
+#[test]
+fn memory_body_repaired() {
+    assert_repair_visible(MemoryStorage::new(), Damage::Op);
+}
+
+#[test]
+fn memory_meta_repaired() {
+    assert_repair_visible(MemoryStorage::new(), Damage::Meta);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_body_repaired() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+    assert_repair_visible(storage, Damage::Op);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_meta_repaired() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+    assert_repair_visible(storage, Damage::Meta);
+}
+
+/// A one-op scan step pauses in its Fjall snapshot while the repair of `lost`
+/// commits; the released step records `lost` missing, yet the next question is whole.
+/// With `known`, an earlier step published `lost` and the paused one reads its dependent.
+#[cfg(feature = "fjall")]
+fn assert_overlap_healed(known: bool) {
+    use crate::tests::support::{Gate, GatePoint, StaleReadStorage};
+    let dir = tempfile::tempdir().unwrap();
+    let storage = StaleReadStorage::new(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    let (log, topic_id, ops) = seeded(&storage, 40, 41);
+    // A chain op whose dependent sorts after it, so a scan meets it first.
+    let index = (1..40).find(|&i| ops[i].id < ops[i + 1].id).unwrap();
+    let (lost, dependent) = (ops[index].clone(), ops[index + 1].id);
+    storage.inner.drop_op_record(&lost.id);
+    log.set_step_reads(2);
+    let paused = if known { dependent } else { lost.id };
+    let gate = std::sync::Arc::new(Gate::default());
+    let release = gate.releaser();
+    storage.arm_read(GatePoint::Meta(paused), std::sync::Arc::clone(&gate));
+    let scanning = std::thread::spawn({
+        let log = log.clone();
+        move || loop {
+            let integrity = ask(&log, &topic_id);
+            if integrity.is_complete() {
+                return integrity;
+            }
+        }
+    });
+    gate.wait_arrival();
+    let published = log.integrity.topics().unwrap()[&topic_id]
+        .holes()
+        .is_some_and(|holes| holes.contains_key(&lost.id));
+    assert_eq!(published, known, "the lost op was published: {published}");
+    log.receive_ops(vec![lost.clone()]).unwrap();
+    assert!(storage.inner.dep_resolvable(&lost.id).unwrap());
+    drop(release);
+    let finished = scanning.join().unwrap();
+    assert!(finished.is_complete());
+    assert_eq!(ask(&log, &topic_id), Integrity::Whole);
+    assert!(log.topic_unresolved(&topic_id).unwrap().is_empty());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn overlap_unpublished_heals() {
+    assert_overlap_healed(false);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn overlap_known_heals() {
+    assert_overlap_healed(true);
+}
+
+/// A view of the fixed topic under `epoch`.
+fn fixed_view(epoch: u64) -> TopicView {
+    TopicView {
+        state: TopicState {
+            topic_id: TopicId::hash(b"fixed"),
+            event_type_id: "test.note".into(),
+            genesis: OpId::hash(b"fixed genesis"),
+            heads: BTreeSet::new(),
+            members: BTreeSet::new(),
+            replication_policy: Default::default(),
+            membership_controls: Default::default(),
+            replication_policy_control: None,
+        },
+        clock: crate::ActorClock::new(),
+        tips: BTreeMap::new(),
+        fingerprint: [0; 32],
+        epoch,
+        pending_missing: BTreeSet::new(),
+        ack: None,
+        owed: false,
+    }
+}
+
+/// Twenty lost records found by a complete scan, then all stored. Each question
+/// checks at most one step's reads of cached holes, resumes where the last one
+/// stopped, and the questions reach a whole verdict once no hole is left.
+#[test]
+fn rechecks_stay_bounded() {
+    let id = |byte: u8| OpId::from_bytes([byte; 32]);
+    let listed = (1..=20)
+        .map(|byte| (id(byte), Some((1, Vec::new()))))
+        .collect();
+    let lost = Fixed {
+        listed,
+        stored: BTreeSet::new(),
+        checks: Default::default(),
+    };
+    let inspections = Inspections::default();
+    inspections.set_reads(4);
+    let view = fixed_view(1);
+    let mut integrity = Integrity::Unknown;
+    for _ in 0..100 {
+        integrity = inspections.step(&lost, &view).unwrap();
+        if integrity.is_complete() {
+            break;
+        }
+    }
+    assert_eq!(integrity.holes().map(BTreeMap::len), Some(20));
+    let stored = Fixed {
+        stored: lost.listed.keys().copied().collect(),
+        checks: Default::default(),
+        ..lost
+    };
+    let mut questions = 0;
+    while inspections.step(&stored, &view).unwrap() != Integrity::Whole {
+        questions += 1;
+        let checked = stored.checks.replace(0);
+        assert!(checked <= 4, "{checked} presence checks in one question");
+        assert!(questions <= 6, "the rechecks never reached every hole");
+    }
+}
+
+/// A delayed admission callback that listed a hole on the old branch must not
+/// remove the same id from the scan of the branch a reset replaced it with.
+#[test]
+fn delayed_fill_scoped() {
+    let storage = MemoryStorage::new();
+    let (log, topic_id, ops) = seeded(&storage, 12, 13);
+    let lost = &ops[6];
+    damage_op(&storage, &lost.id, Damage::Op);
+    assert!(!log.topic_unresolved(&topic_id).unwrap().is_empty());
+    let listed = log.integrity.listed([lost]).unwrap();
+    storage.reset_topic(&topic_id).unwrap();
+    log.receive_ops(ops.clone()).unwrap();
+    damage_op(&storage, &lost.id, Damage::Op);
+    let hole = BTreeSet::from([lost.id]);
+    assert_eq!(log.topic_unresolved(&topic_id).unwrap(), hole);
+    log.integrity.fill(&listed).unwrap();
+    assert_eq!(log.topic_unresolved(&topic_id).unwrap(), hole);
+}
+
+/// A repair whose write fails leaves the hole reported; the later repair that
+/// does commit, through another oplog, is then seen.
+#[test]
+fn failed_repair_kept() {
+    use crate::tests::support::StaleReadStorage;
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let (log, topic_id, ops) = seeded(&storage, 12, 13);
+    let lost = &ops[6];
+    storage.inner.drop_op_record(&lost.id);
+    let hole = BTreeSet::from([lost.id]);
+    assert_eq!(log.topic_unresolved(&topic_id).unwrap(), hole);
+    storage.failed_ops.lock().unwrap().insert(lost.id);
+    let repair = Oplog::with_storage(storage.clone());
+    assert!(repair.receive_ops(vec![lost.clone()]).is_err());
+    assert_eq!(log.topic_unresolved(&topic_id).unwrap(), hole);
+    storage.failed_ops.lock().unwrap().clear();
+    repair.receive_ops(vec![lost.clone()]).unwrap();
+    assert!(log.topic_unresolved(&topic_id).unwrap().is_empty());
+}
+
+/// A presence check that fails with a storage error fails the question with
+/// that error and changes no cached hole; the next question works.
+#[test]
+fn recheck_error_typed() {
+    let storage = MemoryStorage::new();
+    let (log, topic_id, ops) = seeded(&storage, 12, 13);
+    let lost = &ops[6];
+    damage_op(&storage, &lost.id, Damage::Op);
+    let hole = BTreeSet::from([lost.id]);
+    assert_eq!(log.topic_unresolved(&topic_id).unwrap(), hole);
+    let failed = log.storage().read_snapshot(|read| {
+        let view = read.topic_view(&topic_id, None)?.unwrap();
+        let left = std::cell::Cell::new(usize::MAX);
+        log.integrity_in(
+            &Faulty {
+                read,
+                left,
+                absent: true,
+            },
+            &view,
+        )
+    });
+    assert!(matches!(failed, Err(Error::Storage(_))), "{failed:?}");
+    assert_eq!(log.topic_unresolved(&topic_id).unwrap(), hole);
 }
