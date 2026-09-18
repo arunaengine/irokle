@@ -11,7 +11,7 @@ use crate::sync::SyncMessage;
 use crate::{PeerId, Storage};
 
 use super::budget::{ByteBudget, Charge, OwnedClass, Pool};
-use super::exchange::reply_fits;
+use super::exchange::stream_fits;
 use super::{
     IROKLE_SYNC_ALPN, SharedNet, StreamLimits, invalid_data, may_open_topic, message_topic_id,
     peer_from_endpoint,
@@ -416,7 +416,7 @@ impl SyncSession {
                 responses.push(SyncMessage::Page(result));
             }
         }
-        reply_fits(&responses, limits)?;
+        stream_fits(&responses, limits)?;
         Ok((responses, held))
     }
 

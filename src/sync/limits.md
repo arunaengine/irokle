@@ -77,6 +77,15 @@ the largest legal frame of every kind in both directions. A stream waits only fo
 its first frame; later growth that finds its pool full fails with `OutOfMemory`,
 which is temporary pressure rather than invalid input.
 
+`handle_messages` serves messages an embedder already decoded. Before it handles
+any of them, it checks the limits a served stream reads under: each message sized
+as one frame of at most 16 MiB, four prefix bytes per message toward the stream
+bytes, the stream's message count, and at most 256 operations per data message.
+Refused input fails with `InvalidData` and changes nothing. The caller owns the
+vector and any buffers its messages share; the library charges what it keeps and
+replies. A served stream checks each frame as it arrives, so records admitted
+before a refused frame stay committed and keep their obligations.
+
 Fjall admits each authorization or clock record against a raw envelope just under
 16 MiB before decoding. Its underlying read can allocate an oversized corrupt
 value before returning its length. The envelope bounds admitted records and

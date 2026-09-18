@@ -594,13 +594,18 @@ async fn saturated_activation_reopen() {
 
 /// An open whose event type pads its frame to exactly `len` payload bytes.
 fn padded_open(node: &Irokle, topic_id: TopicId, len: usize) -> SyncMessage {
+    let size = |message: &SyncMessage| postcard::experimental::serialized_size(message).unwrap();
     let mut open = node.sync_open(topic_id);
     open.event_type_id = Some(String::new());
-    let empty = postcard::experimental::serialized_size(&SyncMessage::Open(open.clone())).unwrap();
-    // The string length grows from one to four varint bytes.
-    open.event_type_id = Some("x".repeat(len - empty - 3));
+    // Padding `pad` adds its bytes and replaces the one-byte empty length.
+    let target = len + 1 - size(&SyncMessage::Open(open.clone()));
+    let pad = (1..=5)
+        .map(|varint| target - varint)
+        .find(|pad| postcard::experimental::serialized_size(pad).unwrap() == target - pad)
+        .expect("a padding length");
+    open.event_type_id = Some("x".repeat(pad));
     let open = SyncMessage::Open(open);
-    assert_eq!(postcard::experimental::serialized_size(&open).unwrap(), len);
+    assert_eq!(size(&open), len);
     open
 }
 
@@ -767,6 +772,153 @@ async fn refused_frames_released() {
     let topic_id = shared_topic(&alice, &bob);
     let replies = net.sync_with(bob_addr, &probe(&alice, &[topic_id])).await;
     assert!(!replies.unwrap().is_empty());
+    net.shutdown().await;
+    bob_net.shutdown().await;
+    assert_released(&net);
+    assert_released(&bob_net);
+}
+
+/// An embedder's messages obey the limits a served stream reads under: message
+/// count, total and frame bytes, and data operations. Refused input changes
+/// nothing, however small the reply it would have produced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedded_input_admitted() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let limits = StreamLimits {
+        messages: 8,
+        bytes: 64 * 1024,
+        ..StreamLimits::default()
+    };
+    let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
+    let wide = StreamLimits::default();
+    let (carol, carol_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), wide).await;
+    let alice_id = net.endpoint().id();
+    let topic_id = shared_topic(&alice, &bob);
+    publish(&alice, topic_id, 1, 16);
+    let op = crate::oplog::topological(alice.storage(), &topic_id)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let open = SyncMessage::Open(alice.sync_open(topic_id));
+    let push = SyncMessage::Data(SyncData {
+        topic_id,
+        ops: vec![op.clone()],
+    });
+    let request = SyncMessage::Request(SyncRequest {
+        topic_id,
+        known: BTreeSet::new(),
+        wants: BTreeSet::new(),
+        actor_range_hints: Vec::new(),
+        genesis: genesis_of(alice.storage(), &topic_id),
+        credit: SyncCredit::default(),
+        window: Default::default(),
+    });
+    let refused = |net: &IrohNet, messages: Vec<SyncMessage>, pushed: &crate::Op| {
+        let error = net
+            .handle_messages(alice_id, messages)
+            .map(drop)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(net.node.storage().get_op(&pushed.id).unwrap().is_none());
+        assert_released(net);
+    };
+    // Replacement requests fill the stream while the reply stays one page.
+    let requests = |count: usize| {
+        let mut messages = vec![open.clone(), push.clone()];
+        messages.extend(std::iter::repeat_n(request.clone(), count - 2));
+        messages
+    };
+    // An open padded so the stream frames exactly `total` bytes with the push.
+    let padded = |total: usize| {
+        let open_len = total - framed_len(&push) - 4;
+        vec![padded_open(&alice, topic_id, open_len), push.clone()]
+    };
+    refused(&bob_net, requests(limits.messages + 1), &op);
+    refused(&bob_net, padded(limits.bytes + 1), &op);
+    for messages in [requests(limits.messages), requests(limits.messages - 1)] {
+        // The open's summary, the push's ack and one page result.
+        let replies = bob_net.handle_messages(alice_id, messages).unwrap();
+        assert_eq!(replies.len(), 3);
+        drop(replies);
+        assert!(bob.storage().get_op(&op.id).unwrap().is_some());
+    }
+    for total in [limits.bytes, limits.bytes - 1] {
+        drop(bob_net.handle_messages(alice_id, padded(total)).unwrap());
+    }
+    assert_released(&bob_net);
+
+    // Default limits: one frame above the wire maximum, and one more data
+    // operation than a frame may carry, after a push that must not land.
+    let wide_topic = shared_topic(&alice, &carol);
+    publish(&alice, wide_topic, MAX_DATA_OPS + 1, 8);
+    let ops = crate::oplog::topological(alice.storage(), &wide_topic).unwrap();
+    let wide_open = SyncMessage::Open(alice.sync_open(wide_topic));
+    let too_long = padded_open(&alice, wide_topic, MAX_FRAME_LEN + 1);
+    refused(&carol_net, vec![too_long], &ops[1]);
+    let messages = vec![
+        wide_open.clone(),
+        SyncMessage::Data(SyncData {
+            topic_id: wide_topic,
+            ops: ops[1..2].to_vec(),
+        }),
+        SyncMessage::Data(SyncData {
+            topic_id: wide_topic,
+            ops: ops[1..].to_vec(),
+        }),
+    ];
+    refused(&carol_net, messages, &ops[1]);
+
+    // The largest legal frames of step one are served.
+    let largest = padded_open(&alice, wide_topic, MAX_FRAME_LEN);
+    assert!(
+        !carol_net
+            .handle_messages(alice_id, vec![largest])
+            .unwrap()
+            .is_empty()
+    );
+    let genesis = genesis_of(carol.storage(), &wide_topic);
+    let summary = clock_summary(wide_topic, genesis, MAX_FRAME_LEN);
+    let replies = carol_net.handle_messages(alice_id, vec![wide_open, summary]);
+    assert!(!replies.unwrap().is_empty());
+    for net in [&net, &bob_net, &carol_net] {
+        net.shutdown().await;
+        assert_released(net);
+    }
+}
+
+/// A served stream refuses a frame past its message cap after it admitted the
+/// pushes before it. Those records stay stored and counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_frame_keeps_records() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let limits = StreamLimits {
+        messages: 3,
+        ..StreamLimits::default()
+    };
+    let (bob, bob_net) = server(MemoryStorage::new(), &lookup, alice.peer_id(), limits).await;
+    let topic_id = shared_topic(&alice, &bob);
+    publish(&alice, topic_id, 3, 16);
+    let ops = crate::oplog::topological(alice.storage(), &topic_id).unwrap();
+    let mut messages = vec![SyncMessage::Open(alice.sync_open(topic_id))];
+    messages.extend(ops[1..].iter().map(|op| {
+        SyncMessage::Data(SyncData {
+            topic_id,
+            ops: vec![op.clone()],
+        })
+    }));
+    assert_eq!(messages.len(), limits.messages + 1);
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    let replies = net.sync_with(bob_addr, &messages).await;
+    assert!(replies.is_err() || replies.unwrap().is_empty());
+
+    let stored = bob.storage().list_op_ids(&topic_id).unwrap();
+    assert!(ops[..3].iter().all(|op| stored.contains(&op.id)));
+    assert!(!stored.contains(&ops[3].id));
+    let actor = crate::actor_id_for(topic_id, alice.peer_id());
+    assert_eq!(bob.storage().actor_clock(&topic_id).unwrap().get(&actor), 3);
+    assert!(bob.topic_unresolved(topic_id).unwrap().is_empty());
     net.shutdown().await;
     bob_net.shutdown().await;
     assert_released(&net);

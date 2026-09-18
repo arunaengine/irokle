@@ -3234,7 +3234,7 @@ impl<S: Storage> IrohNet<S> {
             }
             drop(permit);
             let held = session.charge.take();
-            exchange::reply_fits(&responses, self.limits)?;
+            exchange::stream_fits(&responses, self.limits)?;
             // Retained messages stay charged until the reply carrying them is out.
             let budget = grant.is_none().then_some(&self.budget);
             write_sync_messages(&mut send, &responses, timeout, self.limits, budget).await?;
@@ -3247,9 +3247,9 @@ impl<S: Storage> IrohNet<S> {
 }
 
 impl<S: Storage> SharedNet<S> {
-    /// Serve the messages of one stream an embedder read. It is admitted and
-    /// charged like a served stream, but never waits: a full slot or pool fails
-    /// the call. The reply stays charged until it is dropped.
+    /// Serve the messages of one stream an embedder read. They must fit the limits a
+    /// served stream reads under, checked before any is handled. Admission and charges
+    /// match a served stream, but a full slot or pool fails the call instead of waiting.
     pub fn handle_messages(
         &self,
         peer: iroh::EndpointId,
@@ -3259,6 +3259,7 @@ impl<S: Storage> SharedNet<S> {
         let _served = Arc::clone(&self.served).try_acquire_owned().map_err(|_| {
             io::Error::new(io::ErrorKind::WouldBlock, "served sync streams are full")
         })?;
+        exchange::stream_fits(&messages, self.limits)?;
         let mut session = SyncSession::new(peer);
         for message in messages {
             session.handle(self, message)?;

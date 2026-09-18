@@ -6,18 +6,19 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::net::frame::MAX_FRAME_LEN;
+use crate::net::frame::{MAX_FRAME_LEN, MAX_SYNC_DATA_OPS_PER_MESSAGE as MAX_DATA_OPS};
 use crate::net::{decode_sync_message, encode_sync_message, framed_message_len};
 use crate::sync::SyncMessage;
 
 use super::budget::{ByteBudget, Charge, DATA_TAG, OwnedClass, Pool};
 use super::{StreamLimits, invalid_data, other, timed_out};
 
-/// Refuses a reply the stream writer would refuse, before any of it is queued.
-pub(super) fn reply_fits(messages: &[SyncMessage], stream_limits: StreamLimits) -> io::Result<()> {
+/// Refuses messages a stream would refuse in either direction: a reply before
+/// any of it is written, or an embedder's input before any of it is handled.
+pub(super) fn stream_fits(messages: &[SyncMessage], stream_limits: StreamLimits) -> io::Result<()> {
     let mut limits = SyncReadLimits::new(stream_limits);
     for message in messages {
-        limits.observe_frame(framed_message_len(message)? - 4)?;
+        limits.observe_message(message)?;
     }
     Ok(())
 }
@@ -37,7 +38,13 @@ impl SyncReadLimits {
         }
     }
 
+    /// Counts a frame of `frame_len` payload bytes, and its four-byte prefix
+    /// toward the stream bytes. Refuses a frame above the wire maximum, and a
+    /// stream past its message count or bytes. Returns the frame's index.
     pub(super) fn observe_frame(&mut self, frame_len: usize) -> io::Result<usize> {
+        if frame_len > MAX_FRAME_LEN {
+            return Err(invalid_data("sync frame exceeds maximum length"));
+        }
         if self.messages >= self.limits.messages {
             return Err(invalid_data("sync stream has too many messages"));
         }
@@ -51,6 +58,18 @@ impl SyncReadLimits {
         let frame_index = self.messages;
         self.messages += 1;
         Ok(frame_index)
+    }
+
+    /// [`Self::observe_frame`] for a message sized as the writer frames it,
+    /// which may also carry no more data operations than a decoded frame.
+    pub(super) fn observe_message(&mut self, message: &SyncMessage) -> io::Result<usize> {
+        if let SyncMessage::Data(data) = message
+            && data.ops.len() > MAX_DATA_OPS
+        {
+            return Err(invalid_data("sync data exceeds maximum operation count"));
+        }
+        let len = postcard::experimental::serialized_size(message).map_err(invalid_data)?;
+        self.observe_frame(len)
     }
 }
 
@@ -206,7 +225,7 @@ pub(super) async fn write_sync_messages(
     stream_limits: StreamLimits,
     budget: Option<&Arc<ByteBudget>>,
 ) -> io::Result<()> {
-    reply_fits(messages, stream_limits)?;
+    stream_fits(messages, stream_limits)?;
     for message in messages {
         let _encoding = match budget {
             Some(budget) => {
@@ -264,12 +283,6 @@ pub(super) async fn read_frame_head(
     }
 
     let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "sync frame exceeds maximum length",
-        ));
-    }
     if len == 0 {
         return Err(invalid_data("empty sync message frame"));
     }
