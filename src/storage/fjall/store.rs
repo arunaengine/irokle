@@ -2938,6 +2938,30 @@ impl SnapshotRead for FjallSnapshot<'_> {
         }
         FjallStorage::read_topic_ids(&self.tx, &self.store.records, topic_id)
     }
+    fn topic_ids_after(
+        &self,
+        topic_id: &TopicId,
+        after: Option<&OpId>,
+        limit: usize,
+    ) -> Result<Vec<OpId>> {
+        use std::ops::Bound::{Excluded, Included};
+        if !self.shown(topic_id)? {
+            return Ok(Vec::new());
+        }
+        let prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
+        let start = match after {
+            Some(after) => Excluded([prefix.as_slice(), after.as_ref()].concat()),
+            None => Included(prefix.clone()),
+        };
+        let end = Included([prefix.as_slice(), &[u8::MAX; OpId::LEN]].concat());
+        let mut ids = Vec::new();
+        for item in fjall::Readable::range(&self.tx, &self.store.records, (start, end)).take(limit)
+        {
+            let (key, _) = item.into_inner()?;
+            ids.push(FjallStorage::id_from_key(key.as_ref(), prefix.len())?);
+        }
+        Ok(ids)
+    }
 }
 
 fn clear_satisfied_tx(

@@ -1073,6 +1073,19 @@ impl SnapshotRead for MemorySnapshot<'_> {
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         Ok(topic_ids_locked(self.inner, topic_id))
     }
+    fn topic_ids_after(
+        &self,
+        topic_id: &TopicId,
+        after: Option<&OpId>,
+        limit: usize,
+    ) -> Result<Vec<OpId>> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let Some(ids) = self.inner.topic_ops.get(topic_id) else {
+            return Ok(Vec::new());
+        };
+        let start = after.map_or(Unbounded, |after| Excluded(*after));
+        Ok(ids.range((start, Unbounded)).take(limit).copied().collect())
+    }
 }
 
 fn actor_range_locked(

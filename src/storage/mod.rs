@@ -132,6 +132,19 @@ pub trait SnapshotRead {
         limit: usize,
     ) -> Result<Vec<(u64, OpId)>>;
     fn list_op_ids(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
+    /// At most `limit` ids of [`Self::list_op_ids`] after `after`, in id order. Backends
+    /// override it to read one range; integrity scans list topics through it in steps.
+    fn topic_ids_after(
+        &self,
+        topic_id: &TopicId,
+        after: Option<&OpId>,
+        limit: usize,
+    ) -> Result<Vec<OpId>> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let start = after.map_or(Unbounded, |after| Excluded(*after));
+        let ids = self.list_op_ids(topic_id)?;
+        Ok(ids.range((start, Unbounded)).take(limit).copied().collect())
+    }
 }
 
 pub trait Storage: Clone + Send + Sync + 'static {
