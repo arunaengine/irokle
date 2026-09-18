@@ -502,6 +502,12 @@ impl<S: Storage> Irokle<S> {
         self.oplog.view_unresolved(view)
     }
 
+    /// The same node reading at most `reads` ids and edges per integrity scan step.
+    #[cfg(all(test, feature = "iroh"))]
+    pub(crate) fn set_step_reads(&self, reads: usize) {
+        self.oplog.set_step_reads(reads);
+    }
+
     /// Audit stored records again on the next integrity question instead of
     /// trusting the earlier verdict. Admission keeps topics whole, so this only
     /// matters for damage that happened outside irokle.

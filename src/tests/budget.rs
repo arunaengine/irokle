@@ -924,3 +924,63 @@ async fn refusal_keeps_records() {
     assert_released(&net);
     assert_released(&bob_net);
 }
+
+/// A requester cancelled while the responder's integrity step is paused inside
+/// a storage read: the step's job still ends, shutdown waits for it, and its
+/// claim ends with it, so the scan completes afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_scan_released() {
+    let lookup = Lookup::new();
+    let (alice, net) = client(&lookup, StreamLimits::default()).await;
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let limits = StreamLimits::default();
+    let (bob, bob_net) = server(storage.clone(), &lookup, alice.peer_id(), limits).await;
+    let topic_id = shared_topic(&alice, &bob);
+    publish(&alice, topic_id, 40, 16);
+    let ops = crate::oplog::topological(alice.storage(), &topic_id).unwrap();
+    crate::oplog::Oplog::with_storage(storage.clone())
+        .receive_ops(ops.clone())
+        .unwrap();
+    // Bob found the topic whole at its genesis; appends keep that verdict.
+    bob.recheck_topics().unwrap();
+    bob.set_step_reads(8);
+    let first = ops.iter().map(|op| op.id).min().unwrap();
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    storage.arm_read(GatePoint::Meta(first), Arc::clone(&gate));
+    let messages = probe(&alice, &[topic_id]);
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    let asking = tokio::spawn({
+        let net = Arc::clone(&net);
+        async move { net.sync_with(bob_addr, &messages).await.map(drop) }
+    });
+    let arrival = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || arrival.wait_arrival())
+        .await
+        .unwrap();
+    assert!(gate.arrived());
+    asking.abort();
+    assert!(asking.await.unwrap_err().is_cancelled());
+    let outcome = bob_net
+        .shutdown_with_timeout(Duration::from_millis(200))
+        .await;
+    assert!(
+        matches!(outcome, ShutdownOutcome::Incomplete { .. }),
+        "{outcome:?}"
+    );
+
+    drop(release);
+    assert_eq!(
+        bob_net.shutdown_with_timeout(Duration::from_secs(60)).await,
+        ShutdownOutcome::Complete
+    );
+    let unresolved = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || bob.topic_unresolved(topic_id)),
+    )
+    .await
+    .expect("the released scan never completed");
+    assert!(unresolved.unwrap().unwrap().is_empty());
+    assert_released(&bob_net);
+    net.shutdown().await;
+}
