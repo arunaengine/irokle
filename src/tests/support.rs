@@ -983,6 +983,7 @@ pub(crate) fn obligation_covers<S: Storage>(
 
 /// A summary whose actor clock fills a frame of at most `len` payload bytes,
 /// the most clock entries a legal control frame of that size can carry.
+#[cfg(feature = "iroh")]
 pub(crate) fn clock_summary(
     topic_id: TopicId,
     genesis: Option<OpId>,

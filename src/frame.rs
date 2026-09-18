@@ -58,6 +58,7 @@ pub fn frame_decode_bound(bytes: usize, tag: u8) -> usize {
 
 /// The largest [`frame_decode_bound`] of a legal frame, of any kind up to
 /// [`MAX_FRAME_LEN`]. A pool that fits it can admit every frame a peer may send.
+#[cfg(feature = "iroh")]
 pub(super) fn largest_decode_bound() -> usize {
     (0..=u8::MAX)
         .map(|tag| frame_decode_bound(MAX_FRAME_LEN, tag))
@@ -66,6 +67,7 @@ pub(super) fn largest_decode_bound() -> usize {
 
 /// The largest [`decoded_message_bound`] of a message of `bytes` wire bytes:
 /// every operation a data frame may carry, or a clock entry per 33 bytes.
+#[cfg(feature = "iroh")]
 pub(super) fn retained_bound(bytes: usize) -> usize {
     let entries = bytes / (crate::ActorId::LEN + 1);
     let clocks = crate::ActorClock::allocation_bound(entries);
