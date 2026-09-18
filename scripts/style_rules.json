@@ -632,6 +632,7 @@
     "src/tests",
     "src/iroh/session_tests.rs",
     "src/iroh/exchange_tests.rs",
+    "src/oplog/integrity_tests.rs",
     "src/storage/pressure_tests.rs",
     "src/sync/tests.rs",
     "src/sync/repair_tests.rs"

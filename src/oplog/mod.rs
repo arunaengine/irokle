@@ -17,6 +17,7 @@ use crate::{
 mod admission;
 mod creation;
 mod genesis;
+mod integrity;
 mod membership;
 mod pending;
 mod topology;
@@ -144,27 +145,21 @@ fn view_key(view: &TopicView) -> (OpId, u64) {
 }
 
 /// Ids a topic's stored records reference without resolving them, with the generation of each
-/// one whose position is stored.
-fn scan_holes_in(
-    read: &dyn SnapshotRead,
-    topic_id: &TopicId,
-) -> Result<BTreeMap<OpId, Option<u64>>> {
-    let mut holes = BTreeMap::new();
-    for id in read.list_op_ids(topic_id)? {
-        let Some(meta) = read.get_position(&id)? else {
-            holes.insert(id, None);
-            continue;
-        };
-        if read.get_op(&id)?.is_none() {
-            holes.insert(id, Some(meta.generation));
+/// one whose position is stored. Positions and record presence are read, never payloads.
+fn scan_holes_in(read: &dyn SnapshotRead, topic_id: &TopicId) -> Result<integrity::Holes> {
+    let mut holes = integrity::Holes::new();
+    let mut cursor = integrity::Cursor::default();
+    loop {
+        let step = integrity::scan_step(read, topic_id, cursor, integrity::STEP_READS)?;
+        for (id, generation) in step.holes {
+            let known = holes.entry(id).or_insert(generation);
+            *known = known.or(generation);
         }
-        for dep in &meta.deps {
-            if !read.dep_resolvable(dep)? {
-                holes.entry(*dep).or_insert(None);
-            }
+        if step.done {
+            return Ok(holes);
         }
+        cursor = step.cursor;
     }
-    Ok(holes)
 }
 
 #[derive(Clone)]
