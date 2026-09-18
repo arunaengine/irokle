@@ -1240,3 +1240,129 @@ fn repair_forward() {
         bounded_backends(true, informed);
     }
 }
+
+/// Rounds of summary, fingerprint and request plan per repeated measurement.
+const INTEGRITY_ROUNDS: u64 = 8;
+
+/// A 16384-op topic with one record lost, as its holder answers for it: the
+/// first fingerprint, rounds on the unchanged store, then the repair of the
+/// record with the next fingerprint.
+fn integrity_round<S: Storage + PayloadReads + Corrupt>(storage: Counting<S>) -> [Sample; 3] {
+    let (author, reader) = (signer(11), signer(12));
+    let ops = signed_chain(&author, "bench-integrity", &[reader.peer_id()], 16384, note);
+    let topic_id = ops[0].signed.body.topic_id;
+    load(&storage, &ops);
+    fixture("integrity", &storage, std::iter::once(topic_id));
+    let lost = ops[8192].clone();
+    storage.inner.drop_op_record(&lost.id);
+    let log = Oplog::with_storage(storage.clone());
+    let engine = SyncEngine::new(log.clone(), author.peer_id());
+    let peer = Oplog::new();
+    load(peer.storage(), &ops);
+    let remote = SyncEngine::new(peer, reader.peer_id())
+        .summary(topic_id)
+        .unwrap();
+    let measure = |work: &dyn Fn()| {
+        let before = storage.snapshot();
+        let started = Instant::now();
+        work();
+        let ms = millis(started);
+        Sample {
+            ms,
+            counters: read_delta(before, storage.snapshot()),
+        }
+    };
+    let cold = measure(&|| {
+        engine.fingerprint(topic_id).unwrap();
+    });
+    let repeated = measure(&|| {
+        for _ in 0..INTEGRITY_ROUNDS {
+            engine.summary(topic_id).unwrap();
+            engine.fingerprint(topic_id).unwrap();
+            let request = engine.plan_request(reader.peer_id(), &remote).unwrap();
+            assert!(request.wants.contains(&lost.id));
+        }
+    });
+    let healed = measure(&|| {
+        log.receive_ops(vec![lost.clone()]).unwrap();
+        let fingerprint = engine.fingerprint(topic_id).unwrap();
+        assert_eq!(fingerprint.fingerprint, remote.fingerprint);
+    });
+    [cold, repeated, healed]
+}
+
+#[test]
+#[ignore = "measurement, run explicitly"]
+fn integrity_costs() {
+    let params = format!("history=16384 lost=1 rounds={INTEGRITY_ROUNDS}");
+    let run = |backend: &str, samples: Vec<[Sample; 3]>| {
+        let mut parts: [Vec<Sample>; 3] = Default::default();
+        for sample in samples {
+            for (part, value) in parts.iter_mut().zip(sample) {
+                part.push(value);
+            }
+        }
+        let [cold, repeated, healed] = parts;
+        let params = format!("backend={backend} {params}");
+        report("integrity_cold", &params, cold);
+        report("integrity_repeat", &params, repeated);
+        report("integrity_heal", &params, healed);
+    };
+    let memory = (0..REPS)
+        .map(|_| integrity_round(Counting::new(MemoryStorage::new())))
+        .collect();
+    run("memory", memory);
+    let fjall = (0..REPS)
+        .map(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = FjallStorage::open_with_persist_mode(dir.path(), persist_mode()).unwrap();
+            integrity_round(Counting::new(storage))
+        })
+        .collect();
+    run("fjall", fjall);
+}
+
+/// Admitting 256 ops one by one into a healthy topic while another thread keeps
+/// asking for the fingerprint of a damaged 16384-op topic in the same store.
+fn healthy_service<S: Storage + PayloadReads + Corrupt>(storage: Counting<S>) -> Sample {
+    let (author, reader) = (signer(13), signer(14).peer_id());
+    let damaged = signed_chain(&author, "bench-damaged", &[reader], 16384, note);
+    let healthy = signed_chain(&author, "bench-healthy", &[reader], 256, note);
+    let damaged_id = damaged[0].signed.body.topic_id;
+    load(&storage, &damaged);
+    load(&storage, &healthy[..1]);
+    fixture("healthy_service", &storage, std::iter::once(damaged_id));
+    storage.inner.drop_op_record(&damaged[8192].id);
+    let log = Oplog::with_storage(storage.clone());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let asking = thread::spawn({
+        let (log, stop) = (log.clone(), Arc::clone(&stop));
+        move || {
+            let engine = SyncEngine::new(log, author.peer_id());
+            let mut answers = 0_u64;
+            while !stop.load(Ordering::Relaxed) {
+                engine.fingerprint(damaged_id).unwrap();
+                answers += 1;
+            }
+            answers
+        }
+    });
+    let before = storage.snapshot();
+    let started = Instant::now();
+    for op in &healthy[1..] {
+        log.receive_ops(vec![op.clone()]).unwrap();
+    }
+    let ms = millis(started);
+    stop.store(true, Ordering::Relaxed);
+    let answers = asking.join().unwrap();
+    let mut counters = vec![("fingerprints", answers)];
+    counters.extend(read_delta(before, storage.snapshot()));
+    Sample { ms, counters }
+}
+
+#[test]
+#[ignore = "measurement, run explicitly"]
+fn healthy_during_repair() {
+    let params = "damaged=16384 lost=1 healthy_ops=256";
+    each_backend("healthy_service", params, healthy_service, healthy_service);
+}

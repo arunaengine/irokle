@@ -1001,3 +1001,145 @@ async fn held_item_cost() {
         held_sample(rep, ops, bytes).await;
     }
 }
+
+/// Payload bytes of the control frames the frame workload sends: near the wire
+/// maximum, and the largest a pool of 256 MiB admits for a non-data frame.
+const CONTROL_FRAME: usize = 13 * 1024 * 1024;
+/// Messages of the embedded stream, the default stream message limit.
+const EMBEDDED_MESSAGES: usize = 4096;
+
+/// An open whose event type pads its frame to about `len` payload bytes.
+fn padded_open(node: &Irokle, topic_id: TopicId, len: usize) -> crate::sync::SyncMessage {
+    let mut open = node.sync_open(topic_id);
+    open.event_type_id = Some("x".repeat(len - 128));
+    crate::sync::SyncMessage::Open(open)
+}
+
+/// A summary of `topic_id` whose clock fills about `len` payload bytes.
+fn clock_frame(topic_id: TopicId, len: usize) -> crate::sync::SyncMessage {
+    let entries = len / (ActorId::LEN + 1) - 8;
+    let mut bytes = postcard::to_allocvec(&entries).unwrap();
+    for n in 0..entries as u32 {
+        bytes.extend_from_slice(ActorId::hash(n.to_le_bytes()).as_ref());
+        bytes.push(1);
+    }
+    crate::sync::SyncMessage::Summary(crate::sync::SyncSummary {
+        topic_id,
+        event_type_id: None,
+        genesis: None,
+        fingerprint: [0; 32],
+        heads: BTreeSet::new(),
+        actor_clock: postcard::from_bytes(&bytes).unwrap(),
+        actor_tips: Default::default(),
+        staged: None,
+    })
+}
+
+/// One control frame near the wire maximum each way between default nodes,
+/// then one embedded stream of many small same-topic requests with a small reply.
+async fn control_frames(rep: u8) -> [Run; 3] {
+    let lookup = MemoryLookup::new();
+    let key = |seed: u8| Some(iroh::SecretKey::from_bytes(&[seed; 32]));
+    let alice_endpoint = bind(&lookup, key(70 + 3 * rep), None).await;
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .build()
+        .unwrap();
+    let alice_net =
+        net::IrohNet::new_with_config(alice_endpoint, alice.clone(), runtime()).unwrap();
+    let bob_endpoint = bind(&lookup, key(71 + 3 * rep), None).await;
+    let bob = Irokle::builder()
+        .with_iroh_secret_key(bob_endpoint.secret_key())
+        .with_peer_whitelist([alice.peer_id()])
+        .build()
+        .unwrap();
+    let bob_net =
+        Arc::new(net::IrohNet::new_with_config(bob_endpoint, bob.clone(), runtime()).unwrap());
+    bob_net.start_accept_loop().unwrap();
+    let bob_addr = ready_addr(bob_net.endpoint()).await;
+    let config = TopicConfig {
+        initial_peers: [alice.peer_id()].into(),
+        ..TopicConfig::default()
+    };
+    let topic_id = bob.create_topic::<Note>(config).unwrap().id();
+    let ops = bob.storage().list_ops(&topic_id).unwrap();
+    let data = SyncData { topic_id, ops };
+    alice.receive_sync_data_from(bob.peer_id(), data).unwrap();
+    let frame = [("frame_bytes", CONTROL_FRAME as u64)];
+
+    let open = padded_open(&alice, topic_id, CONTROL_FRAME);
+    let started = Instant::now();
+    let replies = alice_net.sync_with(bob_addr.clone(), &[open]).await;
+    let ms = millis(started);
+    let done = replies.is_ok_and(|replies| !replies.is_empty());
+    let served = Run {
+        ms,
+        done,
+        values: frame.to_vec(),
+    };
+
+    let answering = bind(&lookup, key(72 + 3 * rep), None).await;
+    let answering_addr = ready_addr(&answering).await;
+    let reply = clock_frame(topic_id, CONTROL_FRAME);
+    let bytes =
+        crate::net::encode_frame(&crate::net::encode_sync_message(&reply).unwrap()).unwrap();
+    let answer = tokio::spawn(async move {
+        let connection = answering.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+        recv.read_to_end(1 << 20).await.unwrap();
+        send.write_all(&bytes).await.unwrap();
+        send.finish().unwrap();
+        connection.closed().await;
+        answering.close().await;
+    });
+    let open = crate::sync::SyncMessage::Open(alice.sync_open(topic_id));
+    let started = Instant::now();
+    let replies = alice_net.sync_with(answering_addr, &[open]).await;
+    let ms = millis(started);
+    let done = replies.is_ok_and(|replies| replies.len() == 1);
+    let read = Run {
+        ms,
+        done,
+        values: frame.to_vec(),
+    };
+
+    let mut messages = full_request(&alice, bob.peer_id(), topic_id);
+    let request = messages.pop().unwrap();
+    messages.extend(std::iter::repeat_n(request, EMBEDDED_MESSAGES - 1));
+    let alice_id = alice_net.endpoint().id();
+    let started = Instant::now();
+    let replies = bob_net.handle_messages(alice_id, messages).unwrap().len();
+    let ms = millis(started);
+    let values = vec![
+        ("messages", EMBEDDED_MESSAGES as u64),
+        ("replies", replies as u64),
+    ];
+    let embedded = Run {
+        ms,
+        done: replies <= 3,
+        values,
+    };
+
+    alice_net.shutdown().await;
+    bob_net.shutdown().await;
+    answer.await.unwrap();
+    [served, read, embedded]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement, run explicitly"]
+async fn frame_admission() {
+    let params = format!("backend=memory frame_bytes={CONTROL_FRAME} messages={EMBEDDED_MESSAGES}");
+    let identity = blake3::hash(params.as_bytes());
+    eprintln!("bench_fixture name=frame_admission blake3={identity}");
+    let mut parts: [Vec<Run>; 3] = Default::default();
+    for rep in 0..REPS as u8 {
+        for (part, run) in parts.iter_mut().zip(control_frames(rep).await) {
+            part.push(run);
+        }
+    }
+    let [served, read, embedded] = parts;
+    report("frame_served", &params, served);
+    report("frame_read", &params, read);
+    report("embedded_small", &params, embedded);
+}
