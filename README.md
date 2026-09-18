@@ -69,7 +69,9 @@ fn main() -> irokle::Result<()> {
 
 This example uses the transport-neutral sync API directly. Iroh examples can use `sync_now(peer_id, topic_id)` instead.
 
-`plan_sync_data` and `negotiate_sync` export the whole missing closure in one call; they are for small histories and tests, not bounded sync. A custom transport pages instead: `plan_sync_request` builds a request that walks no history and names the branch it plans on, and `Irokle::response_page` serves one causal page within the request's credit, reporting whether the goal holds more. `plan_sync_response_data` returns the same page without that flag. A request planned on another genesis is refused with `Error::StaleIncarnation`. Iroh uses these same planners.
+`plan_sync_data` and `negotiate_sync` export the whole missing closure in one call; they are for small histories and tests, not bounded sync. A custom transport pages instead: `plan_sync_request` builds a request from indexed actor positions and names the branch it plans on, and `Irokle::response_page` serves one causal page within the request's credit, reporting whether the goal holds more. `plan_sync_response_data` returns the same page without that flag. A request planned on another genesis is refused with `Error::StaleIncarnation`. Iroh uses these same planners.
+
+Steady planning walks no history. Integrity inspection is separate: a topic is only certified after a scan found no referenced id it cannot resolve, and that scan reads every stored position once per branch and data epoch, and again after `recheck_topics`. It runs in steps of at most 65,536 listed ids and dependency edges, each in its own snapshot, decodes no payload, and keeps its place between steps. A planner inside one snapshot advances an unfinished scan by one step and treats the topic as not yet whole; `sync_summary`, `sync_fingerprint` and `topic_unresolved` finish the scan first. A complete verdict is kept, including its holes, so later questions read nothing again. See [page admission and progress](src/sync/limits.md) for its freshness rules.
 
 Bob does not hold the topic before the first receive. Data for an unknown topic is staged first and becomes visible only when its history makes both Bob and the sender members, as it does here. See "Joining A Topic" below.
 
@@ -83,7 +85,7 @@ When a node receives a topic for the first time, it can discover it through `lis
 
 ## Joining A Topic
 
-Data for a topic that a node does not hold yet is not admitted right away. It is staged per sender and topic, apart from every topic query. Once the staged history contains the genesis and makes both the receiving node and the sender members, the whole history is admitted in one storage transaction. Before that, the node has no topic state, no history and sends no acknowledgement.
+Data for a topic that a node does not hold yet is not admitted right away. It is staged per sender and topic, apart from every topic query. Once the staged history contains the genesis and makes both the receiving node and the sender members, the whole history becomes visible at once. `MemoryStorage` installs it under one lock. `FjallStorage` copies it into hidden records in bounded transactions of at most 4,096 records each, then publishes the topic in one transaction; the full history is not written in one transaction. Before publication, the node has no topic state, no history and sends no acknowledgement.
 
 - `Irokle::receive_sync_outcome` returns `ReceiveOutcome::Acked { ack, evictions }` or `ReceiveOutcome::Staged(staged)`. `StagedTopic` reports the staged clock and the staged op and byte counts. It is a receipt, not an acknowledgement.
 - `receive_sync_data_from` and `receive_sync_data_from_evicting` keep their signatures and return `Error::BootstrapPending { staged }` while data stays staged.
@@ -207,6 +209,7 @@ A `SyncObligation` names the work one peer still owes for one topic. Its `target
 - `sync_obligation_count` counts obligation records without decoding them where the backend can.
 - `next_attempt_epoch` durably advances the attempt epoch.
 - `read_snapshot` runs one closure over one lock or read transaction. `SnapshotRead::get_position` reads where an op sits without its observed clock; a backend overrides it to leave that clock undecoded.
+- Integrity scans list a topic through `SnapshotRead::topic_ids_after` and read edges through `SnapshotRead::dependency_ids`. The default listing reads the whole topic on every step, so a backend overrides it to read one range; bounded dependency reads are required, as for page planning.
 - Provisional namespaces hold staged history apart from every topic query. `open_provisional` registers one per sender and topic. `provisional_store` returns a store that checks, on every read and in the transaction of every write, that its session is still registered and, for writes, not activating. `provisional_topics` lists each namespace with its `revision` and the `bytes` it holds, `touch_provisional` records a write time, and `discard_provisional` ends a namespace only while it is exactly as observed.
 - `activate_provisional` claims the topic's one activation for the session, which refuses another session's claim, and freezes the namespace at the expected state. Nothing of the history is visible to a read until one transaction installs the topic, its forwarding work and ends every namespace of the topic. An interrupted activation resumes when called again.
 

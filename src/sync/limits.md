@@ -31,20 +31,30 @@ Larger output credit does not increase traversal or workspace allowances.
 A negotiation plans its push page and its request in one slice. Remote heads it
 has no reads left to check stay unchecked, which hides no work: a head ahead of
 the local clock is reached through actor ranges, and one at or behind it is held,
-a hole the history scan finds, or a fork no page admits. Wants are ordered by the
-generations the hole scan read, and a want without a stored position is unknown.
+a hole the integrity scan finds, or a fork no page admits. Wants are ordered by the
+generations the integrity scan read, and a want without a stored position is unknown.
 
-The hole scan reads a topic's whole history and is not sliced. It lists every
-operation id the topic stores, reads each one's position and full record, and
-checks each dependency edge, so its reads and memory grow with stored history.
-Admission never creates a hole, so an oplog that found a topic whole does not
-scan it again on the same branch and data epoch. While a topic has a hole, each
-summary, fingerprint, request plan and negotiation of it scans again: until
-repair fills the hole, and without end if no peer holds it. Slicing the scan
-needs a ranged topic listing in `SnapshotRead` and a fingerprint for partly
-scanned topics, both public contract changes. Services therefore assume damaged
-topics are rare and accept one history scan per planning call while a topic has a
-hole.
+A topic is certified only after an integrity scan found every stored record and
+dependency edge resolvable. The scan lists the topic in id order and reads each
+position, the presence of its record and each dependency edge, but decodes no
+payload. One step reads at most 65,536 listed ids and edges in its own snapshot
+and saves where it stopped, inside an operation's dependencies if needed, so the
+next step resumes there. One step at a time may read a topic; its claim ends with
+the step, including by error or panic. A planner inside a held snapshot takes at
+most one step and plans an unfinished topic as not whole: it requests the holes
+found so far, and its digest differs from the whole fingerprint. Facades without
+a work budget finish the scan step by step, each step in its own snapshot, so
+other storage users proceed between steps; an Iroh batch does so in the control
+job that prepares its fingerprints.
+
+A complete verdict is kept per branch and data epoch, holes included, so later
+questions read nothing again. Admission never creates a hole, and appends made
+during a scan do not restart it. When admission receives an operation named as a
+hole, a new one or a copy already stored, and it is resolvable afterwards, it
+leaves the verdict; a verdict without holes is whole. A reset changes the data
+epoch and starts a new scan, `recheck_topics` drops every verdict and scan, and a
+reopened store starts over. Damage written outside Irokle is found only by such a
+new scan. A buffered operation's missing dependency is read fresh from each view.
 
 Planning work that grows with a peer's summary is bounded by its frame. Iroh
 decodes each message from one frame of at most 16 MiB, where a head takes 32
