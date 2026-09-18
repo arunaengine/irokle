@@ -1367,3 +1367,56 @@ fn healthy_during_repair() {
     let params = "damaged=16384 lost=1 healthy_ops=256";
     each_backend("healthy_service", params, healthy_service, healthy_service);
 }
+
+/// A 4096-op topic with one record lost by `damage`: oplog A scans it, and a
+/// separate oplog B repairs the record after A's scan completed, or between two of
+/// A's steps with `overlap`. Timed and counted: A's next complete answer.
+fn freshness_round<S: Storage + PayloadReads + Corrupt>(
+    storage: Counting<S>,
+    damage: Damage,
+    overlap: bool,
+) -> Sample {
+    let (author, reader) = (signer(15), signer(16).peer_id());
+    let ops = signed_chain(&author, "bench-freshness", &[reader], 4096, note);
+    let topic_id = ops[0].signed.body.topic_id;
+    load(&storage, &ops);
+    fixture("freshness", &storage, std::iter::once(topic_id));
+    let lost = ops[2048].clone();
+    damage_op(&storage.inner, &lost.id, damage);
+    let log = Oplog::with_storage(storage.clone());
+    if overlap {
+        log.set_step_reads(1024);
+        storage
+            .read_snapshot(|read| {
+                let view = read.topic_view(&topic_id, None)?.unwrap();
+                log.integrity_in(read, &view)
+            })
+            .unwrap();
+    } else {
+        assert!(!log.topic_unresolved(&topic_id).unwrap().is_empty());
+    }
+    Oplog::with_storage(storage.clone())
+        .receive_ops(vec![lost])
+        .unwrap();
+    let before = storage.snapshot();
+    let started = Instant::now();
+    let unresolved = log.topic_unresolved(&topic_id).unwrap();
+    let ms = millis(started);
+    let mut counters = vec![("healed", u64::from(unresolved.is_empty()))];
+    counters.extend(read_delta(before, storage.snapshot()));
+    Sample { ms, counters }
+}
+
+#[test]
+#[ignore = "measurement, run explicitly"]
+fn freshness_costs() {
+    for (damage, lost) in [(Damage::Op, "body"), (Damage::Meta, "meta")] {
+        let params = format!("history=4096 lost={lost}");
+        for (overlap, name) in [(false, "freshness_cross"), (true, "freshness_overlap")] {
+            let round = |storage| freshness_round(storage, damage, overlap);
+            each_backend(name, &params, round, |storage| {
+                freshness_round(storage, damage, overlap)
+            });
+        }
+    }
+}
