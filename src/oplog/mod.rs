@@ -23,7 +23,7 @@ mod pending;
 mod topology;
 
 pub(crate) use genesis::is_structural_genesis;
-use integrity::{Holes, Integrity};
+pub(crate) use integrity::{Holes, Integrity};
 pub(crate) use topology::topological_ids;
 pub(crate) use topology::{subset_in, topological_subset_entries};
 pub use topology::{topological, topological_subset};
@@ -140,24 +140,6 @@ fn conflict_pause(attempt: usize) {
     std::thread::sleep(std::time::Duration::from_micros(micros));
 }
 
-/// Ids a topic's stored records reference without resolving them, with the generation of each
-/// one whose position is stored. Positions and record presence are read, never payloads.
-fn scan_holes_in(read: &dyn SnapshotRead, topic_id: &TopicId) -> Result<integrity::Holes> {
-    let mut holes = integrity::Holes::new();
-    let mut cursor = integrity::Cursor::default();
-    loop {
-        let step = integrity::scan_step(read, topic_id, cursor, integrity::STEP_READS)?;
-        for (id, generation) in step.holes {
-            let known = holes.entry(id).or_insert(generation);
-            *known = known.or(generation);
-        }
-        if step.done {
-            return Ok(holes);
-        }
-        cursor = step.cursor;
-    }
-}
-
 /// Branch and data epoch an integrity verdict is recorded under.
 #[cfg(feature = "iroh")]
 fn view_key(view: &TopicView) -> (OpId, u64) {
@@ -249,26 +231,6 @@ impl<S: Storage> Oplog<S> {
         view: &TopicView,
     ) -> Result<Integrity> {
         self.integrity.step(read, view)
-    }
-
-    /// Ids `view`'s topic cannot resolve, where `view` came from `read`.
-    pub(crate) fn unresolved_in(
-        &self,
-        read: &dyn SnapshotRead,
-        view: &TopicView,
-    ) -> Result<BTreeSet<OpId>> {
-        Ok(self.holes_in(read, view)?.into_keys().collect())
-    }
-
-    /// [`Self::unresolved_in`] with generations; an unfinished scan finishes within `read`.
-    pub(crate) fn holes_in(&self, read: &dyn SnapshotRead, view: &TopicView) -> Result<Holes> {
-        let integrity = self.integrity_in(read, view)?;
-        if integrity.is_complete() {
-            return Ok(integrity.unresolved(view));
-        }
-        let mut unresolved = Integrity::Unknown.unresolved(view);
-        unresolved.extend(scan_holes_in(read, &view.state.topic_id)?);
-        Ok(unresolved)
     }
 
     /// A view of the topic and whether it is whole, both from one snapshot.

@@ -2250,7 +2250,7 @@ impl<S: Storage> SharedNet<S> {
         let converged = view.state.members.contains(&remote_peer_id)
             && summary.genesis == Some(view.state.genesis)
             && summary.heads == view.state.heads
-            && self.node.unresolved_in(read, &view)?.is_empty();
+            && self.node.integrity_in(read, &view)?.certifies(&view);
         let mut leave = None;
         if !view.state.members.contains(&self.node.peer_id())
             && let Some((op_id, position)) = self.leave_in(read, &view.state)?
@@ -3390,7 +3390,6 @@ impl<S: Storage> SharedNet<S> {
                     invalid_data("sync fingerprint requires a preceding SyncOpen with peer_id")
                 })?;
                 let topic_id = fingerprint.topic_id;
-                let sync = self.node.sync_engine();
                 let compared = self
                     .node
                     .storage()
@@ -3401,15 +3400,13 @@ impl<S: Storage> SharedNet<S> {
                         if !may_open_topic(&view.state, peer_id) {
                             return Ok(None);
                         }
-                        let local = sync.digest_in(read, &view)?;
-                        let whole = self.node.unresolved_in(read, &view)?.is_empty();
+                        // One integrity answer serves the digest, the verdict and the summary.
+                        let integrity = self.node.integrity_in(read, &view)?;
+                        let local = crate::sync::digest_for(&view, &integrity)?;
+                        let whole = integrity.certifies(&view);
                         let member = view.state.members.contains(&peer_id);
-                        Ok(Some((
-                            local,
-                            whole,
-                            member,
-                            sync.summary_in(read, topic_id)?,
-                        )))
+                        let summary = crate::sync::SyncEngine::<S>::summary_for(view, &integrity)?;
+                        Ok(Some((local, whole, member, summary)))
                     })
                     .map_err(invalid_data)?;
                 let Some((local, whole, member, summary)) = compared else {

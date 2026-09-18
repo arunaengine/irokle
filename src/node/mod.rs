@@ -482,14 +482,14 @@ impl<S: Storage> Irokle<S> {
         self
     }
 
-    /// Ids `view`'s topic cannot resolve, where `view` came from `read`.
+    /// What is known of `view`'s topic integrity within `read`, which `view` came from.
     #[cfg(feature = "iroh")]
-    pub(crate) fn unresolved_in(
+    pub(crate) fn integrity_in(
         &self,
         read: &dyn crate::storage::SnapshotRead,
         view: &crate::storage::TopicView,
-    ) -> Result<BTreeSet<OpId>> {
-        self.oplog.unresolved_in(read, view)
+    ) -> Result<crate::oplog::Integrity> {
+        self.oplog.integrity_in(read, view)
     }
 
     /// Ids `view`'s topic cannot resolve, with any hole scan recorded under the

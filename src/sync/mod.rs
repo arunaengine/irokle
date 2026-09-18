@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use smallvec::SmallVec;
 
-use crate::oplog::{Oplog, ReceiveEffects, TopicEviction, subset_in};
+use crate::oplog::{Integrity, Oplog, ReceiveEffects, TopicEviction, subset_in};
 use crate::storage::{SnapshotCharge, SnapshotRead, Storage, TopicView, topic_fingerprint_for};
 use crate::{ActorClock, ActorId, Error, Op, OpId, PeerId, Result, TopicId, canonical_bytes};
 
@@ -215,31 +215,32 @@ impl<S: Storage> SyncEngine<S> {
 
     /// The topic as one snapshot reads it. Heads, clock, tips and the digest
     /// all describe the same commit, so no part can come from a replaced branch.
+    /// The integrity scan finishes first, one bounded step per snapshot.
     pub fn summary(&self, topic_id: TopicId) -> Result<SyncSummary> {
-        self.oplog
-            .storage()
-            .read_snapshot(|read| self.summary_in(read, topic_id))
+        match self.oplog.inspect(&topic_id)? {
+            Some((view, integrity)) => Self::summary_for(view, &integrity),
+            None => Self::unknown_summary(topic_id),
+        }
     }
 
-    /// [`Self::summary`] read from a snapshot the caller already holds.
+    /// [`Self::summary`] read from a snapshot the caller already holds, where the
+    /// integrity scan takes at most one step; an unfinished scan digests as incomplete.
+    #[cfg(feature = "iroh")]
     pub(crate) fn summary_in(
         &self,
         read: &dyn SnapshotRead,
         topic_id: TopicId,
     ) -> Result<SyncSummary> {
         let Some(view) = read.topic_view(&topic_id, None)? else {
-            return Ok(SyncSummary {
-                topic_id,
-                event_type_id: None,
-                genesis: None,
-                fingerprint: topic_fingerprint_for(&BTreeSet::new(), &ActorClock::new())?,
-                heads: BTreeSet::new(),
-                actor_clock: ActorClock::new(),
-                actor_tips: BTreeMap::new(),
-                staged: None,
-            });
+            return Self::unknown_summary(topic_id);
         };
-        let fingerprint = self.digest_in(read, &view)?;
+        let integrity = self.oplog.integrity_in(read, &view)?;
+        Self::summary_for(view, &integrity)
+    }
+
+    /// The summary of `view`, digested with its topic's `integrity`.
+    pub(crate) fn summary_for(view: TopicView, integrity: &Integrity) -> Result<SyncSummary> {
+        let fingerprint = digest_for(&view, integrity)?;
         let actor_tips = view
             .tips
             .iter()
@@ -247,7 +248,7 @@ impl<S: Storage> SyncEngine<S> {
             .map(|(actor_id, tip)| (*actor_id, *tip))
             .collect();
         Ok(SyncSummary {
-            topic_id,
+            topic_id: view.state.topic_id,
             genesis: Some(view.state.genesis),
             event_type_id: Some(view.state.event_type_id),
             fingerprint,
@@ -258,28 +259,28 @@ impl<S: Storage> SyncEngine<S> {
         })
     }
 
+    fn unknown_summary(topic_id: TopicId) -> Result<SyncSummary> {
+        Ok(SyncSummary {
+            topic_id,
+            event_type_id: None,
+            genesis: None,
+            fingerprint: topic_fingerprint_for(&BTreeSet::new(), &ActorClock::new())?,
+            heads: BTreeSet::new(),
+            actor_clock: ActorClock::new(),
+            actor_tips: BTreeMap::new(),
+            staged: None,
+        })
+    }
+
     pub fn fingerprint(&self, topic_id: TopicId) -> Result<SyncFingerprint> {
-        let fingerprint = self.oplog.storage().read_snapshot(|read| {
-            match read.topic_view(&topic_id, None)? {
-                Some(view) => self.digest_in(read, &view),
-                None => topic_fingerprint_for(&BTreeSet::new(), &ActorClock::new()),
-            }
-        })?;
+        let fingerprint = match self.oplog.inspect(&topic_id)? {
+            Some((view, integrity)) => digest_for(&view, &integrity)?,
+            None => topic_fingerprint_for(&BTreeSet::new(), &ActorClock::new())?,
+        };
         Ok(SyncFingerprint {
             topic_id,
             fingerprint,
         })
-    }
-
-    /// Digest heads, clock and unresolved IDs so incomplete and whole topics differ.
-    /// Identically damaged topics can still match, so callers must reject the
-    /// fingerprint fast path whenever their local topic is incomplete.
-    pub(crate) fn digest_in(&self, read: &dyn SnapshotRead, view: &TopicView) -> Result<[u8; 32]> {
-        let unresolved = self.oplog.unresolved_in(read, view)?;
-        if unresolved.is_empty() {
-            return Ok(view.fingerprint);
-        }
-        Ok(*blake3::hash(&canonical_bytes(&(view.fingerprint, &unresolved))?).as_bytes())
     }
 
     /// The whole missing closure against `remote`, unbounded: an export of
@@ -430,10 +431,11 @@ impl<S: Storage> SyncEngine<S> {
             };
             return Ok((plan, genesis));
         }
-        // A hole moves neither heads nor the clock, so a matching fingerprint
-        // does not prove we are whole; keep negotiating until it is repaired.
-        let unresolved = self.oplog.holes_in(read, &view)?;
-        if unresolved.is_empty() && view.fingerprint == remote.fingerprint {
+        // A hole moves neither heads nor the clock, so a matching fingerprint does
+        // not prove we are whole; keep negotiating until a complete scan finds none.
+        let integrity = self.oplog.integrity_in(read, &view)?;
+        let unresolved = integrity.unresolved(&view);
+        if integrity.certifies(&view) && view.fingerprint == remote.fingerprint {
             let plan = SyncPlan {
                 topic_id: remote.topic_id,
                 common: local_heads.clone(),
@@ -1138,6 +1140,20 @@ impl<S: Storage> SyncEngine<S> {
             }),
         }
     }
+}
+
+/// Digest heads, clock and unresolved ids so incomplete and whole topics differ; a
+/// scan not yet complete digests the holes it found. Identically damaged topics can
+/// still match, so callers reject the fingerprint fast path unless theirs is whole.
+pub(crate) fn digest_for(view: &TopicView, integrity: &Integrity) -> Result<[u8; 32]> {
+    if integrity.certifies(view) {
+        return Ok(view.fingerprint);
+    }
+    let unresolved = integrity
+        .unresolved(view)
+        .into_keys()
+        .collect::<BTreeSet<_>>();
+    Ok(*blake3::hash(&canonical_bytes(&(view.fingerprint, &unresolved))?).as_bytes())
 }
 
 fn reserve_snapshot(slice: &mut slice::Slice, charge: SnapshotCharge) -> Result<()> {
