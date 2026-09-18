@@ -5151,22 +5151,22 @@ mod tests {
         )
         .unwrap();
         let remote = crate::Signer::peer_id(&crate::Ed25519Signer::from_bytes(&[41; 32]));
-        let healthy = node
-            .create_topic::<Note>(crate::TopicConfig {
-                initial_peers: [remote].into(),
-                ..crate::TopicConfig::default()
-            })
-            .unwrap()
-            .id();
-        // Topics are visited in id order, so the held topic must sort first.
-        let slow = (0..256)
-            .map(|_| {
-                node.create_topic::<Note>(crate::TopicConfig::default())
-                    .unwrap()
-                    .id()
-            })
-            .find(|topic_id| *topic_id < healthy)
-            .expect("a topic sorting before the healthy one");
+        // Topics are visited in id order, so the held topic must sort first: two
+        // fixed ids, sorted, decide which topic is held and which is healthy.
+        let mut ids = [
+            crate::TopicId::hash(b"sweep held"),
+            crate::TopicId::hash(b"sweep healthy"),
+        ];
+        ids.sort();
+        let [slow, healthy] = ids;
+        let log = crate::oplog::Oplog::with_storage(storage.clone());
+        for (topic_id, peers) in [(slow, vec![]), (healthy, vec![remote])] {
+            let members = peers.into_iter().chain([node.peer_id()]);
+            let genesis = crate::TopicGenesis::new(<Note as crate::Event>::TYPE_ID, members);
+            let actor = crate::actor_id_for(topic_id, node.peer_id());
+            log.create_topic_genesis(topic_id, actor, genesis, node.signer())
+                .unwrap();
+        }
         let genesis = storage
             .topic_state(&healthy)
             .unwrap()
