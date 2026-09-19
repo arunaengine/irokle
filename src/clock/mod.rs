@@ -15,6 +15,13 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(feature = "fjall")]
 pub(crate) mod scan;
 
+/// The cached hash of a node's stored form. Only Fjall stores nodes, so other
+/// builds keep nothing here.
+#[cfg(feature = "fjall")]
+type NodeHash = OnceLock<[u8; 32]>;
+#[cfg(not(feature = "fjall"))]
+type NodeHash = ();
+
 /// Actor positions in a persistent trie over actor-ID nibbles. Clones share nodes;
 /// updates copy only changed paths. Iteration is ID-ordered; serialization is a map
 /// of every entry, including zero positions.
@@ -54,12 +61,15 @@ impl Iterator for ClockCursor {
     }
 }
 
+#[cfg_attr(
+    not(feature = "fjall"),
+    expect(dead_code, reason = "only Fjall reads node hashes")
+)]
 enum Node {
     Leaf {
         actor: ActorId,
         seq: u64,
-        #[cfg(feature = "fjall")]
-        hash: OnceLock<[u8; 32]>,
+        hash: NodeHash,
     },
     /// Entries sharing the nibbles of `key` before `level`, one child per
     /// distinct nibble at `level`, in nibble order. At least two children.
@@ -69,8 +79,7 @@ enum Node {
         len: usize,
         key: ActorId,
         children: Vec<Arc<Node>>,
-        #[cfg(feature = "fjall")]
-        hash: OnceLock<[u8; 32]>,
+        hash: NodeHash,
     },
 }
 
@@ -81,8 +90,7 @@ impl Clone for Node {
             Node::Leaf { actor, seq, .. } => Node::Leaf {
                 actor: *actor,
                 seq: *seq,
-                #[cfg(feature = "fjall")]
-                hash: OnceLock::new(),
+                hash: NodeHash::default(),
             },
             Node::Branch {
                 level,
@@ -97,8 +105,7 @@ impl Clone for Node {
                 len: *len,
                 key: *key,
                 children: children.clone(),
-                #[cfg(feature = "fjall")]
-                hash: OnceLock::new(),
+                hash: NodeHash::default(),
             },
         }
     }
@@ -241,8 +248,7 @@ fn leaf(actor: ActorId, seq: u64) -> Arc<Node> {
     Arc::new(Node::Leaf {
         actor,
         seq,
-        #[cfg(feature = "fjall")]
-        hash: OnceLock::new(),
+        hash: NodeHash::default(),
     })
 }
 
@@ -258,8 +264,7 @@ fn pair(level: u8, a: Arc<Node>, b: Arc<Node>) -> Arc<Node> {
         len,
         key,
         children,
-        #[cfg(feature = "fjall")]
-        hash: OnceLock::new(),
+        hash: NodeHash::default(),
     })
 }
 
@@ -309,8 +314,7 @@ fn selected_node(
             len: children.iter().map(|child| child.len()).sum(),
             key: *children[0].key(),
             children,
-            #[cfg(feature = "fjall")]
-            hash: OnceLock::new(),
+            hash: NodeHash::default(),
         })),
     }
 }
@@ -350,13 +354,11 @@ fn set_node(node: &mut Arc<Node>, actor: &ActorId, seq: Option<u64>) -> bool {
         len,
         key,
         children,
-        #[cfg(feature = "fjall")]
         hash,
     } = Arc::make_mut(node)
     {
         // A node held only here changes in place and loses its hash.
-        #[cfg(feature = "fjall")]
-        hash.take();
+        *hash = NodeHash::default();
         let digit = nibble(actor, *level);
         let index = slot(*bitmap, digit);
         if *bitmap & (1 << digit) == 0 {
@@ -490,8 +492,7 @@ fn union_children(a: &Arc<Node>, b: &Arc<Node>) -> Arc<Node> {
         len: children.iter().map(|child| child.len()).sum(),
         key: *key,
         children,
-        #[cfg(feature = "fjall")]
-        hash: OnceLock::new(),
+        hash: NodeHash::default(),
     })
 }
 
