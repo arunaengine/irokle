@@ -2,9 +2,8 @@
 
 use std::collections::HashMap;
 
-use crate::clock::{
-    ActorClock, ActorId, CACHE_BYTES, ClockCache, corrupt, digest, first_difference, nibble,
-};
+use crate::clock::store::ClockCache;
+use crate::clock::{ActorClock, ActorId, CACHE_BYTES, corrupt, digest, first_difference, nibble};
 
 #[derive(serde::Deserialize)]
 enum Prefix {

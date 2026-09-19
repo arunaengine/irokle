@@ -2,10 +2,14 @@
 //! Stored clock nodes: their encoding and hashes, a clock loaded from its root
 //! node, and the cache that shares loaded nodes between clocks.
 
-use crate::clock::{ActorClock, ClockCache, ClockRecord, Node};
+use crate::clock::{
+    ActorClock, CACHE_BYTES, CacheInner, ClockRecord, ENTRY_BYTES, Encoded, Node, NodeFetch,
+    corrupt, digest, first_difference, nibble, table_bytes,
+};
 use crate::ids::ActorId;
 use serde::de::Deserializer;
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 impl ActorClock {
     #[cfg(test)]
@@ -111,8 +115,147 @@ impl ActorClock {
     }
 }
 
+/// Reuse shared clock nodes without reading them again. Only the latest clocks
+/// retain nodes within an estimated byte limit; other cached nodes are weak references.
+#[derive(Default)]
+pub(crate) struct ClockCache {
+    inner: Mutex<CacheInner>,
+}
+
+impl ClockCache {
+    pub(crate) fn bytes(&self) -> usize {
+        let inner = self.lock();
+        let weak = inner
+            .nodes
+            .values()
+            .filter(|node| !inner.retained.contains_key(&(node.as_ptr() as usize)))
+            .count();
+        inner.root_bytes()
+            + table_bytes(&inner.nodes)
+            + weak * (size_of::<Node>() + 2 * size_of::<usize>() + 16)
+            + size_of::<Self>()
+            + 2 * size_of::<usize>()
+            + 16
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheInner> {
+        // Only a shortcut: a poisoned cache still names valid nodes.
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hold `clock` among the latest clocks and name its nodes, so a clock
+    /// loaded or derived from it next shares them.
+    pub(crate) fn keep(&self, clock: &ActorClock) {
+        let Some(root) = &clock.root else {
+            return;
+        };
+        let bytes = root.len().saturating_mul(ENTRY_BYTES);
+        if bytes > CACHE_BYTES {
+            return;
+        }
+        let mut inner = self.lock();
+        if inner
+            .retained
+            .get(&(Arc::as_ptr(root) as usize))
+            .is_some_and(|node| node.root)
+        {
+            return;
+        }
+        inner.remember(root);
+        if let Some(node) = inner.retained.get_mut(&(Arc::as_ptr(root) as usize)) {
+            node.root = true;
+        }
+        inner.latest.push_back(Arc::clone(root));
+        inner.trim(CACHE_BYTES);
+    }
+
+    /// The node named `hash`: shared when something still holds it, otherwise
+    /// read, checked against its name and, below `parent`, against its place.
+    fn node(
+        &self,
+        hash: &[u8; 32],
+        fetch: &mut NodeFetch<'_>,
+        parent: Option<(u8, &ActorId)>,
+    ) -> crate::Result<Arc<Node>> {
+        let held = self.lock().nodes.get(hash).and_then(Weak::upgrade);
+        let node = match held {
+            Some(node) => node,
+            None => {
+                let bytes = fetch(hash)?.ok_or_else(corrupt)?;
+                if digest(&bytes) != *hash {
+                    return Err(corrupt());
+                }
+                let node = match postcard::from_bytes::<Encoded>(&bytes)? {
+                    Encoded::Leaf { actor, seq } => Node::Leaf {
+                        actor,
+                        seq,
+                        hash: OnceLock::from(*hash),
+                    },
+                    Encoded::Branch {
+                        level,
+                        bitmap,
+                        len,
+                        key,
+                        children,
+                    } => {
+                        if level >= 64
+                            || children.len() < 2
+                            || bitmap.count_ones() as usize != children.len()
+                        {
+                            return Err(corrupt());
+                        }
+                        let children = children
+                            .iter()
+                            .map(|child| self.node(child, fetch, Some((level, &key))))
+                            .collect::<crate::Result<Vec<_>>>()?;
+                        let digits = children
+                            .iter()
+                            .map(|child| 1_u16 << nibble(child.key(), level))
+                            .fold(0, |bits, bit| bits | bit);
+                        let total = children.iter().map(|child| child.len()).sum::<usize>();
+                        if digits != bitmap
+                            || total as u64 != len
+                            || children.windows(2).any(|pair| {
+                                nibble(pair[0].key(), level) >= nibble(pair[1].key(), level)
+                            })
+                        {
+                            return Err(corrupt());
+                        }
+                        Node::Branch {
+                            level,
+                            bitmap,
+                            len: total,
+                            key,
+                            children,
+                            hash: OnceLock::from(*hash),
+                        }
+                    }
+                };
+                let node = Arc::new(node);
+                self.lock().name(hash, &node);
+                node
+            }
+        };
+        // A child shares its parent's nibbles before the parent's level and
+        // branches, if at all, below it.
+        if let Some((level, key)) = parent {
+            let below = match &*node {
+                Node::Leaf { .. } => true,
+                Node::Branch { level: child, .. } => *child > level,
+            };
+            if !below || first_difference(node.key(), key).is_some_and(|at| at < level) {
+                return Err(corrupt());
+            }
+        }
+        Ok(node)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::clock::store::*;
     use crate::clock::*;
 
     #[test]

@@ -34,7 +34,7 @@ pub struct FjallStorage {
     /// for the main store.
     pub(super) namespace: Option<Fence>,
     /// Clock nodes loaded or stored recently, shared with every view.
-    clocks: std::sync::Arc<crate::clock::ClockCache>,
+    clocks: std::sync::Arc<crate::clock::store::ClockCache>,
     /// Key a test rewrites before every single-attempt commit, forcing a conflict.
     #[cfg(test)]
     conflict_key: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
@@ -2170,7 +2170,7 @@ pub(crate) fn write_legacy_metas(
     tx: &mut fjall::OptimisticWriteTx,
     records: &fjall::OptimisticTxKeyspace,
 ) -> Result<()> {
-    let cache = crate::clock::ClockCache::default();
+    let cache = crate::clock::store::ClockCache::default();
     let mut legacy = Vec::new();
     for item in fjall::Readable::prefix(tx, records, b"m") {
         let (key, value) = item.into_inner()?;

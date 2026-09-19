@@ -336,7 +336,7 @@ fn malformed_frame_bounds() {
 fn shared_cache_bounds() {
     for actors in [1024_u32, 2048, 4096] {
         let before = LIVE.load(Ordering::Relaxed);
-        let cache = clock::ClockCache::default();
+        let cache = clock::store::ClockCache::default();
         let mut clock = clock::ActorClock::new();
         for n in 0..actors {
             clock.observe(
