@@ -1,5 +1,3 @@
-#[cfg(feature = "fjall")]
-use crate::storage as crate_storage;
 use crate::tests::support::*;
 
 fn assert_clears_satisfied<S: Storage>(storage: S) {
@@ -879,68 +877,6 @@ fn removal_defeats_evidence() {
     );
 }
 
-/// A backend failure after one acknowledgement's writes are staged must abort
-/// the whole batch. Otherwise its ack row commits while clearing its work
-/// failed, and the caller is told the ack was not applied.
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_batch_rollback() {
-    let dir = tempfile::tempdir().unwrap();
-    let (acks, topics, peer) = {
-        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-        let (_, acks, topics, peer) = batch_ack_fixture(storage);
-        (acks, topics, peer)
-    };
-    // An obligation record nothing can decode makes the clearing step fail
-    // after the ack row of the middle topic was staged.
-    {
-        let db = fjall::OptimisticTxDatabase::builder(dir.path())
-            .open()
-            .unwrap();
-        let records = db
-            .keyspace("records", fjall::KeyspaceCreateOptions::default)
-            .unwrap();
-        let mut tx = db.write_tx().unwrap();
-        tx.insert(
-            &records,
-            [
-                b"ob".as_slice(),
-                topics[1].as_ref(),
-                peer.as_ref(),
-                b"r".as_slice(),
-            ]
-            .concat(),
-            vec![0xff; 3],
-        );
-        tx.commit().unwrap().unwrap();
-    }
-
-    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    let irokle = Irokle::with_storage(
-        storage,
-        NodeConfig {
-            signer: Ed25519Signer::from_bytes(&[87; 32]),
-            ..NodeConfig::default()
-        },
-    )
-    .unwrap();
-    let results = irokle.apply_sync_acks(&acks);
-    assert!(
-        results.iter().all(Result::is_err),
-        "a backend failure fails every ack of the batch"
-    );
-    for topic_id in &topics {
-        assert!(
-            irokle
-                .storage()
-                .peer_ack(&peer, topic_id)
-                .unwrap()
-                .is_none(),
-            "no ack row of the failed batch may commit"
-        );
-    }
-}
-
 #[test]
 fn batch_preserves_causes() {
     let pressure = Error::MemoryPressure {
@@ -983,72 +919,8 @@ fn shared_failure(error: Error) {
 }
 
 #[cfg(feature = "fjall")]
-#[test]
-fn backend_causes_survive() {
-    for error in [
-        Error::ReopenRequired(fjall::Error::Poisoned),
-        Error::StoragePressure("disk headroom".into()),
-        Error::StorageBuffer {
-            required: 10,
-            limit: 1,
-        },
-        Error::StorageProbe(std::io::Error::other("probe unavailable")),
-        Error::Fjall(fjall::Error::Poisoned),
-    ] {
-        shared_failure(error);
-    }
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn uncertain_ack_reopens() {
-    for batch in [false, true] {
-        let directory = tempfile::tempdir().unwrap();
-        let storage =
-            StaleReadStorage::new(crate_storage::FjallStorage::open(directory.path()).unwrap());
-        let (node, acks, topics, peer) = batch_ack_fixture(storage.clone());
-        let before = storage.list_op_ids(&topics[0]).unwrap();
-        *storage.ack_fault.lock().unwrap() = Some(AckFault {
-            committed: true,
-            error: Error::ReopenRequired(fjall::Error::Poisoned),
-        });
-        let result = if batch {
-            node.apply_sync_acks(&acks[..1]).pop().unwrap()
-        } else {
-            node.apply_sync_ack(&acks[0])
-        };
-        assert!(matches!(
-            result.unwrap_err().cause(),
-            Error::ReopenRequired(_)
-        ));
-        assert_eq!(
-            storage.ack_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
-        assert_eq!(storage.list_op_ids(&topics[0]).unwrap(), before);
-        assert!(storage.peer_ack(&peer, &topics[0]).unwrap().is_some());
-        for topic in &topics[1..] {
-            assert!(!storage.sync_obligations(&peer, topic).unwrap().is_empty());
-            assert!(storage.peer_ack(&peer, topic).unwrap().is_none());
-        }
-        drop((node, storage));
-        let reopened = crate_storage::FjallStorage::open(directory.path()).unwrap();
-        assert_eq!(reopened.list_op_ids(&topics[0]).unwrap(), before);
-        assert!(reopened.peer_ack(&peer, &topics[0]).unwrap().is_some());
-        assert!(
-            reopened
-                .sync_obligations(&peer, &topics[0])
-                .unwrap()
-                .is_empty()
-        );
-        for topic in &topics[1..] {
-            assert!(!reopened.sync_obligations(&peer, topic).unwrap().is_empty());
-        }
-    }
-}
-
-#[cfg(feature = "fjall")]
 mod with_fjall {
+    use crate::storage as crate_storage;
     use crate::tests::ack::*;
 
     #[test]
@@ -1276,5 +1148,129 @@ mod with_fjall {
             1
         );
         assert!(storage.peer_reached_op(&peer, &op_id).unwrap());
+    }
+
+    /// A backend failure after one acknowledgement's writes are staged must abort
+    /// the whole batch. Otherwise its ack row commits while clearing its work
+    /// failed, and the caller is told the ack was not applied.
+    #[test]
+    fn batch_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let (acks, topics, peer) = {
+            let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+            let (_, acks, topics, peer) = batch_ack_fixture(storage);
+            (acks, topics, peer)
+        };
+        // An obligation record nothing can decode makes the clearing step fail
+        // after the ack row of the middle topic was staged.
+        {
+            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+                .open()
+                .unwrap();
+            let records = db
+                .keyspace("records", fjall::KeyspaceCreateOptions::default)
+                .unwrap();
+            let mut tx = db.write_tx().unwrap();
+            tx.insert(
+                &records,
+                [
+                    b"ob".as_slice(),
+                    topics[1].as_ref(),
+                    peer.as_ref(),
+                    b"r".as_slice(),
+                ]
+                .concat(),
+                vec![0xff; 3],
+            );
+            tx.commit().unwrap().unwrap();
+        }
+
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        let irokle = Irokle::with_storage(
+            storage,
+            NodeConfig {
+                signer: Ed25519Signer::from_bytes(&[87; 32]),
+                ..NodeConfig::default()
+            },
+        )
+        .unwrap();
+        let results = irokle.apply_sync_acks(&acks);
+        assert!(
+            results.iter().all(Result::is_err),
+            "a backend failure fails every ack of the batch"
+        );
+        for topic_id in &topics {
+            assert!(
+                irokle
+                    .storage()
+                    .peer_ack(&peer, topic_id)
+                    .unwrap()
+                    .is_none(),
+                "no ack row of the failed batch may commit"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_causes_survive() {
+        for error in [
+            Error::ReopenRequired(fjall::Error::Poisoned),
+            Error::StoragePressure("disk headroom".into()),
+            Error::StorageBuffer {
+                required: 10,
+                limit: 1,
+            },
+            Error::StorageProbe(std::io::Error::other("probe unavailable")),
+            Error::Fjall(fjall::Error::Poisoned),
+        ] {
+            shared_failure(error);
+        }
+    }
+
+    #[test]
+    fn uncertain_ack_reopens() {
+        for batch in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage =
+                StaleReadStorage::new(crate_storage::FjallStorage::open(directory.path()).unwrap());
+            let (node, acks, topics, peer) = batch_ack_fixture(storage.clone());
+            let before = storage.list_op_ids(&topics[0]).unwrap();
+            *storage.ack_fault.lock().unwrap() = Some(AckFault {
+                committed: true,
+                error: Error::ReopenRequired(fjall::Error::Poisoned),
+            });
+            let result = if batch {
+                node.apply_sync_acks(&acks[..1]).pop().unwrap()
+            } else {
+                node.apply_sync_ack(&acks[0])
+            };
+            assert!(matches!(
+                result.unwrap_err().cause(),
+                Error::ReopenRequired(_)
+            ));
+            assert_eq!(
+                storage.ack_calls.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert_eq!(storage.list_op_ids(&topics[0]).unwrap(), before);
+            assert!(storage.peer_ack(&peer, &topics[0]).unwrap().is_some());
+            for topic in &topics[1..] {
+                assert!(!storage.sync_obligations(&peer, topic).unwrap().is_empty());
+                assert!(storage.peer_ack(&peer, topic).unwrap().is_none());
+            }
+            drop((node, storage));
+            let reopened = crate_storage::FjallStorage::open(directory.path()).unwrap();
+            assert_eq!(reopened.list_op_ids(&topics[0]).unwrap(), before);
+            assert!(reopened.peer_ack(&peer, &topics[0]).unwrap().is_some());
+            assert!(
+                reopened
+                    .sync_obligations(&peer, &topics[0])
+                    .unwrap()
+                    .is_empty()
+            );
+            for topic in &topics[1..] {
+                assert!(!reopened.sync_obligations(&peer, topic).unwrap().is_empty());
+            }
+        }
     }
 }
