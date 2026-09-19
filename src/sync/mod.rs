@@ -18,6 +18,8 @@ mod repair;
 mod request;
 mod slice;
 mod space;
+#[cfg(feature = "iroh")]
+mod transport;
 mod types;
 
 #[cfg(test)]
@@ -111,12 +113,6 @@ enum SendSet {
 }
 
 impl<S: Storage> SyncEngine<S> {
-    #[cfg(feature = "iroh")]
-    pub(crate) fn bound_genesis(mut self, topic: TopicId, genesis: OpId) -> Self {
-        self.oplog = self.oplog.bound_genesis(topic, genesis);
-        self
-    }
-
     pub fn new(oplog: Oplog<S>, peer_id: PeerId) -> Self {
         Self {
             oplog,
@@ -130,23 +126,6 @@ impl<S: Storage> SyncEngine<S> {
             ))),
             work: Arc::default(),
         }
-    }
-
-    #[cfg(feature = "iroh")]
-    pub(crate) fn session_plan(&self) -> Self {
-        let mut engine = self.clone();
-        engine.continuations = Arc::new(Mutex::new(self.continuations().fork()));
-        engine
-    }
-
-    #[cfg(feature = "iroh")]
-    pub(crate) fn plan_idle(&self) -> bool {
-        self.continuations().idle()
-    }
-
-    #[cfg(feature = "iroh")]
-    pub(crate) fn release_plan(&self, peer: PeerId, topic: TopicId) {
-        self.continuations().release((peer, topic));
     }
 
     fn continuations(&self) -> MutexGuard<'_, Continuations> {
@@ -176,18 +155,6 @@ impl<S: Storage> SyncEngine<S> {
     pub(crate) fn with_page_actors(mut self, actors: usize) -> Self {
         self.page_actors = actors.max(1);
         self
-    }
-
-    /// The ranges and window of a request from `local` toward `remote` that
-    /// continues from `knowledge` within this engine's item limit.
-    #[cfg(feature = "iroh")]
-    pub(crate) fn request_ranges(
-        &self,
-        local: &ActorClock,
-        remote: &ActorClock,
-        knowledge: &RequestKnowledge,
-    ) -> (Vec<ActorRangeHint>, ActorWindow) {
-        request_ranges(local, remote, self.request_items, knowledge)
     }
 
     /// The same engine naming at most `positions` needed positions per page.
@@ -221,21 +188,6 @@ impl<S: Storage> SyncEngine<S> {
             Some((view, integrity)) => Self::summary_for(view, &integrity),
             None => Self::unknown_summary(topic_id),
         }
-    }
-
-    /// [`Self::summary`] read from a snapshot the caller already holds, where the
-    /// integrity scan takes at most one step; an unfinished scan digests as incomplete.
-    #[cfg(feature = "iroh")]
-    pub(crate) fn summary_in(
-        &self,
-        read: &dyn SnapshotRead,
-        topic_id: TopicId,
-    ) -> Result<SyncSummary> {
-        let Some(view) = read.topic_view(&topic_id, None)? else {
-            return Self::unknown_summary(topic_id);
-        };
-        let integrity = self.oplog.integrity_in(read, &view)?;
-        Self::summary_for(view, &integrity)
     }
 
     /// The summary of `view`, digested with its topic's `integrity`.
@@ -701,18 +653,6 @@ impl<S: Storage> SyncEngine<S> {
         self.oplog
             .storage()
             .read_snapshot(|read| self.response_known(read, peer_id, request, budget, None))
-    }
-
-    /// [`Self::response_page`] over a snapshot the caller already holds.
-    #[cfg(feature = "iroh")]
-    pub(crate) fn response_in(
-        &self,
-        read: &dyn SnapshotRead,
-        peer_id: PeerId,
-        request: &SyncRequest,
-        budget: PageBudget,
-    ) -> Result<PlannedPage> {
-        self.response_known(read, peer_id, request, budget, None)
     }
 
     /// Serve using the authenticated peer's current summary, never as an ACK.
