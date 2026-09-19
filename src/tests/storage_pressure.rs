@@ -138,16 +138,15 @@ fn small_migration_progress() {
             .open()
             .unwrap();
         let storage = FjallStorage::from_database(db.clone()).unwrap();
-        super::ownership::fjall::staged(&storage, ops[0].signed.body.author, topic, &ops);
-        let slot = db
-            .keyspace("bootstrap-0", ::fjall::KeyspaceCreateOptions::default)
+        oplog::Oplog::with_storage(storage)
+            .receive_ops(ops.clone())
             .unwrap();
         let records = db
             .keyspace("records", ::fjall::KeyspaceCreateOptions::default)
             .unwrap();
         let mut tx = db.write_tx().unwrap();
-        crate::storage::write_legacy_metas(&mut tx, &slot).unwrap();
-        tx.insert(&records, b"sv", postcard::to_allocvec(&6_u32).unwrap());
+        crate::storage::write_legacy_metas(&mut tx, &records).unwrap();
+        tx.insert(&records, b"sv", postcard::to_allocvec(&1_u32).unwrap());
         tx.commit().unwrap().unwrap();
         db.persist(::fjall::PersistMode::SyncAll).unwrap();
     }
@@ -155,12 +154,10 @@ fn small_migration_progress() {
     pressure.recovery_buffer_bytes = 256 * 1024;
     let storage = FjallStorage::open_with_pressure(directory.path(), pressure).unwrap();
     assert!(!storage.migrating().unwrap());
-    assert!(storage.topic_state(&topic).unwrap().is_none());
-    let provisional = storage.provisional_topics().unwrap().pop().unwrap();
-    let view = storage.provisional_store(&provisional).unwrap().unwrap();
+    assert!(storage.topic_state(&topic).unwrap().is_some());
     for op in ops {
         assert_eq!(
-            view.get_meta(&op.id).unwrap(),
+            storage.get_meta(&op.id).unwrap(),
             source.log.storage().get_meta(&op.id).unwrap()
         );
     }

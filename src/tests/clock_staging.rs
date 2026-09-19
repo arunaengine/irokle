@@ -154,8 +154,10 @@ fn staged_nodes_recover() {
     }
 }
 
+/// Schema 1 metadata holding every clock entry is rewritten in bounded steps on
+/// open, and a crash between two steps resumes on the next open.
 #[test]
-fn staged_nodes_migrate() {
+fn legacy_clocks_migrate() {
     let source = reverse_chain(MemoryStorage::new(), 1050);
     let topic = source.topic_id;
     let ops = oplog::topological(source.log.storage(), &topic).unwrap();
@@ -165,17 +167,15 @@ fn staged_nodes_migrate() {
             .open()
             .unwrap();
         let storage = FjallStorage::from_database(db.clone()).unwrap();
-        staged(&storage, ops[0].signed.body.author, topic, &ops);
-        assert!(clock_nodes(&db, "bootstrap-0", topic) > 0);
+        oplog::Oplog::with_storage(storage)
+            .receive_ops(ops.clone())
+            .unwrap();
         let records = db
             .keyspace("records", fjall::KeyspaceCreateOptions::default)
             .unwrap();
-        let slot = db
-            .keyspace("bootstrap-0", fjall::KeyspaceCreateOptions::default)
-            .unwrap();
         let mut tx = db.write_tx().unwrap();
-        crate::storage::write_legacy_metas(&mut tx, &slot).unwrap();
-        tx.insert(&records, b"sv", postcard::to_allocvec(&6_u32).unwrap());
+        crate::storage::write_legacy_metas(&mut tx, &records).unwrap();
+        tx.insert(&records, b"sv", postcard::to_allocvec(&1_u32).unwrap());
         tx.commit().unwrap().unwrap();
         db.persist(fjall::PersistMode::SyncAll).unwrap();
     }
@@ -195,14 +195,6 @@ fn staged_nodes_migrate() {
         };
         let storage = FjallStorage::open(dir.path()).unwrap();
         assert!(!storage.migrating().unwrap());
-        assert_hidden(&storage, topic, ops[0].signed.body.actor_id, &ops);
-        let provisional = storage.provisional_topics().unwrap().pop().unwrap();
-        let view = storage.provisional_store(&provisional).unwrap().unwrap();
-        assert_clocks(&source, &view, &ops);
-        let state = view.topic_state(&topic).unwrap().unwrap();
-        storage
-            .activate_provisional(&provisional, &state, AdmissionEffects::default())
-            .unwrap();
         assert_clocks(&source, &storage, &ops);
         if !pending {
             completed = true;
