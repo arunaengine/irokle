@@ -331,6 +331,35 @@ impl<S: Storage> Irokle<S> {
         Ok(())
     }
 
+    /// Ask the transport to recheck `topic_id`; `message` reports a failed request.
+    pub(super) fn recheck_topic(&self, topic_id: TopicId, message: &'static str) {
+        if let Some(net) = &self.net
+            && let Err(error) = net.schedule_topic_recheck(topic_id)
+        {
+            tracing::warn!(%topic_id, %error, "{}", message);
+        }
+    }
+
+    /// Resync `peer_id` and recheck `topic_id` after a receive whose data committed.
+    pub(super) fn resync_committed(&self, peer_id: PeerId, topic_id: TopicId) {
+        if let Some(net) = &self.net {
+            net.schedule_resync(peer_id, topic_id);
+            if let Err(error) = net.schedule_topic_recheck(topic_id) {
+                tracing::warn!(%topic_id, %error, "committed receive recheck failed");
+            }
+        }
+    }
+
+    pub(super) fn schedule_resync(&self, peer_id: PeerId, topic_id: TopicId) {
+        if let Some(net) = &self.net {
+            net.schedule_resync(peer_id, topic_id);
+        }
+    }
+
+    pub(super) fn network_attached(&self) -> bool {
+        self.net.is_some()
+    }
+
     pub(super) fn wake_async_replication(
         &self,
         topic_id: TopicId,

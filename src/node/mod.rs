@@ -170,7 +170,6 @@ impl<S: Storage> Irokle<S> {
             initial_peers: config.initial_peers,
             replication_policy: config.replication_policy,
         };
-        #[cfg(feature = "iroh")]
         let op = self.oplog.create_topic_effects(
             topic_id,
             actor_id,
@@ -185,10 +184,6 @@ impl<S: Storage> Irokle<S> {
                 )
             },
         )?;
-        #[cfg(not(feature = "iroh"))]
-        self.oplog
-            .create_topic_genesis(topic_id, actor_id, genesis, &self.config.signer)?;
-        #[cfg(feature = "iroh")]
         self.wake_async_replication(
             topic_id,
             op.id,
@@ -236,7 +231,6 @@ impl<S: Storage> Irokle<S> {
             meta.actor_seq,
             meta.observed_clock,
         );
-        #[cfg(feature = "iroh")]
         self.wake_async_replication(
             topic_id,
             event_op.id,
@@ -521,13 +515,8 @@ impl<S: Storage> Irokle<S> {
             &verified,
             Some(&forward),
         );
-        #[cfg(feature = "iroh")]
-        if let Some(net) = &self.net {
-            for topic_id in forwarded.borrow().iter() {
-                if let Err(error) = net.schedule_topic_recheck(*topic_id) {
-                    tracing::warn!(%topic_id, %error, "forwarded replication wake failed");
-                }
-            }
+        for topic_id in forwarded.borrow().iter() {
+            self.recheck_topic(*topic_id, "forwarded replication wake failed");
         }
         for topic_id in forwarded.borrow().iter() {
             self.note_forwarded(source_peer_id, *topic_id);
@@ -535,14 +524,8 @@ impl<S: Storage> Irokle<S> {
         let (mut ack, evictions) = match received {
             Ok(received) => received,
             Err(error) => {
-                #[cfg(feature = "iroh")]
-                if let Error::ReceiveCommitted { ack, .. } = &error
-                    && let Some(net) = &self.net
-                {
-                    net.schedule_resync(source_peer_id, ack.topic_id);
-                    if let Err(error) = net.schedule_topic_recheck(ack.topic_id) {
-                        tracing::warn!(topic_id = %ack.topic_id, %error, "committed receive recheck failed");
-                    }
+                if let Error::ReceiveCommitted { ack, .. } = &error {
+                    self.resync_committed(source_peer_id, ack.topic_id);
                 }
                 return Err(error);
             }
@@ -550,13 +533,7 @@ impl<S: Storage> Irokle<S> {
         ack.accepted
             .extend(promoted.intersection(&verified).copied());
         if let Err(source) = ack.sign(&self.config.signer) {
-            #[cfg(feature = "iroh")]
-            if let Some(net) = &self.net {
-                net.schedule_resync(source_peer_id, ack.topic_id);
-                if let Err(error) = net.schedule_topic_recheck(ack.topic_id) {
-                    tracing::warn!(topic_id = %ack.topic_id, %error, "committed receive recheck failed");
-                }
-            }
+            self.resync_committed(source_peer_id, ack.topic_id);
             return Err(Error::ReceiveCommitted {
                 ack: Box::new(ack),
                 evictions,
@@ -654,10 +631,7 @@ impl<S: Storage> Irokle<S> {
         op_ids: BTreeSet<OpId>,
     ) -> Result<()> {
         self.sync.put_obligation(peer_id, topic_id, op_ids)?;
-        #[cfg(feature = "iroh")]
-        if let Some(net) = &self.net {
-            net.schedule_resync(peer_id, topic_id);
-        }
+        self.schedule_resync(peer_id, topic_id);
         Ok(())
     }
 
@@ -707,11 +681,7 @@ impl<S: Storage> Irokle<S> {
     }
 
     fn validate_concern(&self, concern: &WriteConcern) -> Result<()> {
-        if matches!(concern, WriteConcern::AsyncReplication) {
-            #[cfg(feature = "iroh")]
-            if self.net.is_some() {
-                return Ok(());
-            }
+        if matches!(concern, WriteConcern::AsyncReplication) && !self.network_attached() {
             return Err(Error::ReplicationUnavailable);
         }
         Ok(())
@@ -914,7 +884,6 @@ impl<S: Storage> Irokle<S> {
             meta.actor_seq,
             meta.observed_clock,
         );
-        #[cfg(feature = "iroh")]
         self.wake_async_replication(
             topic_id,
             op.id,
@@ -931,7 +900,6 @@ impl<S: Storage> Irokle<S> {
         control: TopicControl,
     ) -> Result<()> {
         self.validate_concern(&self.config.default_write_concern)?;
-        #[cfg(feature = "iroh")]
         let op = self.oplog.create_control_effects(
             topic_id,
             actor_id,
@@ -946,10 +914,6 @@ impl<S: Storage> Irokle<S> {
                 )
             },
         )?;
-        #[cfg(not(feature = "iroh"))]
-        self.oplog
-            .create_control_op(topic_id, actor_id, control, &self.config.signer)?;
-        #[cfg(feature = "iroh")]
         self.wake_async_replication(
             topic_id,
             op.id,
@@ -1070,6 +1034,29 @@ impl<S: Storage> Irokle<S> {
             }
         }
         Ok(clock)
+    }
+}
+
+/// Without Iroh no transport is attached, so the network hooks do nothing.
+#[cfg(not(feature = "iroh"))]
+impl<S: Storage> Irokle<S> {
+    fn wake_async_replication(
+        &self,
+        _topic_id: TopicId,
+        _op_id: OpId,
+        _write_concern: &WriteConcern,
+        _wake_failed_message: &'static str,
+    ) {
+    }
+
+    fn recheck_topic(&self, _topic_id: TopicId, _message: &'static str) {}
+
+    fn resync_committed(&self, _peer_id: PeerId, _topic_id: TopicId) {}
+
+    fn schedule_resync(&self, _peer_id: PeerId, _topic_id: TopicId) {}
+
+    fn network_attached(&self) -> bool {
+        false
     }
 }
 
