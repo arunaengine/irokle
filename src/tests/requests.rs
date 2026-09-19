@@ -322,18 +322,6 @@ fn memory_beyond_windows() {
     assert_beyond_windows(MemoryStorage::new);
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_beyond_windows() {
-    let dirs = std::sync::Mutex::new(Vec::new());
-    assert_beyond_windows(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-        dirs.lock().unwrap().push(dir);
-        storage
-    });
-}
-
 /// A page that cannot name every unknown ancestor of a chain names the deepest ones, whose
 /// dependents can follow once they are served, not the nearest ones it met first.
 #[test]
@@ -748,18 +736,6 @@ fn memory_batch_views() {
     }
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_batch_views() {
-    for chunk in [1, 7, 128] {
-        let directory = tempfile::tempdir().unwrap();
-        assert_batch_views(
-            crate::storage::FjallStorage::open(directory.path()).unwrap(),
-            chunk,
-        );
-    }
-}
-
 #[test]
 fn prefixes_finish_joins() {
     for width in [3, 128, 255, 256, 257, 512] {
@@ -934,41 +910,6 @@ fn inventory_fills_page() {
     panic!("inventory did not produce a page");
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_prefixes_finish() {
-    for width in [3, 257] {
-        let source_dir = tempfile::tempdir().unwrap();
-        let reader_dir = tempfile::tempdir().unwrap();
-        let source = joined_source(
-            crate::storage::FjallStorage::open(source_dir.path()).unwrap(),
-            width,
-            true,
-        );
-        let reader =
-            Oplog::with_storage(crate::storage::FjallStorage::open(reader_dir.path()).unwrap());
-        reader.receive_ops(vec![source.genesis.clone()]).unwrap();
-        source
-            .engine
-            .put_obligation(
-                source.reader,
-                source.topic_id,
-                source.log.storage().list_op_ids(&source.topic_id).unwrap(),
-            )
-            .unwrap();
-        let paged = page_informed(&source, &reader, 2, 1, true);
-        assert!(paged.complete);
-        assert_eq!(paged.sent, 2 * width + 1);
-        assert!(
-            source
-                .log
-                .storage()
-                .has_sync_obligations(&source.reader, &source.topic_id)
-                .unwrap()
-        );
-    }
-}
-
 /// A responder refuses a request past its item limit, wants and hints together.
 #[test]
 fn request_items_refused() {
@@ -998,18 +939,6 @@ fn request_items_refused() {
         .response_page(source.reader, &request, budget)
         .unwrap();
     assert_eq!(served.ops.len(), 4);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_truncated_causal() {
-    let dirs = std::sync::Mutex::new(Vec::new());
-    assert_truncated_causal(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-        dirs.lock().unwrap().push(dir);
-        storage
-    });
 }
 
 /// A reader repairing a lost op while behind on other actors: the want and the
@@ -1392,5 +1321,77 @@ mod sessions {
         carol_net.shutdown().await;
         bob_net.shutdown().await;
         alice_net.shutdown().await;
+    }
+}
+
+#[cfg(feature = "fjall")]
+mod with_fjall {
+    use crate::tests::requests::*;
+
+    #[test]
+    fn beyond_windows() {
+        let dirs = std::sync::Mutex::new(Vec::new());
+        assert_beyond_windows(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+            dirs.lock().unwrap().push(dir);
+            storage
+        });
+    }
+
+    #[test]
+    fn batch_views() {
+        for chunk in [1, 7, 128] {
+            let directory = tempfile::tempdir().unwrap();
+            assert_batch_views(
+                crate::storage::FjallStorage::open(directory.path()).unwrap(),
+                chunk,
+            );
+        }
+    }
+
+    #[test]
+    fn prefixes_finish() {
+        for width in [3, 257] {
+            let source_dir = tempfile::tempdir().unwrap();
+            let reader_dir = tempfile::tempdir().unwrap();
+            let source = joined_source(
+                crate::storage::FjallStorage::open(source_dir.path()).unwrap(),
+                width,
+                true,
+            );
+            let reader =
+                Oplog::with_storage(crate::storage::FjallStorage::open(reader_dir.path()).unwrap());
+            reader.receive_ops(vec![source.genesis.clone()]).unwrap();
+            source
+                .engine
+                .put_obligation(
+                    source.reader,
+                    source.topic_id,
+                    source.log.storage().list_op_ids(&source.topic_id).unwrap(),
+                )
+                .unwrap();
+            let paged = page_informed(&source, &reader, 2, 1, true);
+            assert!(paged.complete);
+            assert_eq!(paged.sent, 2 * width + 1);
+            assert!(
+                source
+                    .log
+                    .storage()
+                    .has_sync_obligations(&source.reader, &source.topic_id)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_causal() {
+        let dirs = std::sync::Mutex::new(Vec::new());
+        assert_truncated_causal(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+            dirs.lock().unwrap().push(dir);
+            storage
+        });
     }
 }

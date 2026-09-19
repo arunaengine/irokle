@@ -320,13 +320,6 @@ fn memory_stale_view() {
     assert_stale_view(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_stale_view() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_stale_view(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// A discard decided on an observation ends the namespace only while it is
 /// unchanged: a write or a touch since then keeps it.
 fn assert_observed_discard<S: Storage>(storage: S) {
@@ -351,13 +344,6 @@ fn assert_observed_discard<S: Storage>(storage: S) {
 #[test]
 fn memory_observed_discard() {
     assert_observed_discard(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_observed_discard() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_observed_discard(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// A view retained across its activation writes nothing: not into the active
@@ -405,13 +391,6 @@ fn assert_frozen_view<S: Storage>(storage: S) {
 #[test]
 fn memory_frozen_view() {
     assert_frozen_view(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_frozen_view() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_frozen_view(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// The total and source limits hold where staged bytes commit: a view obtained
@@ -483,20 +462,6 @@ fn memory_commit_quota() {
     assert_commit_quota(|limits| MemoryStorage::new().with_staging_limits(limits));
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_commit_quota() {
-    let dirs = std::sync::Mutex::new(Vec::new());
-    assert_commit_quota(|limits| {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::FjallStorage::open(dir.path())
-            .unwrap()
-            .with_staging_limits(limits);
-        dirs.lock().unwrap().push(dir);
-        storage
-    });
-}
-
 /// A fragment that fits once weaker stagings of its topic are discarded makes
 /// progress; one that no discard could fit is refused and discards nothing.
 fn assert_reclaim_fits<S: Storage>(open: impl Fn(StagingLimits) -> S) {
@@ -560,20 +525,6 @@ fn memory_reclaim_fits() {
     assert_reclaim_fits(|limits| MemoryStorage::new().with_staging_limits(limits));
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_reclaim_fits() {
-    let dirs = std::sync::Mutex::new(Vec::new());
-    assert_reclaim_fits(|limits| {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::FjallStorage::open(dir.path())
-            .unwrap()
-            .with_staging_limits(limits);
-        dirs.lock().unwrap().push(dir);
-        storage
-    });
-}
-
 /// Two nodes over one store, each checking staging usage before the other
 /// commits: the fragment committing second is refused, and staging never holds
 /// more than the total.
@@ -629,17 +580,6 @@ fn memory_raced_quota() {
     assert_raced_quota(|limits| MemoryStorage::new().with_staging_limits(limits));
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_raced_quota() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_raced_quota(|limits| {
-        crate::storage::FjallStorage::open(dir.path())
-            .unwrap()
-            .with_staging_limits(limits)
-    });
-}
-
 /// Expiry that found a namespace idle keeps it when the namespace is written
 /// before the discard: the written fragment stays staged.
 fn assert_raced_expiry<S: Storage>(storage: S) {
@@ -682,13 +622,6 @@ fn assert_raced_expiry<S: Storage>(storage: S) {
 #[test]
 fn memory_raced_expiry() {
     assert_raced_expiry(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_raced_expiry() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_raced_expiry(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 #[cfg(feature = "fjall")]
@@ -1299,5 +1232,70 @@ pub(super) mod fjall {
         ));
         assert_eq!(storage.slot_bytes().unwrap(), before);
         assert!(storage.provisional_topics().unwrap().is_empty());
+    }
+}
+
+#[cfg(feature = "fjall")]
+mod with_fjall {
+    use crate::tests::ownership::*;
+
+    #[test]
+    fn stale_view() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_stale_view(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn observed_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_observed_discard(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn frozen_view() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_frozen_view(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn commit_quota() {
+        let dirs = std::sync::Mutex::new(Vec::new());
+        assert_commit_quota(|limits| {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = crate::storage::FjallStorage::open(dir.path())
+                .unwrap()
+                .with_staging_limits(limits);
+            dirs.lock().unwrap().push(dir);
+            storage
+        });
+    }
+
+    #[test]
+    fn reclaim_fits() {
+        let dirs = std::sync::Mutex::new(Vec::new());
+        assert_reclaim_fits(|limits| {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = crate::storage::FjallStorage::open(dir.path())
+                .unwrap()
+                .with_staging_limits(limits);
+            dirs.lock().unwrap().push(dir);
+            storage
+        });
+    }
+
+    #[test]
+    fn raced_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_raced_quota(|limits| {
+            crate::storage::FjallStorage::open(dir.path())
+                .unwrap()
+                .with_staging_limits(limits)
+        });
+    }
+
+    #[test]
+    fn raced_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_raced_expiry(crate::storage::FjallStorage::open(dir.path()).unwrap());
     }
 }

@@ -1430,19 +1430,6 @@ fn memory_repairs_hole() {
     }
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_repairs_hole() {
-    for (seed, damage) in [(111, Damage::Meta), (113, Damage::Op), (115, Damage::Both)] {
-        let dir = tempfile::tempdir().unwrap();
-        assert_repairs_hole(
-            crate_storage::FjallStorage::open(dir.path()).unwrap(),
-            seed,
-            damage,
-        );
-    }
-}
-
 #[test]
 fn repair_dangling_dep() {
     // A store holding a hole must pull it from a peer over the ordinary
@@ -1656,13 +1643,6 @@ fn assert_resolved_targets<S: Storage>(storage: S) {
 #[test]
 fn memory_resolved_targets() {
     assert_resolved_targets(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_resolved_targets() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_resolved_targets(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Forwarding obligations are the durable part of a receive; a failed status
@@ -2052,15 +2032,6 @@ fn memory_forwards_coalesce() {
     assert_forwards_coalesce(storage, move || counters.counters());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_forwards_coalesce() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    let counters = storage.clone();
-    assert_forwards_coalesce(storage, move || counters.counters());
-}
-
 /// Status state follows the typed attempt outcome, so a partial pull with
 /// nothing owed outbound stays behind, and an older attempt changes nothing.
 fn assert_outcome_states<S: Storage>(storage: S) {
@@ -2137,8 +2108,38 @@ fn memory_outcome_states() {
 }
 
 #[cfg(feature = "fjall")]
-#[test]
-fn fjall_outcome_states() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_outcome_states(crate::storage::FjallStorage::open(dir.path()).unwrap());
+mod with_fjall {
+    use crate::tests::sync::*;
+
+    #[test]
+    fn repairs_hole() {
+        for (seed, damage) in [(111, Damage::Meta), (113, Damage::Op), (115, Damage::Both)] {
+            let dir = tempfile::tempdir().unwrap();
+            assert_repairs_hole(
+                crate_storage::FjallStorage::open(dir.path()).unwrap(),
+                seed,
+                damage,
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_resolved_targets(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn forwards_coalesce() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        let counters = storage.clone();
+        assert_forwards_coalesce(storage, move || counters.counters());
+    }
+
+    #[test]
+    fn outcome_states() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_outcome_states(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
 }

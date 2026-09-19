@@ -113,13 +113,6 @@ fn memory_rejects_foreign() {
     assert_rejects_foreign(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_rejects_foreign() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_rejects_foreign(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// A predecessor of the right actor but the wrong sequence is just as final.
 #[test]
 fn rejects_impossible_seq() {
@@ -310,16 +303,6 @@ fn memory_skips_unrelated() {
     assert_skips_unrelated(MemoryStorage::new(), MemoryStorage::counters);
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_skips_unrelated() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_skips_unrelated(
-        crate::storage::FjallStorage::open(dir.path()).unwrap(),
-        crate::storage::FjallStorage::counters,
-    );
-}
-
 /// A rejected subtree stays rejected on its branch: re-inserting the root or
 /// a child that waits on it is refused, in either order against the rejection,
 /// and a reset of the topic forgets the markers.
@@ -398,13 +381,6 @@ fn assert_rejection_sticks<S: Storage>(storage: S) {
 #[test]
 fn memory_rejection_sticks() {
     assert_rejection_sticks(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_rejection_sticks() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_rejection_sticks(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Concurrent child insertion and subtree rejection never leave the child
@@ -523,21 +499,6 @@ fn memory_exact_accounting() {
         MemoryStorage::new(),
         MemoryStorage::pending_usage,
         |storage| storage,
-    );
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_exact_accounting() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().to_path_buf();
-    assert_exact_accounting(
-        crate::storage::FjallStorage::open(&path).unwrap(),
-        crate::storage::FjallStorage::pending_usage,
-        move |storage| {
-            drop(storage);
-            crate::storage::FjallStorage::open(&path).unwrap()
-        },
     );
 }
 
@@ -752,16 +713,6 @@ fn memory_drains_complete() {
     assert_drains_complete(MemoryStorage::new());
 }
 
-/// The same on a durable store, where every admission is a synced commit.
-/// Run explicitly: `cargo test --features fjall --lib fjall_drains_complete -- --ignored`.
-#[cfg(feature = "fjall")]
-#[test]
-#[ignore = "about two minutes of synced commits, run explicitly"]
-fn fjall_drains_complete() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_drains_complete(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// Write faults keep ready ops indexed while one receive releases a long chain.
 /// The receive admits the whole chain however many visits retained ops cost.
 /// Reconciliation stops while ops cannot be admitted and admits them once the fault clears.
@@ -849,14 +800,62 @@ fn memory_retained_drain() {
 }
 
 #[cfg(feature = "fjall")]
-#[test]
-fn fjall_retained_drain() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_retained_drain(
-        crate::storage::FjallStorage::open_with_persist_mode(
-            dir.path(),
-            fjall::PersistMode::Buffer,
-        )
-        .unwrap(),
-    );
+mod with_fjall {
+    use crate::tests::pending::*;
+
+    #[test]
+    fn rejects_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_rejects_foreign(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn skips_unrelated() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_skips_unrelated(
+            crate::storage::FjallStorage::open(dir.path()).unwrap(),
+            crate::storage::FjallStorage::counters,
+        );
+    }
+
+    #[test]
+    fn rejection_sticks() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_rejection_sticks(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn exact_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        assert_exact_accounting(
+            crate::storage::FjallStorage::open(&path).unwrap(),
+            crate::storage::FjallStorage::pending_usage,
+            move |storage| {
+                drop(storage);
+                crate::storage::FjallStorage::open(&path).unwrap()
+            },
+        );
+    }
+
+    /// The same on a durable store, where every admission is a synced commit.
+    /// Run explicitly: `cargo test --features fjall --lib with_fjall::drains_complete -- --ignored`.
+    #[test]
+    #[ignore = "about two minutes of synced commits, run explicitly"]
+    fn drains_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_drains_complete(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn retained_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_retained_drain(
+            crate::storage::FjallStorage::open_with_persist_mode(
+                dir.path(),
+                fjall::PersistMode::Buffer,
+            )
+            .unwrap(),
+        );
+    }
 }

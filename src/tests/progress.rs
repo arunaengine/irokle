@@ -97,13 +97,6 @@ fn memory_chain_suspends() {
     assert_chain_suspends(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_chain_suspends() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_chain_suspends(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// Suspended waiters cost bounded work: the whole chain page reads a few
 /// records per op and per actor, not a repeated traversal.
 #[test]
@@ -243,13 +236,6 @@ fn lost_range(chain: &[Op]) -> Option<std::ops::RangeInclusive<usize>> {
 #[test]
 fn memory_hole_chain() {
     assert_hole_chain(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_hole_chain() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_hole_chain(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// A source that lost one record of a chain serves an independent chain beside
@@ -398,13 +384,6 @@ fn wants_fit_request() {
     assert_wants_fit(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_wants_fit() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_wants_fit(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// A negotiation checks remote heads and orders wants within one page slice shared with its
 /// push. A summary naming more heads than that slice reads still yields a request the
 /// responder serves, and heads past the slice wait for a later request.
@@ -470,16 +449,6 @@ fn memory_selection_bounded() {
     assert_selection_bounded(MemoryStorage::new(), MemoryStorage::counters);
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_selection_bounded() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_selection_bounded(
-        crate::storage::FjallStorage::open(dir.path()).unwrap(),
-        crate::storage::FjallStorage::counters,
-    );
-}
-
 /// A request naming only some of a hole chain names its oldest holes, even when their ids sort
 /// past the reads one negotiation slice holds, so every page admits what it carries.
 fn assert_holes_ordered<S: Corrupt>(reader_store: S) {
@@ -532,13 +501,6 @@ fn memory_holes_ordered() {
     assert_holes_ordered(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_holes_ordered() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_holes_ordered(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// Remote heads past the reads of a negotiation slice hide no work: a head ahead of the local
 /// clock is reached through its actor's range, and a held head that lost its record is a hole
 /// the history scan finds.
@@ -589,13 +551,6 @@ fn assert_heads_reached<S: Corrupt>(reader_store: S) {
 #[test]
 fn memory_heads_reached() {
     assert_heads_reached(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_heads_reached() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_heads_reached(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// A request accepted on one genesis is refused as stale once a reset replaced
@@ -893,4 +848,48 @@ fn finite_goals_progress() {
     assert_eq!(delivered, 34);
     assert!(refused > 0);
     assert_eq!(responder.page_work().kept_bytes, 0);
+}
+
+#[cfg(feature = "fjall")]
+mod with_fjall {
+    use crate::tests::progress::*;
+
+    #[test]
+    fn chain_suspends() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_chain_suspends(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn hole_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_hole_chain(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn wants_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_wants_fit(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn selection_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_selection_bounded(
+            crate::storage::FjallStorage::open(dir.path()).unwrap(),
+            crate::storage::FjallStorage::counters,
+        );
+    }
+
+    #[test]
+    fn holes_ordered() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_holes_ordered(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn heads_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_heads_reached(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
 }
