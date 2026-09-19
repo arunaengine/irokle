@@ -159,8 +159,9 @@ pub(crate) fn select_sync_peers(
     select_sync_targets(topic_id, local_peer, state, PeerHealth::empty()).peers
 }
 
-/// Chooses which peers to sync a topic with, within its replication policy and peer health.
-#[doc = include_str!("peer_selection.md")]
+/// Sync targets for a topic within its replication policy and peer health: at most
+/// `max_sync_peers` in all, never outside `selected_peers` or current membership, and reported
+/// blocked rather than widened when every allowed peer is past its retry limit.
 pub(crate) fn select_sync_targets(
     topic_id: TopicId,
     local_peer: PeerId,

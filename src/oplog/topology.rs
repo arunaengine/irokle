@@ -22,9 +22,9 @@ pub(crate) fn topological_entries<S: Storage>(
     })
 }
 
-/// Order the ops named by `ids` oldest-first.
-///
-#[doc = include_str!("contracts/topological_subset.md")]
+/// Order the ops named by `ids` oldest-first. An op with missing records or a dependency
+/// without metadata is a hole: it and what depends on it are left out, not discarded, and only
+/// a cycle among fully present ops is an error.
 pub fn topological_subset<S: Storage>(storage: &S, ids: &BTreeSet<crate::OpId>) -> Result<Vec<Op>> {
     Ok(topological_subset_entries(storage, ids)?
         .into_iter()

@@ -88,9 +88,9 @@ pub struct EvictedOp {
     pub payload: TopicPayload,
 }
 
-/// Reports ops discarded from a topic's local chain.
-///
-#[doc = include_str!("contracts/topic_eviction.md")]
+/// Ops discarded from a topic's local chain, ordered by `(actor_id, actor_seq)`, for the
+/// embedder to re-emit. A genesis tie-break names the replaced and the winning genesis; a
+/// quarantine names the surviving genesis in both fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicEviction {
     pub topic_id: TopicId,
@@ -100,9 +100,8 @@ pub struct TopicEviction {
 }
 
 impl TopicEviction {
-    /// Identity of this eviction's durable journal record, derived from its content.
-    ///
-    #[doc = include_str!("contracts/eviction_key.md")]
+    /// Identity of this eviction's durable journal record, derived from its content: repeating the
+    /// write, delivery or recovery never adds a record, and the eviction alone names it.
     pub fn key(&self) -> EvictionKey {
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.topic_id.as_ref());
@@ -198,9 +197,9 @@ impl<S: Storage> Oplog<S> {
         }
     }
 
-    /// Holes that keep this topic from being locally complete.
-    ///
-    #[doc = include_str!("contracts/topic_unresolved.md")]
+    /// Ids this topic references but cannot resolve; empty means every admitted op is usable and
+    /// sync may certify the topic. Kept holes are checked again on each question, so a repair
+    /// stored through any facade of the store is seen without receiving it again.
     pub fn topic_unresolved(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
         let holes = match self.inspect(topic_id)? {
             Some((view, integrity)) => integrity.unresolved(&view),
@@ -291,9 +290,8 @@ impl<S: Storage> Oplog<S> {
         }
     }
 
-    /// Clear every integrity verdict and scan, and the membership projections.
-    ///
-    #[doc = include_str!("contracts/recheck_topics.md")]
+    /// Clear every integrity verdict and scan, and the membership projections, so the next
+    /// question scans the stored records again: damage from outside Irokle is found no other way.
     pub fn recheck_topics(&self) -> Result<()> {
         self.integrity.clear()?;
         *self.membership_cache()? = MembershipCache::default();
@@ -346,9 +344,9 @@ impl<S: Storage> Oplog<S> {
         Ok(orphans)
     }
 
-    /// Repair a topic by discarding the ops outside its head closure.
-    ///
-    #[doc = include_str!("contracts/quarantine_orphans.md")]
+    /// Discard the ops no head reaches and re-admit the rest from the genesis in one transaction,
+    /// dropping acks and obligations of the old frontier. `None` when nothing is orphaned, the
+    /// head closure still has a hole, or no head reaches the genesis.
     pub fn quarantine_orphans(&self, topic_id: &TopicId) -> Result<Option<TopicEviction>> {
         if self.topic_orphans(topic_id)?.is_empty() {
             return Ok(None);

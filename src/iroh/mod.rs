@@ -494,8 +494,9 @@ impl<S: Storage> IrohNet<S> {
         Self::new_with_alpns_config_and_sink(endpoint, node, alpns, runtime, None)
     }
 
-    /// Creates the net with an optional sink for genesis tie-break evictions.
-    #[doc = include_str!("eviction_sink.md")]
+    /// Like [`Self::new_with_alpns_and_config`], with a sink that receives every
+    /// [`TopicEviction`] of remote sync data promptly. Evictions are journalled and drained
+    /// through [`Irokle::pending_evictions`] with or without it.
     pub fn new_with_alpns_config_and_sink(
         endpoint: iroh::Endpoint,
         node: Irokle<S>,
@@ -1454,8 +1455,8 @@ impl<S: Storage> IrohNet<S> {
             .unwrap_or(Ok(()))
     }
 
-    /// Syncs topics now: each is `Ok` if complete, `WouldBlock` if more is scheduled, or an error.
-    #[doc = include_str!("sync_topics.md")]
+    /// Syncs `topic_ids` with one peer now, through the batched page exchange of the resync loop.
+    /// Each topic is `Ok` when complete, `WouldBlock` when the rest is scheduled, or its error.
     pub async fn sync_topics_now(
         &self,
         peer: iroh::EndpointAddr,

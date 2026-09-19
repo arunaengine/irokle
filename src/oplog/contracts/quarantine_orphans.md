@@ -1,8 +1,0 @@
-Discard the ops no head reaches and rebuild the topic from the ops that remain,
-in the single transaction genesis adoption already uses. The survivors are
-re-validated and re-admitted from the genesis up, so heads, clock, actor
-indexes, generation and fingerprint come back agreeing with one current-genesis
-DAG, and acks and obligations naming the old frontier are dropped rather than
-carried over. Returns the discarded payloads for re-emission, or `None` when
-there is nothing to quarantine, when the head closure still has a hole that sync
-must repair first, or when no head reaches the recorded genesis.

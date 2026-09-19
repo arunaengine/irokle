@@ -404,8 +404,9 @@ impl<S: Storage> Irokle<S> {
         self.sync.negotiate_page(peer_id, remote, budget)
     }
 
-    /// Plans a response page for `request` that fits `budget`.
-    #[doc = include_str!("response_page.md")]
+    /// Plans one bounded response page for `request` that fits `budget`; see
+    /// [`crate::sync::SyncEngine::response_page`]. A transport repeats request and page until the
+    /// page reports no more, as `tests/paging.rs` shows.
     pub fn response_page(
         &self,
         peer_id: PeerId,

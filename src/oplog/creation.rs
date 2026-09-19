@@ -56,9 +56,8 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         .map(|(op, _)| op)
     }
 
-    /// Create a topic and its first event as one atomic admission.
-    ///
-    #[doc = include_str!("contracts/create_genesis_event.md")]
+    /// Create a topic and its first event, chained off the genesis, as one atomic admission.
+    /// Returns `(genesis, event)`; fails with [`crate::Error::InvalidGenesis`] if the topic exists.
     pub fn create_topic_genesis_with_event(
         &self,
         topic_id: TopicId,
