@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use crate::clock::store::ClockCache;
-use crate::clock::{ActorClock, ActorId, CACHE_BYTES, corrupt, digest, first_difference, nibble};
+use crate::clock::store::{CACHE_BYTES, ClockCache, corrupt, digest};
+use crate::clock::{ActorClock, ActorId, first_difference, nibble};
 
 #[derive(serde::Deserialize)]
 enum Prefix {
@@ -174,8 +174,8 @@ impl ClockScan {
 
 #[cfg(test)]
 mod tests {
-    use crate::clock::Encoded;
     use crate::clock::scan::*;
+    use crate::clock::store::Encoded;
     use std::collections::BTreeMap;
 
     fn history() -> (BTreeMap<[u8; 32], Vec<u8>>, Vec<ActorClock>) {

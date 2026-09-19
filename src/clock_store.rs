@@ -2,14 +2,85 @@
 //! Stored clock nodes: their encoding and hashes, a clock loaded from its root
 //! node, and the cache that shares loaded nodes between clocks.
 
-use crate::clock::{
-    ActorClock, CACHE_BYTES, CacheInner, ClockRecord, ENTRY_BYTES, Encoded, Node, NodeFetch,
-    corrupt, digest, first_difference, nibble, table_bytes,
-};
+use crate::clock::{ActorClock, Node, first_difference, nibble};
 use crate::ids::ActorId;
 use serde::de::Deserializer;
-use std::collections::BTreeMap;
+use serde::ser::Serializer;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+/// The stored form of one trie node, its children named by their hashes.
+#[derive(Serialize, Deserialize)]
+pub(super) enum Encoded {
+    Leaf {
+        actor: ActorId,
+        seq: u64,
+    },
+    Branch {
+        level: u8,
+        bitmap: u16,
+        len: u64,
+        key: ActorId,
+        children: Vec<[u8; 32]>,
+    },
+}
+
+/// Separates node hashes from every other blake3 hash of this crate.
+const NODE_DOMAIN: &[u8] = b"irokle/clock-node/1";
+
+pub(crate) struct ClockRecord<'a> {
+    node: &'a Node,
+    pub(crate) hash: [u8; 32],
+}
+
+impl Serialize for ClockRecord<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.node.encoded().serialize(serializer)
+    }
+}
+
+pub(super) fn digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(NODE_DOMAIN);
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+impl Node {
+    fn encoded(&self) -> Encoded {
+        match self {
+            Node::Leaf { actor, seq, .. } => Encoded::Leaf {
+                actor: *actor,
+                seq: *seq,
+            },
+            Node::Branch {
+                level,
+                bitmap,
+                len,
+                key,
+                children,
+                ..
+            } => Encoded::Branch {
+                level: *level,
+                bitmap: *bitmap,
+                len: *len as u64,
+                key: *key,
+                children: children.iter().map(|child| child.hash()).collect(),
+            },
+        }
+    }
+
+    /// The hash of this node's stored form, computed once.
+    fn hash(&self) -> [u8; 32] {
+        let cell = match self {
+            Node::Leaf { hash, .. } | Node::Branch { hash, .. } => hash,
+        };
+        *cell.get_or_init(|| {
+            digest(&postcard::to_allocvec(&self.encoded()).expect("a clock node encodes"))
+        })
+    }
+}
 
 impl ActorClock {
     #[cfg(test)]
@@ -115,12 +186,39 @@ impl ActorClock {
     }
 }
 
+/// Reads the stored bytes of the node a hash names.
+type NodeFetch<'a> = dyn FnMut(&[u8; 32]) -> crate::Result<Option<Vec<u8>>> + 'a;
+
+pub(super) fn corrupt() -> crate::Error {
+    crate::Error::Storage("corrupt stored clock node".into())
+}
+
 /// Reuse shared clock nodes without reading them again. Only the latest clocks
 /// retain nodes within an estimated byte limit; other cached nodes are weak references.
 #[derive(Default)]
 pub(crate) struct ClockCache {
     inner: Mutex<CacheInner>,
 }
+
+#[derive(Default)]
+struct CacheInner {
+    nodes: HashMap<[u8; 32], Weak<Node>>,
+    latest: VecDeque<Arc<Node>>,
+    retained: HashMap<usize, CachedNode>,
+    bytes: usize,
+}
+
+struct CachedNode {
+    references: usize,
+    root: bool,
+}
+
+/// Modeled bytes of retained nodes and their ownership index.
+pub(super) const CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// A single root's conservative node and ownership-index allowance per entry.
+const ENTRY_BYTES: usize = 512;
+/// Node names the cache tracks before it drops those nothing holds.
+const CACHE_NODES: usize = 1 << 18;
 
 impl ClockCache {
     pub(crate) fn bytes(&self) -> usize {
@@ -251,6 +349,92 @@ impl ClockCache {
         }
         Ok(node)
     }
+}
+
+impl CacheInner {
+    fn root_bytes(&self) -> usize {
+        self.bytes
+            + table_bytes(&self.retained)
+            + self.latest.capacity() * size_of::<Arc<Node>>()
+            + usize::from(self.latest.capacity() > 0) * 16
+    }
+
+    fn trim(&mut self, limit: usize) {
+        while self.root_bytes() > limit {
+            let Some(root) = self.latest.pop_front() else {
+                self.retained.shrink_to_fit();
+                self.latest.shrink_to_fit();
+                break;
+            };
+            self.release(&root);
+        }
+    }
+
+    fn name(&mut self, hash: &[u8; 32], node: &Arc<Node>) {
+        if let Some(named) = self.nodes.get_mut(hash) {
+            *named = Arc::downgrade(node);
+            return;
+        }
+        if self.nodes.len() >= CACHE_NODES {
+            self.nodes.retain(|_, node| node.strong_count() > 0);
+            if self.nodes.len() >= CACHE_NODES / 2 {
+                self.nodes.clear();
+            }
+        }
+        self.nodes.insert(*hash, Arc::downgrade(node));
+    }
+
+    /// Count each retained parent edge and root, visiting a shared subtree once.
+    fn remember(&mut self, node: &Arc<Node>) {
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            let address = Arc::as_ptr(node) as usize;
+            if let Some(node) = self.retained.get_mut(&address) {
+                node.references += 1;
+                continue;
+            }
+            self.retained.insert(
+                address,
+                CachedNode {
+                    references: 1,
+                    root: false,
+                },
+            );
+            self.bytes += node.bytes();
+            self.name(&node.hash(), node);
+            if let Node::Branch { children, .. } = &**node {
+                stack.extend(children);
+            }
+        }
+    }
+
+    fn release(&mut self, node: &Arc<Node>) {
+        if let Some(node) = self.retained.get_mut(&(Arc::as_ptr(node) as usize)) {
+            node.root = false;
+        }
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            let address = Arc::as_ptr(node) as usize;
+            if let Some(node) = self.retained.get_mut(&address) {
+                node.references -= 1;
+                if node.references != 0 {
+                    continue;
+                }
+            }
+            self.retained.remove(&address);
+            self.bytes -= node.bytes();
+            if let Node::Branch { children, .. } = &**node {
+                stack.extend(children);
+            }
+        }
+    }
+}
+
+fn table_bytes<K, V>(table: &HashMap<K, V>) -> usize {
+    if table.capacity() == 0 {
+        return 0;
+    }
+    table.capacity().next_power_of_two() * (size_of::<(K, V)>() + 1) + 64
 }
 
 #[cfg(test)]
