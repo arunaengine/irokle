@@ -219,190 +219,6 @@ fn memory_evidence_heals() {
     assert_evidence_heals(MemoryStorage::new());
 }
 
-/// An endpoint whose id is the peer id of `Ed25519Signer::from_bytes(&[seed; 32])`.
-#[cfg(feature = "iroh")]
-async fn keyed_endpoint(seed: u8) -> iroh::Endpoint {
-    iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-        .secret_key(iroh::SecretKey::from_bytes(&[seed; 32]))
-        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
-        .bind()
-        .await
-        .unwrap()
-}
-
-/// A matching fingerprint is no evidence while the answering side has not
-/// finished scanning: it answers with summaries and records no ack until then.
-#[cfg(feature = "iroh")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn evidence_waits_scan() {
-    let (holder, source, ops) = whole_topic(&MemoryStorage::new(), 40);
-    let topic_id = ops[0].signed.body.topic_id;
-    holder.set_step_reads(8);
-    let holder_net = net::IrohNet::new(keyed_endpoint(44).await, holder.clone()).unwrap();
-    let source_id = keyed_endpoint(42).await.id();
-    let messages = vec![
-        sync::SyncMessage::Open(source.sync_open(topic_id)),
-        sync::SyncMessage::Fingerprint(source.sync_fingerprint(topic_id).unwrap()),
-    ];
-    let mut summaries = 0;
-    loop {
-        let replies = holder_net
-            .handle_messages(source_id, messages.clone())
-            .unwrap();
-        let acked = holder
-            .storage()
-            .peer_ack(&source.peer_id(), &topic_id)
-            .unwrap();
-        if replies
-            .iter()
-            .any(|reply| matches!(reply, sync::SyncMessage::Fingerprint(_)))
-        {
-            assert!(acked.is_some(), "a matching answer recorded no ack");
-            break;
-        }
-        assert!(acked.is_none(), "an unfinished scan recorded an ack");
-        summaries += 1;
-        assert!(summaries < 20, "the scan never finished");
-    }
-    assert!(
-        summaries >= 2,
-        "{summaries} answers before the scan finished"
-    );
-    holder_net.shutdown().await;
-}
-
-/// A member removed while the answering side still scans gets no ack from the
-/// scan's verdict: its matching fingerprint is answered, but not recorded.
-#[cfg(feature = "iroh")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn removal_records_nothing() {
-    let (holder, source, ops) = whole_topic(&MemoryStorage::new(), 40);
-    let topic_id = ops[0].signed.body.topic_id;
-    source.set_step_reads(8);
-    let source_net = net::IrohNet::new(keyed_endpoint(42).await, source.clone()).unwrap();
-    let holder_id = keyed_endpoint(44).await.id();
-    let answer = || {
-        let messages = vec![
-            sync::SyncMessage::Open(holder.sync_open(topic_id)),
-            sync::SyncMessage::Fingerprint(holder.sync_fingerprint(topic_id).unwrap()),
-        ];
-        let replies = source_net.handle_messages(holder_id, messages).unwrap();
-        let acked = source
-            .storage()
-            .peer_ack(&holder.peer_id(), &topic_id)
-            .unwrap();
-        assert!(acked.is_none(), "evidence recorded for a removed member");
-        replies
-            .iter()
-            .any(|reply| matches!(reply, sync::SyncMessage::Fingerprint(_)))
-    };
-    assert!(!answer(), "an unfinished scan matched");
-    let topic = source.open_topic::<Note>(topic_id).unwrap();
-    topic.remove_peer(holder.peer_id()).unwrap();
-    let history = oplog::topological(source.storage(), &topic_id).unwrap();
-    let data = sync::SyncData {
-        topic_id,
-        ops: history,
-    };
-    holder
-        .receive_sync_data_from(source.peer_id(), data)
-        .unwrap();
-    let mut answers = 1;
-    while !answer() {
-        answers += 1;
-        assert!(answers < 20, "the scan never finished");
-    }
-    source_net.shutdown().await;
-}
-
-/// A damaged topic's scan paused between steps holds nothing: a healthy topic
-/// publishes and answers a control exchange meanwhile, then the scan resumes.
-#[cfg(feature = "iroh")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn healthy_while_paused() {
-    let storage = MemoryStorage::new();
-    let (holder, source, ops) = reuse_topic(&storage);
-    let damaged = ops[0].signed.body.topic_id;
-    holder.set_step_reads(64);
-    let holder_net = net::IrohNet::new(keyed_endpoint(44).await, holder.clone()).unwrap();
-    let source_id = keyed_endpoint(42).await.id();
-    let open = |topic_id| sync::SyncMessage::Open(source.sync_open(topic_id));
-    let first = holder_net
-        .handle_messages(source_id, vec![open(damaged)])
-        .unwrap();
-    assert_eq!(first.len(), 1);
-    let healthy = source
-        .create_topic::<Note>(TopicConfig {
-            initial_peers: [holder.peer_id()].into(),
-            ..TopicConfig::default()
-        })
-        .unwrap();
-    let genesis = oplog::topological(source.storage(), &healthy.id()).unwrap();
-    let data = sync::SyncData {
-        topic_id: healthy.id(),
-        ops: genesis,
-    };
-    holder
-        .receive_sync_data_from(source.peer_id(), data)
-        .unwrap();
-    let local = holder.open_topic::<Note>(healthy.id()).unwrap();
-    local
-        .publish(Note {
-            text: "healthy".into(),
-        })
-        .unwrap();
-    let fingerprint = holder.sync_fingerprint(healthy.id()).unwrap();
-    let messages = vec![
-        open(healthy.id()),
-        sync::SyncMessage::Fingerprint(fingerprint),
-    ];
-    let replies = holder_net.handle_messages(source_id, messages).unwrap();
-    assert!(
-        replies
-            .iter()
-            .any(|reply| matches!(reply, sync::SyncMessage::Fingerprint(_)))
-    );
-    let hole = BTreeSet::from([ops[REUSE_OPS / 2].id]);
-    assert_eq!(holder.topic_unresolved(damaged).unwrap(), hole);
-    holder_net.shutdown().await;
-}
-
-/// One fingerprint answer of a damaged topic scans it at most once and decodes
-/// no payload; the next answer of the unchanged store scans nothing.
-#[cfg(feature = "iroh")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fingerprint_scans_once() {
-    let storage = MemoryStorage::new();
-    let (holder, source, ops) = reuse_topic(&storage);
-    let topic_id = ops[0].signed.body.topic_id;
-    let holder_net = net::IrohNet::new(keyed_endpoint(44).await, holder.clone()).unwrap();
-    let source_id = keyed_endpoint(42).await.id();
-    let messages = vec![
-        sync::SyncMessage::Open(source.sync_open(topic_id)),
-        sync::SyncMessage::Fingerprint(source.sync_fingerprint(topic_id).unwrap()),
-    ];
-    let answer = || {
-        let replies = holder_net
-            .handle_messages(source_id, messages.clone())
-            .unwrap();
-        assert!(
-            replies
-                .iter()
-                .any(|reply| matches!(reply, sync::SyncMessage::Summary(_)))
-        );
-    };
-    let (payloads, positions) = reads(&storage, MemoryStorage::counters, answer);
-    assert_eq!(payloads, 0, "the answer decoded payloads");
-    assert!(
-        positions <= 2 * REUSE_OPS as u64 + 64,
-        "{positions} positions read"
-    );
-    let (payloads, positions) = reads(&storage, MemoryStorage::counters, answer);
-    assert_eq!(payloads, 0);
-    assert!(positions < 64, "{positions} positions read again");
-    holder_net.shutdown().await;
-}
-
 /// Every call either finishes the repair or reports `WouldBlock` with fewer
 /// holes than before, and no call reports success while a hole is left.
 #[cfg(feature = "iroh")]
@@ -525,5 +341,189 @@ mod with_fjall {
     fn evidence_heals() {
         let dir = tempfile::tempdir().unwrap();
         assert_evidence_heals(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+}
+
+#[cfg(feature = "iroh")]
+mod with_iroh {
+    use crate::tests::holes::*;
+
+    /// An endpoint whose id is the peer id of `Ed25519Signer::from_bytes(&[seed; 32])`.
+    async fn keyed_endpoint(seed: u8) -> iroh::Endpoint {
+        iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .secret_key(iroh::SecretKey::from_bytes(&[seed; 32]))
+            .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap()
+    }
+
+    /// A matching fingerprint is no evidence while the answering side has not
+    /// finished scanning: it answers with summaries and records no ack until then.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evidence_waits_scan() {
+        let (holder, source, ops) = whole_topic(&MemoryStorage::new(), 40);
+        let topic_id = ops[0].signed.body.topic_id;
+        holder.set_step_reads(8);
+        let holder_net = net::IrohNet::new(keyed_endpoint(44).await, holder.clone()).unwrap();
+        let source_id = keyed_endpoint(42).await.id();
+        let messages = vec![
+            sync::SyncMessage::Open(source.sync_open(topic_id)),
+            sync::SyncMessage::Fingerprint(source.sync_fingerprint(topic_id).unwrap()),
+        ];
+        let mut summaries = 0;
+        loop {
+            let replies = holder_net
+                .handle_messages(source_id, messages.clone())
+                .unwrap();
+            let acked = holder
+                .storage()
+                .peer_ack(&source.peer_id(), &topic_id)
+                .unwrap();
+            if replies
+                .iter()
+                .any(|reply| matches!(reply, sync::SyncMessage::Fingerprint(_)))
+            {
+                assert!(acked.is_some(), "a matching answer recorded no ack");
+                break;
+            }
+            assert!(acked.is_none(), "an unfinished scan recorded an ack");
+            summaries += 1;
+            assert!(summaries < 20, "the scan never finished");
+        }
+        assert!(
+            summaries >= 2,
+            "{summaries} answers before the scan finished"
+        );
+        holder_net.shutdown().await;
+    }
+
+    /// A member removed while the answering side still scans gets no ack from the
+    /// scan's verdict: its matching fingerprint is answered, but not recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removal_records_nothing() {
+        let (holder, source, ops) = whole_topic(&MemoryStorage::new(), 40);
+        let topic_id = ops[0].signed.body.topic_id;
+        source.set_step_reads(8);
+        let source_net = net::IrohNet::new(keyed_endpoint(42).await, source.clone()).unwrap();
+        let holder_id = keyed_endpoint(44).await.id();
+        let answer = || {
+            let messages = vec![
+                sync::SyncMessage::Open(holder.sync_open(topic_id)),
+                sync::SyncMessage::Fingerprint(holder.sync_fingerprint(topic_id).unwrap()),
+            ];
+            let replies = source_net.handle_messages(holder_id, messages).unwrap();
+            let acked = source
+                .storage()
+                .peer_ack(&holder.peer_id(), &topic_id)
+                .unwrap();
+            assert!(acked.is_none(), "evidence recorded for a removed member");
+            replies
+                .iter()
+                .any(|reply| matches!(reply, sync::SyncMessage::Fingerprint(_)))
+        };
+        assert!(!answer(), "an unfinished scan matched");
+        let topic = source.open_topic::<Note>(topic_id).unwrap();
+        topic.remove_peer(holder.peer_id()).unwrap();
+        let history = oplog::topological(source.storage(), &topic_id).unwrap();
+        let data = sync::SyncData {
+            topic_id,
+            ops: history,
+        };
+        holder
+            .receive_sync_data_from(source.peer_id(), data)
+            .unwrap();
+        let mut answers = 1;
+        while !answer() {
+            answers += 1;
+            assert!(answers < 20, "the scan never finished");
+        }
+        source_net.shutdown().await;
+    }
+
+    /// A damaged topic's scan paused between steps holds nothing: a healthy topic
+    /// publishes and answers a control exchange meanwhile, then the scan resumes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn healthy_while_paused() {
+        let storage = MemoryStorage::new();
+        let (holder, source, ops) = reuse_topic(&storage);
+        let damaged = ops[0].signed.body.topic_id;
+        holder.set_step_reads(64);
+        let holder_net = net::IrohNet::new(keyed_endpoint(44).await, holder.clone()).unwrap();
+        let source_id = keyed_endpoint(42).await.id();
+        let open = |topic_id| sync::SyncMessage::Open(source.sync_open(topic_id));
+        let first = holder_net
+            .handle_messages(source_id, vec![open(damaged)])
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let healthy = source
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [holder.peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let genesis = oplog::topological(source.storage(), &healthy.id()).unwrap();
+        let data = sync::SyncData {
+            topic_id: healthy.id(),
+            ops: genesis,
+        };
+        holder
+            .receive_sync_data_from(source.peer_id(), data)
+            .unwrap();
+        let local = holder.open_topic::<Note>(healthy.id()).unwrap();
+        local
+            .publish(Note {
+                text: "healthy".into(),
+            })
+            .unwrap();
+        let fingerprint = holder.sync_fingerprint(healthy.id()).unwrap();
+        let messages = vec![
+            open(healthy.id()),
+            sync::SyncMessage::Fingerprint(fingerprint),
+        ];
+        let replies = holder_net.handle_messages(source_id, messages).unwrap();
+        assert!(
+            replies
+                .iter()
+                .any(|reply| matches!(reply, sync::SyncMessage::Fingerprint(_)))
+        );
+        let hole = BTreeSet::from([ops[REUSE_OPS / 2].id]);
+        assert_eq!(holder.topic_unresolved(damaged).unwrap(), hole);
+        holder_net.shutdown().await;
+    }
+
+    /// One fingerprint answer of a damaged topic scans it at most once and decodes
+    /// no payload; the next answer of the unchanged store scans nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fingerprint_scans_once() {
+        let storage = MemoryStorage::new();
+        let (holder, source, ops) = reuse_topic(&storage);
+        let topic_id = ops[0].signed.body.topic_id;
+        let holder_net = net::IrohNet::new(keyed_endpoint(44).await, holder.clone()).unwrap();
+        let source_id = keyed_endpoint(42).await.id();
+        let messages = vec![
+            sync::SyncMessage::Open(source.sync_open(topic_id)),
+            sync::SyncMessage::Fingerprint(source.sync_fingerprint(topic_id).unwrap()),
+        ];
+        let answer = || {
+            let replies = holder_net
+                .handle_messages(source_id, messages.clone())
+                .unwrap();
+            assert!(
+                replies
+                    .iter()
+                    .any(|reply| matches!(reply, sync::SyncMessage::Summary(_)))
+            );
+        };
+        let (payloads, positions) = reads(&storage, MemoryStorage::counters, answer);
+        assert_eq!(payloads, 0, "the answer decoded payloads");
+        assert!(
+            positions <= 2 * REUSE_OPS as u64 + 64,
+            "{positions} positions read"
+        );
+        let (payloads, positions) = reads(&storage, MemoryStorage::counters, answer);
+        assert_eq!(payloads, 0);
+        assert!(positions < 64, "{positions} positions read again");
+        holder_net.shutdown().await;
     }
 }
