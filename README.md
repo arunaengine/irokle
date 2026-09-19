@@ -6,19 +6,11 @@ Irokle is a signed Merkle-DAG operation log for invite-only topics. Application 
 
 - Signed operations: every event or control change is signed by the peer that authored it.
 - Topic membership: topics are not public broadcast channels; typed access is gated by the current signed member set.
-- Paged sync: peers exchange summaries, requests with a receive credit, bounded pages of operations, and signed acknowledgements. The Iroh wire protocol is `irokle/sync/5`.
+- Paged sync: peers exchange summaries, requests with a receive credit, bounded pages of operations, and signed acknowledgements. The Iroh wire protocol is `irokle/sync/2`.
 - Bounded fanout: topic replication is capped by `ReplicationPolicy::max_sync_peers` so a node does not sync with every member by default.
 - Observability: sync status records expose pending obligations, failure counts, last errors, last success, the newest attempt, and per-state counts.
 - Storage choices: `MemoryStorage` is available by default; `FjallStorage` is available behind the `fjall` feature.
 - Iroh integration: the `iroh` feature syncs over `iroh::Endpoint` using `PeerId`/`NodeId` dialing.
-
-## Version 0.2 API compatibility
-
-Consuming `SyncResponses` now yields `SyncResponse` items that retain the batch's byte reservation. Read an owned item with `item.as_ref()` or `&*item`. Existing borrowed `responses.iter()` and `responses.messages()` interfaces are unchanged. The whole batch remains reserved until its iterator and final owned item drop. Explicit caller-created clones are outside that reservation, including any buffers those clones share.
-
-Custom `SnapshotRead` implementations must implement `sync_identity`, `sync_clock`, and `dependency_ids` to serve bounded page goals. Their defaults return `Error::SyncCapacity` with an actionable unsupported-backend cause. The built-in Memory and Fjall backends implement these operations. `Error::cause()` exposes the typed cause beneath shared batch errors; an uncertain commit still requires reopening and reconciliation. `AttemptOutcome::ReopenRequired` marks a sync attempt that stopped because the store must be reopened; sync status keeps that peer `Behind` and records the reason in `last_error`.
-
-These Rust API changes retain the `irokle/sync/5` wire protocol and Fjall schema 2. Wire failures identify a failed stage, so a remote backend cause remains unknown and retryable. Persistent record encodings, signed operation and ACK domains, public configuration fields, and existing long public method names remain unchanged.
 
 ## Minimal Example
 
@@ -154,7 +146,7 @@ By default, Iroh auto-accept only admits brand-new topics from peers in `peer_wh
 
 Automatic acceptance requires a dedicated Irokle endpoint; `build()` rejects additional protocols configured through `with_alpn` or `with_alpns` while auto-accept is enabled. For multiple protocols, call `without_auto_accept()` after `with_net(endpoint)` and route incoming connections manually. Construction replaces the endpoint ALPN list with the builder-configured protocols plus Irokle, so include every required protocol in `with_alpns`.
 
-Nodes speak the sync protocol `irokle/sync/5` (`irokle::sync::SYNC_PROTOCOL`, also the ALPN). A peer that only offers `irokle/sync/4` cannot connect, so upgrade every node of a deployment together. A requester sends a `SyncRequest` with its branch (`genesis`) and a receive credit. It names the actors it is behind on by range hints, at most 65,536 wants and hints together; an actor past the range span gets a zero-span hint that only states its position. When more actors are behind than a request can name, the request's `window` states which actor ids its hints describe completely. An actor outside the window that the request does not name is unknown to the responder, which never takes it as held: an operation depending on such an actor waits, and the page result names the actor in `positions`. The requester names those positions in its next request for the same window, and otherwise moves the window on. The responder reads the whole request stream, then replies with every control message first, one bounded page of data per request, and a `SyncMessage::Page` that says whether more is left and names records the goal needs that the responder does not hold. A traversal slice admits at most 65,536 combined record visits and actor work items, and at most 65,536 dependency edges; preparation and decoding have separate allowances. A page that holds more but carries no data always names such a record or needed positions, or `PlannedPage::too_large` names an operation larger than the page budget, or `continued` says the responder kept its plan: the same request goes on from it, and appends made meanwhile are later work. A responder keeps at most 16 such plans; a slice that cannot be kept fails its request. A request for another branch fails for that topic and receives no data.
+Nodes speak the sync protocol `irokle/sync/2` (`irokle::sync::SYNC_PROTOCOL`, also the ALPN). A requester sends a `SyncRequest` with its branch (`genesis`) and a receive credit. It names the actors it is behind on by range hints, at most 65,536 wants and hints together; an actor past the range span gets a zero-span hint that only states its position. When more actors are behind than a request can name, the request's `window` states which actor ids its hints describe completely. An actor outside the window that the request does not name is unknown to the responder, which never takes it as held: an operation depending on such an actor waits, and the page result names the actor in `positions`. The requester names those positions in its next request for the same window, and otherwise moves the window on. The responder reads the whole request stream, then replies with every control message first, one bounded page of data per request, and a `SyncMessage::Page` that says whether more is left and names records the goal needs that the responder does not hold. A traversal slice admits at most 65,536 combined record visits and actor work items, and at most 65,536 dependency edges; preparation and decoding have separate allowances. A page that holds more but carries no data always names such a record or needed positions, or `PlannedPage::too_large` names an operation larger than the page budget, or `continued` says the responder kept its plan: the same request goes on from it, and appends made meanwhile are later work. A responder keeps at most 16 such plans; a slice that cannot be kept fails its request. A request for another branch fails for that topic and receives no data.
 
 See [page admission and progress](src/sync/limits.md) for units, ownership boundaries, continuation lifetime and service assumptions.
 
@@ -218,22 +210,3 @@ A `SyncObligation` names the work one peer still owes for one topic. Its `target
 ## Disk Recovery
 
 With `fjall` and `iroh`, durable recovery means reopening the same Fjall path and reusing the same Iroh `SecretKey`, because the Iroh key defines the node’s `PeerId`. Production applications should persist the Iroh secret in their normal secret-management system, restrict filesystem permissions for local key files, and back up the key with the Fjall database path.
-
-See `examples/iroh/fjall_recovery.rs` for a complete example that creates a topic, closes the endpoint, reopens the database with the same key, lists recovered topics, and reads typed history.
-
-## Examples
-
-- `examples/basic.rs`: in-memory typed events plus transport-neutral sync planning, including the receive outcome of a first receive.
-- `examples/rdf.rs`: observed-remove RDF projection implemented as application code on top of event history.
-- `examples/iroh/chat.rs`: NodeId-only Iroh chat sync using discovery.
-- `examples/iroh/topic_intro.rs`: introduces a peer to a topic, opens it on the receiver, then rejects membership.
-- `examples/iroh/fjall_recovery.rs`: reopens an Iroh/Fjall node from disk with the same Iroh secret key.
-- `examples/iroh/runtime_config.rs`: builds an Iroh node with custom runtime timeouts and resync interval.
-
-Run examples with features as needed:
-
-```bash
-cargo run --features iroh --example iroh_chat
-cargo run --features iroh --example iroh_topic_intro
-cargo run --features 'iroh fjall' --example iroh_fjall_recovery
-```

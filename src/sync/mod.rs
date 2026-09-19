@@ -38,9 +38,9 @@ pub use types::{
 
 const ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/2";
 
-/// Wire contract this build speaks. Version 5 bounds the actors a request describes by a
+/// Wire contract this build speaks. Version 2 bounds the actors a request describes by a
 /// window and names the positions a page needed. Older peers are refused before any message.
-pub const SYNC_PROTOCOL: &str = "irokle/sync/5";
+pub const SYNC_PROTOCOL: &str = "irokle/sync/2";
 
 /// Maximum sequences a single `ActorRangeHint` may span. Hints built by `request_ranges` stay
 /// within it, and every response clamps peer hints to it, so a malicious peer cannot make us

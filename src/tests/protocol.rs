@@ -554,8 +554,8 @@ async fn lost_reply_retransmits() {
 /// A peer offering only the previous protocol cannot open a sync connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn old_protocol_refused() {
-    assert_eq!(crate::sync::SYNC_PROTOCOL, "irokle/sync/5");
-    assert_eq!(crate::net::IROKLE_SYNC_ALPN, b"irokle/sync/5");
+    assert_eq!(crate::sync::SYNC_PROTOCOL, "irokle/sync/2");
+    assert_eq!(crate::net::IROKLE_SYNC_ALPN, b"irokle/sync/2");
     let alice = peer(
         bind(None).await,
         net::IrohRuntimeConfig::default(),
@@ -563,7 +563,7 @@ async fn old_protocol_refused() {
     );
     let alice_addr = serve(&alice).await;
     let old = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-        .alpns(vec![b"irokle/sync/4".to_vec()])
+        .alpns(vec![b"irokle/sync/1".to_vec()])
         .bind()
         .await
         .unwrap();
@@ -591,7 +591,7 @@ async fn old_protocol_refused() {
 
     let connected = tokio::time::timeout(
         Duration::from_secs(30),
-        old.connect(alice_addr, b"irokle/sync/4"),
+        old.connect(alice_addr, b"irokle/sync/1"),
     )
     .await
     .expect("the handshake ends instead of hanging");
