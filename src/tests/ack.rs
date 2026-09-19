@@ -593,88 +593,6 @@ fn bad_ack_isolated() {
     );
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_batch_matches() {
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
-    assert_batch_matches(
-        crate_storage::FjallStorage::open(dir_a.path()).unwrap(),
-        crate_storage::FjallStorage::open(dir_b.path()).unwrap(),
-    );
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_clears_satisfied() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_clears_satisfied(storage);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_keeps_newest() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_stale_ack(storage);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_clear_persists() {
-    let dir = tempfile::tempdir().unwrap();
-    let ack_signer = Ed25519Signer::from_bytes(&[97; 32]);
-    let peer = ack_signer.peer_id();
-    let (topic_id, unsatisfied_id) = {
-        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-        let irokle = Irokle::with_storage(storage, NodeConfig::default()).unwrap();
-        let topic = irokle
-            .create_topic::<Note>(TopicConfig {
-                initial_peers: [peer].into(),
-                ..TopicConfig::default()
-            })
-            .unwrap();
-        let satisfied = topic
-            .publish(Note {
-                text: "durable-satisfied".into(),
-            })
-            .unwrap();
-        let unsatisfied = topic
-            .publish(Note {
-                text: "durable-unsatisfied".into(),
-            })
-            .unwrap();
-
-        irokle
-            .put_sync_obligation(peer, topic.id(), [satisfied.meta.op_id].into())
-            .unwrap();
-        irokle
-            .put_sync_obligation(peer, topic.id(), [unsatisfied.meta.op_id].into())
-            .unwrap();
-        let mut clock = ActorClock::new();
-        clock.observe(satisfied.meta.actor_id, satisfied.meta.actor_seq);
-        let mut ack = sync::SyncAck {
-            topic_id: topic.id(),
-            peer_id: peer,
-            genesis: genesis_of(irokle.storage(), &topic.id()),
-            accepted: BTreeSet::new(),
-            heads: [satisfied.meta.op_id].into(),
-            clock,
-            signature: None,
-        };
-        ack.sign(&ack_signer).unwrap();
-        irokle.apply_sync_ack(&ack).unwrap();
-
-        (topic.id(), unsatisfied.meta.op_id)
-    };
-
-    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    let obligations = storage.sync_obligations(&peer, &topic_id).unwrap();
-    assert_eq!(obligations.len(), 1);
-    assert!(obligation_covers(&storage, &obligations, &unsatisfied_id));
-}
-
 #[test]
 fn ack_needs_closure() {
     // A receiver holding a hole must not clear the source's retry obligation:
@@ -845,13 +763,6 @@ fn assert_stale_batch<S: Storage>(storage: S) {
 #[test]
 fn memory_stale_batch() {
     assert_stale_batch(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_stale_batch() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_stale_batch(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Evidence proving an earlier frontier of the current branch stays valid while
@@ -1277,5 +1188,94 @@ fn uncertain_ack_reopens() {
         for topic in &topics[1..] {
             assert!(!reopened.sync_obligations(&peer, topic).unwrap().is_empty());
         }
+    }
+}
+
+#[cfg(feature = "fjall")]
+mod with_fjall {
+    use crate::tests::ack::*;
+
+    #[test]
+    fn batch_matches() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        assert_batch_matches(
+            crate_storage::FjallStorage::open(dir_a.path()).unwrap(),
+            crate_storage::FjallStorage::open(dir_b.path()).unwrap(),
+        );
+    }
+
+    #[test]
+    fn clears_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        assert_clears_satisfied(storage);
+    }
+
+    #[test]
+    fn keeps_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        assert_stale_ack(storage);
+    }
+
+    #[test]
+    fn clear_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let ack_signer = Ed25519Signer::from_bytes(&[97; 32]);
+        let peer = ack_signer.peer_id();
+        let (topic_id, unsatisfied_id) = {
+            let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+            let irokle = Irokle::with_storage(storage, NodeConfig::default()).unwrap();
+            let topic = irokle
+                .create_topic::<Note>(TopicConfig {
+                    initial_peers: [peer].into(),
+                    ..TopicConfig::default()
+                })
+                .unwrap();
+            let satisfied = topic
+                .publish(Note {
+                    text: "durable-satisfied".into(),
+                })
+                .unwrap();
+            let unsatisfied = topic
+                .publish(Note {
+                    text: "durable-unsatisfied".into(),
+                })
+                .unwrap();
+
+            irokle
+                .put_sync_obligation(peer, topic.id(), [satisfied.meta.op_id].into())
+                .unwrap();
+            irokle
+                .put_sync_obligation(peer, topic.id(), [unsatisfied.meta.op_id].into())
+                .unwrap();
+            let mut clock = ActorClock::new();
+            clock.observe(satisfied.meta.actor_id, satisfied.meta.actor_seq);
+            let mut ack = sync::SyncAck {
+                topic_id: topic.id(),
+                peer_id: peer,
+                genesis: genesis_of(irokle.storage(), &topic.id()),
+                accepted: BTreeSet::new(),
+                heads: [satisfied.meta.op_id].into(),
+                clock,
+                signature: None,
+            };
+            ack.sign(&ack_signer).unwrap();
+            irokle.apply_sync_ack(&ack).unwrap();
+
+            (topic.id(), unsatisfied.meta.op_id)
+        };
+
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        let obligations = storage.sync_obligations(&peer, &topic_id).unwrap();
+        assert_eq!(obligations.len(), 1);
+        assert!(obligation_covers(&storage, &obligations, &unsatisfied_id));
+    }
+
+    #[test]
+    fn stale_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_stale_batch(crate_storage::FjallStorage::open(dir.path()).unwrap());
     }
 }
