@@ -71,84 +71,6 @@ pub(super) fn reset_to_new<S: Storage>(storage: &S, branches: &Branches) {
     assert_eq!(admitted.evictions.len(), 1, "the old branch was replaced");
 }
 
-#[cfg(feature = "iroh")]
-fn assert_bound_admission<S: Storage>(storage: S) {
-    for pending in [false, true] {
-        let branches = branches(if pending { 206 } else { 207 });
-        let topic = branches.topic_id;
-        let store = StaleReadStorage::new(storage.clone());
-        let log = Oplog::with_storage(store.clone());
-        log.receive_ops(vec![branches.old.0.clone()]).unwrap();
-        let node = Irokle::with_storage(
-            store.clone(),
-            NodeConfig {
-                signer: branches.member.clone(),
-                ..NodeConfig::default()
-            },
-        )
-        .unwrap();
-        let op = if pending {
-            old_followers(&branches).0
-        } else {
-            branches.old.1.clone()
-        };
-        let gate = Arc::new(Gate::default());
-        let release = gate.releaser();
-        store.arm_read(
-            if pending {
-                GatePoint::Sync(topic, "pending")
-            } else {
-                GatePoint::Admit(topic)
-            },
-            Arc::clone(&gate),
-        );
-        let received = thread::spawn({
-            let author = branches.author.peer_id();
-            let genesis = branches.old.0.id;
-            move || {
-                node.receive_bound(
-                    author,
-                    SyncData {
-                        topic_id: topic,
-                        ops: vec![op],
-                    },
-                    Some(genesis),
-                )
-            }
-        });
-        gate.wait_arrival();
-        assert!(gate.arrived() && !gate.has_left() && !received.is_finished());
-        reset_to_new(&store, &branches);
-        let before = store.topic_view(&topic, None).unwrap();
-        let obligations = store.all_sync_obligations().unwrap();
-        drop(release);
-        assert!(matches!(
-            received.join().unwrap(),
-            Err(Error::StaleIncarnation)
-        ));
-        assert_eq!(store.topic_view(&topic, None).unwrap(), before);
-        assert_eq!(store.all_sync_obligations().unwrap(), obligations);
-        assert!(store.pending_missing_deps(&topic).unwrap().is_empty());
-        assert_eq!(
-            store.list_op_ids(&topic).unwrap(),
-            [branches.new.0.id, branches.new.1.id].into()
-        );
-    }
-}
-
-#[cfg(feature = "iroh")]
-#[test]
-fn memory_bound_admission() {
-    assert_bound_admission(MemoryStorage::new());
-}
-
-#[cfg(all(feature = "iroh", feature = "fjall"))]
-#[test]
-fn fjall_bound_admission() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_bound_admission(crate::storage::FjallStorage::open(directory.path()).unwrap());
-}
-
 /// An ack is built while a reset replaces the branch it started reading. It
 /// must not pair the old genesis with the new branch's clock, which would prove
 /// an old-branch position the member never held.
@@ -210,16 +132,6 @@ fn assert_ack_keeps<S: Storage>(inner: S, isolation: Isolation) {
 #[test]
 fn ack_keeps_branch() {
     assert_ack_keeps(MemoryStorage::new(), Isolation::Blocks);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_ack_keeps() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_ack_keeps(
-        crate::storage::FjallStorage::open(dir.path()).unwrap(),
-        Isolation::Commits,
-    );
 }
 
 /// A reached query reads an old op's metadata, then a reset installs the new
@@ -383,13 +295,6 @@ fn memory_epoch_advances() {
     assert_epoch_advances(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_epoch_advances() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_epoch_advances(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// Obligation ids resolved against one branch must not be written once a reset
 /// replaced it: the write is conditioned on the genesis the ids were read from.
 #[test]
@@ -484,13 +389,6 @@ fn assert_clear_keeps<S: Storage>(storage: S) {
 #[test]
 fn memory_clear_keeps() {
     assert_clear_keeps(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_clear_keeps() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_clear_keeps(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Events beyond the first: the author's next old-branch event, its new-branch
@@ -771,15 +669,121 @@ fn memory_reset_pauses() {
 }
 
 #[cfg(feature = "fjall")]
-#[test]
-fn fjall_reset_pauses() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_reset_pauses(
-        crate::storage::FjallStorage::open(dir.path()).unwrap(),
-        Isolation::Commits,
-        |storage| {
-            let (ops, bytes, _, _) = storage.pending_usage(&PeerId::from_bytes([0; 32]));
-            (ops, bytes)
-        },
-    );
+mod with_fjall {
+    use crate::tests::branch::*;
+
+    #[test]
+    fn ack_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_ack_keeps(
+            crate::storage::FjallStorage::open(dir.path()).unwrap(),
+            Isolation::Commits,
+        );
+    }
+
+    #[test]
+    fn epoch_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_epoch_advances(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn clear_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_clear_keeps(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn reset_pauses() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_reset_pauses(
+            crate::storage::FjallStorage::open(dir.path()).unwrap(),
+            Isolation::Commits,
+            |storage| {
+                let (ops, bytes, _, _) = storage.pending_usage(&PeerId::from_bytes([0; 32]));
+                (ops, bytes)
+            },
+        );
+    }
+}
+
+#[cfg(feature = "iroh")]
+mod with_iroh {
+    use crate::tests::branch::*;
+
+    fn assert_bound_admission<S: Storage>(storage: S) {
+        for pending in [false, true] {
+            let branches = branches(if pending { 206 } else { 207 });
+            let topic = branches.topic_id;
+            let store = StaleReadStorage::new(storage.clone());
+            let log = Oplog::with_storage(store.clone());
+            log.receive_ops(vec![branches.old.0.clone()]).unwrap();
+            let node = Irokle::with_storage(
+                store.clone(),
+                NodeConfig {
+                    signer: branches.member.clone(),
+                    ..NodeConfig::default()
+                },
+            )
+            .unwrap();
+            let op = if pending {
+                old_followers(&branches).0
+            } else {
+                branches.old.1.clone()
+            };
+            let gate = Arc::new(Gate::default());
+            let release = gate.releaser();
+            store.arm_read(
+                if pending {
+                    GatePoint::Sync(topic, "pending")
+                } else {
+                    GatePoint::Admit(topic)
+                },
+                Arc::clone(&gate),
+            );
+            let received = thread::spawn({
+                let author = branches.author.peer_id();
+                let genesis = branches.old.0.id;
+                move || {
+                    node.receive_bound(
+                        author,
+                        SyncData {
+                            topic_id: topic,
+                            ops: vec![op],
+                        },
+                        Some(genesis),
+                    )
+                }
+            });
+            gate.wait_arrival();
+            assert!(gate.arrived() && !gate.has_left() && !received.is_finished());
+            reset_to_new(&store, &branches);
+            let before = store.topic_view(&topic, None).unwrap();
+            let obligations = store.all_sync_obligations().unwrap();
+            drop(release);
+            assert!(matches!(
+                received.join().unwrap(),
+                Err(Error::StaleIncarnation)
+            ));
+            assert_eq!(store.topic_view(&topic, None).unwrap(), before);
+            assert_eq!(store.all_sync_obligations().unwrap(), obligations);
+            assert!(store.pending_missing_deps(&topic).unwrap().is_empty());
+            assert_eq!(
+                store.list_op_ids(&topic).unwrap(),
+                [branches.new.0.id, branches.new.1.id].into()
+            );
+        }
+    }
+
+    #[test]
+    fn memory_bound_admission() {
+        assert_bound_admission(MemoryStorage::new());
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn fjall_bound_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_bound_admission(crate::storage::FjallStorage::open(directory.path()).unwrap());
+    }
 }

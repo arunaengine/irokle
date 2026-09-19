@@ -39,13 +39,6 @@ fn memory_holes_admit() {
     assert_holes_admit(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_holes_admit() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_holes_admit(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// Stored operations of the topics the reuse tests scan.
 const REUSE_OPS: usize = 2000;
 
@@ -131,14 +124,6 @@ fn memory_holes_reused() {
     assert_holes_reused(MemoryStorage::new(), MemoryStorage::counters);
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_holes_reused() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    assert_holes_reused(storage, crate::storage::FjallStorage::counters);
-}
-
 /// Once a topic was found whole, appending and receiving one op and answering
 /// for the topic again read a few records, not its history.
 fn assert_warm_cheap<S: Corrupt>(storage: S, counters: fn(&S) -> crate::CounterSnapshot) {
@@ -176,14 +161,6 @@ fn assert_warm_cheap<S: Corrupt>(storage: S, counters: fn(&S) -> crate::CounterS
 #[test]
 fn memory_warm_cheap() {
     assert_warm_cheap(MemoryStorage::new(), MemoryStorage::counters);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_warm_cheap() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    assert_warm_cheap(storage, crate::storage::FjallStorage::counters);
 }
 
 /// A holder's summary, fingerprint, request plan and ack withhold whole-topic
@@ -240,13 +217,6 @@ fn assert_evidence_heals<S: Corrupt>(storage: S) {
 #[test]
 fn memory_evidence_heals() {
     assert_evidence_heals(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_evidence_heals() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_evidence_heals(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// An endpoint whose id is the peer id of `Ed25519Signer::from_bytes(&[seed; 32])`.
@@ -525,4 +495,35 @@ async fn holes_repair_sliced() {
 
     alice_net.shutdown().await;
     bob_net.shutdown().await;
+}
+
+#[cfg(feature = "fjall")]
+mod with_fjall {
+    use crate::tests::holes::*;
+
+    #[test]
+    fn holes_admit() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_holes_admit(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn holes_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        assert_holes_reused(storage, crate::storage::FjallStorage::counters);
+    }
+
+    #[test]
+    fn warm_cheap() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        assert_warm_cheap(storage, crate::storage::FjallStorage::counters);
+    }
+
+    #[test]
+    fn evidence_heals() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_evidence_heals(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
 }

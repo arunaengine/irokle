@@ -141,13 +141,6 @@ fn memory_split_invitation() {
     split_invitation(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_split_invitation() {
-    let dir = tempfile::tempdir().unwrap();
-    split_invitation(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 fn byte_split<S: Storage>(storage: S) {
     let (alice, topic_id, ops) = invited_history(183, 12, 48 * 1024);
     let budget = 128 * 1024;
@@ -178,13 +171,6 @@ fn memory_byte_split() {
     byte_split(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_byte_split() {
-    let dir = tempfile::tempdir().unwrap();
-    byte_split(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// Two full 4096-op stages before the stage holding the invitation.
 fn large_stages<S: Storage>(storage: S) {
     static HISTORY: OnceLock<(PeerId, TopicId, Vec<Op>, BTreeSet<OpId>)> = OnceLock::new();
@@ -207,13 +193,6 @@ fn large_stages<S: Storage>(storage: S) {
 #[test]
 fn memory_large_stages() {
     large_stages(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_large_stages() {
-    let dir = tempfile::tempdir().unwrap();
-    large_stages(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Segments no staged branch anchors yet are not kept; once the genesis
@@ -249,13 +228,6 @@ fn reordered_segments<S: Storage>(storage: S) {
 #[test]
 fn memory_reordered_segments() {
     reordered_segments(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_reordered_segments() {
-    let dir = tempfile::tempdir().unwrap();
-    reordered_segments(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Staging of one source never completes another's, and a complete history
@@ -294,13 +266,6 @@ fn memory_source_mismatch() {
     source_mismatch(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_source_mismatch() {
-    let dir = tempfile::tempdir().unwrap();
-    source_mismatch(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// An invitation the staged history revokes again promotes nothing.
 fn revoked_invitation<S: Storage>(storage: S) {
     let alice = node(188);
@@ -323,13 +288,6 @@ fn revoked_invitation<S: Storage>(storage: S) {
 #[test]
 fn memory_revoked_invitation() {
     revoked_invitation(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_revoked_invitation() {
-    let dir = tempfile::tempdir().unwrap();
-    revoked_invitation(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Two staged genesis candidates: the first proven one becomes active and the
@@ -374,13 +332,6 @@ fn competing_genesis<S: Storage>(storage: S) {
 #[test]
 fn memory_competing_genesis() {
     competing_genesis(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_competing_genesis() {
-    let dir = tempfile::tempdir().unwrap();
-    competing_genesis(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Namespaces per source and in total are refused with a typed capacity error
@@ -459,13 +410,6 @@ fn memory_staging_quota() {
     staging_quota(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_staging_quota() {
-    let dir = tempfile::tempdir().unwrap();
-    staging_quota(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// Bytes past the per-source limit are refused before admission, stage
 /// nothing, and leave earlier staging intact.
 fn staging_bytes<S: Storage>(storage: S) {
@@ -497,54 +441,6 @@ fn byte_limits() -> crate::storage::StagingLimits {
 #[test]
 fn memory_staging_bytes() {
     staging_bytes(MemoryStorage::new().with_staging_limits(byte_limits()));
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_staging_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    staging_bytes(
-        crate::storage::FjallStorage::open(dir.path())
-            .unwrap()
-            .with_staging_limits(byte_limits()),
-    );
-}
-
-/// Staging survives a reopen, and a reopen after promotion shows the whole
-/// history.
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_reopen_promotion() {
-    let dir = tempfile::tempdir().unwrap();
-    let open = || crate::storage::FjallStorage::open(dir.path()).unwrap();
-    let (alice, topic_id, ops) = invited_history(192, 30, 1);
-    let (invite, history) = ops.split_last().unwrap();
-    {
-        let bob = bob_node(open());
-        staged(receive(&bob, alice.peer_id(), topic_id, &history[..16]));
-        staged(receive(&bob, alice.peer_id(), topic_id, &history[16..]));
-    }
-
-    let bob = bob_node(open());
-    let staged = bob
-        .staged_topic(alice.peer_id(), topic_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        staged.clock.get(&actor_of(&alice, topic_id)),
-        history.len() as u64
-    );
-    assert_invisible(&bob, alice.peer_id(), topic_id, &ops);
-    let ack = acked(receive(
-        &bob,
-        alice.peer_id(),
-        topic_id,
-        std::slice::from_ref(invite),
-    ));
-    drop(bob);
-
-    let bob = bob_node(open());
-    assert_promoted(&bob, &alice, topic_id, &ack);
 }
 
 /// A source that replaced its branch pushes the new one: the staged ops of the
@@ -615,8 +511,106 @@ fn memory_replaced_branch() {
 }
 
 #[cfg(feature = "fjall")]
-#[test]
-fn fjall_replaced_branch() {
-    let dir = tempfile::tempdir().unwrap();
-    replaced_branch(crate::storage::FjallStorage::open(dir.path()).unwrap());
+mod with_fjall {
+    use crate::tests::bootstrap::*;
+
+    #[test]
+    fn fjall_split_invitation() {
+        let dir = tempfile::tempdir().unwrap();
+        split_invitation(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn fjall_byte_split() {
+        let dir = tempfile::tempdir().unwrap();
+        byte_split(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn fjall_large_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        large_stages(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn fjall_reordered_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        reordered_segments(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn fjall_source_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        source_mismatch(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn fjall_revoked_invitation() {
+        let dir = tempfile::tempdir().unwrap();
+        revoked_invitation(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn fjall_competing_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        competing_genesis(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn fjall_staging_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        staging_quota(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn fjall_staging_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        staging_bytes(
+            crate::storage::FjallStorage::open(dir.path())
+                .unwrap()
+                .with_staging_limits(byte_limits()),
+        );
+    }
+
+    /// Staging survives a reopen, and a reopen after promotion shows the whole
+    /// history.
+    #[test]
+    fn reopen_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || crate::storage::FjallStorage::open(dir.path()).unwrap();
+        let (alice, topic_id, ops) = invited_history(192, 30, 1);
+        let (invite, history) = ops.split_last().unwrap();
+        {
+            let bob = bob_node(open());
+            staged(receive(&bob, alice.peer_id(), topic_id, &history[..16]));
+            staged(receive(&bob, alice.peer_id(), topic_id, &history[16..]));
+        }
+
+        let bob = bob_node(open());
+        let staged = bob
+            .staged_topic(alice.peer_id(), topic_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            staged.clock.get(&actor_of(&alice, topic_id)),
+            history.len() as u64
+        );
+        assert_invisible(&bob, alice.peer_id(), topic_id, &ops);
+        let ack = acked(receive(
+            &bob,
+            alice.peer_id(),
+            topic_id,
+            std::slice::from_ref(invite),
+        ));
+        drop(bob);
+
+        let bob = bob_node(open());
+        assert_promoted(&bob, &alice, topic_id, &ack);
+    }
+
+    #[test]
+    fn fjall_replaced_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        replaced_branch(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
 }
