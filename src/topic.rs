@@ -11,7 +11,7 @@ pub const DEFAULT_MAX_SYNC_PEERS: usize = 8;
 pub struct ReplicationPolicy {
     /// Empty means all current topic members are eligible, still capped by `max_sync_peers`.
     pub selected_peers: BTreeSet<PeerId>,
-    #[serde(default = "default_max_sync_peers")]
+    #[serde(default = "default_peer_limit")]
     pub max_sync_peers: usize,
 }
 
@@ -42,7 +42,7 @@ impl Default for ReplicationPolicy {
     }
 }
 
-fn default_max_sync_peers() -> usize {
+fn default_peer_limit() -> usize {
     DEFAULT_MAX_SYNC_PEERS
 }
 

@@ -7,47 +7,49 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::storage::{
-    AdmissionEffects, AdmittedBatch, MAX_PENDING_MISSING_DEPS, MemoryStorage, OpMeta, Storage,
-    TopicState,
+    AdmissionEffects, AdmittedBatch, MemoryStorage, OpMeta, SnapshotRead, Storage, TopicState,
+    TopicView,
 };
 use crate::{
-    ActorId, Error, EventEnvelope, EvictionKey, Op, OpBody, OpId, PeerId, Result, SignedOp, Signer,
-    TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
+    ActorId, Error, EvictionKey, Op, OpId, PeerId, Result, SignedOp, TopicId, TopicPayload,
 };
 
-mod helpers;
+mod admission;
+mod creation;
+mod genesis;
+mod integrity;
+mod membership;
+mod pending;
 mod topology;
 
-use helpers::{
-    apply_control_to_state, checked_next, ensure_event_type, heads_after, is_local_admission_race,
-    is_semantic_rejection, materialize_topic_state, merge_states, next_actor_position,
-    pending_meta_for,
-};
-use topology::topological_ops;
+pub(crate) use genesis::is_structural_genesis;
+pub(crate) use integrity::{Holes, Integrity};
+pub(crate) use topology::topological_ids;
+pub(crate) use topology::{subset_in, topological_subset_entries};
 pub use topology::{topological, topological_subset};
 
-const MAX_ADMISSION_RETRIES: usize = 64;
-// Genesis collisions are rare. Serialize their resolution across all Oplog
-// facades in this process; storage reset preconditions still provide the
-// authoritative stale-write guard.
-static GENESIS_RESOLUTION_LOCK: Mutex<()> = Mutex::new(());
+/// Attempts one admission job makes; storage writes on this path try once each.
+pub(crate) const MAX_ADMISSION_RETRIES: usize = 64;
+const MAX_CACHED_PROJECTIONS: usize = 4096;
+
+#[derive(Default)]
+struct MembershipCache {
+    epoch: Arc<()>,
+    states: BTreeMap<OpId, Arc<TopicState>>,
+    order: VecDeque<OpId>,
+}
 
 enum OpAdmission {
     Admit,
     Duplicate,
 }
 
-/// How much of an op the local store already holds. `Repair` is an id the local
-/// chain already accounts for while its records are missing or half written:
-/// refilling it is not an append, so the actor-position checks that guard a new
-/// op do not apply to it.
-enum StoredOp {
-    Absent,
-    Repair,
-    Complete,
-}
-
 type GenesisResolution = (Vec<Op>, Option<ResetPlan>, Option<OpId>);
+
+/// Effects a received batch must commit together with its ops, computed from
+/// the batch's source, its entries and the topic state it produces.
+pub(crate) type ReceiveEffects<'a> =
+    &'a dyn Fn(Option<PeerId>, &[(Op, OpMeta)], &TopicState) -> Result<AdmissionEffects>;
 
 /// The reset an admission must fold into its own storage transaction: the state
 /// that must still be current for it to proceed, and the record of the payloads
@@ -65,10 +67,8 @@ struct QuarantinePlan {
     evicted: Vec<EvictedOp>,
 }
 
-/// The batch-local view admission validates against: the entries this batch has
-/// already accepted, plus whether the topic is being reset. A reset removes the
-/// stored actor slots and tips of the topic in the same transaction, so they
-/// must not count towards the position of an op the batch installs.
+/// Batch-local validation view, including accepted entries and reset state. A
+/// reset removes stored actor slots and tips, so they cannot affect new positions.
 struct BatchOverlay<'a> {
     ops: &'a BTreeMap<OpId, Op>,
     meta: &'a BTreeMap<OpId, OpMeta>,
@@ -88,13 +88,9 @@ pub struct EvictedOp {
     pub payload: TopicPayload,
 }
 
-/// Reports ops discarded from a topic's local chain. A genesis tie-break sets
-/// `losing_genesis` to the replaced chain's genesis and `winning_genesis` to the
-/// foreign one that took its place; a quarantine of ops no head reaches has no
-/// second genesis to name, so both fields carry the surviving genesis and equal
-/// fields are what tells the two apart. `evicted` holds the discarded
-/// non-genesis payloads ordered by `(actor_id, actor_seq)`; re-emission is the
-/// embedder's responsibility.
+/// Ops discarded from a topic's local chain, ordered by `(actor_id, actor_seq)`, for the
+/// embedder to re-emit. A genesis tie-break names the replaced and the winning genesis; a
+/// quarantine names the surviving genesis in both fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicEviction {
     pub topic_id: TopicId,
@@ -104,10 +100,8 @@ pub struct TopicEviction {
 }
 
 impl TopicEviction {
-    /// Identity of this eviction's durable journal record, derived from its
-    /// content. The same discarded chain always names the same record, so
-    /// repeating the write, the delivery, or the recovery cannot multiply
-    /// entries, and a consumer can acknowledge a record from the eviction alone.
+    /// Identity of this eviction's durable journal record, derived from its content: repeating the
+    /// write, delivery or recovery never adds a record, and the eviction alone names it.
     pub fn key(&self) -> EvictionKey {
         let mut hasher = blake3::Hasher::new();
         hasher.update(self.topic_id.as_ref());
@@ -126,23 +120,39 @@ impl TopicEviction {
 pub struct Admitted {
     pub accepted: BTreeSet<OpId>,
     pub evictions: Vec<TopicEviction>,
+    /// Ready buffered ops were left because a whole visit window admitted
+    /// none of them: each failed with a retryable error. A later admission or
+    /// [`Oplog::reconcile_pending_ops`] retries them.
+    pub ready_remaining: bool,
 }
 
-fn is_structural_genesis(op: &Op) -> bool {
-    let body = &op.signed.body;
-    matches!(body.payload, TopicPayload::Genesis(_))
-        && body.actor_seq == 1
-        && body.actor_prev.is_none()
-        && body.deps.is_empty()
+/// Spread retries of writers that keep losing the same optimistic race, with
+/// a short random pause that grows with the attempt. No lock is held here.
+fn conflict_pause(attempt: usize) {
+    if attempt < 4 {
+        return;
+    }
+    let mut jitter = [0_u8; 8];
+    let _ = getrandom::fill(&mut jitter);
+    let ceiling = 200_u64 << (attempt - 4).min(5);
+    let micros = u64::from_le_bytes(jitter) % ceiling;
+    std::thread::sleep(std::time::Duration::from_micros(micros));
+}
+
+/// Branch and data epoch an integrity verdict is recorded under.
+#[cfg(feature = "iroh")]
+fn view_key(view: &TopicView) -> (OpId, u64) {
+    (view.state.genesis, view.epoch)
 }
 
 #[derive(Clone)]
 pub struct Oplog<S = MemoryStorage> {
     storage: S,
-    // Topics whose stored records were scanned and found whole. Admission keeps
-    // that invariant, so only damage from outside irokle can reintroduce a
-    // hole; scanning once per topic keeps the sync fast path off a full scan.
-    whole_topics: Arc<Mutex<BTreeSet<TopicId>>>,
+    // Scans and verdicts per branch and data epoch. Admission never creates a
+    // hole, so only a reset or damage from outside irokle needs a new scan.
+    integrity: Arc<integrity::Inspections>,
+    membership_cache: Arc<Mutex<MembershipCache>>,
+    receive_genesis: Option<(TopicId, OpId)>,
 }
 
 impl Default for Oplog<MemoryStorage> {
@@ -161,65 +171,156 @@ impl<S: Storage> Oplog<S> {
     pub fn with_storage(storage: S) -> Self {
         Self {
             storage,
-            whole_topics: Arc::new(Mutex::new(BTreeSet::new())),
+            integrity: Arc::default(),
+            membership_cache: Arc::new(Mutex::new(MembershipCache::default())),
+            receive_genesis: None,
         }
     }
     pub fn storage(&self) -> &S {
         &self.storage
     }
 
-    /// Ids this topic references but cannot resolve: admitted ops whose own
-    /// records are incomplete, dependencies of admitted ops that are not fully
-    /// stored, and the holes buffered ops are still waiting for. An empty set
-    /// means every admitted op is locally usable, which is what lets sync
-    /// certify the topic; anything else is turned into concrete repair wants.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn bound_genesis(mut self, topic: TopicId, genesis: OpId) -> Self {
+        self.receive_genesis = Some((topic, genesis));
+        self
+    }
+
+    /// An oplog over `storage` sharing this oplog's membership projections,
+    /// which are keyed by op id and filtered by topic and genesis on use.
+    pub(crate) fn sharing_membership<T: Storage>(&self, storage: T) -> Oplog<T> {
+        Oplog {
+            storage,
+            integrity: Arc::default(),
+            membership_cache: Arc::clone(&self.membership_cache),
+            receive_genesis: self.receive_genesis,
+        }
+    }
+
+    /// Ids this topic references but cannot resolve; empty means every admitted op is usable and
+    /// sync may certify the topic. Kept holes are checked again on each question, so a repair
+    /// stored through any facade of the store is seen without receiving it again.
     pub fn topic_unresolved(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
-        let mut unresolved = self.storage.pending_missing_deps(topic_id)?;
-        unresolved.extend(self.scan_stored_holes(topic_id)?);
-        Ok(unresolved)
+        let holes = match self.inspect(topic_id)? {
+            Some((view, integrity)) => integrity.unresolved(&view),
+            None => self.stateless_holes(topic_id)?,
+        };
+        Ok(holes.into_keys().collect())
     }
 
-    fn scan_stored_holes(&self, topic_id: &TopicId) -> Result<BTreeSet<crate::OpId>> {
-        if self.whole_topics()?.contains(topic_id) {
-            return Ok(BTreeSet::new());
+    /// Ids `view`'s topic cannot resolve, after its scan completed in later
+    /// snapshots. A reset since `view` scans the new branch or epoch instead.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn view_unresolved(&self, view: &TopicView) -> Result<BTreeSet<OpId>> {
+        let Some((current, integrity)) = self.inspect(&view.state.topic_id)? else {
+            return Ok(view.pending_missing.clone());
+        };
+        let mut unresolved = integrity.unresolved(&current);
+        if view_key(&current) != view_key(view) {
+            unresolved.extend(view.pending_missing.iter().map(|id| (*id, None)));
         }
-        let mut holes = BTreeSet::new();
-        for id in self.storage.list_op_ids(topic_id)? {
-            let Some(meta) = self.storage.get_meta(&id)? else {
-                holes.insert(id);
-                continue;
+        Ok(unresolved.into_keys().collect())
+    }
+
+    /// What is known of `view`'s topic, read from `read`: the verdict, or one
+    /// more bounded step of its scan. `view` must come from `read`.
+    pub(crate) fn integrity_in(
+        &self,
+        read: &dyn SnapshotRead,
+        view: &TopicView,
+    ) -> Result<Integrity> {
+        self.integrity.step(read, view)
+    }
+
+    /// A view of the topic and whether it is whole, both from one snapshot.
+    pub(crate) fn whole_view(&self, topic_id: &TopicId) -> Result<Option<(TopicView, bool)>> {
+        Ok(self.inspect(topic_id)?.map(|(view, integrity)| {
+            let whole = integrity.certifies(&view);
+            (view, whole)
+        }))
+    }
+
+    /// The topic's integrity once its scan is complete, with the view of the
+    /// snapshot that answered. Each step reads its own snapshot.
+    pub(crate) fn inspect(&self, topic_id: &TopicId) -> Result<Option<(TopicView, Integrity)>> {
+        loop {
+            match self.ask(topic_id)? {
+                Some((_, integrity)) if !integrity.is_complete() => {}
+                answer => return Ok(answer),
+            }
+        }
+    }
+
+    /// One integrity question in a fresh snapshot. An unfinished answer returns
+    /// once no step holds the scan, so the next question can step it.
+    fn ask(&self, topic_id: &TopicId) -> Result<Option<(TopicView, Integrity)>> {
+        let answer = self.storage.read_snapshot(|read| {
+            let Some(view) = read.topic_view(topic_id, None)? else {
+                return Ok(None);
             };
-            if self.storage.get_op(&id)?.is_none() {
-                holes.insert(id);
-            }
-            for dep in &meta.deps {
-                if !self.storage.dep_resolvable(dep)? {
-                    holes.insert(*dep);
-                }
-            }
+            let integrity = self.integrity.step(read, &view)?;
+            Ok(Some((view, integrity)))
+        })?;
+        if answer
+            .as_ref()
+            .is_some_and(|(_, integrity)| !integrity.is_complete())
+        {
+            self.integrity.wait_idle(topic_id)?;
         }
-        if holes.is_empty() {
-            self.whole_topics()?.insert(*topic_id);
-        }
-        Ok(holes)
+        Ok(answer)
     }
 
-    /// Drop the record of which topics were found whole, so the next integrity
-    /// question audits the stored records again. Admission cannot introduce a
-    /// hole, but damage from outside irokle can, and nothing else would ever
-    /// ask a second time.
+    /// Holes of a topic without state. There is no branch to keep a verdict
+    /// for, so each call scans what the stored records reference.
+    fn stateless_holes(&self, topic_id: &TopicId) -> Result<Holes> {
+        let mut holes = Holes::new();
+        let mut cursor = integrity::Cursor::default();
+        loop {
+            let step = self.storage.read_snapshot(|read| {
+                integrity::scan_step(read, topic_id, cursor, integrity::STEP_READS)
+            })?;
+            for (id, generation) in step.holes {
+                let known = holes.entry(id).or_insert(generation);
+                *known = known.or(generation);
+            }
+            if step.done {
+                return Ok(holes);
+            }
+            cursor = step.cursor;
+        }
+    }
+
+    /// Clear every integrity verdict and scan, and the membership projections, so the next
+    /// question scans the stored records again: damage from outside Irokle is found no other way.
     pub fn recheck_topics(&self) -> Result<()> {
-        self.whole_topics()?.clear();
+        self.integrity.clear()?;
+        *self.membership_cache()? = MembershipCache::default();
         Ok(())
     }
 
-    /// Ops the topic stores that no head reaches. Admission puts every new op
-    /// into `heads` and takes it out only when a later op names it as a
-    /// dependency, so the head closure covers exactly the ops the local chain
-    /// accounts for. Anything outside it was never part of this lineage's
-    /// frontier and its ancestry cannot be validated against the current
-    /// genesis: the pre-`reset_topic_and_admit` genesis reset could leave such
-    /// a descendant behind after removing the losing chain it stood on.
+    /// Removes the holes of `listed` that are stored now from this oplog's cache
+    /// at once. Questions check cached holes again anyway, so this is only faster.
+    fn fill_holes(&self, listed: Vec<integrity::Listed>) {
+        let mut filled = Vec::new();
+        for hole in listed {
+            match self.storage.dep_resolvable(&hole.id) {
+                Ok(true) => filled.push(hole),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(id = %hole.id, %error, "kept a hole unchecked"),
+            }
+        }
+        if let Err(error) = self.integrity.fill(&filled) {
+            tracing::warn!(%error, "kept filled holes in the integrity cache");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_step_reads(&self, reads: usize) {
+        self.integrity.set_reads(reads);
+    }
+
+    /// Return stored ops unreachable from current heads. Reachability defines
+    /// the local lineage; replaced-genesis descendants lie outside its frontier.
     fn topic_orphans(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         let mut reachable = BTreeSet::new();
         let mut frontier = self
@@ -233,7 +334,7 @@ impl<S: Storage> Oplog<S> {
             }
             // A head-reachable id with no metadata is an ordinary hole to
             // repair, not an orphan; it still counts as accounted for.
-            let Some(meta) = self.storage.get_meta(&id)? else {
+            let Some(meta) = self.storage.get_position(&id)? else {
                 continue;
             };
             frontier.extend(meta.deps);
@@ -243,23 +344,19 @@ impl<S: Storage> Oplog<S> {
         Ok(orphans)
     }
 
-    /// Discard the ops no head reaches and rebuild the topic from the ops that
-    /// remain, in the single transaction genesis adoption already uses. The
-    /// survivors are re-validated and re-admitted from the genesis up, so heads,
-    /// clock, actor indexes, generation and fingerprint come back agreeing with
-    /// one current-genesis DAG, and acks and obligations naming the old frontier
-    /// are dropped rather than carried over. Returns the discarded payloads for
-    /// re-emission, or `None` when there is nothing to quarantine.
+    /// Discard the ops no head reaches and re-admit the rest from the genesis in one transaction,
+    /// dropping acks and obligations of the old frontier. `None` when nothing is orphaned, the
+    /// head closure still has a hole, or no head reaches the genesis.
     pub fn quarantine_orphans(&self, topic_id: &TopicId) -> Result<Option<TopicEviction>> {
         if self.topic_orphans(topic_id)?.is_empty() {
             return Ok(None);
         }
-        // The rebuild resets the topic, so it must not interleave with a
-        // genesis tie-break resolving the same topic.
-        let _guard = GENESIS_RESOLUTION_LOCK
-            .lock()
-            .map_err(|_| Error::Storage("genesis resolution lock poisoned".into()))?;
-        for _ in 0..MAX_ADMISSION_RETRIES {
+        // The rebuild commits only if the topic still matches the planned
+        // state, so a concurrent tie-break or append makes it replan. A
+        // survivor's signature is checked once, however often the plan repeats.
+        let mut checked = BTreeSet::new();
+        for attempt in 0..MAX_ADMISSION_RETRIES {
+            conflict_pause(attempt);
             let Some(plan) = self.plan_quarantine(topic_id)? else {
                 return Ok(None);
             };
@@ -268,6 +365,12 @@ impl<S: Storage> Oplog<S> {
                 survivors,
                 evicted,
             } = plan;
+            for op in &survivors {
+                if !checked.contains(&op.id) {
+                    op.validate()?;
+                    checked.insert(op.id);
+                }
+            }
             let eviction = TopicEviction {
                 topic_id: *topic_id,
                 losing_genesis: state.genesis,
@@ -278,12 +381,11 @@ impl<S: Storage> Oplog<S> {
                 expected_state: state,
                 eviction: eviction.clone(),
             };
-            match self.admit_ops_batch(None, survivors, &BTreeSet::new(), Some(reset)) {
+            match self.admit_ops_batch(None, survivors, &checked, Some(reset), None) {
                 Err(Error::AdmissionConflict) => continue,
                 Err(err) => return Err(err),
                 Ok(_) => {}
             }
-            self.whole_topics()?.remove(topic_id);
             tracing::warn!(
                 %topic_id,
                 genesis = %eviction.winning_genesis,
@@ -295,11 +397,8 @@ impl<S: Storage> Oplog<S> {
         Err(Error::AdmissionConflict)
     }
 
-    /// Split the topic's stored ops into the head closure and the orphans.
-    /// Refuses while the head closure itself has a hole: that is ordinary
-    /// repair work sync must finish first, and a rebuild would drop the whole
-    /// branch standing on it. Refuses too when the closure does not reach the
-    /// recorded genesis, since then there is no chain left to rebuild from.
+    /// Plan a quarantine by splitting stored ops into reachable survivors and orphans.
+    /// Refuse when the frontier has holes or cannot reach the recorded genesis.
     fn plan_quarantine(&self, topic_id: &TopicId) -> Result<Option<QuarantinePlan>> {
         let Some(state) = self.storage.topic_state(topic_id)? else {
             return Ok(None);
@@ -317,6 +416,10 @@ impl<S: Storage> Oplog<S> {
                 tracing::warn!(%topic_id, %id, "deferred quarantine: repair the frontier first");
                 return Ok(None);
             };
+            if self.storage.get_position(&id)?.is_none() {
+                tracing::warn!(%topic_id, %id, "deferred quarantine: repair the frontier first");
+                return Ok(None);
+            }
             survivors.push(op);
         }
         if !survivors.iter().any(|op| op.id == state.genesis) {
@@ -334,169 +437,10 @@ impl<S: Storage> Oplog<S> {
         }))
     }
 
-    fn whole_topics(&self) -> Result<std::sync::MutexGuard<'_, BTreeSet<TopicId>>> {
-        self.whole_topics
+    fn membership_cache(&self) -> Result<std::sync::MutexGuard<'_, MembershipCache>> {
+        self.membership_cache
             .lock()
-            .map_err(|_| Error::Storage("topic integrity cache lock poisoned".into()))
-    }
-
-    pub fn create_topic_genesis(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        genesis: TopicGenesis,
-        signer: &impl Signer,
-    ) -> Result<Op> {
-        self.create_topic_genesis_with_effects(topic_id, actor_id, genesis, signer, |_, _, _| {
-            Ok(AdmissionEffects::default())
-        })
-    }
-
-    pub(crate) fn create_topic_genesis_with_effects<F>(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        genesis: TopicGenesis,
-        signer: &impl Signer,
-        effects: F,
-    ) -> Result<Op>
-    where
-        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
-    {
-        let mut peers = genesis.initial_peers.clone();
-        peers.insert(signer.peer_id());
-        let genesis = TopicGenesis {
-            initial_peers: peers,
-            ..genesis
-        };
-        self.create_and_admit_local_op_with_effects(
-            topic_id,
-            actor_id,
-            TopicPayload::Genesis(genesis),
-            signer,
-            effects,
-        )
-    }
-
-    /// Create a topic genesis op plus its first event op and admit both in a
-    /// single storage transaction. The event op chains off the genesis
-    /// (actor_seq 2, actor_prev/deps = genesis op). Returns `(genesis, event)`.
-    /// Fails with [`Error::InvalidGenesis`] if the topic already exists, same
-    /// as [`Self::create_topic_genesis`].
-    pub fn create_topic_genesis_with_event(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        genesis: TopicGenesis,
-        event: EventEnvelope,
-        signer: &impl Signer,
-    ) -> Result<(Op, Op)> {
-        self.create_topic_genesis_with_event_with_effects(
-            topic_id,
-            actor_id,
-            genesis,
-            event,
-            signer,
-            |_, _, _| Ok(AdmissionEffects::default()),
-        )
-    }
-
-    pub(crate) fn create_topic_genesis_with_event_with_effects<F>(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        genesis: TopicGenesis,
-        event: EventEnvelope,
-        signer: &impl Signer,
-        effects: F,
-    ) -> Result<(Op, Op)>
-    where
-        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
-    {
-        let mut peers = genesis.initial_peers.clone();
-        peers.insert(signer.peer_id());
-        let genesis = TopicGenesis {
-            initial_peers: peers,
-            ..genesis
-        };
-        for _ in 0..MAX_ADMISSION_RETRIES {
-            match self.try_create_and_admit_genesis_with_event(
-                topic_id,
-                actor_id,
-                genesis.clone(),
-                event.clone(),
-                signer,
-                &effects,
-            ) {
-                Err(err) if is_local_admission_race(&err) => continue,
-                result => return result,
-            }
-        }
-        Err(Error::AdmissionConflict)
-    }
-
-    pub fn create_event_op(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        event: EventEnvelope,
-        signer: &impl Signer,
-    ) -> Result<Op> {
-        self.create_event_op_with_effects(topic_id, actor_id, event, signer, |_, _, _| {
-            Ok(AdmissionEffects::default())
-        })
-    }
-
-    pub(crate) fn create_event_op_with_effects<F>(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        event: EventEnvelope,
-        signer: &impl Signer,
-        effects: F,
-    ) -> Result<Op>
-    where
-        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
-    {
-        self.create_and_admit_local_op_with_effects(
-            topic_id,
-            actor_id,
-            TopicPayload::Event(event),
-            signer,
-            effects,
-        )
-    }
-
-    pub fn create_control_op(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        control: TopicControl,
-        signer: &impl Signer,
-    ) -> Result<Op> {
-        self.create_control_op_with_effects(topic_id, actor_id, control, signer, |_, _, _| {
-            Ok(AdmissionEffects::default())
-        })
-    }
-
-    pub(crate) fn create_control_op_with_effects<F>(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        control: TopicControl,
-        signer: &impl Signer,
-        effects: F,
-    ) -> Result<Op>
-    where
-        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
-    {
-        self.create_and_admit_local_op_with_effects(
-            topic_id,
-            actor_id,
-            TopicPayload::Control(control),
-            signer,
-            effects,
-        )
+            .map_err(|_| Error::Storage("membership cache lock poisoned".into()))
     }
 
     pub fn receive_op(&self, op: Op) -> Result<()> {
@@ -513,7 +457,7 @@ impl<S: Storage> Oplog<S> {
         ops: Vec<Op>,
     ) -> Result<BTreeSet<crate::OpId>> {
         Ok(self
-            .receive_ops_admission(source_peer, ops, &BTreeSet::new())?
+            .receive_ops_admission(source_peer, ops, &BTreeSet::new(), None)?
             .accepted)
     }
 
@@ -524,26 +468,20 @@ impl<S: Storage> Oplog<S> {
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
     ) -> Result<Admitted> {
-        self.receive_ops_admission(source_peer, ops, &BTreeSet::new())
+        self.receive_ops_admission(source_peer, ops, &BTreeSet::new(), None)
     }
 
-    /// Like [`Self::receive_ops_from_peer_evicting`], but skips signature
-    /// verification for ops whose id is in `verified`. The caller must have run
-    /// [`Op::validate`] on those exact ops; op ids are content-addressed over
-    /// the signed envelope, so a verified id proves the signature.
-    pub(crate) fn receive_ops_from_peer_preverified(
+    /// Like [`Self::receive_ops_from_peer_evicting`], but skips signature checks
+    /// for ids in `verified`, which the caller validated (ids are content-addressed).
+    /// `effects` computes what each admitted batch commits alongside its ops.
+    pub(crate) fn receive_preverified(
         &self,
         source_peer: Option<crate::PeerId>,
         ops: Vec<Op>,
         verified: &BTreeSet<crate::OpId>,
+        effects: Option<ReceiveEffects<'_>>,
     ) -> Result<Admitted> {
-        self.receive_ops_admission(source_peer, ops, verified)
-    }
-
-    pub fn reconcile_pending_ops(&self) -> Result<BTreeSet<crate::OpId>> {
-        Ok(self
-            .receive_ops_admission(None, Vec::new(), &BTreeSet::new())?
-            .accepted)
+        self.receive_ops_admission(source_peer, ops, verified, effects)
     }
 
     pub fn receive_signed_op(&self, signed: SignedOp) -> Result<Op> {
@@ -552,1265 +490,22 @@ impl<S: Storage> Oplog<S> {
         Ok(op)
     }
 
-    fn receive_ops_admission(
-        &self,
-        source_peer: Option<crate::PeerId>,
-        ops: Vec<Op>,
-        verified: &BTreeSet<crate::OpId>,
-    ) -> Result<Admitted> {
+    /// Admit every buffered op whose dependencies resolved, in finite passes.
+    pub fn reconcile_pending_ops(&self) -> Result<BTreeSet<crate::OpId>> {
         let mut accepted = BTreeSet::new();
-        let mut evictions = Vec::new();
-        let mut queue = VecDeque::new();
-        let mut queued_pending = BTreeSet::new();
-        if !ops.is_empty() {
-            queue.push_back((source_peer, ops, false));
-        }
-        self.enqueue_ready_pending_ops(&mut queue, &mut queued_pending)?;
-
-        while let Some((batch_source_peer, ops, from_pending)) = queue.pop_front() {
-            let pending_op_ids = if from_pending {
-                ops.iter().map(|op| op.id).collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            for op_id in &pending_op_ids {
-                queued_pending.remove(op_id);
-            }
-            // Pending ops re-queued from storage are not in `verified`; they
-            // get re-verified during admission like before.
-            let (batch_accepted, batch_eviction) =
-                match self.admit_ops_batch_retry(batch_source_peer, ops, verified) {
-                    Ok(outcome) => outcome,
-                    Err(err) if from_pending && is_semantic_rejection(&err) => {
-                        for op_id in pending_op_ids {
-                            self.storage.remove_pending_op(&op_id)?;
-                        }
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                };
-            if let Some(eviction) = batch_eviction {
-                evictions.push(eviction);
-            }
-            for op_id in &batch_accepted {
-                self.enqueue_pending_ops(
-                    &mut queue,
-                    &mut queued_pending,
-                    self.storage.pending_waiters(op_id)?,
-                );
-            }
-            self.enqueue_ready_pending_ops(&mut queue, &mut queued_pending)?;
-            accepted.extend(batch_accepted);
-        }
-
-        Ok(Admitted {
-            accepted,
-            evictions,
-        })
-    }
-
-    fn enqueue_ready_pending_ops(
-        &self,
-        queue: &mut VecDeque<(Option<PeerId>, Vec<Op>, bool)>,
-        queued_pending: &mut BTreeSet<crate::OpId>,
-    ) -> Result<()> {
-        let pending = self.storage.ready_pending_ops()?;
-        self.enqueue_pending_ops(queue, queued_pending, pending);
-        Ok(())
-    }
-
-    fn enqueue_pending_ops(
-        &self,
-        queue: &mut VecDeque<(Option<PeerId>, Vec<Op>, bool)>,
-        queued_pending: &mut BTreeSet<crate::OpId>,
-        pending: Vec<(PeerId, Op)>,
-    ) {
-        for (source_peer, op) in pending {
-            if queued_pending.insert(op.id) {
-                queue.push_back((Some(source_peer), vec![op], true));
+        loop {
+            let pass = self.receive_ops_admission(None, Vec::new(), &BTreeSet::new(), None)?;
+            // A pass that admitted nothing met only retained ops; repeating it now spins.
+            let progressed = !pass.accepted.is_empty();
+            accepted.extend(pass.accepted);
+            if !pass.ready_remaining || !progressed {
+                return Ok(accepted);
             }
         }
     }
 
-    fn admit_ops_batch_retry(
-        &self,
-        source_peer: Option<crate::PeerId>,
-        ops: Vec<Op>,
-        verified: &BTreeSet<crate::OpId>,
-    ) -> Result<(BTreeSet<crate::OpId>, Option<TopicEviction>)> {
-        let has_genesis = ops.iter().any(is_structural_genesis);
-        let _genesis_guard = if has_genesis {
-            Some(
-                GENESIS_RESOLUTION_LOCK
-                    .lock()
-                    .map_err(|_| Error::Storage("genesis resolution lock poisoned".into()))?,
-            )
-        } else {
-            None
-        };
-        for _ in 0..MAX_ADMISSION_RETRIES {
-            let (ops_to_admit, reset, rejected_genesis) = if has_genesis {
-                self.resolve_genesis_collision(ops.clone(), verified)?
-            } else {
-                (ops.clone(), None, None)
-            };
-            let eviction = reset.as_ref().map(|plan| plan.eviction.clone());
-            // A won foreign genesis discards the local chain: admit the winner
-            // batch against a fresh topic and fold the reset into the same
-            // storage transaction as its admission (`reset_topic_and_admit`).
-            match self.admit_ops_batch(source_peer, ops_to_admit, verified, reset) {
-                Err(Error::AdmissionConflict) => continue,
-                Ok(accepted) => {
-                    if let Some(losing) = rejected_genesis {
-                        self.purge_losing_pending(losing)?;
-                    }
-                    return Ok((accepted, eviction));
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        Err(Error::AdmissionConflict)
-    }
-
-    /// Drain pending ops that transitively wait on a genesis that lost (or was
-    /// rejected by) a collision resolution: the local topic keeps a different
-    /// genesis, so that id will never be admitted here and nothing depending on
-    /// it can ever become ready. The storage layer walks the waiter closure in
-    /// one transaction so a crash cannot strand half of it.
-    fn purge_losing_pending(&self, losing_genesis: OpId) -> Result<()> {
-        self.storage
-            .purge_pending_waiters(&losing_genesis)
-            .map(drop)
-    }
-
-    /// Resolve a genesis tie-break for a batch that carries a structurally
-    /// valid genesis. Returns the ops to admit (unchanged when the incoming
-    /// genesis wins or there is no collision; with a losing foreign genesis
-    /// filtered out when the local one wins), the reset the admission must
-    /// perform when the local topic loses, and any rejected genesis to purge
-    /// from pending.
-    fn resolve_genesis_collision(
-        &self,
-        ops: Vec<Op>,
-        verified: &BTreeSet<crate::OpId>,
-    ) -> Result<GenesisResolution> {
-        let Some(genesis) = ops.iter().find(|op| is_structural_genesis(op)).cloned() else {
-            return Ok((ops, None, None));
-        };
-        let topic_id = genesis.signed.body.topic_id;
-        let Some(state) = self.storage.topic_state(&topic_id)? else {
-            // Fresh topic: normal admission accepts the genesis.
-            return Ok((ops, None, None));
-        };
-        if state.genesis == genesis.id {
-            // Same node re-sending its genesis: normal dedup handles it.
-            return Ok((ops, None, None));
-        }
-        // Only a signature-valid genesis may win the tie-break.
-        if !verified.contains(&genesis.id) {
-            genesis.validate()?;
-        }
-        // Op ids are content-addressed 32-byte blake3 digests; the derived
-        // `Ord` is lexicographic over those bytes, so both nodes pick the same
-        // winner with no coordination.
-        if genesis.id < state.genesis {
-            // A smaller foreign genesis only wins if its author is a current
-            // member of the LOCAL chain — the same membership the admission
-            // path enforces for NotTopicMember (`state.members`, which folds in
-            // AddPeer/RemovePeer control ops), not the genesis `initial_peers`
-            // alone. Genesis op ids are grindable, so an unauthenticated
-            // smaller id must not be allowed to force a topic reset.
-            // Consequence: two forks with disjoint memberships never auto-
-            // converge; the warn below is the intended, deliberate signal.
-            if !state.members.contains(&genesis.signed.body.author) {
-                tracing::warn!(
-                    %topic_id,
-                    local_genesis = %state.genesis,
-                    foreign_genesis = %genesis.id,
-                    author = %genesis.signed.body.author,
-                    "rejected non-member genesis collision"
-                );
-                let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
-                return Ok((filtered, None, Some(genesis.id)));
-            }
-            let eviction = self.extract_eviction(topic_id, &state, genesis.id)?;
-            tracing::warn!(
-                %topic_id,
-                losing_genesis = %state.genesis,
-                winning_genesis = %genesis.id,
-                evicted = eviction.evicted.len(),
-                "genesis collision resolved: reset local topic for smaller winning genesis"
-            );
-            Ok((
-                ops,
-                Some(ResetPlan {
-                    expected_state: state,
-                    eviction,
-                }),
-                None,
-            ))
-        } else {
-            tracing::warn!(
-                %topic_id,
-                local_genesis = %state.genesis,
-                foreign_genesis = %genesis.id,
-                evicted = 0,
-                "genesis collision resolved: kept local genesis, rejected larger foreign genesis"
-            );
-            let filtered = ops.into_iter().filter(|op| op.id != genesis.id).collect();
-            Ok((filtered, None, Some(genesis.id)))
-        }
-    }
-
-    /// Extract the local topic chain's non-genesis payloads (ordered by actor,
-    /// then sequence) so the application can re-emit them under the winning
-    /// genesis. The actual reset is deferred: the winner batch's admission runs
-    /// the reset and the writes in one storage transaction
-    /// (`reset_topic_and_admit`), so a crash cannot land between them. These
-    /// reads stay outside that transaction.
-    fn extract_eviction(
-        &self,
-        topic_id: TopicId,
-        local_state: &TopicState,
-        winning_genesis: OpId,
-    ) -> Result<TopicEviction> {
-        let mut discarded = self.storage.list_op_ids(&topic_id)?;
-        discarded.remove(&local_state.genesis);
-        Ok(TopicEviction {
-            topic_id,
-            losing_genesis: local_state.genesis,
-            winning_genesis,
-            evicted: self.evicted_ops(&discarded)?,
-        })
-    }
-
-    /// Payloads for the ops named by `ids`, ordered by actor then sequence so
-    /// re-emission preserves each actor's order. A half-stored id is reported
-    /// and skipped: its payload cannot be read, and failing here would strand
-    /// the whole topic instead of discarding one unreadable record.
-    fn evicted_ops(&self, ids: &BTreeSet<OpId>) -> Result<Vec<EvictedOp>> {
-        let mut metas = Vec::new();
-        for id in ids {
-            match self.storage.get_meta(id)? {
-                Some(meta) => metas.push(meta),
-                None => tracing::warn!(%id, "discarded op has no metadata to re-emit"),
-            }
-        }
-        metas.sort_by_key(|meta| (meta.actor_id, meta.actor_seq));
-        let mut evicted = Vec::new();
-        for meta in metas {
-            let Some(op) = self.storage.get_op(&meta.id)? else {
-                tracing::warn!(id = %meta.id, "discarded op has no record to re-emit");
-                continue;
-            };
-            evicted.push(EvictedOp {
-                op_id: meta.id,
-                actor_id: meta.actor_id,
-                author: meta.author,
-                actor_seq: meta.actor_seq,
-                payload: op.signed.body.payload.clone(),
-            });
-        }
-        Ok(evicted)
-    }
-
-    fn admit_ops_batch(
-        &self,
-        source_peer: Option<crate::PeerId>,
-        ops: Vec<Op>,
-        verified: &BTreeSet<crate::OpId>,
-        reset_plan: Option<ResetPlan>,
-    ) -> Result<BTreeSet<crate::OpId>> {
-        let ops = topological_ops(ops)?;
-        let mut accepted = BTreeSet::new();
-        let Some(topic_id) = ops.first().map(|op| op.signed.body.topic_id) else {
-            return Ok(accepted);
-        };
-        if ops.iter().any(|op| op.signed.body.topic_id != topic_id) {
-            return Err(Error::TopicMismatch);
-        }
-
-        // On the reset path the local topic is wiped and the winner batch is
-        // self-contained, so validate and admit it against a fresh topic; the
-        // reset is applied atomically with these writes below.
-        let reset = reset_plan.is_some();
-        let (expected_heads, expected_state) = if reset {
-            (BTreeSet::new(), None)
-        } else {
-            (
-                self.storage.heads(&topic_id)?,
-                self.storage.topic_state(&topic_id)?,
-            )
-        };
-        let mut heads = expected_heads.clone();
-        let mut state = expected_state.clone();
-        let mut topic_state_changed = false;
-        let mut overlay_ops = BTreeMap::new();
-        let mut overlay_meta = BTreeMap::new();
-        let mut overlay_tips = BTreeMap::new();
-        let mut overlay_index = BTreeMap::new();
-        let mut entries = Vec::new();
-        let mut pending = Vec::new();
-        let mut projections = BTreeMap::new();
-
-        for op in ops {
-            if !verified.contains(&op.id) {
-                op.validate()?;
-            }
-            let stored = if reset {
-                StoredOp::Absent
-            } else {
-                self.stored_op_state(&op)?
-            };
-            if matches!(stored, StoredOp::Complete) {
-                continue;
-            }
-
-            let missing_deps = self.missing_deps_projected(&op, &overlay_ops, reset)?;
-            // Refilling an already-accounted id changes no head, clock entry or
-            // topic state: only the records themselves are rewritten, once its
-            // dependencies can be resolved again.
-            if matches!(stored, StoredOp::Repair) {
-                if missing_deps.is_empty() {
-                    let meta = self.meta_for_projected(&op, &overlay_meta)?;
-                    overlay_meta.insert(op.id, meta.clone());
-                    overlay_ops.insert(op.id, op.clone());
-                    accepted.insert(op.id);
-                    entries.push((op, meta));
-                } else {
-                    pending.push((op, missing_deps));
-                }
-                continue;
-            }
-            if !missing_deps.is_empty() {
-                match self.validate_pending_op_projected(
-                    &op,
-                    &missing_deps,
-                    &BatchOverlay {
-                        ops: &overlay_ops,
-                        meta: &overlay_meta,
-                        tips: &overlay_tips,
-                        index: &overlay_index,
-                        reset,
-                    },
-                    state.as_ref(),
-                )? {
-                    OpAdmission::Duplicate => {}
-                    OpAdmission::Admit => pending.push((op, missing_deps)),
-                }
-                continue;
-            }
-
-            if let OpAdmission::Duplicate = self.validate_op_projected(
-                &op,
-                &BatchOverlay {
-                    ops: &overlay_ops,
-                    meta: &overlay_meta,
-                    tips: &overlay_tips,
-                    index: &overlay_index,
-                    reset,
-                },
-                &heads,
-                state.as_ref(),
-                &mut projections,
-            )? {
-                continue;
-            }
-            let meta = self.meta_for_projected(&op, &overlay_meta)?;
-            heads = heads_after(&heads, &op);
-            match &op.signed.body.payload {
-                TopicPayload::Genesis(genesis) => {
-                    state = Some(TopicState {
-                        topic_id,
-                        event_type_id: genesis.event_type_id.clone(),
-                        genesis: op.id,
-                        heads: heads.clone(),
-                        members: genesis.initial_peers.clone(),
-                        replication_policy: genesis.replication_policy.clone(),
-                        membership_controls: BTreeMap::new(),
-                        replication_policy_control: None,
-                    });
-                    topic_state_changed = true;
-                }
-                TopicPayload::Event(_) => {
-                    if let Some(state) = state.as_mut() {
-                        state.heads = heads.clone();
-                    }
-                }
-                TopicPayload::Control(control) => {
-                    let state = state.as_mut().ok_or(Error::TopicNotFound)?;
-                    state.heads = heads.clone();
-                    apply_control_to_state(state, &op, control);
-                    topic_state_changed = true;
-                }
-            }
-
-            overlay_index.insert((topic_id, meta.actor_id, meta.actor_seq), op.id);
-            overlay_tips.insert((topic_id, meta.actor_id), (meta.actor_seq, op.id));
-            overlay_meta.insert(op.id, meta.clone());
-            overlay_ops.insert(op.id, op.clone());
-            accepted.insert(op.id);
-            entries.push((op, meta));
-        }
-
-        if let Some(plan) = &reset_plan {
-            // Reset, winner admission, and the record of the discarded payloads
-            // share one storage transaction, so a crash never leaves the topic
-            // empty with the winner uninstalled or the payloads unrecorded.
-            self.storage.reset_topic_and_admit(
-                &topic_id,
-                &plan.expected_state,
-                AdmittedBatch {
-                    topic_id,
-                    expected_heads,
-                    expected_topic_state: expected_state,
-                    entries,
-                    heads,
-                    topic_state: topic_state_changed.then(|| state.clone()).flatten(),
-                    effects: AdmissionEffects::default(),
-                },
-                Some(&plan.eviction),
-            )?;
-        } else if !entries.is_empty() {
-            self.storage.put_admitted_batch(AdmittedBatch {
-                topic_id,
-                expected_heads,
-                expected_topic_state: expected_state,
-                entries,
-                heads,
-                topic_state: topic_state_changed.then(|| state.clone()).flatten(),
-                effects: AdmissionEffects::default(),
-            })?;
-        }
-
-        // Buffer not-yet-ready ops last: on the reset path the reset above wipes
-        // the topic's pending, so a partial winner batch's descendants must be
-        // written after it to survive. A pending op's missing deps are never in
-        // `entries`, so ordering after admission cannot spuriously reject it.
-        for (op, missing_deps) in pending {
-            let source_peer = source_peer.unwrap_or(op.signed.body.author);
-            self.storage.put_pending_op(
-                source_peer,
-                op.clone(),
-                pending_meta_for(&op, missing_deps),
-            )?;
-        }
-
-        Ok(accepted)
-    }
-
+    /// The stored actor clock of `topic_id`: each actor's admitted position.
     pub fn observed_clock(&self, topic_id: &TopicId) -> Result<crate::ActorClock> {
         self.storage.actor_clock(topic_id)
-    }
-
-    fn create_and_admit_local_op_with_effects<F>(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        payload: TopicPayload,
-        signer: &impl Signer,
-        effects: F,
-    ) -> Result<Op>
-    where
-        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
-    {
-        for _ in 0..MAX_ADMISSION_RETRIES {
-            match self.try_create_and_admit_local_op(
-                topic_id,
-                actor_id,
-                payload.clone(),
-                signer,
-                &effects,
-            ) {
-                Err(err) if is_local_admission_race(&err) => continue,
-                result => return result,
-            }
-        }
-        Err(Error::AdmissionConflict)
-    }
-
-    fn try_create_and_admit_local_op<F>(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        payload: TopicPayload,
-        signer: &impl Signer,
-        effects: &F,
-    ) -> Result<Op>
-    where
-        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
-    {
-        if !matches!(payload, TopicPayload::Genesis(_)) {
-            self.ensure_member(&topic_id, signer.peer_id())?;
-        }
-        let expected_heads = self.storage.heads(&topic_id)?;
-        let expected_state = self.storage.topic_state(&topic_id)?;
-        let op = self.next_local_op(topic_id, actor_id, expected_heads.clone(), payload, signer)?;
-        op.validate()?;
-        self.validate_op(&op)?;
-        let meta = self.meta_for(&op)?;
-        self.commit_admission(op.clone(), meta, expected_heads, expected_state, effects)?;
-        Ok(op)
-    }
-
-    fn try_create_and_admit_genesis_with_event<F>(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        genesis: TopicGenesis,
-        event: EventEnvelope,
-        signer: &impl Signer,
-        effects: &F,
-    ) -> Result<(Op, Op)>
-    where
-        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
-    {
-        let expected_heads = self.storage.heads(&topic_id)?;
-        let expected_state = self.storage.topic_state(&topic_id)?;
-        let genesis_op = self.next_local_op(
-            topic_id,
-            actor_id,
-            expected_heads.clone(),
-            TopicPayload::Genesis(genesis),
-            signer,
-        )?;
-        genesis_op.validate()?;
-        self.validate_op(&genesis_op)?;
-        let genesis_meta = self.meta_for(&genesis_op)?;
-
-        let event_op = Op::sign(
-            OpBody {
-                topic_id,
-                author: signer.peer_id(),
-                actor_id,
-                actor_seq: checked_next(genesis_meta.actor_seq)?,
-                actor_prev: Some(genesis_op.id),
-                deps: [genesis_op.id].into(),
-                generation: checked_next(genesis_meta.generation)?,
-                payload: TopicPayload::Event(event),
-            },
-            signer,
-        )?;
-        event_op.validate()?;
-
-        let genesis_heads = heads_after(&expected_heads, &genesis_op);
-        let mut state = self
-            .topic_state_after(&genesis_op, genesis_heads.clone(), expected_state.clone())?
-            .ok_or(Error::TopicNotFound)?;
-        let overlay_ops = BTreeMap::from([(genesis_op.id, genesis_op.clone())]);
-        let overlay_meta = BTreeMap::from([(genesis_op.id, genesis_meta.clone())]);
-        let overlay_tips = BTreeMap::from([(
-            (topic_id, actor_id),
-            (genesis_meta.actor_seq, genesis_op.id),
-        )]);
-        let overlay_index =
-            BTreeMap::from([((topic_id, actor_id, genesis_meta.actor_seq), genesis_op.id)]);
-        if let OpAdmission::Duplicate = self.validate_op_projected(
-            &event_op,
-            &BatchOverlay {
-                ops: &overlay_ops,
-                meta: &overlay_meta,
-                tips: &overlay_tips,
-                index: &overlay_index,
-                reset: false,
-            },
-            &genesis_heads,
-            Some(&state),
-            &mut BTreeMap::new(),
-        )? {
-            return Err(Error::AdmissionConflict);
-        }
-        let event_meta = self.meta_for_projected(&event_op, &overlay_meta)?;
-
-        let mut admission_effects = effects(&genesis_op, &genesis_meta, &state)?;
-        let heads = heads_after(&genesis_heads, &event_op);
-        state.heads = heads.clone();
-        admission_effects
-            .sync_obligations
-            .extend(effects(&event_op, &event_meta, &state)?.sync_obligations);
-        self.storage.put_admitted_batch(AdmittedBatch {
-            topic_id,
-            expected_heads,
-            expected_topic_state: expected_state,
-            entries: vec![
-                (genesis_op.clone(), genesis_meta),
-                (event_op.clone(), event_meta),
-            ],
-            heads,
-            topic_state: Some(state),
-            effects: admission_effects,
-        })?;
-        Ok((genesis_op, event_op))
-    }
-
-    fn next_local_op(
-        &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
-        mut deps: BTreeSet<crate::OpId>,
-        payload: TopicPayload,
-        signer: &impl Signer,
-    ) -> Result<Op> {
-        let tip = self.storage.actor_tip(&topic_id, &actor_id)?;
-        let (actor_seq, actor_prev) = match tip {
-            Some((seq, id)) => (
-                seq.checked_add(1)
-                    .ok_or_else(|| Error::Storage("actor sequence overflow".into()))?,
-                Some(id),
-            ),
-            None => (1, None),
-        };
-        if let Some(prev) = actor_prev {
-            deps.insert(prev);
-        }
-        let generation = if deps.is_empty() {
-            0
-        } else {
-            self.storage
-                .max_generation(&topic_id)?
-                .checked_add(1)
-                .ok_or(Error::InvalidOpId)?
-        };
-        Op::sign(
-            OpBody {
-                topic_id,
-                author: signer.peer_id(),
-                actor_id,
-                actor_seq,
-                actor_prev,
-                deps,
-                generation,
-                payload,
-            },
-            signer,
-        )
-    }
-
-    fn validate_op(&self, op: &Op) -> Result<()> {
-        let body = &op.signed.body;
-        if body.actor_id != actor_id_for(body.topic_id, body.author) {
-            return Err(Error::ActorAuthorMismatch);
-        }
-        for dep in &body.deps {
-            if self.storage.get_op(dep)?.is_none() {
-                return Err(Error::MissingDependency(*dep));
-            }
-        }
-        match &body.payload {
-            TopicPayload::Genesis(_) => {
-                if body.actor_seq != 1
-                    || body.actor_prev.is_some()
-                    || !body.deps.is_empty()
-                    || self.storage.topic_state(&body.topic_id)?.is_some()
-                {
-                    return Err(Error::InvalidGenesis);
-                }
-            }
-            TopicPayload::Event(envelope) => {
-                let current = self
-                    .storage
-                    .topic_state(&body.topic_id)?
-                    .ok_or(Error::TopicNotFound)?;
-                ensure_event_type(&current.event_type_id, &envelope.type_id)?;
-                let author_is_member = if body.deps == current.heads {
-                    current.members.contains(&body.author)
-                } else {
-                    self.topic_state_for_deps(&body.topic_id, &body.deps)?
-                        .members
-                        .contains(&body.author)
-                };
-                if !author_is_member {
-                    return Err(Error::NotTopicMember);
-                }
-            }
-            TopicPayload::Control(_) => {
-                let current = self
-                    .storage
-                    .topic_state(&body.topic_id)?
-                    .ok_or(Error::TopicNotFound)?;
-                let author_is_member = if body.deps == current.heads {
-                    current.members.contains(&body.author)
-                } else {
-                    self.topic_state_for_deps(&body.topic_id, &body.deps)?
-                        .members
-                        .contains(&body.author)
-                };
-                if !author_is_member {
-                    return Err(Error::NotTopicMember);
-                }
-            }
-        }
-        if let Some(existing) =
-            self.storage
-                .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            && existing != op.id
-        {
-            return Err(Error::ActorFork);
-        }
-        let expected = self.storage.actor_tip(&body.topic_id, &body.actor_id)?;
-        let (expected_seq, expected_prev) = next_actor_position(expected)?;
-        if body.actor_seq != expected_seq {
-            return Err(Error::ActorSeqGap {
-                expected: expected_seq,
-                actual: body.actor_seq,
-            });
-        }
-        if body.actor_prev != expected_prev {
-            return Err(Error::ActorPrevMismatch);
-        }
-        let mut generation = 0;
-        for id in &body.deps {
-            let meta = self
-                .storage
-                .get_meta(id)?
-                .ok_or(Error::MissingDependency(*id))?;
-            generation = generation.max(checked_next(meta.generation)?);
-        }
-        if body.generation != generation {
-            return Err(Error::InvalidOpId);
-        }
-        Ok(())
-    }
-
-    fn meta_for(&self, op: &Op) -> Result<OpMeta> {
-        let body = &op.signed.body;
-        let observed_clock = self.observed_clock_for_deps(&body.topic_id, &body.deps)?;
-        Ok(OpMeta {
-            id: op.id,
-            topic_id: body.topic_id,
-            author: body.author,
-            actor_id: body.actor_id,
-            actor_seq: body.actor_seq,
-            actor_prev: body.actor_prev,
-            deps: body.deps.clone(),
-            generation: body.generation,
-            observed_clock,
-            ready: true,
-            missing_deps: BTreeSet::new(),
-        })
-    }
-
-    fn meta_for_projected(
-        &self,
-        op: &Op,
-        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
-    ) -> Result<OpMeta> {
-        let body = &op.signed.body;
-        let mut observed_clock = crate::ActorClock::new();
-        for dep in &body.deps {
-            let meta = self.meta_projected(dep, overlay_meta)?;
-            if meta.topic_id != body.topic_id {
-                return Err(Error::TopicMismatch);
-            }
-            observed_clock.merge(&meta.observed_clock);
-            observed_clock.observe(meta.actor_id, meta.actor_seq);
-        }
-        Ok(OpMeta {
-            id: op.id,
-            topic_id: body.topic_id,
-            author: body.author,
-            actor_id: body.actor_id,
-            actor_seq: body.actor_seq,
-            actor_prev: body.actor_prev,
-            deps: body.deps.clone(),
-            generation: body.generation,
-            observed_clock,
-            ready: true,
-            missing_deps: BTreeSet::new(),
-        })
-    }
-
-    fn meta_projected(
-        &self,
-        id: &crate::OpId,
-        overlay_meta: &BTreeMap<crate::OpId, OpMeta>,
-    ) -> Result<OpMeta> {
-        overlay_meta.get(id).cloned().map(Ok).unwrap_or_else(|| {
-            self.storage
-                .get_meta(id)?
-                .ok_or(Error::MissingDependency(*id))
-        })
-    }
-
-    fn op_projected(
-        &self,
-        id: &crate::OpId,
-        overlay_ops: &BTreeMap<crate::OpId, Op>,
-    ) -> Result<Op> {
-        overlay_ops.get(id).cloned().map(Ok).unwrap_or_else(|| {
-            self.storage
-                .get_op(id)?
-                .ok_or(Error::MissingDependency(*id))
-        })
-    }
-
-    /// Dependencies this op cannot resolve yet. A dependency counts as present
-    /// only when both its op record and its metadata are stored: the DAG is
-    /// traversed through metadata, so either record alone is a hole to refill,
-    /// never a satisfied edge. On the reset path storage is about to be wiped,
-    /// so only the batch overlay counts.
-    fn missing_deps_projected(
-        &self,
-        op: &Op,
-        overlay_ops: &BTreeMap<crate::OpId, Op>,
-        reset: bool,
-    ) -> Result<BTreeSet<crate::OpId>> {
-        let mut missing = BTreeSet::new();
-        for dep in &op.signed.body.deps {
-            if overlay_ops.contains_key(dep) {
-                continue;
-            }
-            if reset || self.storage.get_op(dep)?.is_none() || self.storage.get_meta(dep)?.is_none()
-            {
-                missing.insert(*dep);
-            }
-        }
-        Ok(missing)
-    }
-
-    fn validate_pending_op_projected(
-        &self,
-        op: &Op,
-        missing_deps: &BTreeSet<crate::OpId>,
-        overlay: &BatchOverlay<'_>,
-        state: Option<&TopicState>,
-    ) -> Result<OpAdmission> {
-        let body = &op.signed.body;
-        if missing_deps.len() > MAX_PENDING_MISSING_DEPS {
-            return Err(Error::Storage(
-                "pending op has too many missing deps".into(),
-            ));
-        }
-        if body.actor_id != actor_id_for(body.topic_id, body.author) {
-            return Err(Error::ActorAuthorMismatch);
-        }
-        if body.actor_seq == 0 {
-            return Err(Error::ActorSeqGap {
-                expected: 1,
-                actual: 0,
-            });
-        }
-        if let Some(existing) = self.stored_actor_index(body, overlay.reset)?.or_else(|| {
-            overlay
-                .index
-                .get(&(body.topic_id, body.actor_id, body.actor_seq))
-                .copied()
-        }) {
-            if existing != op.id {
-                return Err(Error::ActorFork);
-            }
-            if self.is_admitted_duplicate(op)? {
-                return Ok(OpAdmission::Duplicate);
-            }
-        }
-        match &body.payload {
-            TopicPayload::Genesis(_) => {
-                if body.actor_seq != 1
-                    || body.actor_prev.is_some()
-                    || !body.deps.is_empty()
-                    || state.is_some()
-                {
-                    return Err(Error::InvalidGenesis);
-                }
-            }
-            TopicPayload::Event(envelope) => {
-                if body.deps.is_empty() || body.generation == 0 {
-                    return Err(Error::InvalidOpId);
-                }
-                // When we already know the topic, only buffer pending ops from
-                // known members. This stops non-members from consuming
-                // per-source pending quota by submitting structurally-valid
-                // ops that would be rejected at admission time anyway.
-                if let Some(state) = state {
-                    ensure_event_type(&state.event_type_id, &envelope.type_id)?;
-                    if !state.members.contains(&body.author) {
-                        return Err(Error::NotTopicMember);
-                    }
-                }
-            }
-            TopicPayload::Control(_) => {
-                if body.deps.is_empty() || body.generation == 0 {
-                    return Err(Error::InvalidOpId);
-                }
-                if let Some(state) = state
-                    && !state.members.contains(&body.author)
-                {
-                    return Err(Error::NotTopicMember);
-                }
-            }
-        }
-        match (body.actor_seq, body.actor_prev) {
-            (1, Some(_)) => return Err(Error::ActorPrevMismatch),
-            (2.., None) => return Err(Error::ActorPrevMismatch),
-            _ => {}
-        }
-        if let Some(prev) = body.actor_prev {
-            if !body.deps.contains(&prev) {
-                return Err(Error::ActorPrevMismatch);
-            }
-            if !missing_deps.contains(&prev) {
-                let prev_meta = self.meta_projected(&prev, overlay.meta)?;
-                if prev_meta.topic_id != body.topic_id || prev_meta.actor_id != body.actor_id {
-                    return Err(Error::ActorPrevMismatch);
-                }
-                if checked_next(prev_meta.actor_seq)? != body.actor_seq {
-                    return Err(Error::ActorSeqGap {
-                        expected: checked_next(prev_meta.actor_seq)?,
-                        actual: body.actor_seq,
-                    });
-                }
-            }
-        }
-        let expected = match overlay.tips.get(&(body.topic_id, body.actor_id)).copied() {
-            Some(tip) => Some(tip),
-            None => self.stored_actor_tip(body, overlay.reset)?,
-        };
-        if let Some((tip_seq, tip_id)) = expected {
-            let next_seq = checked_next(tip_seq)?;
-            if body.actor_seq <= tip_seq {
-                if self.is_admitted_duplicate(op)? {
-                    return Ok(OpAdmission::Duplicate);
-                }
-                return Err(Error::ActorSeqGap {
-                    expected: next_seq,
-                    actual: body.actor_seq,
-                });
-            }
-            if body.actor_prev == Some(tip_id) && body.actor_seq != next_seq {
-                return Err(Error::ActorSeqGap {
-                    expected: next_seq,
-                    actual: body.actor_seq,
-                });
-            }
-        }
-        for dep in &body.deps {
-            if missing_deps.contains(dep) {
-                continue;
-            }
-            let meta = self.meta_projected(dep, overlay.meta)?;
-            if meta.topic_id != body.topic_id {
-                return Err(Error::TopicMismatch);
-            }
-            if meta.generation >= body.generation {
-                return Err(Error::InvalidOpId);
-            }
-        }
-        Ok(OpAdmission::Admit)
-    }
-
-    fn validate_op_projected(
-        &self,
-        op: &Op,
-        overlay: &BatchOverlay<'_>,
-        heads: &BTreeSet<crate::OpId>,
-        state: Option<&TopicState>,
-        projections: &mut BTreeMap<OpId, Arc<TopicState>>,
-    ) -> Result<OpAdmission> {
-        let body = &op.signed.body;
-        if body.actor_id != actor_id_for(body.topic_id, body.author) {
-            return Err(Error::ActorAuthorMismatch);
-        }
-        if let Some(existing) = self.stored_actor_index(body, overlay.reset)?.or_else(|| {
-            overlay
-                .index
-                .get(&(body.topic_id, body.actor_id, body.actor_seq))
-                .copied()
-        }) {
-            if existing != op.id {
-                return Err(Error::ActorFork);
-            }
-            if self.is_admitted_duplicate(op)? {
-                return Ok(OpAdmission::Duplicate);
-            }
-        }
-        match &body.payload {
-            TopicPayload::Genesis(_) => {
-                if body.actor_seq != 1
-                    || body.actor_prev.is_some()
-                    || !body.deps.is_empty()
-                    || state.is_some()
-                {
-                    return Err(Error::InvalidGenesis);
-                }
-            }
-            TopicPayload::Event(envelope) => {
-                let state = state.ok_or(Error::TopicNotFound)?;
-                ensure_event_type(&state.event_type_id, &envelope.type_id)?;
-                let author_is_member = if body.deps == *heads {
-                    state.members.contains(&body.author)
-                } else {
-                    self.project_membership(
-                        &body.topic_id,
-                        &body.deps,
-                        overlay.ops,
-                        overlay.meta,
-                        projections,
-                    )?
-                    .members
-                    .contains(&body.author)
-                };
-                if !author_is_member {
-                    return Err(Error::NotTopicMember);
-                }
-            }
-            TopicPayload::Control(_) => {
-                let state = state.ok_or(Error::TopicNotFound)?;
-                let author_is_member = if body.deps == *heads {
-                    state.members.contains(&body.author)
-                } else {
-                    self.project_membership(
-                        &body.topic_id,
-                        &body.deps,
-                        overlay.ops,
-                        overlay.meta,
-                        projections,
-                    )?
-                    .members
-                    .contains(&body.author)
-                };
-                if !author_is_member {
-                    return Err(Error::NotTopicMember);
-                }
-            }
-        }
-        let expected = match overlay.tips.get(&(body.topic_id, body.actor_id)).copied() {
-            Some(tip) => Some(tip),
-            None => self.stored_actor_tip(body, overlay.reset)?,
-        };
-        let (expected_seq, expected_prev) = next_actor_position(expected)?;
-        if body.actor_seq != expected_seq {
-            if body.actor_seq < expected_seq && self.is_admitted_duplicate(op)? {
-                return Ok(OpAdmission::Duplicate);
-            }
-            return Err(Error::ActorSeqGap {
-                expected: expected_seq,
-                actual: body.actor_seq,
-            });
-        }
-        if body.actor_prev != expected_prev {
-            return Err(Error::ActorPrevMismatch);
-        }
-        let mut generation = 0;
-        for id in &body.deps {
-            let meta = self.meta_projected(id, overlay.meta)?;
-            generation = generation.max(checked_next(meta.generation)?);
-        }
-        if body.generation != generation {
-            return Err(Error::InvalidOpId);
-        }
-        Ok(OpAdmission::Admit)
-    }
-
-    /// The stored actor slot and tip, or `None` on the reset path. A reset wipes
-    /// every actor index and tip of the topic in the same transaction as the
-    /// admission, so validating against them would judge the batch by a chain
-    /// that is about to stop existing.
-    fn stored_actor_index(&self, body: &OpBody, reset: bool) -> Result<Option<OpId>> {
-        if reset {
-            return Ok(None);
-        }
-        self.storage
-            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)
-    }
-
-    fn stored_actor_tip(&self, body: &OpBody, reset: bool) -> Result<Option<(u64, OpId)>> {
-        if reset {
-            return Ok(None);
-        }
-        self.storage.actor_tip(&body.topic_id, &body.actor_id)
-    }
-
-    /// Re-reads storage after a tip/seq mismatch: a concurrent admission may
-    /// have committed this exact op between the batch dedup check and the
-    /// validation reads. Only a completely stored op is such a duplicate; a
-    /// half-stored one is damage that [`Self::stored_op_state`] routes into
-    /// repair, and calling it a duplicate is what left it broken forever.
-    fn is_admitted_duplicate(&self, op: &Op) -> Result<bool> {
-        self.storage.dep_resolvable(&op.id)
-    }
-
-    /// Classify what the store already holds for `op`. Both records present is
-    /// a duplicate; either record alone, or an actor slot or child edge naming
-    /// this exact id while the records are gone, is damage the local chain
-    /// already accounts for and must repair in place.
-    fn stored_op_state(&self, op: &Op) -> Result<StoredOp> {
-        let has_op = self.storage.get_op(&op.id)?.is_some();
-        let has_meta = self.storage.get_meta(&op.id)?.is_some();
-        if has_op && has_meta {
-            return Ok(StoredOp::Complete);
-        }
-        if has_op || has_meta {
-            return Ok(StoredOp::Repair);
-        }
-        let body = &op.signed.body;
-        if self
-            .storage
-            .actor_index(&body.topic_id, &body.actor_id, body.actor_seq)?
-            == Some(op.id)
-            || !self.storage.children(&op.id)?.is_empty()
-        {
-            return Ok(StoredOp::Repair);
-        }
-        Ok(StoredOp::Absent)
-    }
-
-    fn project_membership(
-        &self,
-        topic_id: &TopicId,
-        deps: &BTreeSet<OpId>,
-        overlay_ops: &BTreeMap<OpId, Op>,
-        overlay_meta: &BTreeMap<OpId, OpMeta>,
-        projections: &mut BTreeMap<OpId, Arc<TopicState>>,
-    ) -> Result<Arc<TopicState>> {
-        let mut pending = deps.iter().map(|id| (*id, false)).collect::<Vec<_>>();
-        let mut visiting = BTreeSet::new();
-        while let Some((id, visited)) = pending.pop() {
-            if projections.contains_key(&id) {
-                continue;
-            }
-            let meta = self.meta_projected(&id, overlay_meta)?;
-            if meta.topic_id != *topic_id {
-                return Err(Error::TopicMismatch);
-            }
-            if !visited {
-                if !visiting.insert(id) {
-                    return Err(Error::Storage("cycle in op graph".into()));
-                }
-                pending.push((id, true));
-                pending.extend(meta.deps.iter().map(|dep| (*dep, false)));
-                continue;
-            }
-            let op = self.op_projected(&id, overlay_ops)?;
-            let state = match &op.signed.body.payload {
-                TopicPayload::Genesis(_) => {
-                    Arc::new(materialize_topic_state(vec![op], BTreeSet::new())?)
-                }
-                TopicPayload::Event(_) => merge_states(&meta.deps, projections)?,
-                TopicPayload::Control(control) => {
-                    let mut state = (*merge_states(&meta.deps, projections)?).clone();
-                    apply_control_to_state(&mut state, &op, control);
-                    Arc::new(state)
-                }
-            };
-            visiting.remove(&id);
-            projections.insert(id, state);
-        }
-        merge_states(deps, projections)
-    }
-
-    fn observed_clock_for_deps(
-        &self,
-        topic_id: &TopicId,
-        deps: &BTreeSet<crate::OpId>,
-    ) -> Result<crate::ActorClock> {
-        let mut observed_clock = crate::ActorClock::new();
-        for id in deps {
-            let meta = self
-                .storage
-                .get_meta(id)?
-                .ok_or(Error::MissingDependency(*id))?;
-            if meta.topic_id != *topic_id {
-                return Err(Error::TopicMismatch);
-            }
-            observed_clock.merge(&meta.observed_clock);
-            observed_clock.observe(meta.actor_id, meta.actor_seq);
-        }
-
-        Ok(observed_clock)
-    }
-
-    fn topic_state_after(
-        &self,
-        op: &Op,
-        heads: BTreeSet<crate::OpId>,
-        base_state: Option<TopicState>,
-    ) -> Result<Option<TopicState>> {
-        let body = &op.signed.body;
-        match &body.payload {
-            TopicPayload::Genesis(genesis) => Ok(Some(TopicState {
-                topic_id: body.topic_id,
-                event_type_id: genesis.event_type_id.clone(),
-                genesis: op.id,
-                heads,
-                members: genesis.initial_peers.clone(),
-                replication_policy: genesis.replication_policy.clone(),
-                membership_controls: BTreeMap::new(),
-                replication_policy_control: None,
-            })),
-            TopicPayload::Event(_) => Ok(None),
-            TopicPayload::Control(control) => {
-                let mut state = base_state.ok_or(Error::TopicNotFound)?;
-                state.heads = heads;
-                apply_control_to_state(&mut state, op, control);
-                Ok(Some(state))
-            }
-        }
-    }
-
-    fn commit_admission<F>(
-        &self,
-        op: Op,
-        meta: OpMeta,
-        expected_heads: BTreeSet<crate::OpId>,
-        expected_state: Option<TopicState>,
-        effects: &F,
-    ) -> Result<()>
-    where
-        F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
-    {
-        let heads = heads_after(&expected_heads, &op);
-        let topic_state = self.topic_state_after(&op, heads.clone(), expected_state.clone())?;
-        let effective_state = topic_state
-            .as_ref()
-            .or(expected_state.as_ref())
-            .ok_or(Error::TopicNotFound)?;
-        let effects = effects(&op, &meta, effective_state)?;
-        self.storage.put_admitted_batch(AdmittedBatch {
-            topic_id: op.signed.body.topic_id,
-            expected_heads,
-            expected_topic_state: expected_state,
-            entries: vec![(op, meta)],
-            heads,
-            topic_state,
-            effects,
-        })
-    }
-
-    fn topic_state_for_deps(
-        &self,
-        topic_id: &TopicId,
-        deps: &BTreeSet<crate::OpId>,
-    ) -> Result<TopicState> {
-        let mut reachable = BTreeMap::new();
-        let mut stack = deps.iter().copied().collect::<Vec<_>>();
-        while let Some(id) = stack.pop() {
-            if reachable.contains_key(&id) {
-                continue;
-            }
-            let op = self
-                .storage
-                .get_op(&id)?
-                .ok_or(Error::MissingDependency(id))?;
-            let body = &op.signed.body;
-            if body.topic_id != *topic_id {
-                return Err(Error::TopicMismatch);
-            }
-            stack.extend(body.deps.iter().copied());
-            reachable.insert(id, op);
-        }
-
-        materialize_topic_state(reachable.into_values().collect(), BTreeSet::new())
-    }
-
-    fn ensure_member(&self, topic_id: &TopicId, peer: crate::PeerId) -> Result<()> {
-        let state = self
-            .storage
-            .topic_state(topic_id)?
-            .ok_or(Error::TopicNotFound)?;
-        if state.members.contains(&peer) {
-            Ok(())
-        } else {
-            Err(Error::NotTopicMember)
-        }
     }
 }

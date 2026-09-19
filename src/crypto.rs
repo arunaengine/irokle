@@ -5,7 +5,7 @@ use crate::{
     error::{Error, Result},
     ids::PeerId,
 };
-use ed25519_dalek::{Signature, Signer as DalekSigner, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as DalekSigner, SigningKey, VerifyingKey};
 use serde::Serialize;
 
 pub trait Signer: Send + Sync {
@@ -67,7 +67,10 @@ impl Signer for Ed25519Signer {
 
 pub fn verify(peer: PeerId, message: &[u8], signature: &Signature) -> Result<()> {
     let key = VerifyingKey::from_bytes(peer.as_bytes()).map_err(|_| Error::InvalidPublicKey)?;
-    key.verify(message, signature)
+    if key.is_weak() {
+        return Err(Error::InvalidPublicKey);
+    }
+    key.verify_strict(message, signature)
         .map_err(|_| Error::InvalidSignature)
 }
 

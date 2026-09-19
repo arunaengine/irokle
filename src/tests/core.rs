@@ -1,7 +1,7 @@
-use super::support::*;
+use crate::tests::support::*;
 
 #[test]
-fn op_id_rejects_tamper() {
+fn rejects_tampered_id() {
     let signer = Ed25519Signer::from_bytes(&[1; 32]);
     let topic_id = TopicId::hash(b"topic");
     let body = OpBody {
@@ -23,7 +23,7 @@ fn op_id_rejects_tamper() {
 }
 
 #[test]
-fn actor_chain_links_ops() {
+fn actor_chain_links() {
     let irokle = node(2);
     let topic = irokle.create_topic::<Note>(TopicConfig::default()).unwrap();
     topic.publish(Note { text: "one".into() }).unwrap();
@@ -37,7 +37,7 @@ fn actor_chain_links_ops() {
 }
 
 #[test]
-fn cloned_node_serializes_actor() {
+fn clones_serialize_actor() {
     let irokle = node(44);
     let topic = irokle.create_topic::<Note>(TopicConfig::default()).unwrap();
     let topic_id = topic.id();
@@ -77,7 +77,7 @@ fn cloned_node_serializes_actor() {
 }
 
 #[test]
-fn builder_uses_signer_storage() {
+fn builder_keeps_inputs() {
     let signer = Ed25519Signer::from_bytes(&[77; 32]);
     let irokle = Irokle::builder()
         .with_storage(MemoryStorage::new())
@@ -90,7 +90,7 @@ fn builder_uses_signer_storage() {
 }
 
 #[test]
-fn topic_type_mismatch_on_open() {
+fn topic_open_mismatch() {
     let irokle = node(3);
     let topic = irokle.create_topic::<Note>(TopicConfig::default()).unwrap();
     let err = match irokle.open_topic::<Other>(topic.id()) {
@@ -101,7 +101,7 @@ fn topic_type_mismatch_on_open() {
 }
 
 #[test]
-fn dag_query_honors_limit() {
+fn dag_respects_limit() {
     let alice = node(46);
     let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
     let first = topic.publish(Note { text: "one".into() }).unwrap();
@@ -135,7 +135,7 @@ fn dag_query_honors_limit() {
 }
 
 #[test]
-fn event_envelope_checks_type() {
+fn envelope_checks_type() {
     let envelope = EventEnvelope {
         type_id: "x".into(),
         payload: Bytes::new(),
@@ -147,7 +147,7 @@ fn event_envelope_checks_type() {
 }
 
 #[test]
-fn create_topic_with_event_matches_two_call_path() {
+fn topic_event_equivalent() {
     let signer = Ed25519Signer::from_bytes(&[71; 32]);
     let topic_id = TopicId::hash(b"combined-create");
     let actor_id = actor_id_for(topic_id, signer.peer_id());
@@ -208,7 +208,7 @@ fn create_topic_with_event_matches_two_call_path() {
 }
 
 #[test]
-fn create_topic_with_event_surfaces_genesis_race() {
+fn topic_event_race() {
     let signer = Ed25519Signer::from_bytes(&[72; 32]);
     let topic_id = TopicId::hash(b"combined-race");
     let actor_id = actor_id_for(topic_id, signer.peer_id());
@@ -241,7 +241,7 @@ fn create_topic_with_event_surfaces_genesis_race() {
 }
 
 #[test]
-fn event_rejects_type_mismatch() {
+fn event_type_mismatch() {
     let alice = node(90);
     let bob_signer = Ed25519Signer::from_bytes(&[91; 32]);
     let topic = alice
@@ -271,4 +271,342 @@ fn event_rejects_type_mismatch() {
         oplog.receive_op(op),
         Err(Error::EventTypeMismatch { .. })
     ));
+}
+
+/// A signed generation cannot match a dependency with a different generation.
+/// Once known, reject the op and descendants instead of revalidating it repeatedly.
+/// Keep an independent waiter on that dependency.
+fn assert_rejects_impossible<S: Storage>(storage: S) {
+    let alice = Irokle::with_storage(
+        storage,
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[140; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let bob = Ed25519Signer::from_bytes(&[141; 32]);
+    let carol = Ed25519Signer::from_bytes(&[142; 32]);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id(), carol.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let topic_id = topic.id();
+    let genesis = oplog::topological(alice.storage(), &topic_id).unwrap()[0].clone();
+    let base = genesis.signed.body.generation;
+    let bob_actor = actor_id_for(topic_id, bob.peer_id());
+    let carol_actor = actor_id_for(topic_id, carol.peer_id());
+    let note = |text: &str| {
+        TopicPayload::Event(
+            EventEnvelope::encode_event(&Note {
+                text: text.to_owned(),
+            })
+            .unwrap(),
+        )
+    };
+
+    // Withheld dependency; everything below waits on it.
+    let d = Op::sign(
+        OpBody {
+            topic_id,
+            author: bob.peer_id(),
+            actor_id: bob_actor,
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [genesis.id].into(),
+            generation: base + 1,
+            payload: note("d"),
+        },
+        &bob,
+    )
+    .unwrap();
+    // P claims a generation its only dependency can never justify.
+    let p = Op::sign(
+        OpBody {
+            topic_id,
+            author: bob.peer_id(),
+            actor_id: bob_actor,
+            actor_seq: 2,
+            actor_prev: Some(d.id),
+            deps: [d.id].into(),
+            generation: base + 10,
+            payload: note("p"),
+        },
+        &bob,
+    )
+    .unwrap();
+    let c = Op::sign(
+        OpBody {
+            topic_id,
+            author: bob.peer_id(),
+            actor_id: bob_actor,
+            actor_seq: 3,
+            actor_prev: Some(p.id),
+            deps: [p.id].into(),
+            generation: base + 11,
+            payload: note("c"),
+        },
+        &bob,
+    )
+    .unwrap();
+    let gc = Op::sign(
+        OpBody {
+            topic_id,
+            author: bob.peer_id(),
+            actor_id: bob_actor,
+            actor_seq: 4,
+            actor_prev: Some(c.id),
+            deps: [c.id].into(),
+            generation: base + 12,
+            payload: note("gc"),
+        },
+        &bob,
+    )
+    .unwrap();
+    // Independent sibling waiting on the same dependency.
+    let s = Op::sign(
+        OpBody {
+            topic_id,
+            author: carol.peer_id(),
+            actor_id: carol_actor,
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [d.id].into(),
+            generation: base + 2,
+            payload: note("s"),
+        },
+        &carol,
+    )
+    .unwrap();
+
+    let log = oplog::Oplog::with_storage(alice.storage().clone());
+    log.receive_ops_from_peer(Some(bob.peer_id()), vec![p.clone(), c.clone(), gc.clone()])
+        .unwrap();
+    log.receive_ops_from_peer(Some(carol.peer_id()), vec![s.clone()])
+        .unwrap();
+    assert!(
+        alice
+            .storage()
+            .pending_missing_deps(&topic_id)
+            .unwrap()
+            .contains(&d.id),
+        "all four must be buffered behind the withheld dependency"
+    );
+
+    log.receive_ops_from_peer(Some(bob.peer_id()), vec![d.clone()])
+        .unwrap();
+
+    assert!(
+        alice.storage().ready_pending_ops().unwrap().is_empty(),
+        "an impossible root must not stay eligible for revalidation"
+    );
+    assert!(alice.storage().pending_waiters(&p.id).unwrap().is_empty());
+    assert!(alice.storage().pending_waiters(&c.id).unwrap().is_empty());
+    assert!(
+        alice
+            .storage()
+            .pending_missing_deps(&topic_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    let admitted = alice.storage().list_op_ids(&topic_id).unwrap();
+    assert!(admitted.contains(&d.id), "the dependency admits");
+    assert!(admitted.contains(&s.id), "the independent sibling admits");
+    for rejected in [&p, &c, &gc] {
+        assert!(
+            !admitted.contains(&rejected.id),
+            "an impossible generation must not be admitted"
+        );
+    }
+
+    // Resending the rejected root reports the permanent failure instead of
+    // buffering it again, so it cannot return through the pending pool.
+    assert!(matches!(
+        log.receive_ops_from_peer(Some(bob.peer_id()), vec![p.clone()]),
+        Err(Error::GenerationMismatch { .. })
+    ));
+    assert!(alice.storage().ready_pending_ops().unwrap().is_empty());
+    assert!(
+        !alice
+            .storage()
+            .list_op_ids(&topic_id)
+            .unwrap()
+            .contains(&p.id)
+    );
+
+    // A genuinely repairable record keeps its buffered copy: its dependency is
+    // simply not here yet, which a later arrival can still resolve.
+    let repairable = Op::sign(
+        OpBody {
+            topic_id,
+            author: carol.peer_id(),
+            actor_id: carol_actor,
+            actor_seq: 2,
+            actor_prev: Some(s.id),
+            deps: [s.id, OpId::hash(b"not-yet-here")].into(),
+            generation: base + 3,
+            payload: note("repairable"),
+        },
+        &carol,
+    )
+    .unwrap();
+    log.receive_ops_from_peer(Some(carol.peer_id()), vec![repairable.clone()])
+        .unwrap();
+    assert!(
+        alice
+            .storage()
+            .pending_missing_deps(&topic_id)
+            .unwrap()
+            .contains(&OpId::hash(b"not-yet-here")),
+        "a missing dependency must keep the buffered op"
+    );
+}
+
+#[test]
+fn memory_rejects_impossible() {
+    assert_rejects_impossible(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_rejects_impossible() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_rejects_impossible(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// Signer that counts the signatures it makes.
+struct CountingSigner {
+    inner: Ed25519Signer,
+    signs: std::sync::atomic::AtomicUsize,
+}
+
+impl Signer for CountingSigner {
+    fn peer_id(&self) -> PeerId {
+        self.inner.peer_id()
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<ed25519_dalek::Signature, Error> {
+        self.signs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.sign(message)
+    }
+}
+
+fn verifications() -> usize {
+    crate::op::VERIFICATIONS.with(std::cell::Cell::get)
+}
+
+/// A retried admission checks each received signature once, and a retried
+/// local write signs and checks its unchanged op once.
+#[test]
+fn retry_reuses_signatures() {
+    let signer = CountingSigner {
+        inner: Ed25519Signer::from_bytes(&[62; 32]),
+        signs: Default::default(),
+    };
+    let (_source, topic_id, ops) = chain_source(61, signer.peer_id());
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let log = oplog::Oplog::with_storage(storage.clone());
+
+    storage.conflict_writes(1);
+    let before = verifications();
+    let accepted = log.receive_ops(ops.clone()).unwrap();
+    assert_eq!(accepted.len(), ops.len());
+    assert_eq!(
+        storage.conflicts.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(verifications() - before, ops.len());
+
+    storage.conflict_writes(1);
+    let before = verifications();
+    let op = log
+        .create_event_op(
+            topic_id,
+            actor_id_for(topic_id, signer.peer_id()),
+            EventEnvelope::encode_event(&Note {
+                text: "retried".into(),
+            })
+            .unwrap(),
+            &signer,
+        )
+        .unwrap();
+    assert!(storage.get_op(&op.id).unwrap().is_some());
+    assert_eq!(
+        storage.conflicts.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(signer.signs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(verifications() - before, 1);
+}
+
+/// A genesis created with its first event and retried after a lost commit
+/// signs and checks each of the two ops once.
+#[test]
+fn genesis_retry_once() {
+    let signer = CountingSigner {
+        inner: Ed25519Signer::from_bytes(&[63; 32]),
+        signs: Default::default(),
+    };
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let log = oplog::Oplog::with_storage(storage.clone());
+    let topic_id = TopicId::hash(b"genesis-retry");
+    storage.conflict_writes(2);
+    let before = verifications();
+    let (genesis, event) = log
+        .create_topic_genesis_with_event(
+            topic_id,
+            actor_id_for(topic_id, signer.peer_id()),
+            TopicGenesis::new(Note::TYPE_ID, [signer.peer_id()]),
+            EventEnvelope::encode_event(&Note {
+                text: "first".into(),
+            })
+            .unwrap(),
+            &signer,
+        )
+        .unwrap();
+    assert_eq!(
+        storage.conflicts.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        storage.list_op_ids(&topic_id).unwrap(),
+        [genesis.id, event.id].into()
+    );
+    assert_eq!(signer.signs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(verifications() - before, 2);
+}
+
+/// A commit that lands while a received batch is checked makes it skip ops the
+/// store now holds; the batch retries instead of reporting a false actor gap.
+#[test]
+fn concurrent_commit_retries() {
+    let source = node(64);
+    let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
+    for text in ["one", "two", "three", "four"] {
+        topic.publish(Note { text: text.into() }).unwrap();
+    }
+    let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let receiver = oplog::Oplog::with_storage(storage.clone());
+    receiver.receive_ops(ops[..2].to_vec()).unwrap();
+
+    // The batch pauses at its first read of the fourth op, after the third entered
+    // its overlay, while another receive commits the third and fourth.
+    let writer = oplog::Oplog::with_storage(storage.clone());
+    let (batch, committed) = (ops[2..].to_vec(), ops[2..4].to_vec());
+    let accepted = interleave(
+        &storage,
+        (GatePoint::Meta(ops[3].id), 0),
+        Isolation::Commits,
+        move || receiver.receive_ops(batch),
+        move || {
+            writer.receive_ops(committed).unwrap();
+        },
+    );
+    assert_eq!(accepted.unwrap(), [ops[4].id].into());
+    assert_eq!(storage.heads(&topic.id()).unwrap(), [ops[4].id].into());
 }

@@ -1,6 +1,5 @@
-use super::support::*;
+use crate::tests::support::*;
 
-#[cfg(feature = "iroh")]
 #[tokio::test]
 async fn builder_sets_net() {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -19,9 +18,8 @@ async fn builder_sets_net() {
     assert!(irokle.list_topics().unwrap().is_empty());
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test]
-async fn builder_sets_runtime_config() {
+async fn builder_sets_runtime() {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -42,9 +40,8 @@ async fn builder_sets_runtime_config() {
     assert_eq!(irokle.iroh_runtime_config(), Some(runtime));
 }
 
-#[cfg(feature = "iroh")]
 #[test]
-fn runtime_defaults_use_dirty_sync_and_daily_sweep() {
+fn runtime_default_intervals() {
     let runtime = net::IrohRuntimeConfig::default();
 
     assert_eq!(runtime.resync_interval, std::time::Duration::from_secs(5));
@@ -66,9 +63,8 @@ fn runtime_defaults_use_dirty_sync_and_daily_sweep() {
     );
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resync_runs_without_auto_accept_and_without_obligations() {
+async fn resync_unaccepted() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -118,9 +114,8 @@ async fn resync_runs_without_auto_accept_and_without_obligations() {
     bob_endpoint.close().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn iroh_defaults_to_async_replication() {
+async fn defaults_async_replication() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -144,20 +139,18 @@ async fn iroh_defaults_to_async_replication() {
     let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
 
     let report = alice.sync_report(bob_peer, topic.id()).unwrap();
-    assert!(
-        report
-            .obligations
-            .iter()
-            .any(|obligation| obligation.op_ids.contains(&genesis.id))
-    );
+    assert!(obligation_covers(
+        alice.storage(),
+        &report.obligations,
+        &genesis.id
+    ));
 
     alice.shutdown_iroh().await;
     bob_endpoint.close().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test]
-async fn resync_and_accept_loops_start_once() {
+async fn resync_accept_once() {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -189,29 +182,42 @@ async fn resync_and_accept_loops_start_once() {
     net.shutdown().await;
 }
 
-#[cfg(all(feature = "iroh", feature = "fjall"))]
 #[tokio::test]
-async fn builder_selects_fjall() {
-    let dir = tempfile::tempdir().unwrap();
+async fn abort_allows_replacement() {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
         .unwrap();
-    let irokle = Irokle::builder()
-        .with_net(endpoint)
-        .with_fjall_path(dir.path())
-        .unwrap()
+    let runtime = net::IrohRuntimeConfig {
+        connect_timeout: std::time::Duration::from_millis(20),
+        sync_io_timeout: std::time::Duration::from_millis(20),
+        resync_interval: std::time::Duration::from_secs(60),
+        ..net::IrohRuntimeConfig::default()
+    };
+    let node = Irokle::builder()
+        .with_iroh_secret_key(endpoint.secret_key())
         .without_auto_accept()
         .build()
         .unwrap();
+    let net = Arc::new(net::IrohNet::new_with_config(endpoint, node, runtime).unwrap());
 
-    assert!(irokle.endpoint().is_some());
-    assert!(irokle.list_topics().unwrap().is_empty());
+    let first = net
+        .spawn_resync_loop(runtime.resync_interval)
+        .unwrap()
+        .expect("the first resync loop starts");
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    // The start-once latch clears on actual task exit, so the aborted loop can
+    // be replaced instead of leaving the node without one.
+    let replacement = net.spawn_resync_loop(runtime.resync_interval).unwrap();
+
+    assert!(replacement.is_some());
+    net.shutdown().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sync_now_records_ack() {
+async fn sync_now_records() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
         .bind()
@@ -278,9 +284,8 @@ async fn sync_now_records_ack() {
     );
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_replication_records_scheduled_status() {
+async fn async_status_scheduled() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -328,9 +333,8 @@ async fn async_replication_records_scheduled_status() {
     assert_eq!(status[0].pending_obligations, 1);
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_replication_schedules_genesis_and_control_obligations() {
+async fn async_obligation_schedule() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -361,10 +365,7 @@ async fn async_replication_schedules_genesis_and_control_obligations() {
 
     let report = alice.sync_report(bob.peer_id(), topic.id()).unwrap();
     assert!(
-        report
-            .obligations
-            .iter()
-            .any(|obligation| obligation.op_ids.contains(&genesis.id)),
+        obligation_covers(alice.storage(), &report.obligations, &genesis.id),
         "genesis op should be scheduled for async replication"
     );
 
@@ -379,62 +380,13 @@ async fn async_replication_schedules_genesis_and_control_obligations() {
 
     let report = alice.sync_report(bob.peer_id(), topic.id()).unwrap();
     assert!(
-        report
-            .obligations
-            .iter()
-            .any(|obligation| obligation.op_ids.contains(&control.id)),
+        obligation_covers(alice.storage(), &report.obligations, &control.id),
         "control op should be scheduled for async replication"
     );
 }
 
-#[cfg(all(feature = "iroh", feature = "fjall"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_replication_persists_genesis_obligation_with_fjall() {
-    let dir = tempfile::tempdir().unwrap();
-    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-        .bind()
-        .await
-        .unwrap();
-    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-        .bind()
-        .await
-        .unwrap();
-    let bob_peer = PeerId::from_bytes(*bob_endpoint.id().as_bytes());
-
-    let (topic_id, genesis_id) = {
-        let alice = Irokle::builder()
-            .with_net(alice_endpoint)
-            .with_write_concern(WriteConcern::AsyncReplication)
-            .with_fjall_path(dir.path())
-            .unwrap()
-            .without_auto_accept()
-            .build()
-            .unwrap();
-        let topic = alice
-            .create_topic::<Note>(TopicConfig {
-                initial_peers: [bob_peer].into(),
-                replication_policy: ReplicationPolicy::all().with_max_sync_peers(1),
-            })
-            .unwrap();
-        let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
-        alice.shutdown_iroh().await;
-        bob_endpoint.close().await;
-        (topic.id(), genesis.id)
-    };
-
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    let obligations = storage.sync_obligations(&bob_peer, &topic_id).unwrap();
-    assert!(
-        obligations
-            .iter()
-            .any(|obligation| obligation.op_ids.contains(&genesis_id)),
-        "genesis obligation should be durably committed with the op"
-    );
-}
-
-#[cfg(feature = "iroh")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn open_hides_non_member_summary() {
+async fn open_hides_outsider() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -463,9 +415,8 @@ async fn open_hides_non_member_summary() {
     assert!(responses.is_empty());
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn former_member_can_confirm_matching_fingerprint() {
+async fn former_member_fingerprint() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -527,7 +478,6 @@ async fn former_member_can_confirm_matching_fingerprint() {
     }));
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn whitelist_controls_bootstrap() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -641,9 +591,8 @@ async fn whitelist_controls_bootstrap() {
     assert!(bob.storage().topic_state(&topic.id()).unwrap().is_some());
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handle_messages_accepts_ack_heads_that_arrive_before_data() {
+async fn ack_before_data() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
         .await
@@ -686,6 +635,7 @@ async fn handle_messages_accepts_ack_heads_that_arrive_before_data() {
     let mut ack = sync::SyncAck {
         topic_id: topic.id(),
         peer_id: bob.peer_id(),
+        genesis: genesis_of(bob.storage(), &topic.id()),
         accepted: [alice_record.meta.op_id].into(),
         heads: bob.storage().heads(&topic.id()).unwrap(),
         clock: bob.storage().actor_clock(&topic.id()).unwrap(),
@@ -731,9 +681,8 @@ async fn handle_messages_accepts_ack_heads_that_arrive_before_data() {
     assert!(peer_ack.heads.contains(&bob_record.meta.op_id));
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn batched_resync_drains_topic_backlog_with_few_streams() {
+async fn resync_backlog_bound() {
     const TOPICS: usize = 1000;
     let lookup = iroh::address_lookup::memory::MemoryLookup::new();
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -809,9 +758,8 @@ async fn batched_resync_drains_topic_backlog_with_few_streams() {
     bob.shutdown_iroh().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn genesis_tiebreak_eviction_reaches_sink_via_builder_net() {
+async fn genesis_eviction_sink() {
     use crate::TopicEviction;
 
     let topic_id = TopicId::hash(b"iroh-genesis-fork-topic");
@@ -955,8 +903,7 @@ async fn genesis_tiebreak_eviction_reaches_sink_via_builder_net() {
     alice.shutdown_iroh().await;
 }
 
-#[cfg(feature = "iroh")]
-async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
+pub(super) async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
     use futures::StreamExt;
     use iroh::Watcher;
 
@@ -977,9 +924,8 @@ async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
     .expect("iroh endpoint produced a dialable address")
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bad_ack_spares_other_topics() {
+async fn bad_ack_isolated() {
     // A rejected ack must not discard the other acks batched into the same
     // stream, or their obligations never clear and the peer resends forever.
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -1022,6 +968,7 @@ async fn bad_ack_spares_other_topics() {
     let mut bad = sync::SyncAck {
         topic_id: poisoned,
         peer_id: bob.peer_id(),
+        genesis: genesis_of(bob.storage(), &poisoned),
         accepted: BTreeSet::new(),
         heads: BTreeSet::new(),
         clock: ahead,
@@ -1031,6 +978,7 @@ async fn bad_ack_spares_other_topics() {
     let mut good = sync::SyncAck {
         topic_id: healthy,
         peer_id: bob.peer_id(),
+        genesis: genesis_of(alice.storage(), &healthy),
         accepted: BTreeSet::new(),
         heads: alice.storage().heads(&healthy).unwrap(),
         clock: alice.storage().actor_clock(&healthy).unwrap(),
@@ -1072,7 +1020,6 @@ async fn bad_ack_spares_other_topics() {
     );
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn equal_fingerprint_repairs() {
     // Two stores with identical heads and clocks, one missing a non-head
@@ -1146,7 +1093,7 @@ async fn equal_fingerprint_repairs() {
         )
         .unwrap();
     assert!(matches!(
-        responses.last(),
+        responses.messages().last(),
         Some(sync::SyncMessage::Summary(_))
     ));
 
@@ -1161,7 +1108,6 @@ async fn equal_fingerprint_repairs() {
     alice.shutdown_iroh().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_topic_retries() {
     // A topic whose data the peer could not admit must come back as an explicit
@@ -1263,7 +1209,6 @@ async fn failed_topic_retries() {
     alice.shutdown_iroh().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_peer_ack() {
     // An ack bound to another peer must fail its own topic only; the valid ack
@@ -1306,6 +1251,7 @@ async fn wrong_peer_ack() {
     let mut stray = sync::SyncAck {
         topic_id: unbound,
         peer_id: carol.peer_id(),
+        genesis: genesis_of(alice.storage(), &unbound),
         accepted: BTreeSet::new(),
         heads: alice.storage().heads(&unbound).unwrap(),
         clock: alice.storage().actor_clock(&unbound).unwrap(),
@@ -1315,6 +1261,7 @@ async fn wrong_peer_ack() {
     let mut good = sync::SyncAck {
         topic_id: healthy,
         peer_id: bob.peer_id(),
+        genesis: genesis_of(alice.storage(), &healthy),
         accepted: BTreeSet::new(),
         heads: alice.storage().heads(&healthy).unwrap(),
         clock: alice.storage().actor_clock(&healthy).unwrap(),
@@ -1353,4 +1300,575 @@ async fn wrong_peer_ack() {
             .unwrap()
             .is_none()
     );
+}
+
+/// Shutdown owns the stream tasks it spawned: while one is held inside a
+/// storage read the timed variant reports it running, and once released the
+/// plain shutdown completes and stays complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_awaits_tasks() {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_iroh_secret_key(alice_endpoint.secret_key()),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let bob = Irokle::with_storage(
+        MemoryStorage::new(),
+        NodeConfig {
+            signer: Ed25519Signer::from_iroh_secret_key(bob_endpoint.secret_key()),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let topic_id = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap()
+        .id();
+    let alice_net = Arc::new(net::IrohNet::new(alice_endpoint, alice.clone()).unwrap());
+    alice_net.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice_net.endpoint()).await;
+    let bob_net = Arc::new(net::IrohNet::new(bob_endpoint, bob.clone()).unwrap());
+
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    storage.arm_read(GatePoint::View(topic_id), Arc::clone(&gate));
+    let open = vec![sync::SyncMessage::Open(bob.sync_open(topic_id))];
+    let requester = Arc::clone(&bob_net);
+    let request = tokio::spawn(async move { requester.sync_with(alice_addr, &open).await });
+    let arrival = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || arrival.wait_arrival())
+        .await
+        .unwrap();
+
+    // The held task cannot end, so the timed shutdown must report it.
+    let outcome = alice_net
+        .shutdown_with_timeout(std::time::Duration::from_millis(200))
+        .await;
+    assert!(
+        matches!(outcome, net::ShutdownOutcome::Incomplete { running } if running >= 1),
+        "{outcome:?}"
+    );
+
+    drop(release);
+    tokio::time::timeout(std::time::Duration::from_secs(60), alice_net.shutdown())
+        .await
+        .expect("shutdown completes once the held task ends");
+    assert_eq!(
+        alice_net
+            .shutdown_with_timeout(std::time::Duration::from_secs(60))
+            .await,
+        net::ShutdownOutcome::Complete
+    );
+    request.abort();
+    let _ = request.await;
+    bob_net.shutdown().await;
+}
+
+/// With sweeps off and no new publish, a failing preferred peer must hand its
+/// topic to an allowed alternate: the health change itself schedules the work.
+/// The preferred peer's own obligation stays outstanding for when it returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_gets_work() {
+    let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+    let keys = [iroh::SecretKey::generate(), iroh::SecretKey::generate()];
+    let peers = keys
+        .each_ref()
+        .map(|key| crate::Ed25519Signer::from_iroh_secret_key(key).peer_id());
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .address_lookup(lookup.clone())
+        .bind()
+        .await
+        .unwrap();
+    let runtime = net::IrohRuntimeConfig {
+        connect_timeout: std::time::Duration::from_secs(2),
+        sync_io_timeout: std::time::Duration::from_secs(10),
+        resync_interval: std::time::Duration::from_millis(50),
+        resync_initial_backoff: std::time::Duration::from_millis(10),
+        resync_max_backoff: std::time::Duration::from_millis(50),
+        full_sweep_interval: std::time::Duration::ZERO,
+        ..net::IrohRuntimeConfig::default()
+    };
+    let alice = Irokle::builder()
+        .with_iroh_runtime_config(runtime)
+        .with_net(alice_endpoint)
+        .build()
+        .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: peers.into(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(1),
+        })
+        .unwrap();
+    let state = alice.storage().topic_state(&topic.id()).unwrap().unwrap();
+    let preferred = node::select_sync_peers(topic.id(), alice.peer_id(), &state)[0];
+    let alternate_index = usize::from(peers[0] == preferred);
+    let alternate_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .secret_key(keys[alternate_index].clone())
+        .address_lookup(lookup.clone())
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let alternate = Irokle::builder()
+        .with_peer_whitelist([alice.peer_id()])
+        .with_net(alternate_endpoint)
+        .build()
+        .unwrap();
+    lookup.add_endpoint_info(ready_addr(alternate.endpoint().unwrap()).await);
+
+    // The preferred peer never runs. Only this publish creates work.
+    topic
+        .publish(Note {
+            text: "fall back".into(),
+        })
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while alternate.list_topics().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the alternate was never contacted: {:?} failures {}",
+            alice.sync_status(topic.id()).unwrap(),
+            alice.peer_health().failures(&preferred)
+        )
+    });
+    assert!(
+        alice
+            .storage()
+            .has_sync_obligations(&preferred, &topic.id())
+            .unwrap(),
+        "the failing peer's own work must stay outstanding"
+    );
+
+    alice.shutdown_iroh().await;
+    alternate.shutdown_iroh().await;
+}
+/// Offline async publishes of N and then 2N events keep one clock record per
+/// peer, not one per publish.
+async fn assert_publishes_coalesce<S: Storage>(storage: S) {
+    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .bind()
+        .await
+        .unwrap();
+    let peers = [182, 183].map(|seed| Ed25519Signer::from_bytes(&[seed; 32]).peer_id());
+    let alice = Irokle::builder()
+        .with_storage(storage.clone())
+        .with_net(endpoint)
+        .with_write_concern(WriteConcern::AsyncReplication)
+        .without_auto_accept()
+        .build()
+        .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: peers.into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let actor = actor_id_for(topic.id(), alice.peer_id());
+    let rounds = 8;
+
+    for round in 1..=2 {
+        for index in 0..rounds {
+            topic
+                .publish(Note {
+                    text: format!("{round}-{index}"),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            storage.topic_obligation_counts(&topic.id()).unwrap(),
+            peers.map(|peer| (peer, 1)).into(),
+            "round {round}"
+        );
+        for peer in peers {
+            let records = storage.sync_obligations(&peer, &topic.id()).unwrap();
+            assert!(matches!(
+                &records[..],
+                [crate::storage::SyncObligation {
+                    target: crate::storage::ObligationTarget::Clock(clock),
+                    ..
+                }] if clock.get(&actor) == 1 + round * rounds
+            ));
+        }
+    }
+    alice.shutdown_iroh().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_publishes_coalesce() {
+    assert_publishes_coalesce(MemoryStorage::new()).await;
+}
+
+/// An inviter net without background loops, and a receiver built with its net
+/// that trusts `whitelist`.
+async fn bootstrap_pair(
+    whitelist: bool,
+) -> (
+    Irokle,
+    Arc<net::IrohNet<MemoryStorage>>,
+    Irokle,
+    iroh::EndpointAddr,
+) {
+    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let alice = Irokle::builder()
+        .with_iroh_secret_key(alice_endpoint.secret_key())
+        .build()
+        .unwrap();
+    let alice_net = Arc::new(net::IrohNet::new(alice_endpoint, alice.clone()).unwrap());
+    let trusted = if whitelist {
+        vec![alice.peer_id()]
+    } else {
+        Vec::new()
+    };
+    let bob = Irokle::builder()
+        .with_peer_whitelist(trusted)
+        .with_net(bob_endpoint)
+        .build()
+        .unwrap();
+    let bob_addr = ready_addr(bob.endpoint().unwrap()).await;
+    (alice, alice_net, bob, bob_addr)
+}
+
+/// A topic of `alice` with `events` notes and then the invitation of `bob`.
+fn invite_last(alice: &Irokle, bob: PeerId, events: usize) -> (TopicId, Vec<Op>) {
+    let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
+    for index in 0..events {
+        topic
+            .publish(Note {
+                text: index.to_string(),
+            })
+            .unwrap();
+    }
+    topic.add_peer(bob).unwrap();
+    (
+        topic.id(),
+        oplog::topological(alice.storage(), &topic.id()).unwrap(),
+    )
+}
+
+/// The receiver holds the whole history and the inviter holds its certified ack.
+fn assert_bootstrapped(alice: &Irokle, bob: &Irokle, topic_id: TopicId) {
+    assert_eq!(
+        bob.storage().list_op_ids(&topic_id).unwrap(),
+        alice.storage().list_op_ids(&topic_id).unwrap()
+    );
+    let ack = alice
+        .storage()
+        .peer_ack(&bob.peer_id(), &topic_id)
+        .unwrap()
+        .expect("certified ack");
+    assert_eq!(ack.genesis, genesis_of(alice.storage(), &topic_id));
+    assert_eq!(ack.clock, alice.storage().actor_clock(&topic_id).unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_spans_frames() {
+    let (alice, alice_net, bob, bob_addr) = bootstrap_pair(true).await;
+    let (topic_id, ops) = invite_last(&alice, bob.peer_id(), 300);
+    assert!(ops.len() > crate::net::MAX_SYNC_DATA_OPS_PER_MESSAGE);
+
+    // One data frame without the invitation is staged and only receipted.
+    let first = vec![
+        sync::SyncMessage::Open(alice.sync_open(topic_id)),
+        sync::SyncMessage::Data(sync::SyncData {
+            topic_id,
+            ops: ops[..crate::net::MAX_SYNC_DATA_OPS_PER_MESSAGE].to_vec(),
+        }),
+    ];
+    let responses = alice_net.sync_with(bob_addr.clone(), &first).await.unwrap();
+    let receipt = responses.iter().find_map(|response| match response {
+        sync::SyncMessage::Receipt(receipt) => Some(receipt.clock.clone()),
+        _ => None,
+    });
+    let actor = actor_id_for(topic_id, alice.peer_id());
+    assert_eq!(receipt.map(|clock| clock.get(&actor)), Some(256));
+    assert!(
+        !responses
+            .iter()
+            .any(|response| matches!(response, sync::SyncMessage::Ack(_)))
+    );
+    assert!(bob.storage().topic_state(&topic_id).unwrap().is_none());
+    assert!(
+        alice
+            .storage()
+            .peer_ack(&bob.peer_id(), &topic_id)
+            .unwrap()
+            .is_none()
+    );
+
+    alice_net.sync_now(bob_addr, topic_id).await.unwrap();
+    assert_bootstrapped(&alice, &bob, topic_id);
+    alice_net.shutdown().await;
+    bob.shutdown_iroh().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_spans_pages() {
+    let (alice, alice_net, bob, bob_addr) = bootstrap_pair(true).await;
+    let (topic_id, _) = invite_last(&alice, bob.peer_id(), 4200);
+
+    // Each staged page is progress, so a manual sync either completes or asks
+    // to be called again; it never reports the staged pages as a failure.
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        assert!(attempts <= 8, "bootstrap did not finish");
+        match alice_net.sync_now(bob_addr.clone(), topic_id).await {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("bootstrap sync failed: {error}"),
+        }
+    }
+    assert_bootstrapped(&alice, &bob, topic_id);
+    alice_net.shutdown().await;
+    bob.shutdown_iroh().await;
+}
+
+/// A member invited after the history pulls the topic it does not hold, page
+/// by page. A topic neither side holds leaves nothing to do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invited_pulls_topic() {
+    let (alice, alice_net, bob, _) = bootstrap_pair(true).await;
+    alice_net.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice_net.endpoint()).await;
+    let nowhere = TopicId::hash("pull-nowhere");
+    bob.sync_addr_now(alice_addr.clone(), nowhere)
+        .await
+        .unwrap();
+    assert!(bob.storage().topic_state(&nowhere).unwrap().is_none());
+
+    let (topic_id, _) = invite_last(&alice, bob.peer_id(), 4200);
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        assert!(attempts <= 8, "pull did not finish");
+        match bob.sync_addr_now(alice_addr.clone(), topic_id).await {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("pull failed: {error}"),
+        }
+    }
+    assert_bootstrapped(&alice, &bob, topic_id);
+    alice_net.shutdown().await;
+    bob.shutdown_iroh().await;
+}
+
+/// A source outside the whitelist is never asked for a topic this node lacks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlisted_never_pulls() {
+    let (alice, alice_net, bob, _) = bootstrap_pair(false).await;
+    alice_net.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice_net.endpoint()).await;
+    let (topic_id, _) = invite_last(&alice, bob.peer_id(), 3);
+
+    let error = bob.sync_addr_now(alice_addr, topic_id).await.unwrap_err();
+    assert!(error.to_string().contains("whitelist"), "{error}");
+    assert!(bob.storage().topic_state(&topic_id).unwrap().is_none());
+    assert!(
+        bob.staged_topic(alice.peer_id(), topic_id)
+            .unwrap()
+            .is_none()
+    );
+    alice_net.shutdown().await;
+    bob.shutdown_iroh().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlisted_never_stages() {
+    let (alice, alice_net, bob, bob_addr) = bootstrap_pair(false).await;
+    let (topic_id, _) = invite_last(&alice, bob.peer_id(), 3);
+
+    assert!(alice_net.sync_now(bob_addr, topic_id).await.is_err());
+    assert!(bob.storage().topic_state(&topic_id).unwrap().is_none());
+    assert!(
+        bob.staged_topic(alice.peer_id(), topic_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        alice
+            .storage()
+            .peer_ack(&bob.peer_id(), &topic_id)
+            .unwrap()
+            .is_none()
+    );
+    alice_net.shutdown().await;
+    bob.shutdown_iroh().await;
+}
+
+/// Stages positions 1 and 3 of `alice`'s topic on `bob`, then pulls the rest.
+async fn pull_behind_hole<S: Storage>(
+    alice: &Irokle,
+    alice_addr: iroh::EndpointAddr,
+    bob: Irokle<S>,
+    topic_id: TopicId,
+    ops: &[Op],
+) {
+    let staged_hole = sync::SyncData {
+        topic_id,
+        ops: vec![ops[0].clone(), ops[2].clone()],
+    };
+    let outcome = bob
+        .receive_sync_outcome(alice.peer_id(), staged_hole)
+        .unwrap();
+    assert!(matches!(outcome, crate::node::ReceiveOutcome::Staged(_)));
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        assert!(attempts <= 8, "pull behind a staged hole did not finish");
+        match bob.sync_addr_now(alice_addr.clone(), topic_id).await {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("pull behind a staged hole failed: {error}"),
+        }
+    }
+    assert_eq!(
+        bob.storage().list_op_ids(&topic_id).unwrap(),
+        alice.storage().list_op_ids(&topic_id).unwrap()
+    );
+    bob.shutdown_iroh().await;
+}
+
+/// A pull behind a staged hole asks for the hole: staged positions 1 and 3
+/// are a prefix of 1, never of 3.
+async fn pull_fills_hole(bob_fjall: bool) {
+    let (alice, alice_net, _, _) = bootstrap_pair(true).await;
+    alice_net.start_accept_loop().unwrap();
+    let alice_addr = ready_addr(alice_net.endpoint()).await;
+    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+        .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let bob_peer = PeerId::from_bytes(*bob_endpoint.id().as_bytes());
+    let (topic_id, ops) = invite_last(&alice, bob_peer, 20);
+    let builder = Irokle::builder().with_peer_whitelist(vec![alice.peer_id()]);
+    if bob_fjall {
+        #[cfg(feature = "fjall")]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let bob = builder
+                .with_fjall_path(dir.path())
+                .unwrap()
+                .with_net(bob_endpoint)
+                .build()
+                .unwrap();
+            pull_behind_hole(&alice, alice_addr, bob, topic_id, &ops).await;
+        }
+    } else {
+        let bob = builder.with_net(bob_endpoint).build().unwrap();
+        pull_behind_hole(&alice, alice_addr, bob, topic_id, &ops).await;
+    }
+    alice_net.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_pull_hole() {
+    pull_fills_hole(false).await;
+}
+
+#[cfg(feature = "fjall")]
+mod fjall {
+    use crate::tests::iroh::*;
+
+    #[tokio::test]
+    async fn builder_selects_fjall() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let irokle = Irokle::builder()
+            .with_net(endpoint)
+            .with_fjall_path(dir.path())
+            .unwrap()
+            .without_auto_accept()
+            .build()
+            .unwrap();
+
+        assert!(irokle.endpoint().is_some());
+        assert!(irokle.list_topics().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn genesis_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let bob_peer = PeerId::from_bytes(*bob_endpoint.id().as_bytes());
+
+        let (topic_id, genesis_id) = {
+            let alice = Irokle::builder()
+                .with_net(alice_endpoint)
+                .with_write_concern(WriteConcern::AsyncReplication)
+                .with_fjall_path(dir.path())
+                .unwrap()
+                .without_auto_accept()
+                .build()
+                .unwrap();
+            let topic = alice
+                .create_topic::<Note>(TopicConfig {
+                    initial_peers: [bob_peer].into(),
+                    replication_policy: ReplicationPolicy::all().with_max_sync_peers(1),
+                })
+                .unwrap();
+            let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
+            alice.shutdown_iroh().await;
+            bob_endpoint.close().await;
+            (topic.id(), genesis.id)
+        };
+
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        let obligations = storage.sync_obligations(&bob_peer, &topic_id).unwrap();
+        assert!(
+            obligation_covers(&storage, &obligations, &genesis_id),
+            "genesis obligation should be durably committed with the op"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publishes_coalesce() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_publishes_coalesce(crate::storage::FjallStorage::open(dir.path()).unwrap()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pull_hole() {
+        pull_fills_hole(true).await;
+    }
 }

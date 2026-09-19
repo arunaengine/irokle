@@ -1,0 +1,5870 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::sync::{SyncMessage, SyncSummary};
+use crate::{Irokle, MemoryStorage, PeerId, ReceiveOutcome, Storage, TopicEviction};
+
+use crate::net::frame::MAX_SYNC_DATA_OPS_PER_MESSAGE as MAX_DATA_OPS;
+use crate::net::{_message_type_name, IROKLE_SYNC_ALPN, invalid_data};
+
+mod budget;
+mod exchange;
+mod pool;
+mod runtime;
+mod scheduler;
+mod service;
+mod session;
+
+use budget::{ByteBudget, Charge, Pool};
+pub use budget::{OwnedBytes, OwnedClass};
+use exchange::{
+    SyncReadLimits, read_frame_body, read_frame_head, read_responses, write_sync_messages,
+};
+pub use exchange::{SyncResponse, SyncResponses, SyncResponsesIter};
+use pool::ConnectionPool;
+pub use runtime::{IrohRuntimeConfig, ShutdownOutcome};
+use runtime::{LoopGuard, TaskTracker};
+use scheduler::{
+    AttemptId, ClaimGuard, ResyncLease, ResyncScheduler, ResyncTarget, ResyncTargetKey,
+    next_attempt_id,
+};
+use session::SyncSession;
+
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+const EMPTY_RESYNC_SLEEP: Duration = Duration::from_secs(24 * 60 * 60 * 365);
+const MAX_ACCEPT_CONNECTIONS: usize = 128;
+const MAX_PEER_CONNECTIONS: usize = 4;
+/// Pre-authentication work is globally bounded because peer identity is
+/// unavailable; this prevents one slow peer from delaying every inbound
+/// connection.
+const MAX_PENDING_HANDSHAKES: usize = 32;
+const MAX_RESYNC_PEERS: usize = 8;
+const MAX_RESYNC_TOPICS: usize = 1024;
+const MAX_STREAM_MESSAGES: usize = 4096;
+// Keep batched streams at half the per-stream message cap so the responder's
+// reply (which can echo up to two messages per topic) stays under its own cap.
+const MAX_BATCH_MESSAGES: usize = MAX_STREAM_MESSAGES / 2;
+const MAX_STREAM_BYTES: usize = 256 * 1024 * 1024;
+/// Bytes of the data pool, and of the result pool, of a net. The budget
+/// raises both to fit the largest legal frame, see `src/sync/limits.md`.
+const MAX_INBOUND_BYTES: usize = 256 * 1024 * 1024;
+/// Streams all served connections and embedders may handle at once.
+const MAX_SERVED_STREAMS: usize = 1024;
+/// Delay before a topic that advanced but still owes work is served again. It
+/// is due at once but behind every target that became due earlier, so other
+/// work takes its turn first and an idle queue continues immediately.
+const RESYNC_PROGRESS_TURN: Duration = Duration::ZERO;
+/// Pages one `sync_now` call will fetch while each is really advancing, before
+/// it reports what it reached. Bounds the caller's wait instead of paging on
+/// until the peer stops publishing.
+const SYNC_NOW_PAGES: usize = 64;
+/// Staging receipts remembered per peer and topic, oldest dropped first.
+const MAX_BOOTSTRAP_RECEIPTS: usize = 1024;
+const RECEIPT_LOG_BYTES: usize = 64 * 1024 * 1024;
+const REQUEST_LOG_BYTES: usize = 32 * 1024 * 1024;
+const LOG_INDEX_BYTES: usize = 256 * 1024;
+/// Storage jobs running at once for acks, fingerprints, summaries and status.
+const CONTROL_JOBS: usize = 4;
+/// Storage jobs running at once for admission and page planning.
+const BULK_JOBS: usize = 2;
+
+/// Bounds of one sync stream. Tests scale them down; everything else uses the
+/// defaults.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StreamLimits {
+    pub(crate) bytes: usize,
+    pub(crate) messages: usize,
+    /// Messages one batched request stream may carry.
+    pub(crate) batch_messages: usize,
+    /// Bytes of the net's data pool and of its result pool.
+    pub(crate) inbound_bytes: usize,
+    /// Bytes all served streams may retain until they reply.
+    pub(crate) session_bytes: usize,
+}
+
+impl Default for StreamLimits {
+    fn default() -> Self {
+        Self {
+            bytes: MAX_STREAM_BYTES,
+            messages: MAX_STREAM_MESSAGES,
+            batch_messages: MAX_BATCH_MESSAGES,
+            inbound_bytes: MAX_INBOUND_BYTES,
+            session_bytes: budget::SESSION_POOL_BYTES,
+        }
+    }
+}
+
+/// The newest staging receipt each peer returned for a topic it does not hold,
+/// kept in memory only to measure staged progress within an attempt. Plans
+/// continue from the staged state the peer's own summary names.
+#[derive(Default)]
+struct ReceiptLog {
+    clocks: BTreeMap<(PeerId, crate::TopicId), crate::sync::SyncReceipt>,
+    order: std::collections::VecDeque<(PeerId, crate::TopicId)>,
+    bytes: usize,
+}
+
+impl ReceiptLog {
+    fn record(&mut self, peer_id: PeerId, receipt: crate::sync::SyncReceipt) {
+        let key = (peer_id, receipt.topic_id);
+        self.clear(&key);
+        let bytes = Self::charge(&receipt);
+        if bytes > RECEIPT_LOG_BYTES - LOG_INDEX_BYTES {
+            return;
+        }
+        while self.bytes + bytes > RECEIPT_LOG_BYTES - LOG_INDEX_BYTES
+            || self.clocks.len() >= MAX_BOOTSTRAP_RECEIPTS
+        {
+            let Some(oldest) = self.order.front().copied() else {
+                break;
+            };
+            self.clear(&oldest);
+        }
+        self.clocks.insert(key, receipt);
+        self.order.push_back(key);
+        self.bytes += bytes;
+    }
+
+    fn charge(receipt: &crate::sync::SyncReceipt) -> usize {
+        crate::ActorClock::allocation_bound(receipt.clock.len()).saturating_add(2048)
+    }
+
+    fn clear(&mut self, key: &(PeerId, crate::TopicId)) {
+        if let Some(receipt) = self.clocks.remove(key) {
+            self.bytes -= Self::charge(&receipt);
+            self.order.retain(|kept| kept != key);
+        }
+    }
+}
+
+/// What each peer's page results told this node about its requests for a
+/// topic, kept in memory only and bounded like the receipt log. An entry
+/// continues one branch and staging session; another starts over.
+#[derive(Default)]
+struct RequestLog {
+    entries: BTreeMap<(PeerId, crate::TopicId), RequestEntry>,
+    order: std::collections::VecDeque<(PeerId, crate::TopicId)>,
+    bytes: usize,
+}
+
+struct RequestEntry {
+    genesis: crate::OpId,
+    session: Option<u64>,
+    knowledge: crate::sync::RequestKnowledge,
+    /// The window the newest request described.
+    window: crate::sync::ActorWindow,
+    /// Actors of the peer's clock that request planned toward.
+    actors: usize,
+}
+
+impl RequestEntry {
+    fn bytes(&self) -> usize {
+        self.window
+            .behind
+            .as_ref()
+            .map_or(0, |filter| filter.bits.capacity() + 64 * 1024)
+            + self.knowledge.retained_bytes()
+            + 2048
+    }
+    /// Whether a request on `genesis` and staging `session` continues this
+    /// entry. The first staging session continues requests made before it.
+    fn continues(&self, genesis: crate::OpId, session: Option<u64>) -> bool {
+        self.genesis == genesis && (self.session == session || self.session.is_none())
+    }
+}
+
+impl RequestLog {
+    fn knowledge(
+        &self,
+        key: &(PeerId, crate::TopicId),
+        genesis: crate::OpId,
+        session: Option<u64>,
+    ) -> crate::sync::RequestKnowledge {
+        self.entries
+            .get(key)
+            .filter(|entry| entry.continues(genesis, session))
+            .map(|entry| entry.knowledge.clone())
+            .unwrap_or_default()
+    }
+
+    /// Remember the window of a request planned on `genesis` and `session`
+    /// toward a clock of `actors` actors. A continued entry moves to the back,
+    /// so entries other peers add do not push out one still in use.
+    fn sent(
+        &mut self,
+        key: (PeerId, crate::TopicId),
+        (genesis, session): (crate::OpId, Option<u64>),
+        window: crate::sync::ActorWindow,
+        actors: usize,
+    ) {
+        let knowledge = self
+            .remove(&key)
+            .filter(|entry| entry.continues(genesis, session))
+            .map_or_else(Default::default, |entry| entry.knowledge);
+        let entry = RequestEntry {
+            genesis,
+            session,
+            knowledge,
+            window,
+            actors,
+        };
+        self.bytes += entry.bytes();
+        self.entries.insert(key, entry);
+        self.order.push_back(key);
+        self.trim();
+    }
+
+    fn remove(&mut self, key: &(PeerId, crate::TopicId)) -> Option<RequestEntry> {
+        let entry = self.entries.remove(key)?;
+        self.bytes -= entry.bytes();
+        self.order.retain(|kept| kept != key);
+        Some(entry)
+    }
+
+    fn trim(&mut self) {
+        while self.bytes > REQUEST_LOG_BYTES - LOG_INDEX_BYTES
+            || self.entries.len() > MAX_BOOTSTRAP_RECEIPTS
+        {
+            let Some(oldest) = self.order.front().copied() else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+    }
+
+    /// Fold a page result for a request planned on `genesis`, whose data
+    /// this node `received` in the same exchange or not.
+    fn settle(
+        &mut self,
+        key: &(PeerId, crate::TopicId),
+        genesis: Option<crate::OpId>,
+        page: &crate::sync::SyncPage,
+        received: bool,
+    ) {
+        if let Some(entry) = self
+            .entries
+            .get_mut(key)
+            .filter(|entry| Some(entry.genesis) == genesis)
+        {
+            let before = entry.bytes();
+            entry.knowledge.settle(
+                &entry.window,
+                (&page.positions, page.continued),
+                (received, entry.actors),
+            );
+            self.bytes = self.bytes - before + entry.bytes();
+        }
+        self.trim();
+    }
+
+    fn revision(&self, key: &(PeerId, crate::TopicId), genesis: Option<crate::OpId>) -> u64 {
+        self.entries
+            .get(key)
+            .filter(|entry| Some(entry.genesis) == genesis)
+            .map_or(0, |entry| entry.knowledge.revision())
+    }
+}
+
+pub struct IrohNet<S: Storage = MemoryStorage> {
+    pool: ConnectionPool,
+    accept_started: AtomicBool,
+    resync_started: AtomicBool,
+    quarantine_started: AtomicBool,
+    outbound_streams: AtomicU64,
+    shared: Arc<SharedNet<S>>,
+    /// Accept loop knobs a test sets; empty outside tests.
+    accept_hooks: AcceptHooks,
+}
+
+// SAFETY: checked_threads verifies every field is Send + Sync without omission.
+// Explicit impls bound the recursive Irokle -> IrohNet -> SharedNet proof.
+unsafe impl<S: Storage> Send for IrohNet<S> {}
+// SAFETY: the same exhaustive field checks validate shared access.
+unsafe impl<S: Storage> Sync for IrohNet<S> {}
+
+impl<S: Storage> IrohNet<S> {
+    fn checked_threads(self) -> Self {
+        fn check<T: Send + Sync>(_: &T) {}
+        let Self {
+            pool,
+            accept_started,
+            resync_started,
+            quarantine_started,
+            outbound_streams,
+            shared,
+            accept_hooks,
+        } = &self;
+        check(pool);
+        check(accept_started);
+        check(resync_started);
+        check(quarantine_started);
+        check(outbound_streams);
+        check(shared);
+        check(accept_hooks);
+        self
+    }
+}
+
+/// Test-only accept loop knobs: a lower connection cap, and a semaphore every
+/// handshake waits on before it runs, so tests can hold handshakes pending.
+#[cfg(test)]
+#[derive(Default)]
+struct AcceptHooks {
+    connections: Option<usize>,
+    handshakes: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+#[cfg(test)]
+impl AcceptHooks {
+    fn max_connections(&self) -> usize {
+        self.connections.unwrap_or(MAX_ACCEPT_CONNECTIONS)
+    }
+
+    fn handshake_hold(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.handshakes.clone()
+    }
+}
+
+/// Outside tests the accept loop uses its fixed cap and holds no handshake.
+#[cfg(not(test))]
+#[derive(Default)]
+struct AcceptHooks(());
+
+#[cfg(not(test))]
+impl AcceptHooks {
+    fn max_connections(&self) -> usize {
+        MAX_ACCEPT_CONNECTIONS
+    }
+
+    fn handshake_hold(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        None
+    }
+}
+
+/// The part of a net that storage jobs use off the async executor.
+pub struct SharedNet<S: Storage> {
+    node: Irokle<S>,
+    runtime: IrohRuntimeConfig,
+    resync_scheduler: ResyncScheduler,
+    limits: StreamLimits,
+    budget: Arc<ByteBudget>,
+    /// Outbound peer attempts, automatic batches and manual syncs alike.
+    outbound: Arc<tokio::sync::Semaphore>,
+    served: Arc<tokio::sync::Semaphore>,
+    plans: Arc<service::PlanQueue>,
+    goals: service::PlanStore<S>,
+    receipts: Mutex<ReceiptLog>,
+    requests: Mutex<RequestLog>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    tasks: Arc<TaskTracker>,
+    control_lane: Arc<tokio::sync::Semaphore>,
+    bulk_lane: Arc<tokio::sync::Semaphore>,
+    /// Durable epoch of this net's start; attempts are `(epoch, sequence)`.
+    attempt_epoch: u64,
+    // Optional sink for remote genesis evictions; the journal remains the
+    // recovery path when no sink is configured.
+    eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
+    /// Measurements a test reads; empty outside tests.
+    probes: TestProbes,
+}
+
+impl<S: Storage> std::ops::Deref for IrohNet<S> {
+    type Target = SharedNet<S>;
+
+    fn deref(&self) -> &SharedNet<S> {
+        &self.shared
+    }
+}
+
+#[cfg(all(test, feature = "fjall"))]
+impl<S: Storage> SharedNet<S> {
+    /// Timings of the control and the bulk lane so far.
+    pub(crate) fn lane_times(&self) -> &[LaneTimes; 2] {
+        &self.probes.lane_times
+    }
+}
+
+/// Which bounded worker lane a storage job runs in. Control work has its own
+/// permits, so acks and status never wait behind admission or page planning.
+#[derive(Clone, Copy, Debug)]
+enum Lane {
+    Control,
+    Bulk,
+}
+
+/// Jobs of one lane, the longest time one waited for a permit and the longest
+/// time one ran, which bounds how long it held a snapshot or storage lock.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct LaneTimes {
+    pub(crate) jobs: AtomicU64,
+    pub(crate) waited_max_micros: AtomicU64,
+    pub(crate) ran_max_micros: AtomicU64,
+}
+
+/// The most framed bytes of planned topic messages held at once, and the
+/// timings of the control and the bulk lane.
+#[cfg(test)]
+#[derive(Default)]
+struct TestProbes {
+    planned_peak: std::sync::atomic::AtomicUsize,
+    lane_times: [LaneTimes; 2],
+}
+
+#[cfg(test)]
+impl TestProbes {
+    fn now(&self) -> Option<std::time::Instant> {
+        Some(std::time::Instant::now())
+    }
+
+    /// Count a job of `lane` that waited since `queued` for its permit.
+    fn waited(&self, lane: Lane, queued: Option<std::time::Instant>) {
+        let times = &self.lane_times[lane as usize];
+        times.jobs.fetch_add(1, Ordering::Relaxed);
+        let waited = queued.map_or(0, |queued| queued.elapsed().as_micros() as u64);
+        times.waited_max_micros.fetch_max(waited, Ordering::Relaxed);
+    }
+
+    fn ran(&self, lane: Lane, started: Option<std::time::Instant>) {
+        let ran = started.map_or(0, |started| started.elapsed().as_micros() as u64);
+        self.lane_times[lane as usize]
+            .ran_max_micros
+            .fetch_max(ran, Ordering::Relaxed);
+    }
+
+    fn planned(&self, bytes: usize) {
+        self.planned_peak.fetch_max(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Outside tests nothing is measured, and no clock is read.
+#[cfg(not(test))]
+#[derive(Default)]
+struct TestProbes(());
+
+#[cfg(not(test))]
+impl TestProbes {
+    #[inline(always)]
+    fn now(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    #[inline(always)]
+    fn waited(&self, _lane: Lane, _queued: Option<std::time::Instant>) {}
+
+    #[inline(always)]
+    fn ran(&self, _lane: Lane, _started: Option<std::time::Instant>) {}
+
+    #[inline(always)]
+    fn planned(&self, _bytes: usize) {}
+}
+
+impl<S: Storage> IrohNet<S> {
+    pub fn new(endpoint: iroh::Endpoint, node: Irokle<S>) -> io::Result<Self> {
+        Self::new_with_alpns(endpoint, node, Vec::new())
+    }
+
+    pub fn new_with_config(
+        endpoint: iroh::Endpoint,
+        node: Irokle<S>,
+        runtime: IrohRuntimeConfig,
+    ) -> io::Result<Self> {
+        Self::new_with_alpns_and_config(endpoint, node, Vec::new(), runtime)
+    }
+
+    pub fn new_with_alpns(
+        endpoint: iroh::Endpoint,
+        node: Irokle<S>,
+        alpns: Vec<Vec<u8>>,
+    ) -> io::Result<Self> {
+        Self::new_with_alpns_and_config(endpoint, node, alpns, IrohRuntimeConfig::default())
+    }
+
+    pub fn new_with_alpns_and_config(
+        endpoint: iroh::Endpoint,
+        node: Irokle<S>,
+        alpns: Vec<Vec<u8>>,
+        runtime: IrohRuntimeConfig,
+    ) -> io::Result<Self> {
+        Self::new_with_alpns_config_and_sink(endpoint, node, alpns, runtime, None)
+    }
+
+    /// Like [`Self::new_with_alpns_and_config`], with a sink that receives every
+    /// [`TopicEviction`] of remote sync data promptly. Evictions are journalled and drained
+    /// through [`Irokle::pending_evictions`] with or without it.
+    pub fn new_with_alpns_config_and_sink(
+        endpoint: iroh::Endpoint,
+        node: Irokle<S>,
+        alpns: Vec<Vec<u8>>,
+        runtime: IrohRuntimeConfig,
+        eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
+    ) -> io::Result<Self> {
+        let endpoint_peer = peer_from_endpoint(endpoint.id());
+        if endpoint_peer != node.peer_id() {
+            return Err(invalid_data("iroh endpoint id does not match node signer"));
+        }
+        let alpns = extend_alpns(alpns);
+        if !alpns.is_empty() {
+            endpoint.set_alpns(alpns);
+        }
+        let attempt_epoch = node.storage().next_attempt_epoch().map_err(invalid_data)?;
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        Ok(Self {
+            pool: ConnectionPool::new(endpoint),
+            accept_started: AtomicBool::new(false),
+            resync_started: AtomicBool::new(false),
+            quarantine_started: AtomicBool::new(false),
+            outbound_streams: AtomicU64::new(0),
+            accept_hooks: AcceptHooks::default(),
+            shared: Arc::new(SharedNet {
+                node,
+                runtime,
+                resync_scheduler: ResyncScheduler::default(),
+                limits: StreamLimits::default(),
+                budget: ByteBudget::new(MAX_INBOUND_BYTES, budget::SESSION_POOL_BYTES),
+                outbound: Arc::new(tokio::sync::Semaphore::new(MAX_RESYNC_PEERS)),
+                served: Arc::new(tokio::sync::Semaphore::new(MAX_SERVED_STREAMS)),
+                plans: Arc::default(),
+                goals: service::PlanStore::default(),
+                receipts: Mutex::default(),
+                requests: Mutex::default(),
+                shutdown,
+                tasks: Arc::default(),
+                control_lane: Arc::new(tokio::sync::Semaphore::new(CONTROL_JOBS)),
+                bulk_lane: Arc::new(tokio::sync::Semaphore::new(BULK_JOBS)),
+                attempt_epoch,
+                eviction_sink,
+                probes: TestProbes::default(),
+            }),
+        }
+        .checked_threads())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_stream_limits(mut self, limits: StreamLimits) -> Self {
+        let shared =
+            Arc::get_mut(&mut self.shared).expect("limits are set before the net is shared");
+        shared.limits = limits;
+        shared.budget = ByteBudget::new(limits.inbound_bytes, limits.session_bytes);
+        self
+    }
+
+    /// Run storage work in a blocking lane; its permit and guard survive caller cancellation.
+    /// The result carries the guard, so unawaited data drops before completion ownership ends.
+    async fn run_job<T, F>(&self, lane: Lane, job: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&SharedNet<S>) -> T + Send + 'static,
+    {
+        let permits = match lane {
+            Lane::Control => &self.control_lane,
+            Lane::Bulk => &self.bulk_lane,
+        };
+        let queued = self.probes.now();
+        let permit = Arc::clone(permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("storage job lane closed"))?;
+        self.probes.waited(lane, queued);
+        let task = self.tasks.track();
+        let count = self.budget.job();
+        let shared = Arc::clone(&self.shared);
+        // Locals drop in reverse order: the permit is back before the task
+        // stops counting, so a completed shutdown never sees a held permit.
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _count = count;
+            let started = shared.probes.now();
+            let result = job(&shared);
+            shared.probes.ran(lane, started);
+            (result, task)
+        })
+        .await
+        .map(|(result, _task)| result)
+        .map_err(|error| io::Error::other(format!("storage job failed: {error}")))
+    }
+}
+
+impl<S: Storage> SharedNet<S> {
+    /// Forwards evictions to the optional sink. Journaled payloads remain
+    /// recoverable when the sink is absent or delivery fails.
+    fn forward_evictions(&self, evictions: Vec<TopicEviction>) {
+        if evictions.is_empty() {
+            return;
+        }
+        for eviction in evictions {
+            let undelivered = match &self.eviction_sink {
+                Some(sink) => sink.send(eviction.clone()).is_err(),
+                None => true,
+            };
+            if undelivered {
+                tracing::warn!(
+                    topic_id = %eviction.topic_id,
+                    key = %eviction.key(),
+                    evicted = eviction.evicted.len(),
+                    "eviction not delivered to a sink; recover it from the journal"
+                );
+            }
+        }
+    }
+}
+
+impl<S: Storage> IrohNet<S> {
+    pub fn node(&self) -> &Irokle<S> {
+        &self.node
+    }
+
+    pub fn endpoint(&self) -> &iroh::Endpoint {
+        self.pool.endpoint()
+    }
+
+    pub fn runtime_config(&self) -> IrohRuntimeConfig {
+        self.runtime
+    }
+
+    /// Number of outbound sync streams opened so far. One stream is one
+    /// request/response round trip with a peer.
+    pub fn outbound_sync_streams(&self) -> u64 {
+        self.outbound_streams.load(Ordering::Relaxed)
+    }
+
+    /// Bytes this net's work owns now and at most, by class, and its storage
+    /// jobs. Decoded sizes are conservative estimates, not measured memory.
+    pub fn owned_bytes(&self) -> OwnedBytes {
+        self.budget.owned()
+    }
+
+    pub async fn shutdown(&self) {
+        // Store shutdown even without a receiver; send alone would lose it.
+        // Sealed first: no caller can register work the drain below would miss.
+        self.tasks.close();
+        self.shutdown.send_replace(true);
+        // Waiting charges fail; held ones stay with their work until it ends.
+        self.budget.close();
+        self.plans.close();
+        self.endpoint().close().await;
+        // Returns only once the loops and every task they spawned have ended.
+        // Awaiting this from inside such a task would wait for itself.
+        self.tasks.wait_idle().await;
+        self.goals.clear();
+    }
+
+    /// Like [`Self::shutdown`], but gives up waiting after `timeout` and
+    /// reports how many owned tasks are still running.
+    pub async fn shutdown_with_timeout(&self, timeout: Duration) -> ShutdownOutcome {
+        match tokio::time::timeout(timeout, self.shutdown()).await {
+            Ok(()) => ShutdownOutcome::Complete,
+            Err(_) => ShutdownOutcome::Incomplete {
+                running: self.tasks.running(),
+            },
+        }
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.tasks.is_closed()
+    }
+
+    pub async fn sync_peer_now(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<()> {
+        self.sync_now(endpoint_addr(peer_id)?, topic_id).await
+    }
+}
+
+impl<S: Storage> SharedNet<S> {
+    pub fn schedule_resync(&self, peer_id: PeerId, topic_id: crate::TopicId) {
+        self.resync_scheduler.schedule_now(peer_id, topic_id, false);
+    }
+
+    pub fn note_peer_reachable(&self, peer_id: PeerId) {
+        if self.tasks.is_closed() {
+            return;
+        }
+        self.resync_scheduler.peer_reachable(peer_id);
+        self.note_outcome(peer_id, [Ok(())]);
+    }
+
+    /// Feed one attempt's outcomes to peer health: any answer counts as reached, otherwise any
+    /// unreachable failure counts once. If selection changes, the peer's queued topics are
+    /// rechecked now for an alternate.
+    fn note_outcome<'a>(
+        &self,
+        peer_id: PeerId,
+        results: impl IntoIterator<Item = std::result::Result<(), &'a io::Error>>,
+    ) {
+        let mut reached = false;
+        let mut unreachable = false;
+        for result in results {
+            match result {
+                Ok(()) => reached = true,
+                Err(error) => unreachable |= is_unreachable(error),
+            }
+        }
+        if !self.node.note_peer_outcome(peer_id, reached, unreachable) {
+            return;
+        }
+        for topic_id in self
+            .resync_scheduler
+            .peer_topics(peer_id, MAX_RESYNC_TOPICS)
+        {
+            if let Err(error) = self.schedule_topic_recheck(topic_id) {
+                tracing::warn!(%peer_id, %topic_id, %error, "failed to recheck topic after a health change");
+            }
+        }
+    }
+
+    /// Marks the peer on an externally accepted connection as reachable.
+    /// Outbound sync dials separately because reverse stream support is not guaranteed.
+    pub fn register_connection(&self, connection: iroh::endpoint::Connection) -> io::Result<()> {
+        let _task = self.tasks.enter()?;
+        self.note_peer_reachable(peer_from_endpoint(connection.remote_id()));
+        Ok(())
+    }
+
+    pub fn schedule_topic_recheck(&self, topic_id: crate::TopicId) -> io::Result<usize> {
+        let mut scheduled = 0;
+        for peer_id in self.dirty_selected_targets(topic_id)? {
+            self.schedule_resync(peer_id, topic_id);
+            scheduled += 1;
+        }
+        Ok(scheduled)
+    }
+}
+
+impl<S: Storage> IrohNet<S> {
+    pub async fn sync_endpoint_now(
+        &self,
+        endpoint_id: iroh::EndpointId,
+        topic_id: crate::TopicId,
+    ) -> io::Result<()> {
+        self.sync_now(iroh::EndpointAddr::from(endpoint_id), topic_id)
+            .await
+    }
+
+    pub fn start_accept_loop(self: &Arc<Self>) -> io::Result<()> {
+        let _ = self.spawn_accept_loop()?;
+        Ok(())
+    }
+
+    pub fn spawn_accept_loop(self: &Arc<Self>) -> io::Result<Option<tokio::task::JoinHandle<()>>> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| io::Error::other("iroh auto accept requires a Tokio runtime"))?;
+        let task = self.tasks.enter()?;
+        if self.accept_started.swap(true, Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let net = Arc::downgrade(self);
+        // Created before spawning, so aborting a loop that never ran still
+        // clears the latch.
+        let running = LoopGuard {
+            net: Weak::clone(&net),
+            latch: |net| &net.accept_started,
+        };
+        let tracker = Arc::clone(&self.tasks);
+        let max_connections = self.accept_hooks.max_connections();
+        let hold = self.accept_hooks.handshake_hold();
+        let endpoint = self.endpoint().clone();
+        let mut shutdown = self.shutdown.subscribe();
+        Ok(Some(handle.spawn(async move {
+            let _task = task;
+            let _running = running;
+            let mut connections = tokio::task::JoinSet::new();
+            let mut handshakes =
+                tokio::task::JoinSet::<io::Result<iroh::endpoint::Connection>>::new();
+            let mut peer_connections = HashMap::<iroh::EndpointId, usize>::new();
+            let mut connection_tasks = HashMap::<tokio::task::Id, iroh::EndpointId>::new();
+            'accept: loop {
+                while connections.len() >= max_connections {
+                    tokio::select! {
+                        Some(result) = connections.join_next_with_id() => {
+                            let task_id = match &result {
+                                Ok((task_id, ())) => *task_id,
+                                Err(error) => error.id(),
+                            };
+                            if let Some(peer) = connection_tasks.remove(&task_id)
+                                && let Some(count) = peer_connections.get_mut(&peer)
+                            {
+                                *count = count.saturating_sub(1);
+                                if *count == 0 {
+                                    peer_connections.remove(&peer);
+                                }
+                            }
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "iroh connection task failed");
+                            }
+                        }
+                        changed = shutdown.changed() => {
+                            // Pending handshakes are reaped with the connections below.
+                            if changed.is_err() || *shutdown.borrow() {
+                                break 'accept;
+                            }
+                        }
+                    }
+                }
+                let Some(current) = net.upgrade() else {
+                    break;
+                };
+                if current.is_shutdown() || endpoint.is_closed() {
+                    break;
+                }
+                drop(current);
+
+                let incoming = tokio::select! {
+                    Some(result) = handshakes.join_next(), if !handshakes.is_empty() => {
+                        match result {
+                            Ok(Ok(connection)) => {
+                                if connection.alpn() != IROKLE_SYNC_ALPN {
+                                    connection.close(0u32.into(), b"unsupported protocol");
+                                    continue;
+                                }
+                                // Identity is known only now, so the per-peer
+                                // limit is applied here rather than on accept.
+                                let peer = connection.remote_id();
+                                let peer_count = peer_connections.entry(peer).or_default();
+                                if *peer_count >= MAX_PEER_CONNECTIONS {
+                                    tracing::warn!(
+                                        %peer,
+                                        "rejecting excess inbound iroh connection"
+                                    );
+                                    continue;
+                                }
+                                *peer_count += 1;
+                                let connection_net = Weak::clone(&net);
+                                let connection_shutdown = shutdown.clone();
+                                let owned = tracker.track();
+                                let task = connections.spawn(async move {
+                                    let _task = owned;
+                                    handle_connection(
+                                        connection_net,
+                                        connection_shutdown,
+                                        peer,
+                                        connection,
+                                    )
+                                    .await
+                                });
+                                connection_tasks.insert(task.id(), peer);
+                            }
+                            Ok(Err(error)) => {
+                                tracing::warn!(%error, "failed to accept iroh connection");
+                            }
+                            Err(error) => tracing::warn!(%error, "iroh handshake task failed"),
+                        }
+                        continue;
+                    }
+                    Some(result) = connections.join_next_with_id(), if !connections.is_empty() => {
+                        let task_id = match &result {
+                            Ok((task_id, ())) => *task_id,
+                            Err(error) => error.id(),
+                        };
+                        if let Some(peer) = connection_tasks.remove(&task_id)
+                            && let Some(count) = peer_connections.get_mut(&peer)
+                        {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                peer_connections.remove(&peer);
+                            }
+                        }
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "iroh connection task failed");
+                        }
+                        continue;
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    incoming = endpoint.accept() => incoming,
+                };
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                let Some(current) = net.upgrade() else {
+                    break;
+                };
+                if current.is_shutdown() {
+                    break;
+                }
+                let connect_timeout = current.runtime.connect_timeout;
+                drop(current);
+                if handshakes.len() >= MAX_PENDING_HANDSHAKES {
+                    tracing::warn!("refusing inbound iroh connection: handshakes are saturated");
+                    continue;
+                }
+                let task = tracker.track();
+                let hold = hold.clone();
+                handshakes.spawn(async move {
+                    let _task = task;
+                    if let Some(hold) = hold {
+                        let _ = hold.acquire_owned().await.map(|permit| permit.forget());
+                    }
+                    tokio::time::timeout(connect_timeout, incoming)
+                        .await
+                        .map_err(|_| timed_out("iroh accept timed out"))
+                        .and_then(|accepted| accepted.map_err(other))
+                });
+            }
+            connections.abort_all();
+            handshakes.abort_all();
+            while connections.join_next().await.is_some() {}
+            while handshakes.join_next().await.is_some() {}
+        })))
+    }
+
+    pub fn start_resync_loop(self: &Arc<Self>, interval: Duration) -> io::Result<()> {
+        let _ = self.spawn_resync_loop(interval)?;
+        Ok(())
+    }
+
+    pub fn start_configured_resync_loop(self: &Arc<Self>) -> io::Result<()> {
+        self.start_resync_loop(self.runtime.resync_interval)
+    }
+
+    pub fn spawn_resync_loop(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> io::Result<Option<tokio::task::JoinHandle<()>>> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| io::Error::other("iroh resync requires a Tokio runtime"))?;
+        let task = self.tasks.enter()?;
+        if self.resync_started.swap(true, Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let net = Arc::downgrade(self);
+        let notify = self.resync_scheduler.notifier();
+        let runtime = IrohRuntimeConfig {
+            resync_interval: interval,
+            ..self.runtime
+        };
+        let mut shutdown = self.shutdown.subscribe();
+        // Captured before the first poll so that aborting a loop that never ran
+        // still clears the latch.
+        let running = LoopGuard {
+            net: Weak::clone(&net),
+            latch: |net| &net.resync_started,
+        };
+        Ok(Some(handle.spawn(async move {
+            let _task = task;
+            let _running = running;
+            // A sweep discovers targets in its own task, so dispatch keeps joining
+            // and refilling peer slots while the sweep waits on storage.
+            let mut sweeps = tokio::task::JoinSet::new();
+            let mut startup = true;
+            if let Some(current) = net.upgrade() {
+                sweeps.spawn(async move { current.schedule_startup_resync().await });
+            }
+            let mut sweep_pending = false;
+            let mut sweep_backoff = runtime.resync_initial_backoff.max(Duration::from_millis(1));
+            let mut full_sweep = Box::pin(tokio::time::sleep_until(
+                tokio::time::Instant::now() + EMPTY_RESYNC_SLEEP,
+            ));
+            let mut syncs = tokio::task::JoinSet::new();
+            loop {
+                if !dispatch_due_resyncs(&net, &mut syncs, runtime) {
+                    break;
+                }
+                let next_due = net
+                    .upgrade()
+                    .map(|current| {
+                        let busy = MAX_RESYNC_PEERS
+                            .saturating_sub(current.outbound.available_permits())
+                            .max(syncs.len());
+                        next_resync_wake(&current.resync_scheduler, busy)
+                    })
+                    .unwrap_or_else(|| tokio::time::Instant::now() + EMPTY_RESYNC_SLEEP);
+                let due_sleep = tokio::time::sleep_until(next_due);
+                tokio::pin!(due_sleep);
+                tokio::select! {
+                    biased;
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ = &mut full_sweep, if sweeps.is_empty() && (sweep_pending || !runtime.full_sweep_interval.is_zero()) => {
+                        match net.upgrade() {
+                            Some(current) => {
+                                sweeps.spawn(async move { current.schedule_sweep().await });
+                            }
+                            None => break,
+                        }
+                    }
+                    Some(swept) = sweeps.join_next(), if !sweeps.is_empty() => {
+                        let failed = !matches!(swept, Ok(Ok(_)));
+                        if let Ok(Err(error)) = &swept {
+                            tracing::warn!(%error, startup, "failed to schedule resync sweep");
+                        } else if let Err(error) = &swept {
+                            tracing::warn!(%error, startup, "resync sweep task failed");
+                        }
+                        sweep_pending = failed;
+                        let deadline = if failed {
+                            if !startup {
+                                sweep_backoff = sweep_backoff.saturating_mul(2)
+                                    .min(runtime.resync_max_backoff.max(Duration::from_millis(1)));
+                            }
+                            tokio::time::Instant::now() + sweep_backoff
+                        } else {
+                            sweep_backoff = runtime.resync_initial_backoff.max(Duration::from_millis(1));
+                            if startup {
+                                next_sweep_deadline(runtime.full_sweep_interval, runtime.full_sweep_time_of_day)
+                            } else {
+                                tokio::time::Instant::now() + runtime.full_sweep_interval
+                            }
+                        };
+                        startup = false;
+                        full_sweep.as_mut().reset(deadline);
+                    }
+                    Some(result) = syncs.join_next(), if !syncs.is_empty() => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "resync batch task failed");
+                        }
+                    }
+                    _ = notify.notified() => {}
+                    _ = &mut due_sleep => {}
+                }
+            }
+            syncs.abort_all();
+            sweeps.abort_all();
+            // Draining lets every aborted batch release its own claims before a
+            // replacement loop may start.
+            while syncs.join_next().await.is_some() {}
+            while sweeps.join_next().await.is_some() {}
+        })))
+    }
+}
+
+impl<S: Storage> SharedNet<S> {
+    /// Completes one owned attempt. Only the holder of the claim may call this.
+    fn finish_resync_attempt(
+        &self,
+        claim: ClaimGuard,
+        result: std::result::Result<(), &io::Error>,
+        runtime: IrohRuntimeConfig,
+        advanced: bool,
+    ) {
+        let peer_id = claim.key().peer_id;
+        let topic_id = claim.key().topic_id;
+        let needs_sync = match self.target_needs_sync(peer_id, topic_id) {
+            Ok(needs_sync) => needs_sync,
+            Err(error) => {
+                tracing::warn!(%peer_id, %topic_id, %error, "failed to evaluate resync target");
+                true
+            }
+        };
+
+        // An advancing page continues even when outbound evidence reads clean:
+        // the peer may still hold more of the inbound goal.
+        let state = exchange_state(result, advanced);
+        if state == ExchangeState::Advancing {
+            self.resync_scheduler
+                .complete_dirty(claim.settle(), RESYNC_PROGRESS_TURN);
+            return;
+        }
+        if !needs_sync && state == ExchangeState::Complete {
+            self.resync_scheduler.complete_clean(claim.settle());
+            return;
+        }
+
+        match state {
+            ExchangeState::Complete | ExchangeState::Advancing => self
+                .resync_scheduler
+                .complete_dirty(claim.settle(), runtime.resync_interval),
+            // A quick retry cannot fix invalid data or a store that must be reopened.
+            ExchangeState::Rejected => {
+                self.resync_scheduler.complete_failed(
+                    claim.settle(),
+                    runtime.resync_max_backoff,
+                    runtime.resync_max_backoff,
+                );
+            }
+            #[cfg(feature = "fjall")]
+            ExchangeState::Reconcile => {
+                self.resync_scheduler.complete_failed(
+                    claim.settle(),
+                    runtime.resync_max_backoff,
+                    runtime.resync_max_backoff,
+                );
+            }
+            ExchangeState::Blocked | ExchangeState::Retryable => {
+                self.resync_scheduler.complete_failed(
+                    claim.settle(),
+                    runtime.resync_initial_backoff,
+                    runtime.resync_max_backoff,
+                );
+            }
+        }
+    }
+
+    /// Reevaluates a target after peer evidence changed. Evidence may re-arm a
+    /// target, but never completes or deletes an attempt it does not own.
+    fn reconsider_target(&self, peer_id: PeerId, topic_id: crate::TopicId) {
+        let needs_sync = match self.target_needs_sync(peer_id, topic_id) {
+            Ok(needs_sync) => needs_sync,
+            Err(error) => {
+                tracing::warn!(%peer_id, %topic_id, %error, "failed to reevaluate resync target");
+                true
+            }
+        };
+        if needs_sync {
+            self.resync_scheduler.reconsider(peer_id, topic_id);
+        }
+    }
+
+    fn should_attempt(&self, target: ResyncTarget) -> io::Result<bool> {
+        if target.force.is_some() {
+            return self.target_is_selected(target.key.peer_id, target.key.topic_id);
+        }
+        self.target_needs_sync(target.key.peer_id, target.key.topic_id)
+    }
+
+    fn target_is_selected(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<bool> {
+        let Some(state) = self
+            .node
+            .storage()
+            .topic_state(&topic_id)
+            .map_err(invalid_data)?
+        else {
+            return Ok(false);
+        };
+        if !state.members.contains(&peer_id)
+            || (!state.members.contains(&self.node.peer_id())
+                && self.local_leave_op(&state)?.is_none())
+        {
+            return Ok(false);
+        }
+        // Durable work owed to this peer keeps it a target, blocked with its
+        // backoff, even while selection routes other work around it.
+        Ok(self.node.sync_peers(topic_id, &state).contains(&peer_id)
+            || self
+                .node
+                .storage()
+                .has_sync_obligations(&peer_id, &topic_id)
+                .map_err(invalid_data)?)
+    }
+
+    fn local_leave_op(
+        &self,
+        state: &crate::storage::TopicState,
+    ) -> io::Result<Option<crate::OpId>> {
+        let Some((key, false)) = state.membership_controls.get(&self.node.peer_id()) else {
+            return Ok(None);
+        };
+        let meta = self
+            .node
+            .storage()
+            .get_meta(&key.op_id)
+            .map_err(invalid_data)?;
+        Ok(meta
+            .filter(|meta| meta.ready && meta.author == self.node.peer_id())
+            .map(|_| key.op_id))
+    }
+
+    /// Whether the local topic may be certified as synchronized. A topic
+    /// holding an unresolved id must keep negotiating even when the
+    /// fingerprints match, or the hole survives every sweep.
+    fn topic_is_whole(&self, topic_id: crate::TopicId) -> bool {
+        match self.node.topic_unresolved(topic_id) {
+            Ok(unresolved) => unresolved.is_empty(),
+            Err(error) => {
+                tracing::warn!(%topic_id, %error, "failed to check local topic integrity");
+                false
+            }
+        }
+    }
+
+    /// Whether `peer_id` still needs this topic, judged from one view. Only an
+    /// ack certified for the view's own branch can show the peer caught up;
+    /// evidence that names no branch or another one proves nothing.
+    fn target_needs_sync(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<bool> {
+        let Some(view) = self
+            .node
+            .storage()
+            .topic_view(&topic_id, Some(&peer_id))
+            .map_err(invalid_data)?
+        else {
+            return Ok(false);
+        };
+        let state = &view.state;
+        if !state.members.contains(&peer_id) {
+            return Ok(false);
+        }
+        if !state.members.contains(&self.node.peer_id()) {
+            let Some(op_id) = self.local_leave_op(state)? else {
+                return Ok(false);
+            };
+            return Ok(self.node.sync_peers(topic_id, state).contains(&peer_id)
+                && !self
+                    .node
+                    .peer_reached_op(peer_id, op_id)
+                    .map_err(invalid_data)?);
+        }
+        if view.owed {
+            return Ok(true);
+        }
+        if !self.node.sync_peers(topic_id, state).contains(&peer_id) {
+            return Ok(false);
+        }
+        // A hole clears no obligation and moves no clock, so nothing else here
+        // would ever mark the target dirty again.
+        match self.node.view_unresolved(&view) {
+            Ok(unresolved) if unresolved.is_empty() => {}
+            Ok(_) => return Ok(true),
+            Err(error) => {
+                tracing::warn!(%topic_id, %error, "failed to check local topic integrity");
+                return Ok(true);
+            }
+        }
+        Ok(!view.ack.as_ref().is_some_and(|ack| {
+            ack.genesis == Some(state.genesis) && ack.clock.dominates(&view.clock)
+        }))
+    }
+
+    fn dirty_selected_targets(&self, topic_id: crate::TopicId) -> io::Result<Vec<PeerId>> {
+        let Some(state) = self
+            .node
+            .storage()
+            .topic_state(&topic_id)
+            .map_err(invalid_data)?
+        else {
+            return Ok(Vec::new());
+        };
+        if !state.members.contains(&self.node.peer_id()) && self.local_leave_op(&state)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut targets = Vec::new();
+        for peer_id in self.node.sync_peers(topic_id, &state) {
+            if self.target_needs_sync(peer_id, topic_id)? {
+                targets.push(peer_id);
+            }
+        }
+        Ok(targets)
+    }
+}
+
+impl<S: Storage> IrohNet<S> {
+    async fn schedule_startup_resync(self: &Arc<Self>) -> io::Result<usize> {
+        self.schedule_sweep().await
+    }
+}
+
+impl<S: Storage> SharedNet<S> {
+    fn schedule_persisted_obligations(&self) -> io::Result<usize> {
+        let targets = self
+            .node
+            .storage()
+            .all_sync_obligations()
+            .map_err(invalid_data)?
+            .into_iter()
+            .map(|obligation| (obligation.peer_id, obligation.topic_id))
+            .collect::<BTreeSet<_>>();
+        for (peer_id, topic_id) in &targets {
+            self.resync_scheduler
+                .schedule_now(*peer_id, *topic_id, false);
+        }
+        Ok(targets.len())
+    }
+}
+
+impl<S: Storage> IrohNet<S> {
+    async fn schedule_sweep(self: &Arc<Self>) -> io::Result<usize> {
+        // Durable work is scheduled before maintenance starts, and maintenance
+        // runs as its own job, so no topic it visits can delay that work.
+        let scheduled = self
+            .run_job(Lane::Control, |shared| {
+                // The sweep is the one pass that revisits every topic, so let it
+                // audit stored records again rather than reuse a whole verdict.
+                if let Err(error) = shared.node.recheck_topics() {
+                    tracing::warn!(%error, "sweep could not refresh topic caches");
+                }
+                let mut scheduled = shared.schedule_persisted_obligations()?;
+                for (peer_id, topic_id) in shared.sweep_targets()? {
+                    shared
+                        .resync_scheduler
+                        .schedule_now(peer_id, topic_id, true);
+                    scheduled += 1;
+                }
+                Ok(scheduled)
+            })
+            .await
+            .and_then(|scheduled| scheduled);
+        self.spawn_quarantine();
+        scheduled
+    }
+
+    /// Quarantine every topic in one owned background job, one topic per
+    /// blocking step, forwarding each eviction as soon as its topic commits.
+    /// A failed topic is left for the next sweep; one job runs at a time.
+    fn spawn_quarantine(self: &Arc<Self>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.tasks.is_closed() || self.quarantine_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let net = Arc::downgrade(self);
+        let running = LoopGuard {
+            net: Weak::clone(&net),
+            latch: |net| &net.quarantine_started,
+        };
+        let task = self.tasks.track();
+        handle.spawn(async move {
+            let _task = task;
+            let _running = running;
+            let Some(node) = net.upgrade().map(|current| current.node.clone()) else {
+                return;
+            };
+            let topics = match tokio::task::spawn_blocking(move || node.list_topics()).await {
+                Ok(Ok(topics)) => topics,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "sweep could not list topics to quarantine");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "sweep topic listing job failed");
+                    return;
+                }
+            };
+            for (index, topic) in topics.into_iter().enumerate() {
+                let Some(current) = net.upgrade() else {
+                    return;
+                };
+                if current.is_shutdown() {
+                    return;
+                }
+                let node = current.node.clone();
+                drop(current);
+                let topic_id = topic.topic_id;
+                let result =
+                    tokio::task::spawn_blocking(move || node.quarantine_orphans(topic_id)).await;
+                match result {
+                    Ok(Ok(Some(eviction))) => {
+                        if let Some(current) = net.upgrade() {
+                            current.forward_evictions(vec![eviction]);
+                        }
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        %topic_id,
+                        index,
+                        %error,
+                        "leaving topic quarantine for a later sweep"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(%topic_id, index, %error, "topic quarantine job failed")
+                    }
+                }
+            }
+        });
+    }
+
+    /// Exchanges `messages` with `peer` over one stream. The call takes one of
+    /// the outbound peer slots manual and automatic syncs share, and the
+    /// responses stay charged to the result budget until they are dropped.
+    pub async fn sync_with(
+        &self,
+        peer: iroh::EndpointAddr,
+        messages: &[SyncMessage],
+    ) -> io::Result<SyncResponses> {
+        let _task = self.tasks.enter()?;
+        let _slot = self.outbound_slot().await?;
+        self.exchange(peer, messages).await
+    }
+
+    /// One outbound peer slot. Giving it back wakes the resync loop.
+    async fn outbound_slot(&self) -> io::Result<OutboundSlot> {
+        let permit = Arc::clone(&self.outbound)
+            .acquire_owned()
+            .await
+            .map_err(|_| io::Error::other("outbound sync slots closed"))?;
+        Ok(OutboundSlot {
+            _permit: permit,
+            wake: self.resync_scheduler.notifier(),
+        })
+    }
+
+    /// [`Self::sync_with`] for a caller that already holds an outbound slot.
+    async fn exchange(
+        &self,
+        peer: iroh::EndpointAddr,
+        messages: &[SyncMessage],
+    ) -> io::Result<SyncResponses> {
+        let _task = self.tasks.enter()?;
+        let mut last_error = None;
+        for _ in 0..2 {
+            let connection = match self
+                .pool
+                .get_or_connect(peer.clone(), self.runtime.connect_timeout)
+                .await
+            {
+                Ok(connection) => connection,
+                Err(error) => return Err(error),
+            };
+            match self
+                .sync_with_connection(connection.clone(), messages)
+                .await
+            {
+                Ok(responses) => return Ok(responses),
+                Err(error) => {
+                    // Keep healthy connections pooled on stream-level failures;
+                    // drop them when closed or unresponsive (timed out).
+                    if connection.close_reason().is_some()
+                        || error.kind() == io::ErrorKind::TimedOut
+                    {
+                        let _ = self.pool.remove(&connection);
+                    }
+                    if exchange_state(Err(&error), false) != ExchangeState::Retryable {
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("sync failed")))
+    }
+
+    async fn sync_with_connection(
+        &self,
+        connection: iroh::endpoint::Connection,
+        messages: &[SyncMessage],
+    ) -> io::Result<SyncResponses> {
+        tokio::time::timeout(self.runtime.sync_io_timeout, async {
+            let (mut send, mut recv) = connection.open_bi().await.map_err(other)?;
+            self.outbound_streams.fetch_add(1, Ordering::Relaxed);
+            let timeout = self.runtime.sync_io_timeout;
+            let budget = Some(&self.budget);
+            write_sync_messages(&mut send, messages, timeout, self.limits, budget).await?;
+            read_responses(&mut recv, timeout, self.limits, &self.budget).await
+        })
+        .await
+        .map_err(|_| timed_out("sync exchange timed out"))?
+    }
+
+    pub async fn sync_now(
+        &self,
+        peer: iroh::EndpointAddr,
+        topic_id: crate::TopicId,
+    ) -> io::Result<()> {
+        self.sync_topics_now(peer, &[topic_id])
+            .await
+            .remove(&topic_id)
+            .unwrap_or(Ok(()))
+    }
+
+    /// Syncs `topic_ids` with one peer now, through the batched page exchange of the resync loop.
+    /// Each topic is `Ok` when complete, `WouldBlock` when the rest is scheduled, or its error.
+    pub async fn sync_topics_now(
+        &self,
+        peer: iroh::EndpointAddr,
+        topic_ids: &[crate::TopicId],
+    ) -> BTreeMap<crate::TopicId, io::Result<()>> {
+        let _task = match self.tasks.enter() {
+            Ok(task) => task,
+            Err(error) => {
+                return topic_ids
+                    .iter()
+                    .map(|topic_id| (*topic_id, Err(clone_error(&error))))
+                    .collect();
+            }
+        };
+        // A manual sync takes one of the outbound peer slots the resync loop
+        // uses, and wakes the loop when it gives the slot back.
+        let _slot = match self.outbound_slot().await {
+            Ok(slot) => slot,
+            Err(error) => {
+                return topic_ids
+                    .iter()
+                    .map(|topic_id| (*topic_id, Err(clone_error(&error))))
+                    .collect();
+            }
+        };
+        let attempt_id = next_attempt_id();
+        let attempt = self.attempt_identity(attempt_id);
+        let remote_peer_id = peer_from_endpoint(peer.id);
+        let live = attempt_id.map(|attempt_id| {
+            self.resync_scheduler.begin_attempts(
+                topic_ids.iter().map(|topic_id| ResyncTargetKey {
+                    peer_id: remote_peer_id,
+                    topic_id: *topic_id,
+                }),
+                attempt_id,
+            )
+        });
+        let endpoint_id = peer.id;
+        // A bounded page is not the goal: keep paging while the exchange really
+        // advances, up to a caller budget, so catching up is not reported as an
+        // I/O error merely because another page is needed.
+        let mut settled = BTreeMap::new();
+        let mut paging = topic_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for _ in 0..SYNC_NOW_PAGES {
+            if paging.is_empty() {
+                break;
+            }
+            let mut outcomes = self.run_topic_batch(peer.clone(), &paging, None).await;
+            for topic_id in std::mem::take(&mut paging) {
+                let result = outcomes.results.remove(&topic_id).unwrap_or(Ok(()));
+                let advancing = outcomes.advanced.contains(&topic_id);
+                if result.is_ok() && advancing {
+                    paging.push(topic_id);
+                }
+                settled.insert(topic_id, (result, advancing));
+            }
+        }
+        let mut results = BTreeMap::new();
+        let mut finished = Vec::with_capacity(settled.len());
+        let mut noted = Vec::with_capacity(settled.len());
+        for (topic_id, (mut result, advancing)) in settled {
+            // An exhausted budget is progress, not an unreachable peer.
+            let outcome = attempt_outcome(result.as_ref().copied(), advancing);
+            // Work still outstanding after the page budget is not a completed sync.
+            if result.is_ok() && advancing {
+                result = Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "sync page budget exhausted; the rest is scheduled",
+                ));
+            }
+            noted.push(match &result {
+                Err(error) if !advancing => Err(clone_error(error)),
+                _ => Ok(()),
+            });
+            finished.push((topic_id, outcome, advancing));
+            results.insert(topic_id, result);
+        }
+        if results.values().any(Result::is_err) {
+            // Drops the pooled connection only when it is already closed.
+            let _ = self.pool.get(&endpoint_id);
+        }
+        let recorded = self
+            .run_job(Lane::Control, move |shared| {
+                shared.note_outcome(remote_peer_id, noted.iter().map(|noted| noted.as_ref().copied()));
+                for (topic_id, outcome, advancing) in finished {
+                    let key = ResyncTargetKey {
+                        peer_id: remote_peer_id,
+                        topic_id,
+                    };
+                    let first = live.as_ref().is_some_and(|live| live.end(key));
+                    if let Err(error) = shared.node.record_attempt_result(
+                        remote_peer_id,
+                        topic_id,
+                        attempt,
+                        &outcome,
+                        first,
+                    ) {
+                        tracing::warn!(%remote_peer_id, %topic_id, %error, "failed to record sync attempt");
+                    }
+                    // A manual sync holds no claim, so it reports evidence instead of
+                    // completing an attempt the resync loop may own.
+                    if advancing {
+                        shared.resync_scheduler.reconsider(remote_peer_id, topic_id);
+                    } else {
+                        shared.reconsider_target(remote_peer_id, topic_id);
+                    }
+                }
+            })
+            .await;
+        if let Err(error) = recorded {
+            tracing::warn!(%remote_peer_id, %error, "failed to finish manual sync");
+        }
+        results
+    }
+
+    /// Services a peer's due resync targets as multi-topic batches over the
+    /// pooled connection, recording per-topic results.
+    async fn sync_peer_batch(
+        &self,
+        peer_id: PeerId,
+        mut lease: ResyncLease,
+        runtime: IrohRuntimeConfig,
+    ) {
+        let deadline = tokio::time::Instant::now()
+            + runtime
+                .connect_timeout
+                .saturating_add(runtime.sync_io_timeout)
+                .saturating_mul(4);
+        let claimed = lease.targets();
+        let fail_all = |error: &io::Error| {
+            claimed
+                .iter()
+                .map(|target| (target.key.topic_id, Err(clone_error(error)), false))
+                .collect::<Vec<_>>()
+        };
+        let addr = match endpoint_addr(peer_id) {
+            Ok(addr) => addr,
+            Err(error) => {
+                self.publish_results(peer_id, fail_all(&error), &mut lease, runtime)
+                    .await;
+                return;
+            }
+        };
+        let targets = claimed.clone();
+        let decided = self
+            .run_job(Lane::Control, move |shared| {
+                targets
+                    .into_iter()
+                    .map(|target| {
+                        let topic_id = target.key.topic_id;
+                        let decision = shared.should_attempt(target);
+                        if matches!(decision, Ok(false))
+                            && let Err(error) = shared.gc_stale_obligations(peer_id, topic_id)
+                        {
+                            tracing::warn!(%peer_id, %topic_id, %error, "failed to gc stale sync obligations");
+                        }
+                        (target, decision)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        let decided = match decided {
+            Ok(decided) => decided,
+            Err(error) => {
+                self.publish_results(peer_id, fail_all(&error), &mut lease, runtime)
+                    .await;
+                return;
+            }
+        };
+        let mut topics = Vec::with_capacity(decided.len());
+        let mut failed = Vec::new();
+        for (target, decision) in decided {
+            match decision {
+                Ok(true) => topics.push(target.key.topic_id),
+                Ok(false) => {
+                    if let Some(claim) = lease.take_claim(&target.key) {
+                        self.resync_scheduler.complete_clean(claim.settle());
+                    }
+                }
+                Err(error) => failed.push((target.key.topic_id, Err(error), false)),
+            }
+        }
+        self.publish_results(peer_id, failed, &mut lease, runtime)
+            .await;
+        for chunk in topics.chunks(MAX_RESYNC_TOPICS) {
+            if tokio::time::timeout_at(
+                deadline,
+                self.sync_topic_chunk(addr.clone(), chunk, &mut lease, runtime),
+            )
+            .await
+            .is_err()
+            {
+                // Only the claims this batch never finished belong to the
+                // timeout; a released chunk keeps its recorded result.
+                let error = timed_out("peer sync batch timed out");
+                let results = lease
+                    .drain_claims()
+                    .into_iter()
+                    .map(|claim| {
+                        (
+                            claim.key().topic_id,
+                            Err(clone_error(&error)),
+                            false,
+                            Some(claim),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let recorded = self
+                    .run_job(Lane::Control, move |shared| {
+                        shared.note_outcome(peer_id, [Err(&error)]);
+                        shared.record_results(peer_id, results, runtime);
+                    })
+                    .await;
+                if let Err(error) = recorded {
+                    tracing::warn!(%peer_id, %error, "failed to record timed out sync batch");
+                }
+                return;
+            }
+        }
+    }
+}
+
+impl<S: Storage> SharedNet<S> {
+    /// Drops persisted obligations toward a peer that is no longer a topic
+    /// member (or whose topic state is gone) so sweeps stop rescheduling them.
+    fn gc_stale_obligations(&self, peer_id: PeerId, topic_id: crate::TopicId) -> io::Result<()> {
+        if !self
+            .node
+            .storage()
+            .has_sync_obligations(&peer_id, &topic_id)
+            .map_err(invalid_data)?
+        {
+            return Ok(());
+        }
+        // Storage repeats the branch and membership check in its transaction.
+        let genesis = self
+            .node
+            .storage()
+            .topic_state(&topic_id)
+            .map_err(invalid_data)?
+            .map(|state| state.genesis);
+        self.node
+            .storage()
+            .clear_peer_sync_state(&peer_id, &topic_id, genesis)
+            .map_err(invalid_data)?;
+        Ok(())
+    }
+}
+
+impl<S: Storage> IrohNet<S> {
+    async fn sync_topic_chunk(
+        &self,
+        peer: iroh::EndpointAddr,
+        topic_ids: &[crate::TopicId],
+        lease: &mut ResyncLease,
+        runtime: IrohRuntimeConfig,
+    ) {
+        let remote_peer_id = peer_from_endpoint(peer.id);
+        let endpoint_id = peer.id;
+        let outcomes = self
+            .run_topic_batch(peer, topic_ids, Some((lease, runtime)))
+            .await;
+        let noted = outcomes
+            .results
+            .values()
+            .map(copy_result)
+            .collect::<Vec<_>>();
+        let health = self
+            .run_job(Lane::Control, move |shared| {
+                shared.note_outcome(
+                    remote_peer_id,
+                    noted.iter().map(|result| result.as_ref().copied()),
+                );
+            })
+            .await;
+        if let Err(error) = health {
+            tracing::warn!(peer_id = %remote_peer_id, %error, "failed to record peer health");
+        }
+        let mut failures = 0_usize;
+        let mut first_error = None;
+        let mut unsettled = Vec::new();
+        for (topic_id, outcome) in &outcomes.results {
+            if let Err(error) = outcome {
+                failures += 1;
+                if first_error.is_none() {
+                    first_error = Some(clone_error(error));
+                }
+            }
+            // Outcomes decided before any exchange ran, such as a planning
+            // failure, are the only ones left to publish here.
+            if !outcomes.settled.contains(topic_id) {
+                unsettled.push((
+                    *topic_id,
+                    copy_result(outcome),
+                    outcomes.advanced.contains(topic_id),
+                ));
+            }
+        }
+        self.publish_results(remote_peer_id, unsettled, lease, runtime)
+            .await;
+        if let Some(error) = first_error {
+            // Drops the pooled connection only when it is already closed.
+            let _ = self.pool.get(&endpoint_id);
+            tracing::warn!(
+                peer_id = %remote_peer_id,
+                failures,
+                %error,
+                "failed to resync topics with peer"
+            );
+        }
+    }
+
+    /// Publishes every decided outcome this batch has not published yet:
+    /// records it and releases the claim the batch owns for it. Called between
+    /// exchanges, so ownership of finished work is handed back immediately.
+    async fn settle_known_results(
+        &self,
+        remote_peer_id: PeerId,
+        outcomes: &BTreeMap<crate::TopicId, io::Result<()>>,
+        advanced: &BTreeSet<crate::TopicId>,
+        settled: &mut BTreeSet<crate::TopicId>,
+        lease: &mut ResyncLease,
+        runtime: IrohRuntimeConfig,
+    ) {
+        let results = outcomes
+            .iter()
+            .filter(|(topic_id, _)| settled.insert(**topic_id))
+            .map(|(topic_id, outcome)| {
+                (*topic_id, copy_result(outcome), advanced.contains(topic_id))
+            })
+            .collect();
+        self.publish_results(remote_peer_id, results, lease, runtime)
+            .await;
+    }
+
+    /// Takes this batch's claims for `results` and records them in a control
+    /// job. A job that never runs drops the claims, which releases them.
+    async fn publish_results(
+        &self,
+        remote_peer_id: PeerId,
+        results: Vec<(crate::TopicId, io::Result<()>, bool)>,
+        lease: &mut ResyncLease,
+        runtime: IrohRuntimeConfig,
+    ) {
+        if results.is_empty() {
+            return;
+        }
+        let results = results
+            .into_iter()
+            .map(|(topic_id, result, advanced)| {
+                let key = ResyncTargetKey {
+                    peer_id: remote_peer_id,
+                    topic_id,
+                };
+                (topic_id, result, advanced, lease.take_claim(&key))
+            })
+            .collect::<Vec<_>>();
+        let published = self
+            .run_job(Lane::Control, move |shared| {
+                shared.record_results(remote_peer_id, results, runtime);
+            })
+            .await;
+        if let Err(error) = published {
+            tracing::warn!(peer_id = %remote_peer_id, %error, "failed to publish sync results");
+        }
+    }
+
+    /// Syncs topic_ids through batched fingerprint, data/request and ACK
+    /// exchanges, returning one outcome per topic.
+    async fn run_topic_batch(
+        &self,
+        peer: iroh::EndpointAddr,
+        topic_ids: &[crate::TopicId],
+        mut settle: Option<(&mut ResyncLease, IrohRuntimeConfig)>,
+    ) -> BatchOutcomes {
+        let remote_peer_id = peer_from_endpoint(peer.id);
+        let mut outcomes = BTreeMap::new();
+        let mut advanced = BTreeSet::new();
+        let mut settled = BTreeSet::new();
+
+        let mut fingerprints = BTreeMap::new();
+        let mut request = Vec::with_capacity(topic_ids.len() * 2);
+        let topics = topic_ids.to_vec();
+        let prepared = self
+            .run_job(Lane::Control, move |shared| {
+                topics
+                    .into_iter()
+                    .map(|topic_id| {
+                        let prepared = shared
+                            .node
+                            .sync_fingerprint(topic_id)
+                            .map(|fingerprint| (shared.node.sync_open(topic_id), fingerprint));
+                        (topic_id, prepared)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                for topic_id in topic_ids {
+                    outcomes.insert(*topic_id, Err(clone_error(&error)));
+                }
+                return BatchOutcomes::new(outcomes, advanced, settled);
+            }
+        };
+        for (topic_id, prepared) in prepared {
+            match prepared {
+                Ok((open, fingerprint)) => {
+                    request.push(SyncMessage::Open(open));
+                    fingerprints.insert(topic_id, fingerprint.fingerprint);
+                    request.push(SyncMessage::Fingerprint(fingerprint));
+                }
+                Err(error) => {
+                    outcomes.insert(topic_id, Err(invalid_data(error)));
+                }
+            }
+        }
+        if fingerprints.is_empty() {
+            return BatchOutcomes::new(outcomes, advanced, settled);
+        }
+        let (responses, charge) = match self
+            .exchange(peer.clone(), &request)
+            .await
+            .and_then(|responses| responses.into_session_charge(&self.budget))
+        {
+            Ok(responses) => responses,
+            Err(error) => {
+                for topic_id in fingerprints.keys() {
+                    outcomes.insert(*topic_id, Err(clone_error(&error)));
+                }
+                return BatchOutcomes::new(outcomes, advanced, settled);
+            }
+        };
+
+        let mut matching = BTreeMap::new();
+        let mut summaries = BTreeMap::new();
+        for response in responses {
+            match response {
+                SyncMessage::Fingerprint(remote) => {
+                    if fingerprints.get(&remote.topic_id) != Some(&remote.fingerprint) {
+                        continue;
+                    }
+                    matching.insert(remote.topic_id, remote.fingerprint);
+                }
+                SyncMessage::Summary(summary) if fingerprints.contains_key(&summary.topic_id) => {
+                    summaries.insert(summary.topic_id, summary);
+                }
+                SyncMessage::Failure(failure) if fingerprints.contains_key(&failure.topic_id) => {
+                    outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
+                    summaries.remove(&failure.topic_id);
+                }
+                other => {
+                    let error = invalid_data(format!(
+                        "unexpected sync response {}",
+                        _message_type_name(&other)
+                    ));
+                    for topic_id in fingerprints.keys() {
+                        outcomes
+                            .entry(*topic_id)
+                            .or_insert_with(|| Err(clone_error(&error)));
+                    }
+                    return BatchOutcomes::new(outcomes, advanced, settled);
+                }
+            }
+        }
+        // Two identically damaged stores still match, so the local integrity
+        // check decides whether a matching fingerprint counts as synced.
+        let held_charge = Arc::clone(&charge);
+        let decided = self
+            .run_job(Lane::Control, move |shared| {
+                let decided = matching
+                    .into_iter()
+                    .map(|(topic_id, fingerprint)| {
+                        if !shared.topic_is_whole(topic_id) {
+                            return (
+                                topic_id,
+                                Err(invalid_data(
+                                    "local topic is incomplete despite a matching fingerprint",
+                                )),
+                            );
+                        }
+                        let outcome = shared
+                            .node
+                            .record_fingerprint(remote_peer_id, topic_id, fingerprint)
+                            .map_err(invalid_data)
+                            .and_then(|matched| {
+                                if matched {
+                                    Ok(())
+                                } else {
+                                    Err(invalid_data("topic changed during fingerprint exchange"))
+                                }
+                            });
+                        (topic_id, outcome)
+                    })
+                    .collect::<Vec<_>>();
+                (decided, held_charge)
+            })
+            .await;
+        let decided = match decided {
+            Ok((decided, _held_charge)) => decided,
+            Err(error) => {
+                for topic_id in fingerprints.keys() {
+                    outcomes
+                        .entry(*topic_id)
+                        .or_insert_with(|| Err(clone_error(&error)));
+                }
+                return BatchOutcomes::new(outcomes, advanced, settled);
+            }
+        };
+        for (topic_id, outcome) in decided {
+            summaries.remove(&topic_id);
+            outcomes.insert(topic_id, outcome);
+        }
+        for topic_id in fingerprints.keys() {
+            if !outcomes.contains_key(topic_id) && !summaries.contains_key(topic_id) {
+                outcomes
+                    .entry(*topic_id)
+                    .or_insert_with(|| Err(invalid_data("peer did not return a sync summary")));
+            }
+        }
+
+        // Topics are planned one group at a time: only the group being sent,
+        // plus the one planned topic that did not fit it, is held in memory.
+        let limits = self.limits;
+        let mut queue = summaries.into_iter().collect::<VecDeque<_>>();
+        let mut carried = None;
+        while !queue.is_empty() || carried.is_some() {
+            let unplanned = queue
+                .iter()
+                .map(|(topic_id, _)| *topic_id)
+                .chain(
+                    carried
+                        .as_ref()
+                        .map(|planned: &PlannedTopicSync| planned.topic_id),
+                )
+                .collect::<Vec<_>>();
+            let taken = std::mem::take(&mut queue);
+            let held = carried.take();
+            let held_charge = Arc::clone(&charge);
+            let planned = self
+                .run_job(Lane::Bulk, move |shared| {
+                    (
+                        shared.plan_group(remote_peer_id, taken, held, limits),
+                        held_charge,
+                    )
+                })
+                .await;
+            let PlannedGroup {
+                group,
+                next,
+                rest,
+                outcomes: planned_outcomes,
+            } = match planned {
+                Ok((planned, _held_charge)) => planned,
+                Err(error) => {
+                    for topic_id in unplanned {
+                        outcomes.insert(topic_id, Err(clone_error(&error)));
+                    }
+                    break;
+                }
+            };
+            outcomes.extend(planned_outcomes);
+            queue = rest;
+            carried = next;
+            if group.is_empty() {
+                continue;
+            }
+            self.run_batch_exchange(
+                peer.clone(),
+                remote_peer_id,
+                group,
+                Arc::clone(&charge),
+                &mut outcomes,
+                &mut advanced,
+            )
+            .await;
+            // Each topic's durable outcome is published before the next
+            // exchange awaits, so a later failure or the batch deadline
+            // cannot re-run work this batch already finished.
+            if let Some((lease, runtime)) = settle.as_mut() {
+                self.settle_known_results(
+                    remote_peer_id,
+                    &outcomes,
+                    &advanced,
+                    &mut settled,
+                    lease,
+                    *runtime,
+                )
+                .await;
+            }
+        }
+        BatchOutcomes::new(outcomes, advanced, settled)
+    }
+}
+
+impl<S: Storage> SharedNet<S> {
+    /// Plans topics from `queue`, after `held`, into one group that fits a
+    /// stream. The first planned topic that does not fit is returned as `next`
+    /// with the unplanned rest, so planning never runs ahead of sending.
+    fn plan_group(
+        &self,
+        remote_peer_id: PeerId,
+        mut queue: VecDeque<(crate::TopicId, SyncSummary)>,
+        mut held: Option<PlannedTopicSync>,
+        limits: StreamLimits,
+    ) -> PlannedGroup {
+        let mut planned_group = PlannedGroup {
+            group: Vec::new(),
+            next: None,
+            rest: VecDeque::new(),
+            outcomes: Vec::new(),
+        };
+        let (mut messages, mut responses, mut bytes) = (0_usize, 0_usize, 0_usize);
+        loop {
+            let planned = match held.take() {
+                Some(planned) => planned,
+                None => {
+                    let Some((topic_id, summary)) = queue.pop_front() else {
+                        break;
+                    };
+                    match self.plan_topic_messages(remote_peer_id, topic_id, &summary) {
+                        Ok(Some(planned)) => planned,
+                        Ok(None) => {
+                            planned_group.outcomes.push((topic_id, Ok(())));
+                            continue;
+                        }
+                        Err(error) => {
+                            planned_group.outcomes.push((topic_id, Err(error)));
+                            continue;
+                        }
+                    }
+                }
+            };
+            let size = match planned.messages.iter().try_fold(0usize, |bytes, message| {
+                crate::net::framed_message_len(message).map(|len| bytes.saturating_add(len))
+            }) {
+                Ok(size) if size <= limits.bytes => size,
+                Ok(_) => {
+                    let error = invalid_data("sync plan exceeds stream byte limit");
+                    planned_group.outcomes.push((planned.topic_id, Err(error)));
+                    continue;
+                }
+                Err(error) => {
+                    planned_group.outcomes.push((planned.topic_id, Err(error)));
+                    continue;
+                }
+            };
+            if !planned_group.group.is_empty()
+                && (bytes.saturating_add(size) > limits.bytes
+                    || messages + planned.messages.len() > limits.batch_messages
+                    || responses + planned.estimated_responses > limits.batch_messages)
+            {
+                self.probes.planned(bytes + size);
+                planned_group.next = Some(planned);
+                break;
+            }
+            bytes += size;
+            messages += planned.messages.len();
+            responses += planned.estimated_responses;
+            planned_group.group.push(planned);
+        }
+        self.probes.planned(bytes);
+        planned_group.rest = queue;
+        planned_group
+    }
+
+    fn plan_topic_messages(
+        &self,
+        remote_peer_id: PeerId,
+        topic_id: crate::TopicId,
+        summary: &SyncSummary,
+    ) -> io::Result<Option<PlannedTopicSync>> {
+        let budget = crate::sync::PageBudget::from_credit(crate::sync::SyncCredit::default());
+        let receipt = summary.staged.clone();
+        // Authorization, branch, pages and the summary sent all come from one
+        // snapshot; the evidence write below re-checks its own preconditions.
+        let knowledge = summary.genesis.map(|genesis| {
+            self.request_log()
+                .knowledge(&(remote_peer_id, topic_id), genesis, None)
+        });
+        let Some(read) = self
+            .node
+            .storage()
+            .read_snapshot(|read| {
+                let knowledge = knowledge.clone().unwrap_or_default();
+                self.snapshot_plan(read, remote_peer_id, summary, receipt, budget, &knowledge)
+            })
+            .map_err(invalid_data)?
+        else {
+            return self.plan_pull(remote_peer_id, topic_id, summary);
+        };
+        let SnapshotPlan {
+            state,
+            clock,
+            mut plan,
+            mut push_more,
+            converged,
+            leave,
+            local_summary,
+        } = read;
+        // A peer outside the membership is owed nothing and serves nothing.
+        let member = state.members.contains(&remote_peer_id);
+        // Both sides may have converged since the fingerprints were compared,
+        // through the peer's own push; the summary then proves the same match.
+        if converged
+            && self
+                .node
+                .record_fingerprint(remote_peer_id, topic_id, summary.fingerprint)
+                .map_err(invalid_data)?
+        {
+            return Ok(None);
+        }
+        // Across two branches only the winner's namespace is a goal: the loser
+        // expects the winner's clock, the winner expects its own certified.
+        let branch = summary.genesis.filter(|remote| *remote != state.genesis);
+        let planned = crate::sync::request_genesis(state.genesis, branch);
+        let mut goal = TopicGoal {
+            pull: false,
+            genesis: Some(planned),
+            replaces: (planned != state.genesis).then_some(state.genesis),
+            inbound: if member && (branch.is_none() || planned != state.genesis) {
+                summary.actor_clock.clone()
+            } else {
+                Default::default()
+            },
+            outbound: if member && planned == state.genesis {
+                clock
+            } else {
+                Default::default()
+            },
+        };
+        let terminal = leave.is_some();
+        if let Some((page, position)) = leave {
+            plan.send = page.ops;
+            push_more = page.more;
+            plan.need.clear();
+            plan.actor_range_hints.clear();
+            goal.inbound = crate::ActorClock::new();
+            goal.outbound = crate::ActorClock::new();
+            if let Some((actor_id, seq)) = position {
+                goal.outbound.observe(actor_id, seq);
+            }
+        }
+        let send = std::mem::take(&mut plan.send);
+        let wants = !plan.need.is_empty() || !plan.actor_range_hints.is_empty();
+        let open = crate::sync::SyncEngine::<S>::open(
+            topic_id,
+            self.node.peer_id(),
+            Some(state.event_type_id),
+        );
+        let mut controls = vec![SyncMessage::Open(open)];
+        let mut credit_ops = 0;
+        if wants {
+            let request = crate::sync::page_request(plan, Some(planned));
+            credit_ops = request.credit.ops as usize;
+            self.request_log().sent(
+                (remote_peer_id, topic_id),
+                (planned, None),
+                request.window.clone(),
+                summary.actor_clock.iter().count(),
+            );
+            #[cfg(test)]
+            self.node.storage().sync_boundary(topic_id, "request");
+            controls.push(SyncMessage::Request(request));
+        }
+        if let Some(local_summary) = local_summary.filter(|_| !terminal) {
+            controls.push(SyncMessage::Summary(local_summary));
+        }
+        // The pushed page is cut to what one stream holds beside this topic's controls.
+        let mut control_bytes = 0_usize;
+        for message in &controls {
+            control_bytes = control_bytes.saturating_add(crate::net::framed_message_len(message)?);
+        }
+        let data = crate::net::sync_data_page(
+            topic_id,
+            send,
+            self.limits.messages.saturating_sub(controls.len()),
+            self.limits.bytes.saturating_sub(control_bytes),
+        )?;
+        push_more |= data.cut;
+        let pushes = !data.messages.is_empty();
+        let mut messages = Vec::with_capacity(controls.len() + data.messages.len());
+        let mut controls = controls.into_iter();
+        messages.extend(controls.next());
+        messages.extend(data.messages);
+        messages.extend(controls);
+        // A summary for the open, one ack for the pushed data, the peer's own
+        // request, and at most one page of data frames plus its page result.
+        let estimated_responses = 3 + if wants {
+            credit_ops.div_ceil(MAX_DATA_OPS) + 1
+        } else {
+            0
+        };
+        Ok(Some(PlannedTopicSync {
+            topic_id,
+            goal,
+            pushes,
+            push_more,
+            messages,
+            estimated_responses,
+        }))
+    }
+
+    /// Everything one topic's push, request and summary read, from `read`.
+    /// `None` when the topic is not held here.
+    fn snapshot_plan(
+        &self,
+        read: &dyn crate::storage::SnapshotRead,
+        remote_peer_id: PeerId,
+        summary: &SyncSummary,
+        receipt: Option<crate::sync::SyncReceipt>,
+        budget: crate::sync::PageBudget,
+        knowledge: &crate::sync::RequestKnowledge,
+    ) -> crate::Result<Option<SnapshotPlan>> {
+        let topic_id = summary.topic_id;
+        let Some(view) = read.topic_view(&topic_id, None)? else {
+            return Ok(None);
+        };
+        let sync = self.node.sync_engine();
+        // A peer still staging this topic continues from its newest receipt on
+        // this branch.
+        let staged = match (summary.genesis, receipt) {
+            (None, Some(receipt)) if receipt.genesis == view.state.genesis => Some(SyncSummary {
+                actor_clock: receipt.clock,
+                ..summary.clone()
+            }),
+            _ => None,
+        };
+        let (plan, push_more) = sync.negotiate_in(
+            read,
+            remote_peer_id,
+            staged.as_ref().unwrap_or(summary),
+            budget,
+            knowledge,
+        )?;
+        let converged = view.state.members.contains(&remote_peer_id)
+            && summary.genesis == Some(view.state.genesis)
+            && summary.heads == view.state.heads
+            && self.node.integrity_in(read, &view)?.certifies(&view);
+        let mut leave = None;
+        if !view.state.members.contains(&self.node.peer_id())
+            && let Some((op_id, position)) = self.leave_in(read, &view.state)?
+        {
+            let request = crate::sync::SyncRequest {
+                topic_id,
+                known: BTreeSet::new(),
+                wants: BTreeSet::from([op_id]),
+                actor_range_hints: Vec::new(),
+                genesis: None,
+                credit: crate::sync::SyncCredit::default(),
+                window: crate::sync::ActorWindow::default(),
+            };
+            let page = sync.response_in(read, remote_peer_id, &request, budget)?;
+            leave = Some((page, position));
+        }
+        let local_summary = match leave {
+            Some(_) => None,
+            None => Some(sync.summary_in(read, topic_id)?),
+        };
+        Ok(Some(SnapshotPlan {
+            state: view.state,
+            clock: view.clock,
+            plan,
+            push_more,
+            converged,
+            leave,
+            local_summary,
+        }))
+    }
+
+    /// This node's own signed leave, and its actor position when stored, read
+    /// from `read`.
+    #[allow(clippy::type_complexity)]
+    fn leave_in(
+        &self,
+        read: &dyn crate::storage::SnapshotRead,
+        state: &crate::storage::TopicState,
+    ) -> crate::Result<Option<(crate::OpId, Option<(crate::ActorId, u64)>)>> {
+        let Some((key, false)) = state.membership_controls.get(&self.node.peer_id()) else {
+            return Ok(None);
+        };
+        let meta = read.get_meta(&key.op_id)?;
+        Ok(meta
+            .filter(|meta| meta.ready && meta.author == self.node.peer_id())
+            .map(|meta| (key.op_id, Some((meta.actor_id, meta.actor_seq)))))
+    }
+
+    /// Pull a topic this node does not hold from a peer that does. Its pages are
+    /// staged until the history makes this node a member, then promoted.
+    fn plan_pull(
+        &self,
+        remote_peer_id: PeerId,
+        topic_id: crate::TopicId,
+        summary: &SyncSummary,
+    ) -> io::Result<Option<PlannedTopicSync>> {
+        let Some(genesis) = summary.genesis else {
+            return Ok(None);
+        };
+        let probe = crate::sync::SyncData {
+            topic_id,
+            ops: Vec::new(),
+        };
+        self.node
+            .ensure_peer_allowed(remote_peer_id, &probe)
+            .map_err(invalid_data)?;
+        // Staging of another branch from this peer is continued only by a
+        // smaller genesis, whose first fragment replaces it.
+        let (staged, session) = match self
+            .node
+            .staged_topic(remote_peer_id, topic_id)
+            .map_err(invalid_data)?
+            .and_then(|staged| {
+                staged
+                    .genesis
+                    .map(|staged_genesis| (staged_genesis, staged))
+            }) {
+            Some((staged_genesis, staged)) if staged_genesis == genesis => {
+                (staged.clock, Some(staged.session))
+            }
+            Some((staged_genesis, _)) if genesis < staged_genesis => {
+                (crate::ActorClock::new(), None)
+            }
+            Some(_) => {
+                return Err(invalid_data(
+                    "peer offers a larger branch than the one staged from it",
+                ));
+            }
+            None => (crate::ActorClock::new(), None),
+        };
+        // Staged progress is no replication evidence: the request only names
+        // what the staging holds, continued within this staging session.
+        let key = (remote_peer_id, topic_id);
+        let knowledge = self.request_log().knowledge(&key, genesis, session);
+        let (actor_range_hints, window) =
+            self.node
+                .sync_engine()
+                .request_ranges(&staged, &summary.actor_clock, &knowledge);
+        // Everything the peer holds is staged: finish the activation that
+        // history owes instead of reporting nothing left to pull.
+        if actor_range_hints.is_empty() {
+            if self
+                .node
+                .finish_bootstrap(remote_peer_id, topic_id)
+                .map_err(invalid_data)?
+            {
+                return self.plan_topic_messages(remote_peer_id, topic_id, summary);
+            }
+            return Err(invalid_data(
+                "staged topic history does not make this node a member",
+            ));
+        }
+        let plan = crate::sync::SyncPlan {
+            topic_id,
+            common: BTreeSet::new(),
+            have: BTreeSet::new(),
+            send: Vec::new(),
+            need: BTreeSet::new(),
+            actor_range_hints,
+            window,
+        };
+        self.request_log().sent(
+            key,
+            (genesis, session),
+            plan.window.clone(),
+            summary.actor_clock.iter().count(),
+        );
+        let request = crate::sync::page_request(plan, Some(genesis));
+        #[cfg(test)]
+        self.node.storage().sync_boundary(topic_id, "request");
+        let credit_ops = request.credit.ops as usize;
+        Ok(Some(PlannedTopicSync {
+            topic_id,
+            goal: TopicGoal {
+                pull: true,
+                genesis: Some(genesis),
+                replaces: None,
+                inbound: summary.actor_clock.clone(),
+                outbound: crate::ActorClock::new(),
+            },
+            pushes: false,
+            push_more: false,
+            messages: vec![
+                SyncMessage::Open(self.node.sync_open(topic_id)),
+                SyncMessage::Request(request),
+                SyncMessage::Summary(SyncSummary {
+                    topic_id,
+                    event_type_id: None,
+                    genesis: None,
+                    fingerprint: [0; 32],
+                    heads: BTreeSet::new(),
+                    actor_clock: crate::ActorClock::new(),
+                    actor_tips: BTreeMap::new(),
+                    staged: session.map(|session| crate::sync::SyncReceipt {
+                        topic_id,
+                        genesis,
+                        session,
+                        clock: staged,
+                    }),
+                }),
+            ],
+            estimated_responses: 3 + credit_ops.div_ceil(MAX_DATA_OPS),
+        }))
+    }
+
+    /// The contiguous prefix per actor that `peer_id` staged here for
+    /// `topic_id` on `genesis`. Staging of another branch holds nothing of it.
+    fn staged_clock(
+        &self,
+        peer_id: PeerId,
+        topic_id: crate::TopicId,
+        genesis: Option<crate::OpId>,
+    ) -> io::Result<crate::ActorClock> {
+        Ok(self
+            .node
+            .staged_topic(peer_id, topic_id)
+            .map_err(invalid_data)?
+            .filter(|staged| staged.genesis.is_some() && staged.genesis == genesis)
+            .map(|staged| staged.clock)
+            .unwrap_or_default())
+    }
+}
+
+impl<S: Storage> IrohNet<S> {
+    async fn run_batch_exchange(
+        &self,
+        peer: iroh::EndpointAddr,
+        remote_peer_id: PeerId,
+        group: Vec<PlannedTopicSync>,
+        source_charge: Arc<Vec<Charge>>,
+        outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
+        advanced: &mut BTreeSet<crate::TopicId>,
+    ) {
+        let group_topics = group
+            .iter()
+            .map(|planned| planned.topic_id)
+            .collect::<BTreeSet<_>>();
+        let fail_group = |outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
+                          error: &io::Error| {
+            for topic_id in &group_topics {
+                outcomes.insert(*topic_id, Err(clone_error(error)));
+            }
+        };
+        // Progress is measured toward each topic's captured goal only. Bytes
+        // moved, repeated ids and unrelated local writes are not progress.
+        let held_charge = Arc::clone(&source_charge);
+        let measured = self
+            .run_job(Lane::Control, move |shared| {
+                let measured = group
+                    .into_iter()
+                    .map(|planned| {
+                        let before =
+                            shared.goal_progress(remote_peer_id, planned.topic_id, &planned.goal);
+                        (planned, before)
+                    })
+                    .collect::<Vec<_>>();
+                (measured, held_charge)
+            })
+            .await;
+        let measured = match measured {
+            Ok((measured, _held_charge)) => measured,
+            Err(error) => {
+                fail_group(outcomes, &error);
+                return;
+            }
+        };
+        let mut goals = BTreeMap::new();
+        let mut owed_acks = BTreeSet::new();
+        let mut more = BTreeSet::new();
+        let mut messages = Vec::new();
+        for (planned, before) in measured {
+            match before {
+                Ok(before) => {
+                    goals.insert(planned.topic_id, (planned.goal, before));
+                }
+                Err(error) => {
+                    outcomes.insert(planned.topic_id, Err(error));
+                    continue;
+                }
+            }
+            if planned.pushes {
+                owed_acks.insert(planned.topic_id);
+            }
+            if planned.push_more {
+                more.insert(planned.topic_id);
+            }
+            messages.extend(planned.messages);
+        }
+        let (responses, charge) = match self
+            .exchange(peer.clone(), &messages)
+            .await
+            .and_then(|responses| responses.into_session_charge(&self.budget))
+        {
+            Ok(responses) => responses,
+            Err(error) => {
+                fail_group(outcomes, &error);
+                return;
+            }
+        };
+
+        let topics = group_topics.clone();
+        let geneses = goals
+            .iter()
+            .map(|(topic_id, (goal, _))| (*topic_id, goal.genesis))
+            .collect::<BTreeMap<_, _>>();
+        let held_charge = Arc::clone(&charge);
+        let replies = self
+            .run_job(Lane::Bulk, move |shared| {
+                let replies = shared.batch_replies(
+                    remote_peer_id,
+                    &topics,
+                    &geneses,
+                    responses,
+                    owed_acks,
+                    more,
+                );
+                (replies, held_charge)
+            })
+            .await;
+        let BatchReplies {
+            acks,
+            followups,
+            outcomes: replied,
+            owed_acks,
+            more,
+            unexpected,
+        } = match replies {
+            Ok((replies, _held_charge)) => replies,
+            Err(error) => {
+                fail_group(outcomes, &error);
+                return;
+            }
+        };
+        outcomes.extend(replied);
+        if let Some(error) = unexpected {
+            fail_group(outcomes, &error);
+            return;
+        }
+        let held_charge = Arc::clone(&charge);
+        let applied = self
+            .run_job(Lane::Control, move |shared| {
+                let results = shared.node.apply_sync_acks(&acks);
+                (acks, results, held_charge)
+            })
+            .await;
+        match applied {
+            Ok((acks, results, _held_charge)) => {
+                for (ack, result) in acks.iter().zip(results) {
+                    if let Err(error) = result {
+                        outcomes.insert(ack.topic_id, Err(invalid_data(error)));
+                    }
+                }
+            }
+            Err(error) => fail_group(outcomes, &error),
+        }
+        for topic_id in owed_acks {
+            outcomes
+                .entry(topic_id)
+                .or_insert_with(|| Err(invalid_data("peer omitted sync acknowledgement")));
+        }
+        self.send_followups(peer, remote_peer_id, followups, outcomes)
+            .await;
+
+        let goals = goals
+            .into_iter()
+            .filter(|(topic_id, _)| !outcomes.contains_key(topic_id))
+            .collect::<Vec<_>>();
+        let goal_topics = goals
+            .iter()
+            .map(|(topic_id, _)| *topic_id)
+            .collect::<Vec<_>>();
+        let held_charge = Arc::clone(&source_charge);
+        let measured = self
+            .run_job(Lane::Control, move |shared| {
+                let measured = goals
+                    .into_iter()
+                    .map(|(topic_id, (goal, before))| {
+                        let after = shared.goal_progress(remote_peer_id, topic_id, &goal);
+                        (topic_id, goal, before, after)
+                    })
+                    .collect::<Vec<_>>();
+                (measured, held_charge)
+            })
+            .await;
+        let measured = match measured {
+            Ok((measured, _held_charge)) => measured,
+            Err(error) => {
+                for topic_id in goal_topics {
+                    outcomes.insert(topic_id, Err(clone_error(&error)));
+                }
+                return;
+            }
+        };
+        for (topic_id, goal, before, after) in measured {
+            let outcome = match after {
+                Ok(after) if after.reached(&goal) && !more.contains(&topic_id) => Ok(()),
+                // A page that moved toward the goal is served again at the fair
+                // tail of the queue; it is not a failed attempt.
+                Ok(after) if after.advanced_from(&before) => {
+                    advanced.insert(topic_id);
+                    Ok(())
+                }
+                Ok(_) => Err(invalid_data(NoProgress)),
+                Err(error) => Err(error),
+            };
+            outcomes.insert(topic_id, outcome);
+        }
+    }
+
+    /// Send acks for received pages and data for the peer's requests, one
+    /// stream per group, and apply the peer's acks for that data.
+    async fn send_followups(
+        &self,
+        peer: iroh::EndpointAddr,
+        remote_peer_id: PeerId,
+        followups: BTreeMap<crate::TopicId, Vec<SyncMessage>>,
+        outcomes: &mut BTreeMap<crate::TopicId, io::Result<()>>,
+    ) {
+        let topics = followups
+            .iter()
+            .filter(|(topic_id, replies)| {
+                !matches!(outcomes.get(topic_id), Some(Err(_))) && !replies.is_empty()
+            })
+            .map(|(topic_id, _)| *topic_id)
+            .collect::<Vec<_>>();
+        let failed = topics.clone();
+        let opens = self
+            .run_job(Lane::Control, move |shared| {
+                topics
+                    .into_iter()
+                    .map(|topic_id| (topic_id, shared.node.sync_open(topic_id)))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .await;
+        let mut opens = match opens {
+            Ok(opens) => opens,
+            Err(error) => {
+                for topic_id in failed {
+                    outcomes.insert(topic_id, Err(clone_error(&error)));
+                }
+                return;
+            }
+        };
+        let mut groups: Vec<(BTreeSet<crate::TopicId>, Vec<SyncMessage>)> = Vec::new();
+        let mut current_topics = BTreeSet::new();
+        let mut current_messages: Vec<SyncMessage> = Vec::new();
+        for (topic_id, replies) in followups {
+            let Some(open) = opens.remove(&topic_id) else {
+                continue;
+            };
+            let carries_data = |messages: &[SyncMessage]| {
+                messages
+                    .iter()
+                    .any(|message| matches!(message, SyncMessage::Data(_)))
+            };
+            if !current_messages.is_empty()
+                && (current_messages.len() + replies.len() + 1 > self.limits.batch_messages
+                    || carries_data(&replies)
+                    || carries_data(&current_messages))
+            {
+                groups.push((
+                    std::mem::take(&mut current_topics),
+                    std::mem::take(&mut current_messages),
+                ));
+            }
+            current_messages.push(SyncMessage::Open(open));
+            current_messages.extend(replies);
+            current_topics.insert(topic_id);
+        }
+        if !current_messages.is_empty() {
+            groups.push((current_topics, current_messages));
+        }
+        for (topics, messages) in groups {
+            let mut summaries = topics.clone();
+            let mut owed_acks = messages
+                .iter()
+                .filter_map(|message| match message {
+                    SyncMessage::Data(data) => Some(data.topic_id),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            let mut acks = Vec::new();
+            let mut held_charge = None;
+            match self
+                .exchange(peer.clone(), &messages)
+                .await
+                .and_then(|responses| responses.into_session_charge(&self.budget))
+            {
+                Ok((responses, charge)) => {
+                    held_charge = Some(charge);
+                    for response in responses {
+                        match response {
+                            SyncMessage::Summary(summary) if topics.contains(&summary.topic_id) => {
+                                summaries.remove(&summary.topic_id);
+                            }
+                            SyncMessage::Ack(ack) if topics.contains(&ack.topic_id) => {
+                                if ack.peer_id != remote_peer_id {
+                                    outcomes.insert(
+                                        ack.topic_id,
+                                        Err(invalid_data("sync ack does not match remote peer")),
+                                    );
+                                    continue;
+                                }
+                                owed_acks.remove(&ack.topic_id);
+                                acks.push(ack);
+                            }
+                            SyncMessage::Failure(failure) if topics.contains(&failure.topic_id) => {
+                                outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
+                            }
+                            other => {
+                                let error = invalid_data(format!(
+                                    "unexpected sync ack response {}",
+                                    _message_type_name(&other)
+                                ));
+                                for topic_id in &topics {
+                                    outcomes.insert(*topic_id, Err(clone_error(&error)));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    for topic_id in &topics {
+                        outcomes.insert(*topic_id, Err(clone_error(&error)));
+                    }
+                }
+            }
+            if !acks.is_empty() {
+                let job_charge = held_charge.clone();
+                let applied = self
+                    .run_job(Lane::Control, move |shared| {
+                        let results = shared.node.apply_sync_acks(&acks);
+                        (acks, results, job_charge)
+                    })
+                    .await;
+                match applied {
+                    Ok((acks, results, _held_charge)) => {
+                        for (ack, result) in acks.iter().zip(results) {
+                            if let Err(error) = result {
+                                outcomes.insert(ack.topic_id, Err(invalid_data(error)));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        for topic_id in &topics {
+                            outcomes.insert(*topic_id, Err(clone_error(&error)));
+                        }
+                    }
+                }
+            }
+            for topic_id in summaries {
+                outcomes.entry(topic_id).or_insert_with(|| {
+                    Err(invalid_data("peer omitted sync acknowledgement summary"))
+                });
+            }
+            for topic_id in owed_acks {
+                outcomes
+                    .entry(topic_id)
+                    .or_insert_with(|| Err(invalid_data("peer omitted sync acknowledgement")));
+            }
+        }
+    }
+}
+
+impl<S: Storage> SharedNet<S> {
+    /// Fold the responses of one batch stream: admit received data, serve
+    /// requested pages and collect acks, per topic.
+    fn batch_replies(
+        &self,
+        remote_peer_id: PeerId,
+        group_topics: &BTreeSet<crate::TopicId>,
+        geneses: &BTreeMap<crate::TopicId, Option<crate::OpId>>,
+        responses: Vec<SyncMessage>,
+        mut owed_acks: BTreeSet<crate::TopicId>,
+        mut more: BTreeSet<crate::TopicId>,
+    ) -> BatchReplies {
+        let mut acks = Vec::new();
+        let mut followups: BTreeMap<crate::TopicId, Vec<SyncMessage>> = BTreeMap::new();
+        let mut pages = BTreeMap::new();
+        let mut requests = BTreeMap::new();
+        let mut summaries = BTreeMap::new();
+        let mut outcomes = BTreeMap::new();
+        let mut received = BTreeSet::new();
+        for response in responses {
+            match response {
+                SyncMessage::Ack(ack) if group_topics.contains(&ack.topic_id) => {
+                    // An ack that is not validly bound fails its own topic; the
+                    // other topics in the stream keep their valid work.
+                    if ack.peer_id != remote_peer_id {
+                        outcomes.insert(
+                            ack.topic_id,
+                            Err(invalid_data("sync ack does not match remote peer")),
+                        );
+                        continue;
+                    }
+                    owed_acks.remove(&ack.topic_id);
+                    self.receipt_log().clear(&(remote_peer_id, ack.topic_id));
+                    acks.push(ack);
+                }
+                // Staging continues on the peer: nothing is certified, but the
+                // goal is not reached and the next page goes on from here.
+                SyncMessage::Receipt(receipt) if group_topics.contains(&receipt.topic_id) => {
+                    owed_acks.remove(&receipt.topic_id);
+                    more.insert(receipt.topic_id);
+                    if geneses.get(&receipt.topic_id).copied().flatten() == Some(receipt.genesis) {
+                        self.receipt_log().record(remote_peer_id, receipt);
+                    }
+                }
+                SyncMessage::Failure(failure) if group_topics.contains(&failure.topic_id) => {
+                    outcomes.insert(failure.topic_id, Err(topic_failed(&failure)));
+                }
+                SyncMessage::Summary(summary) if group_topics.contains(&summary.topic_id) => {
+                    summaries.insert(summary.topic_id, summary);
+                }
+                SyncMessage::Page(page) if group_topics.contains(&page.topic_id) => {
+                    #[cfg(test)]
+                    if received.contains(&page.topic_id) {
+                        self.node.storage().sync_boundary(page.topic_id, "page");
+                    }
+                    if page.more {
+                        more.insert(page.topic_id);
+                    }
+                    let genesis = geneses.get(&page.topic_id).copied().flatten();
+                    self.request_log().settle(
+                        &(remote_peer_id, page.topic_id),
+                        genesis,
+                        &page,
+                        received.contains(&page.topic_id),
+                    );
+                }
+                SyncMessage::Request(request) if group_topics.contains(&request.topic_id) => {
+                    requests.insert(request.topic_id, request);
+                }
+                SyncMessage::Data(data) if group_topics.contains(&data.topic_id) => {
+                    let data_topic_id = data.topic_id;
+                    if !data.ops.is_empty() {
+                        received.insert(data_topic_id);
+                    }
+                    let received = self
+                        .node
+                        .ensure_peer_allowed(remote_peer_id, &data)
+                        .and_then(|()| {
+                            self.node.receive_bound(
+                                remote_peer_id,
+                                data,
+                                geneses.get(&data_topic_id).copied().flatten(),
+                            )
+                        });
+                    match received {
+                        // A staged page of a pulled topic owes no ack; the next request continues it.
+                        Ok(ReceiveOutcome::Staged(_)) => {}
+                        Ok(ReceiveOutcome::Acked { ack, evictions }) => {
+                            let ack = *ack;
+                            self.forward_evictions(evictions);
+                            if let Err(error) = self.schedule_topic_recheck(data_topic_id) {
+                                tracing::warn!(%data_topic_id, %error, "failed to schedule received topic resync");
+                            }
+                            let replies = followups.entry(data_topic_id).or_default();
+                            // Only the newest frontier needs certifying; earlier
+                            // acks of this exchange are covered by it.
+                            replies.retain(|message| !matches!(message, SyncMessage::Ack(_)));
+                            replies.push(SyncMessage::Ack(ack));
+                        }
+                        Err(crate::Error::ReceiveCommitted {
+                            evictions, source, ..
+                        }) => {
+                            self.forward_evictions(evictions);
+                            self.resync_scheduler
+                                .schedule_now(remote_peer_id, data_topic_id, true);
+                            outcomes.insert(data_topic_id, Err(invalid_data(source)));
+                        }
+                        Err(error) => {
+                            outcomes.insert(data_topic_id, Err(invalid_data(error)));
+                        }
+                    }
+                }
+                other => {
+                    let error = invalid_data(format!(
+                        "unexpected sync response {}",
+                        _message_type_name(&other)
+                    ));
+                    return BatchReplies {
+                        acks,
+                        followups,
+                        outcomes,
+                        owed_acks,
+                        more,
+                        unexpected: Some(error),
+                    };
+                }
+            }
+        }
+        for (topic_id, request) in requests {
+            let budget = crate::sync::PageBudget::from_credit(request.credit);
+            let planned = match summaries.get(&topic_id) {
+                Some(summary) => self
+                    .node
+                    .response_with(remote_peer_id, &request, budget, summary),
+                None => self.node.response_page(remote_peer_id, &request, budget),
+            };
+            match planned {
+                Ok(page) => {
+                    if page.more {
+                        more.insert(topic_id);
+                    }
+                    pages.insert(topic_id, page.ops);
+                }
+                Err(error) => {
+                    outcomes.insert(topic_id, Err(invalid_data(error)));
+                }
+            }
+        }
+        // Each follow-up stream carries an open, the topic's ack and its page,
+        // so the page is cut to what the stream holds beside the other two.
+        for (topic_id, ops) in pages {
+            let replies = followups.entry(topic_id).or_default();
+            let mut used =
+                crate::net::framed_message_len(&SyncMessage::Open(self.node.sync_open(topic_id)));
+            for reply in replies.iter() {
+                used = used.and_then(|used| Ok(used + crate::net::framed_message_len(reply)?));
+            }
+            let data = used.and_then(|used| {
+                crate::net::sync_data_page(
+                    topic_id,
+                    ops,
+                    self.limits.messages.saturating_sub(replies.len() + 1),
+                    self.limits.bytes.saturating_sub(used),
+                )
+            });
+            match data {
+                Ok(data) => {
+                    if data.cut {
+                        more.insert(topic_id);
+                    }
+                    replies.extend(data.messages);
+                }
+                Err(error) => {
+                    outcomes.insert(topic_id, Err(error));
+                }
+            }
+        }
+        BatchReplies {
+            acks,
+            followups,
+            outcomes,
+            owed_acks,
+            more,
+            unexpected: None,
+        }
+    }
+
+    /// Records each topic's attempt under the identity its claim started
+    /// with, then completes the claim. Topics without a claim take a new one.
+    fn record_results(
+        &self,
+        remote_peer_id: PeerId,
+        results: Vec<TopicResult>,
+        runtime: IrohRuntimeConfig,
+    ) {
+        for (topic_id, result, advanced, claim) in results {
+            // A claim's completion counts once; a topic without one takes a new identity.
+            let first = claim.as_ref().is_none_or(|claim| {
+                self.resync_scheduler
+                    .end_attempt(claim.key(), claim.expect_claim().attempt)
+            });
+            let attempt =
+                self.attempt_identity(claim.as_ref().map(|claim| claim.expect_claim().attempt));
+            let outcome = attempt_outcome(result.as_ref().copied(), advanced);
+            if let Err(error) =
+                self.node
+                    .record_attempt_result(remote_peer_id, topic_id, attempt, &outcome, first)
+            {
+                tracing::warn!(%remote_peer_id, %topic_id, %error, "failed to record sync attempt");
+            }
+            if let Some(claim) = claim {
+                self.finish_resync_attempt(claim, result.as_ref().copied(), runtime, advanced);
+            }
+        }
+    }
+
+    /// `(epoch, sequence)` of an attempt started under scheduler id `attempt`,
+    /// or of a new attempt.
+    fn attempt_identity(&self, attempt: Option<AttemptId>) -> (u64, u64) {
+        let sequence = attempt.or_else(next_attempt_id).map_or(u64::MAX, |id| id.0);
+        (self.attempt_epoch, sequence)
+    }
+
+    /// How far the topic has come toward `goal`: local positions covered of the
+    /// peer's clock, positions the peer certified of the local clock, and holes
+    /// left. Only this branch's certified evidence counts.
+    fn goal_progress(
+        &self,
+        peer_id: PeerId,
+        topic_id: crate::TopicId,
+        goal: &TopicGoal,
+    ) -> io::Result<GoalProgress> {
+        let Some(view) = self
+            .node
+            .storage()
+            .topic_view(&topic_id, Some(&peer_id))
+            .map_err(invalid_data)?
+        else {
+            if !goal.pull {
+                return Err(invalid_data("topic disappeared during sync"));
+            }
+            // Until promotion a pull moves only by staging more of the peer's history.
+            let staged = self.staged_clock(peer_id, topic_id, goal.genesis)?;
+            return Ok(GoalProgress {
+                staged: covered(&staged, &goal.inbound),
+                requested: self
+                    .request_log()
+                    .revision(&(peer_id, topic_id), goal.genesis),
+                ..GoalProgress::default()
+            });
+        };
+        if goal.replaces == Some(view.state.genesis) {
+            return Ok(GoalProgress::default());
+        }
+        if goal.genesis != Some(view.state.genesis) {
+            return Err(invalid_data("topic branch changed during sync"));
+        }
+        let certified = view
+            .ack
+            .as_ref()
+            .filter(|ack| ack.genesis == Some(view.state.genesis))
+            .map(|ack| ack.clock.clone())
+            .unwrap_or_default();
+        let staged = self
+            .receipt_clock(peer_id, topic_id, view.state.genesis)
+            .map_or(0, |clock| covered(&clock, &goal.outbound));
+        Ok(GoalProgress {
+            inbound: covered(&view.clock, &goal.inbound),
+            outbound: covered(&certified, &goal.outbound),
+            staged,
+            requested: self
+                .request_log()
+                .revision(&(peer_id, topic_id), goal.genesis),
+            holes: self
+                .node
+                .view_unresolved(&view)
+                .map_err(invalid_data)?
+                .len(),
+        })
+    }
+
+    fn request_log(&self) -> std::sync::MutexGuard<'_, RequestLog> {
+        // Like the receipt log, only a planning hint.
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn receipt_log(&self) -> std::sync::MutexGuard<'_, ReceiptLog> {
+        // The log is only a planning hint, so a poisoned one is still usable.
+        self.receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The peer's staged clock for pages planned on `genesis`. A receipt for
+    /// pages of a replaced branch says nothing about this one.
+    fn receipt_clock(
+        &self,
+        peer_id: PeerId,
+        topic_id: crate::TopicId,
+        genesis: crate::OpId,
+    ) -> Option<crate::ActorClock> {
+        self.receipt_log()
+            .clocks
+            .get(&(peer_id, topic_id))
+            .filter(|receipt| receipt.genesis == genesis)
+            .map(|receipt| receipt.clock.clone())
+    }
+}
+
+impl<S: Storage> IrohNet<S> {
+    #[cfg(test)]
+    pub(crate) fn plan_counts(&self) -> (usize, usize) {
+        self.plans.counts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_goals(&self) -> usize {
+        self.goals.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_planners(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.bulk_lane)
+            .acquire_many_owned(BULK_JOBS as u32)
+            .await
+            .unwrap()
+    }
+
+    pub async fn accept_one(&self) -> io::Result<Option<iroh::EndpointId>> {
+        let _task = self.tasks.enter()?;
+        let Some(incoming) = self.endpoint().accept().await else {
+            return Ok(None);
+        };
+        let connection = tokio::time::timeout(self.runtime.connect_timeout, incoming)
+            .await
+            .map_err(|_| timed_out("iroh accept timed out"))?
+            .map_err(other)?;
+        if connection.alpn() != IROKLE_SYNC_ALPN {
+            connection.close(0u32.into(), b"unsupported protocol");
+            return Err(invalid_data("unsupported sync protocol"));
+        }
+        let peer = connection.remote_id();
+        let (send, recv) =
+            tokio::time::timeout(self.runtime.sync_io_timeout, connection.accept_bi())
+                .await
+                .map_err(|_| timed_out("sync stream accept timed out"))?
+                .map_err(other)?;
+        self.handle_stream(peer, recv, send).await?;
+        Ok(Some(peer))
+    }
+
+    /// Serve one inbound stream. The whole request is read before anything is
+    /// written, so neither side waits on the other's unread bytes, and the reply
+    /// carries every control message plus data within the requesters' credits.
+    pub async fn handle_stream(
+        &self,
+        peer: iroh::EndpointId,
+        mut recv: iroh::endpoint::RecvStream,
+        mut send: iroh::endpoint::SendStream,
+    ) -> io::Result<()> {
+        let _task = self.tasks.enter()?;
+        let timeout = self.runtime.sync_io_timeout;
+        tokio::time::timeout(timeout, async {
+            let _served = Arc::clone(&self.served)
+                .acquire_owned()
+                .await
+                .map_err(|_| io::Error::other("served sync streams closed"))?;
+            let mut session = SyncSession::new(peer);
+            let mut limits = SyncReadLimits::new(self.limits);
+            while let Some((len, tag)) = read_frame_head(&mut recv, timeout).await? {
+                let frame_index = limits.observe_frame(len)?;
+                let (pool, bytes) = ByteBudget::inbound(len, tag);
+                let charge = self.budget.wait(pool, bytes, OwnedClass::Frames).await?;
+                let message = read_frame_body(&mut recv, len, tag, timeout, frame_index).await?;
+                // Messages are handled one job at a time, in stream order. The
+                // charge moves into the job, so it is held until the job ends.
+                let lane = match message {
+                    SyncMessage::Data(_) | SyncMessage::Summary(_) => Lane::Bulk,
+                    _ => Lane::Control,
+                };
+                let handled;
+                (session, handled) = self
+                    .run_job(lane, move |shared| {
+                        let _charge = charge;
+                        let handled = session
+                            .handle(shared, message)
+                            .and_then(|()| session.hold(&shared.budget));
+                        (session, handled)
+                    })
+                    .await?;
+                handled?;
+            }
+            let lane = if session.requests.is_empty() {
+                Lane::Control
+            } else {
+                Lane::Bulk
+            };
+            let mut permit = if session.requests.is_empty() {
+                None
+            } else {
+                Some(
+                    self.plans
+                        .register(peer_from_endpoint(peer))?
+                        .enter()
+                        .await?,
+                )
+            };
+            // Pages are granted before planning; this stream holds no data bytes now.
+            let mut grant = match session.pages_bound(self.limits) {
+                0 => None,
+                pages => {
+                    let bytes = self.budget.output_bound(pages);
+                    Some(
+                        self.budget
+                            .wait(Pool::Data, bytes, OwnedClass::Output)
+                            .await?,
+                    )
+                }
+            };
+            let mut responses = Vec::new();
+            let mut used = 0;
+            let mut remaining = self.limits;
+            loop {
+                let result;
+                (session, permit, grant, result) = self
+                    .run_job(lane, move |shared| {
+                        let granted = grant.as_ref().map_or(0, Charge::bytes);
+                        let result = session.finish_slice(
+                            shared,
+                            ByteBudget::page_bytes(granted).saturating_sub(used),
+                            remaining,
+                            true,
+                        );
+                        (session, permit, grant, result)
+                    })
+                    .await?;
+                let (slice, bytes) = result?;
+                used += bytes;
+                remaining.messages = remaining.messages.saturating_sub(slice.len());
+                for message in &slice {
+                    remaining.bytes = remaining
+                        .bytes
+                        .saturating_sub(crate::net::framed_message_len(message)?);
+                }
+                responses.extend(slice);
+                if session.requests.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            if let Some(grant) = &mut grant {
+                let granted = grant.bytes();
+                grant.shrink(granted - ByteBudget::page_bytes(granted) + used);
+            }
+            drop(permit);
+            let held = session.charge.take();
+            exchange::stream_fits(&responses, self.limits)?;
+            // Retained messages stay charged until the reply carrying them is out.
+            let budget = grant.is_none().then_some(&self.budget);
+            write_sync_messages(&mut send, &responses, timeout, self.limits, budget).await?;
+            drop((held, grant));
+            Ok(())
+        })
+        .await
+        .map_err(|_| timed_out("sync stream timed out"))?
+    }
+}
+
+impl<S: Storage> SharedNet<S> {
+    /// Serve the messages of one stream an embedder read. They must fit the limits a
+    /// served stream reads under, checked before any is handled. Admission and charges
+    /// match a served stream, but a full slot or pool fails the call instead of waiting.
+    pub fn handle_messages(
+        &self,
+        peer: iroh::EndpointId,
+        messages: Vec<SyncMessage>,
+    ) -> io::Result<SyncResponses> {
+        let _task = self.tasks.enter()?;
+        let _served = Arc::clone(&self.served).try_acquire_owned().map_err(|_| {
+            io::Error::new(io::ErrorKind::WouldBlock, "served sync streams are full")
+        })?;
+        exchange::stream_fits(&messages, self.limits)?;
+        let mut session = SyncSession::new(peer);
+        for message in messages {
+            session.handle(self, message)?;
+            session.hold(&self.budget)?;
+        }
+        let mut charges = Vec::new();
+        let pages = session.pages_bound(self.limits);
+        let granted = if pages == 0 {
+            0
+        } else {
+            let bytes = self.budget.output_bound(pages);
+            charges.push(
+                self.budget
+                    .try_take(Pool::Data, bytes, OwnedClass::Output)?,
+            );
+            bytes
+        };
+        let (messages, used) = session.finish(self, ByteBudget::page_bytes(granted))?;
+        if let Some(grant) = charges.first_mut() {
+            grant.shrink(used);
+        }
+        charges.extend(session.charge.take());
+        Ok(SyncResponses { messages, charges })
+    }
+
+    fn sweep_targets(&self) -> io::Result<BTreeSet<(PeerId, crate::TopicId)>> {
+        let mut targets = BTreeSet::new();
+        for topic in self.node.storage().list_topics().map_err(invalid_data)? {
+            let state = match self.node.storage().topic_state(&topic.topic_id) {
+                Ok(Some(state)) => state,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        topic_id = %topic.topic_id,
+                        %error,
+                        "skipping one unreadable topic while planning the sweep"
+                    );
+                    continue;
+                }
+            };
+            if !state.members.contains(&self.node.peer_id()) {
+                match self.dirty_selected_targets(topic.topic_id) {
+                    Ok(dirty) => {
+                        targets.extend(dirty.into_iter().map(|peer_id| (peer_id, topic.topic_id)))
+                    }
+                    Err(error) => tracing::warn!(
+                        topic_id = %topic.topic_id,
+                        %error,
+                        "skipping one topic while planning the sweep"
+                    ),
+                }
+                continue;
+            }
+            targets.extend(
+                self.node
+                    .sync_peers(topic.topic_id, &state)
+                    .into_iter()
+                    .map(|peer_id| (peer_id, topic.topic_id)),
+            );
+        }
+        Ok(targets)
+    }
+
+    fn summary_reply(
+        &self,
+        peer_id: PeerId,
+        summary: &SyncSummary,
+    ) -> io::Result<Vec<SyncMessage>> {
+        let request = self
+            .node
+            .plan_sync_request(peer_id, summary)
+            .map_err(invalid_data)?;
+        if request.wants.is_empty() && request.actor_range_hints.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![SyncMessage::Request(request)])
+    }
+
+    fn handle_message(
+        &self,
+        message: SyncMessage,
+        remote_peer_id: Option<PeerId>,
+    ) -> io::Result<Vec<SyncMessage>> {
+        match message {
+            SyncMessage::Open(open) => {
+                let peer_id = remote_peer_id
+                    .ok_or_else(|| invalid_data("sync open requires authenticated peer context"))?;
+                // Unknown topics return an empty local summary so an inviter can
+                // bootstrap a new member by pushing the signed genesis/history.
+                // The permission and the summary come from one snapshot.
+                let summary = self
+                    .node
+                    .storage()
+                    .read_snapshot(|read| {
+                        if let Some(view) = read.topic_view(&open.topic_id, None)?
+                            && !may_open_topic(&view.state, peer_id)
+                        {
+                            return Ok(None);
+                        }
+                        self.node
+                            .sync_engine()
+                            .summary_in(read, open.topic_id)
+                            .map(Some)
+                    })
+                    .map_err(invalid_data)?;
+                let Some(mut summary) = summary else {
+                    return Ok(Vec::new());
+                };
+                // A topic not held here names what this peer already staged.
+                if summary.genesis.is_none()
+                    && let Some(staged) = self
+                        .node
+                        .staged_topic(peer_id, open.topic_id)
+                        .map_err(invalid_data)?
+                    && let Some(genesis) = staged.genesis
+                {
+                    summary.staged = Some(crate::sync::SyncReceipt {
+                        topic_id: open.topic_id,
+                        genesis,
+                        session: staged.session,
+                        clock: staged.clock,
+                    });
+                }
+                Ok(vec![SyncMessage::Summary(summary)])
+            }
+            SyncMessage::Fingerprint(fingerprint) => {
+                let peer_id = remote_peer_id.ok_or_else(|| {
+                    invalid_data("sync fingerprint requires a preceding SyncOpen with peer_id")
+                })?;
+                let topic_id = fingerprint.topic_id;
+                let compared = self
+                    .node
+                    .storage()
+                    .read_snapshot(|read| {
+                        let Some(view) = read.topic_view(&topic_id, None)? else {
+                            return Ok(None);
+                        };
+                        if !may_open_topic(&view.state, peer_id) {
+                            return Ok(None);
+                        }
+                        // One integrity answer serves the digest, the verdict and the summary.
+                        let integrity = self.node.integrity_in(read, &view)?;
+                        let local = crate::sync::digest_for(&view, &integrity)?;
+                        let whole = integrity.certifies(&view);
+                        let member = view.state.members.contains(&peer_id);
+                        let summary = crate::sync::SyncEngine::<S>::summary_for(view, &integrity)?;
+                        Ok(Some((local, whole, member, summary)))
+                    })
+                    .map_err(invalid_data)?;
+                let Some((local, whole, member, summary)) = compared else {
+                    return Ok(Vec::new());
+                };
+                // A damaged responder must fall through to the summary path so
+                // the requester can serve what this side cannot resolve. The
+                // evidence write re-checks the frontier it certifies.
+                if local == fingerprint.fingerprint
+                    && whole
+                    && (!member
+                        || self
+                            .node
+                            .record_fingerprint(peer_id, topic_id, fingerprint.fingerprint)
+                            .map_err(invalid_data)?)
+                {
+                    if member {
+                        self.reconsider_target(peer_id, topic_id);
+                    }
+                    Ok(vec![SyncMessage::Fingerprint(
+                        crate::sync::SyncFingerprint {
+                            topic_id,
+                            fingerprint: local,
+                        },
+                    )])
+                } else {
+                    Ok(vec![SyncMessage::Summary(summary)])
+                }
+            }
+            SyncMessage::Summary(summary) => {
+                let peer_id = remote_peer_id.ok_or_else(|| {
+                    invalid_data("sync summary requires a preceding SyncOpen with peer_id")
+                })?;
+                self.summary_reply(peer_id, &summary)
+            }
+            SyncMessage::Request(_) => {
+                Err(invalid_data("sync request must be served by the session"))
+            }
+            SyncMessage::Data(data) => {
+                let data_topic_id = data.topic_id;
+                let source_peer = remote_peer_id.ok_or_else(|| {
+                    invalid_data("sync data requires a preceding SyncOpen with peer_id")
+                })?;
+                self.node
+                    .ensure_peer_allowed(source_peer, &data)
+                    .map_err(invalid_data)?;
+                let outcome = self
+                    .node
+                    .receive_sync_outcome(source_peer, data)
+                    .map_err(|mut error| {
+                        if let crate::Error::ReceiveCommitted { evictions, .. } = &mut error {
+                            self.forward_evictions(std::mem::take(evictions));
+                            if let Err(retry) = self.schedule_topic_recheck(data_topic_id) {
+                                tracing::warn!(%data_topic_id, %retry, "failed to schedule received topic resync");
+                            }
+                        }
+                        invalid_data(error)
+                    })?;
+                let (ack, evictions) = match outcome {
+                    ReceiveOutcome::Acked { ack, evictions } => (*ack, evictions),
+                    ReceiveOutcome::Staged(staged) => {
+                        // Data no staged branch anchors fails its topic visibly.
+                        let genesis = staged
+                            .genesis
+                            .ok_or_else(|| invalid_data("sync data names no staged branch"))?;
+                        return Ok(vec![SyncMessage::Receipt(crate::sync::SyncReceipt {
+                            topic_id: data_topic_id,
+                            genesis,
+                            session: staged.session,
+                            clock: staged.clock,
+                        })]);
+                    }
+                };
+                self.forward_evictions(evictions);
+                if let Err(error) = self.schedule_topic_recheck(data_topic_id) {
+                    tracing::warn!(%data_topic_id, %error, "failed to schedule received topic resync");
+                }
+                Ok(vec![SyncMessage::Ack(ack)])
+            }
+            // Acks are collected by the session and applied together in
+            // `SyncSession::finish`, so one rejected ack cannot discard the
+            // rest; there is deliberately no second path that applies one.
+            SyncMessage::Ack(_) => Err(invalid_data("sync ack must be applied by the session")),
+            SyncMessage::Failure(_) | SyncMessage::Page(_) | SyncMessage::Receipt(_) => Err(
+                invalid_data("sync failure, page and receipt are response-only messages"),
+            ),
+        }
+    }
+}
+
+/// Per-topic results of one batch, with the topics that made durable progress
+/// but still owe more work. Advancing pages are kept apart from failures so a
+/// catch-up that is working is not retried as an unreachable peer.
+struct BatchOutcomes {
+    results: BTreeMap<crate::TopicId, io::Result<()>>,
+    advanced: BTreeSet<crate::TopicId>,
+    /// Topics already recorded and released during the batch, so the caller
+    /// does not publish them a second time.
+    settled: BTreeSet<crate::TopicId>,
+}
+
+impl BatchOutcomes {
+    fn new(
+        results: BTreeMap<crate::TopicId, io::Result<()>>,
+        advanced: BTreeSet<crate::TopicId>,
+        settled: BTreeSet<crate::TopicId>,
+    ) -> Self {
+        Self {
+            results,
+            advanced,
+            settled,
+        }
+    }
+}
+
+/// What the responses to one batch stream settled.
+struct BatchReplies {
+    acks: Vec<crate::sync::SyncAck>,
+    followups: BTreeMap<crate::TopicId, Vec<SyncMessage>>,
+    outcomes: BTreeMap<crate::TopicId, io::Result<()>>,
+    owed_acks: BTreeSet<crate::TopicId>,
+    more: BTreeSet<crate::TopicId>,
+    /// A response outside the protocol, which fails the whole group.
+    unexpected: Option<io::Error>,
+}
+
+/// One group of planned topics that fits a stream, and where planning stopped.
+struct PlannedGroup {
+    group: Vec<PlannedTopicSync>,
+    /// A planned topic that did not fit, first in the next group.
+    next: Option<PlannedTopicSync>,
+    rest: VecDeque<(crate::TopicId, SyncSummary)>,
+    outcomes: Vec<(crate::TopicId, io::Result<()>)>,
+}
+
+/// What one topic plan read from a single snapshot.
+struct SnapshotPlan {
+    state: crate::storage::TopicState,
+    clock: crate::ActorClock,
+    plan: crate::sync::SyncPlan,
+    push_more: bool,
+    /// The summary matches this branch's whole frontier, pending the write.
+    converged: bool,
+    /// This node's leave page and its position, when it left the topic.
+    leave: Option<(crate::sync::PlannedPage, Option<(crate::ActorId, u64)>)>,
+    local_summary: Option<SyncSummary>,
+}
+
+struct PlannedTopicSync {
+    topic_id: crate::TopicId,
+    goal: TopicGoal,
+    /// Whether the stream carries data the peer must acknowledge.
+    pushes: bool,
+    /// Whether the push page left data behind for a later page.
+    push_more: bool,
+    messages: Vec<SyncMessage>,
+    estimated_responses: usize,
+}
+
+/// What one attempt set out to reach, captured when it was planned. Later
+/// appends on either side are later work, not a moving target.
+#[derive(Clone, Debug)]
+struct TopicGoal {
+    /// Whether the topic was not held locally when planned.
+    pull: bool,
+    genesis: Option<crate::OpId>,
+    /// The losing local genesis a branch pull replaces; until the winner is
+    /// admitted the topic has made no progress toward the goal.
+    replaces: Option<crate::OpId>,
+    /// The peer's clock from its summary.
+    inbound: crate::ActorClock,
+    /// The local clock the peer should certify.
+    outbound: crate::ActorClock,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GoalProgress {
+    inbound: u64,
+    outbound: u64,
+    holes: usize,
+    /// Staged positions: the peer's receipts for a push, or this node's own
+    /// staging for a pull.
+    staged: u64,
+    /// Page results that named positions this node's requests had not given.
+    requested: u64,
+}
+
+impl GoalProgress {
+    fn reached(&self, goal: &TopicGoal) -> bool {
+        self.inbound == covered(&goal.inbound, &goal.inbound)
+            && self.outbound == covered(&goal.outbound, &goal.outbound)
+            && self.holes == 0
+    }
+
+    fn advanced_from(&self, before: &GoalProgress) -> bool {
+        self.inbound > before.inbound
+            || self.outbound > before.outbound
+            || self.holes < before.holes
+            || self.staged > before.staged
+            || self.requested > before.requested
+    }
+}
+
+/// Positions of `target` that `clock` covers, summed over actors.
+fn covered(clock: &crate::ActorClock, target: &crate::ActorClock) -> u64 {
+    target
+        .iter()
+        .map(|(actor_id, seq)| clock.get(actor_id).min(*seq))
+        .sum()
+}
+
+/// One outbound peer slot held by a manual sync. Releasing it wakes the resync
+/// loop, which may have parked with every slot taken.
+struct OutboundSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for OutboundSlot {
+    fn drop(&mut self) {
+        self.wake.notify_one();
+    }
+}
+
+/// The loop's next wake deadline. With every slot taken there is nothing to
+/// dispatch, so no due deadline is armed and an expired one cannot spin.
+fn next_resync_wake(scheduler: &ResyncScheduler, in_flight: usize) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    if in_flight >= MAX_RESYNC_PEERS {
+        return now + EMPTY_RESYNC_SLEEP;
+    }
+    scheduler.next_due().unwrap_or(now + EMPTY_RESYNC_SLEEP)
+}
+
+/// Fills the free peer slots from the due queue and returns false when the loop
+/// must stop. Claims are taken here, one turn per peer, so a slow peer cannot
+/// hold capacity another due peer could use.
+fn dispatch_due_resyncs<S: Storage>(
+    net: &Weak<IrohNet<S>>,
+    syncs: &mut tokio::task::JoinSet<()>,
+    runtime: IrohRuntimeConfig,
+) -> bool {
+    let Some(current) = net.upgrade() else {
+        return false;
+    };
+    if current.is_shutdown() || current.endpoint().is_closed() {
+        return false;
+    }
+    // Slots are taken before targets are claimed, so manual syncs holding
+    // slots leave nothing claimed that cannot run.
+    let mut slots = Vec::new();
+    while slots.len() < MAX_RESYNC_PEERS.saturating_sub(syncs.len()) {
+        match Arc::clone(&current.outbound).try_acquire_owned() {
+            Ok(slot) => slots.push(slot),
+            Err(_) => break,
+        }
+    }
+    if slots.is_empty() {
+        return true;
+    }
+    let due = current
+        .resync_scheduler
+        .due_targets(slots.len(), MAX_RESYNC_TOPICS);
+    for ((peer_id, targets), slot) in due.into_iter().zip(slots) {
+        // The lease owns the claims before the task is spawned, so an abort
+        // releases them instead of wedging the targets in flight.
+        let lease = current
+            .resync_scheduler
+            .lease(targets, runtime.resync_interval);
+        let peer_net = Arc::clone(&current);
+        let task = current.tasks.track();
+        syncs.spawn(async move {
+            let _task = task;
+            let _slot = slot;
+            peer_net.sync_peer_batch(peer_id, lease, runtime).await;
+        });
+    }
+    true
+}
+
+fn next_sweep_deadline(interval: Duration, time_of_day: Duration) -> tokio::time::Instant {
+    if interval.is_zero() {
+        return tokio::time::Instant::now() + EMPTY_RESYNC_SLEEP;
+    }
+    tokio::time::Instant::now() + initial_sweep_delay(interval, time_of_day)
+}
+
+fn initial_sweep_delay(interval: Duration, time_of_day: Duration) -> Duration {
+    if interval < Duration::from_secs(SECONDS_PER_DAY) {
+        return interval;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let current_day_second = now % SECONDS_PER_DAY;
+    let target_day_second = time_of_day.as_secs() % SECONDS_PER_DAY;
+    let delay_secs = if current_day_second < target_day_second {
+        target_day_second - current_day_second
+    } else {
+        SECONDS_PER_DAY - current_day_second + target_day_second
+    };
+    Duration::from_secs(delay_secs)
+}
+
+fn may_open_topic(state: &crate::storage::TopicState, peer_id: PeerId) -> bool {
+    state.members.contains(&peer_id)
+        || state
+            .membership_controls
+            .get(&peer_id)
+            .is_some_and(|(_, is_member)| !*is_member)
+}
+
+async fn handle_connection<S: Storage>(
+    net: Weak<IrohNet<S>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    peer: iroh::EndpointId,
+    connection: iroh::endpoint::Connection,
+) {
+    let Some(current) = net.upgrade() else {
+        return;
+    };
+    let idle_timeout = current.runtime.sync_io_timeout;
+    drop(current);
+    let mut tasks = tokio::task::JoinSet::new();
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = &mut idle, if tasks.is_empty() => break,
+            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Err(error) = result {
+                    tracing::warn!(%peer, %error, "iroh sync stream task failed");
+                }
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+            }
+            streams = connection.accept_bi(), if tasks.len() < 8 => {
+                let (send, recv) = match streams {
+                    Ok(streams) => streams,
+                    Err(error) => {
+                        tracing::debug!(%peer, %error, "iroh connection stopped accepting streams");
+                        break;
+                    }
+                };
+                let Some(current) = net.upgrade() else {
+                    break;
+                };
+                if current.is_shutdown() {
+                    break;
+                }
+                let task = current.tasks.track();
+                tasks.spawn(async move {
+                    let _task = task;
+                    if let Err(error) = current.handle_stream(peer, recv, send).await {
+                        tracing::warn!(%peer, %error, "failed to handle iroh sync stream");
+                    } else if let Err(error) = current
+                        .run_job(Lane::Control, move |shared| {
+                            shared.note_peer_reachable(peer_from_endpoint(peer));
+                        })
+                        .await
+                    {
+                        tracing::warn!(%peer, %error, "failed to record a reachable peer");
+                    }
+                });
+            }
+        }
+    }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    connection.close(0u32.into(), b"sync connection idle or closed");
+}
+
+impl<S: Storage> Drop for IrohNet<S> {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
+    }
+}
+
+fn peer_from_endpoint(peer: iroh::EndpointId) -> PeerId {
+    PeerId::from_bytes(*peer.as_bytes())
+}
+
+fn endpoint_addr(peer_id: PeerId) -> io::Result<iroh::EndpointAddr> {
+    Ok(iroh::EndpointAddr::from(
+        iroh::EndpointId::from_bytes(peer_id.as_bytes()).map_err(invalid_data)?,
+    ))
+}
+
+fn extend_alpns(mut alpns: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let irokle = IROKLE_SYNC_ALPN.to_vec();
+    if !alpns.contains(&irokle) {
+        alpns.push(irokle);
+    }
+    alpns
+}
+
+fn message_topic_id(message: &SyncMessage) -> Option<crate::TopicId> {
+    match message {
+        SyncMessage::Open(open) => Some(open.topic_id),
+        SyncMessage::Fingerprint(fingerprint) => Some(fingerprint.topic_id),
+        SyncMessage::Summary(summary) => Some(summary.topic_id),
+        SyncMessage::Request(request) => Some(request.topic_id),
+        SyncMessage::Data(data) => Some(data.topic_id),
+        SyncMessage::Ack(ack) => Some(ack.topic_id),
+        SyncMessage::Failure(failure) => Some(failure.topic_id),
+        SyncMessage::Page(page) => Some(page.topic_id),
+        SyncMessage::Receipt(receipt) => Some(receipt.topic_id),
+    }
+}
+
+/// One topic's result, whether it advanced, and the claim held for it.
+type TopicResult = (crate::TopicId, io::Result<()>, bool, Option<ClaimGuard>);
+
+/// How one attempt ended, which sets its retry delay and its status outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExchangeState {
+    /// The exchange succeeded and owes no further page.
+    Complete,
+    /// A page moved the topic toward its goal and more work remains.
+    Advancing,
+    /// Local capacity ran short or the exchange made no progress.
+    Blocked,
+    /// A transport, peer or storage failure that a later attempt may clear.
+    Retryable,
+    /// Invalid data or input without a typed cause.
+    Rejected,
+    /// The store must be reopened and its commit outcome verified.
+    #[cfg(feature = "fjall")]
+    Reconcile,
+}
+
+fn exchange_state(result: std::result::Result<(), &io::Error>, advanced: bool) -> ExchangeState {
+    let Err(error) = result else {
+        return if advanced {
+            ExchangeState::Advancing
+        } else {
+            ExchangeState::Complete
+        };
+    };
+    let mut source = error
+        .get_ref()
+        .map(|source| source as &dyn std::error::Error);
+    while let Some(cause) = source {
+        if cause.is::<RemoteFailure>() {
+            return ExchangeState::Retryable;
+        }
+        if cause.is::<NoProgress>() {
+            return ExchangeState::Blocked;
+        }
+        if let Some(cause) = cause.downcast_ref::<crate::Error>() {
+            match cause.cause() {
+                crate::Error::SyncCapacity(_)
+                | crate::Error::MemoryPressure { .. }
+                | crate::Error::StagingCapacity(_)
+                | crate::Error::EvictionJournalFull => return ExchangeState::Blocked,
+                #[cfg(feature = "fjall")]
+                crate::Error::StoragePressure(_) | crate::Error::StorageBuffer { .. } => {
+                    return ExchangeState::Blocked;
+                }
+                #[cfg(feature = "fjall")]
+                crate::Error::ReopenRequired(_) => return ExchangeState::Reconcile,
+                crate::Error::Storage(_) | crate::Error::AdmissionConflict => {
+                    return ExchangeState::Retryable;
+                }
+                #[cfg(feature = "fjall")]
+                crate::Error::Fjall(_) | crate::Error::StorageProbe(_) => {
+                    return ExchangeState::Retryable;
+                }
+                _ => {}
+            }
+        }
+        source = cause.source();
+    }
+    match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory => ExchangeState::Blocked,
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => ExchangeState::Rejected,
+        _ => ExchangeState::Retryable,
+    }
+}
+
+/// Whether a failure shows its peer could not be reached. Only a retryable failure outside
+/// invalid data or input does; local limits, a store to reopen, refused data and failures
+/// the peer reported leave peer health unchanged.
+fn is_unreachable(error: &io::Error) -> bool {
+    exchange_state(Err(error), false) == ExchangeState::Retryable
+        && !matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput
+        )
+}
+
+fn attempt_outcome(
+    result: std::result::Result<(), &io::Error>,
+    advanced: bool,
+) -> crate::AttemptOutcome {
+    match result {
+        Ok(()) if advanced => crate::AttemptOutcome::Advanced,
+        Ok(()) => crate::AttemptOutcome::Complete,
+        Err(error) => match exchange_state(Err(error), advanced) {
+            ExchangeState::Blocked => crate::AttemptOutcome::Blocked(error.to_string()),
+            #[cfg(feature = "fjall")]
+            ExchangeState::Reconcile => crate::AttemptOutcome::ReopenRequired(error.to_string()),
+            _ => crate::AttemptOutcome::Failed(error.to_string()),
+        },
+    }
+}
+
+fn copy_result(result: &io::Result<()>) -> io::Result<()> {
+    result.as_ref().copied().map_err(clone_error)
+}
+
+/// The wire identifies the failed stage but cannot distinguish resource or backend causes.
+#[derive(Debug, thiserror::Error)]
+#[error("peer failed this topic at {0:?}")]
+struct RemoteFailure(crate::sync::SyncFailureCode);
+
+/// The exchange did not move its topic toward the goal; it retries with the normal backoff.
+#[derive(Debug, thiserror::Error)]
+#[error("sync exchange made no progress")]
+struct NoProgress;
+
+fn topic_failed(failure: &crate::sync::SyncFailure) -> io::Error {
+    invalid_data(RemoteFailure(failure.code))
+}
+
+fn timed_out(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, message)
+}
+
+fn clone_error(error: &io::Error) -> io::Error {
+    if let Some(source) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<crate::net::SharedError>())
+    {
+        return io::Error::new(error.kind(), source.clone());
+    }
+    if let Some(code) = error.raw_os_error() {
+        return io::Error::from_raw_os_error(code);
+    }
+    io::Error::new(error.kind(), error.to_string())
+}
+
+fn other(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::other(crate::net::SharedError::new(error))
+}
+
+#[cfg(test)]
+#[path = "../tests/scheduler.rs"]
+mod scheduler_tests;
+
+#[cfg(test)]
+#[path = "../tests/budget.rs"]
+mod budget_tests;
+
+#[cfg(test)]
+mod tests {
+    use crate::TopicId;
+    use crate::net::iroh::*;
+
+    #[test]
+    fn typed_decisions() {
+        for wording in ["credit exhausted", "wording changed"] {
+            let error = invalid_data(crate::Error::SyncCapacity(wording.into()));
+            for error in [&error, &clone_error(&error)] {
+                assert_eq!(exchange_state(Err(error), false), ExchangeState::Blocked);
+                assert!(matches!(
+                    attempt_outcome(Err(error), false),
+                    crate::AttemptOutcome::Blocked(_)
+                ));
+            }
+        }
+        let rejected = invalid_data("sync exchange made no progress");
+        assert_eq!(
+            exchange_state(Err(&rejected), false),
+            ExchangeState::Rejected
+        );
+        let stalled = invalid_data(NoProgress);
+        assert_eq!(stalled.kind(), io::ErrorKind::InvalidData);
+        for error in [&stalled, &clone_error(&stalled)] {
+            assert_eq!(exchange_state(Err(error), false), ExchangeState::Blocked);
+            assert!(matches!(
+                attempt_outcome(Err(error), false),
+                crate::AttemptOutcome::Blocked(text) if text == "sync exchange made no progress"
+            ));
+        }
+        let transport = timed_out("no reply");
+        assert_eq!(
+            exchange_state(Err(&transport), false),
+            ExchangeState::Retryable
+        );
+        assert_eq!(exchange_state(Ok(()), false), ExchangeState::Complete);
+        assert_eq!(exchange_state(Ok(()), true), ExchangeState::Advancing);
+    }
+
+    /// Only a retryable failure outside invalid data or input demotes a peer, under every
+    /// typed cause and error kind, and a copied error keeps that decision.
+    #[test]
+    fn health_decisions() {
+        use crate::net::SharedError;
+        use io::ErrorKind::{
+            ConnectionRefused, InvalidData, InvalidInput, Other, OutOfMemory, TimedOut, WouldBlock,
+        };
+        let kinds = [
+            InvalidData,
+            InvalidInput,
+            WouldBlock,
+            OutOfMemory,
+            TimedOut,
+            ConnectionRefused,
+            Other,
+        ];
+        let never = [false; 7];
+        let untyped = [false, false, false, false, true, true, true];
+        let retryable = [false, false, true, true, true, true, true];
+        let typed = |cause: crate::Error| Some(SharedError::new(cause));
+        let storage = || crate::Error::Storage("backend failed".into());
+        let capacity = || crate::Error::SyncCapacity("credit".into());
+        let rows = [
+            (None, untyped),
+            (typed(crate::Error::TopicNotFound), untyped),
+            (
+                Some(SharedError::new(RemoteFailure(
+                    crate::sync::SyncFailureCode::Request,
+                ))),
+                retryable,
+            ),
+            (Some(SharedError::new(NoProgress)), never),
+            (typed(capacity()), never),
+            (
+                typed(crate::Error::MemoryPressure {
+                    domain: crate::storage::MemoryDomain::Workspace,
+                    required: 2,
+                    limit: 1,
+                }),
+                never,
+            ),
+            (
+                typed(crate::Error::StagingCapacity("staging".into())),
+                never,
+            ),
+            (typed(crate::Error::EvictionJournalFull), never),
+            (typed(storage()), retryable),
+            (typed(crate::Error::AdmissionConflict), retryable),
+            (typed(crate::Error::Shared(Arc::new(storage()))), retryable),
+            (typed(crate::Error::Shared(Arc::new(capacity()))), never),
+        ];
+        #[cfg(feature = "fjall")]
+        let rows = rows.into_iter().chain([
+            (typed(crate::Error::StoragePressure("disk".into())), never),
+            (
+                typed(crate::Error::StorageBuffer {
+                    required: 2,
+                    limit: 1,
+                }),
+                never,
+            ),
+            (
+                typed(crate::Error::ReopenRequired(fjall::Error::Poisoned)),
+                never,
+            ),
+            (
+                typed(crate::Error::Fjall(fjall::Error::Poisoned)),
+                retryable,
+            ),
+            (
+                typed(crate::Error::StorageProbe(io::Error::other("probe"))),
+                retryable,
+            ),
+        ]);
+        for (cause, expected) in rows {
+            for (kind, expected) in kinds.into_iter().zip(expected) {
+                let error = match &cause {
+                    Some(cause) => io::Error::new(kind, cause.clone()),
+                    None => io::Error::new(kind, "untyped failure"),
+                };
+                assert_eq!(is_unreachable(&error), expected, "{error:?}");
+                assert_eq!(is_unreachable(&clone_error(&error)), expected, "{error:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn remote_failure_retries() {
+        for code in [
+            crate::sync::SyncFailureCode::Request,
+            crate::sync::SyncFailureCode::Ack,
+        ] {
+            let error = topic_failed(&crate::sync::SyncFailure {
+                topic_id: TopicId::hash(b"remote failure"),
+                code,
+            });
+            assert_eq!(exchange_state(Err(&error), false), ExchangeState::Retryable);
+            assert_eq!(
+                exchange_state(Err(&clone_error(&error)), false),
+                ExchangeState::Retryable
+            );
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn ack_failure_decisions() {
+        use crate::tests::support::{AckFault, Note, StaleReadStorage};
+        use crate::{Ed25519Signer, Signer, TopicConfig};
+        let storage = StaleReadStorage::new(MemoryStorage::new());
+        let node = Irokle::with_storage(
+            storage.clone(),
+            crate::NodeConfig {
+                signer: Ed25519Signer::from_bytes(&[221; 32]),
+                ..crate::NodeConfig::default()
+            },
+        )
+        .unwrap();
+        let signer = Ed25519Signer::from_bytes(&[222; 32]);
+        let peer = signer.peer_id();
+        let topic = node
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let record = topic
+            .publish(Note {
+                text: "retained".into(),
+            })
+            .unwrap();
+        node.put_sync_obligation(peer, topic.id(), [record.meta.op_id].into())
+            .unwrap();
+        let summary = node.sync_summary(topic.id()).unwrap();
+        let mut ack = crate::sync::SyncAck {
+            topic_id: topic.id(),
+            peer_id: peer,
+            genesis: summary.genesis,
+            accepted: summary.heads.clone(),
+            heads: summary.heads,
+            clock: summary.actor_clock,
+            signature: None,
+        };
+        ack.sign(&signer).unwrap();
+        let failures = [
+            (
+                crate::Error::SyncCapacity("credit unavailable".into()),
+                ExchangeState::Blocked,
+            ),
+            (
+                crate::Error::Storage("temporary backend failure".into()),
+                ExchangeState::Retryable,
+            ),
+        ];
+        #[cfg(feature = "fjall")]
+        let failures = failures.into_iter().chain([(
+            crate::Error::ReopenRequired(fjall::Error::Poisoned),
+            ExchangeState::Reconcile,
+        )]);
+        for (index, (error, expected)) in failures.into_iter().enumerate() {
+            *storage.ack_fault.lock().unwrap() = Some(AckFault {
+                committed: false,
+                error,
+            });
+            let error = node
+                .apply_sync_acks(std::slice::from_ref(&ack))
+                .pop()
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(error, crate::Error::Shared(_)));
+            let error = invalid_data(error);
+            assert_eq!(exchange_state(Err(&error), false), expected);
+            let copied = clone_error(&error);
+            drop(error);
+            assert_eq!(exchange_state(Err(&copied), false), expected);
+            assert_eq!(storage.ack_calls.load(Ordering::SeqCst), index + 1);
+            assert!(storage.peer_ack(&peer, &topic.id()).unwrap().is_none());
+            assert!(
+                !storage
+                    .sync_obligations(&peer, &topic.id())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn reconciliation_survives_copy() {
+        let error = invalid_data(crate::Error::Shared(Arc::new(
+            crate::Error::ReopenRequired(fjall::Error::Poisoned),
+        )));
+        let copied = clone_error(&error);
+        drop(error);
+        assert_eq!(
+            exchange_state(Err(&copied), false),
+            ExchangeState::Reconcile
+        );
+        assert!(matches!(
+            attempt_outcome(Err(&copied), false),
+            crate::AttemptOutcome::ReopenRequired(text) if text.starts_with("storage requires reopen")
+        ));
+    }
+
+    /// Wide enough that the second backoff step cannot be mistaken for the
+    /// first on a slow machine.
+    const BACKOFF: Duration = Duration::from_secs(60);
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Ping;
+
+    impl crate::Event for Ping {
+        const TYPE_ID: &'static str = "test.ping";
+    }
+
+    fn peer(byte: u8) -> PeerId {
+        PeerId::from_bytes([byte; 32])
+    }
+
+    fn topic(byte: u8) -> TopicId {
+        TopicId::from_bytes([byte; 32])
+    }
+
+    /// A request continues its peer's knowledge only on the same branch and
+    /// staging session; the first session continues what came before it.
+    #[test]
+    fn requests_follow_branch() {
+        let key = (peer(1), topic(1));
+        let (genesis, other) = (crate::OpId::hash(b"branch"), crate::OpId::hash(b"reset"));
+        let window = crate::sync::ActorWindow {
+            after: None,
+            through: Some(crate::ActorId::from_bytes([4; 32])),
+            behind: None,
+        };
+        let mut log = RequestLog::default();
+        log.sent(key, (genesis, None), window, 2);
+        let positions = BTreeSet::from([crate::ActorId::from_bytes([9; 32])]);
+        let page = crate::sync::SyncPage {
+            topic_id: topic(1),
+            more: true,
+            missing: BTreeSet::new(),
+            positions: positions.clone(),
+            continued: false,
+        };
+        log.settle(&key, Some(genesis), &page, false);
+        let learned = log.knowledge(&key, genesis, None);
+        assert_eq!((learned.positions(), learned.revision()), (1, 1));
+        assert_eq!(log.knowledge(&key, genesis, Some(3)), learned);
+        log.sent(key, (genesis, Some(3)), Default::default(), 2);
+        assert_eq!(log.knowledge(&key, genesis, Some(3)), learned);
+        assert_eq!(log.knowledge(&key, genesis, Some(4)), Default::default());
+        assert_eq!(log.knowledge(&key, other, Some(3)), Default::default());
+        assert_eq!(log.revision(&key, Some(other)), 0);
+        log.settle(&key, Some(other), &page, false);
+        assert_eq!(log.knowledge(&key, genesis, Some(3)), learned);
+        log.sent(key, (other, None), Default::default(), 2);
+        assert_eq!(log.knowledge(&key, genesis, Some(3)), Default::default());
+    }
+
+    /// An entry a node keeps requesting with stays while more entries than the
+    /// log holds come and go around it.
+    #[test]
+    fn requests_remain_used() {
+        let genesis = crate::OpId::hash(b"branch");
+        let key = (peer(1), topic(1));
+        let page = crate::sync::SyncPage {
+            topic_id: topic(1),
+            more: true,
+            missing: BTreeSet::new(),
+            positions: BTreeSet::from([crate::ActorId::from_bytes([9; 32])]),
+            continued: false,
+        };
+        let mut log = RequestLog::default();
+        log.sent(key, (genesis, None), Default::default(), 2);
+        log.settle(&key, Some(genesis), &page, false);
+        for index in 0..2 * MAX_BOOTSTRAP_RECEIPTS as u64 {
+            let mut id = [0_u8; 32];
+            id[..8].copy_from_slice(&index.to_le_bytes());
+            let other = (PeerId::from_bytes(id), topic(2));
+            log.sent(other, (genesis, None), Default::default(), 2);
+            log.sent(key, (genesis, None), Default::default(), 2);
+        }
+        assert_eq!(log.knowledge(&key, genesis, None).positions(), 1);
+        assert!(log.entries.len() <= MAX_BOOTSTRAP_RECEIPTS);
+    }
+
+    #[test]
+    fn hint_bytes_bound() {
+        let genesis = crate::OpId::hash(b"byte-bound");
+        let mut requests = RequestLog::default();
+        for index in 0..40_u8 {
+            let key = (peer(index), topic(1));
+            requests.sent(
+                key,
+                (genesis, None),
+                crate::sync::ActorWindow {
+                    after: None,
+                    through: Some(crate::ActorId::from_bytes([1; 32])),
+                    behind: Some(crate::sync::ActorFilter {
+                        bits: vec![255; crate::sync::MAX_FILTER_BYTES],
+                    }),
+                },
+                40,
+            );
+            requests.settle(
+                &key,
+                Some(genesis),
+                &crate::sync::SyncPage {
+                    topic_id: key.1,
+                    more: true,
+                    missing: Default::default(),
+                    positions: [crate::ActorId::from_bytes([index; 32])].into(),
+                    continued: false,
+                },
+                false,
+            );
+            assert!(requests.bytes + LOG_INDEX_BYTES <= REQUEST_LOG_BYTES);
+            assert_eq!(
+                requests.bytes,
+                requests
+                    .entries
+                    .values()
+                    .map(RequestEntry::bytes)
+                    .sum::<usize>()
+            );
+        }
+        assert!(requests.entries.len() < 40);
+        assert_eq!(
+            requests.knowledge(&(peer(0), topic(1)), genesis, None),
+            Default::default()
+        );
+        let key = (peer(39), topic(1));
+        assert_eq!(requests.knowledge(&key, genesis, None).positions(), 1);
+        let before = requests.bytes;
+        requests.sent(key, (genesis, None), Default::default(), 40);
+        assert!(requests.bytes < before);
+
+        let mut receipts = ReceiptLog::default();
+        for index in 0..8_u8 {
+            let mut clock = crate::ActorClock::new();
+            for actor in 0..65_536_u32 {
+                clock.observe(
+                    crate::ActorId::hash(
+                        [index]
+                            .into_iter()
+                            .chain(actor.to_le_bytes())
+                            .collect::<Vec<_>>(),
+                    ),
+                    1,
+                );
+            }
+            receipts.record(
+                peer(index),
+                crate::sync::SyncReceipt {
+                    topic_id: topic(1),
+                    genesis,
+                    session: u64::from(index),
+                    clock,
+                },
+            );
+            assert!(receipts.bytes + LOG_INDEX_BYTES <= RECEIPT_LOG_BYTES);
+            assert_eq!(
+                receipts.bytes,
+                receipts
+                    .clocks
+                    .values()
+                    .map(ReceiptLog::charge)
+                    .sum::<usize>()
+            );
+        }
+        assert!(receipts.clocks.len() < 8);
+        assert!(!receipts.clocks.contains_key(&(peer(0), topic(1))));
+        receipts.record(
+            peer(7),
+            crate::sync::SyncReceipt {
+                topic_id: topic(1),
+                genesis,
+                session: 9,
+                clock: Default::default(),
+            },
+        );
+        receipts.clear(&(peer(7), topic(1)));
+        assert_eq!(
+            receipts.bytes,
+            receipts
+                .clocks
+                .values()
+                .map(ReceiptLog::charge)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn scheduler_deduplicates_targets() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(1), topic(2), false);
+        scheduler.schedule_now(peer(1), topic(2), false);
+
+        let due = scheduler.due_targets(8, 8);
+
+        assert_eq!(due.len(), 1);
+        let (peer_id, targets) = &due[0];
+        assert_eq!(*peer_id, peer(1));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].key.topic_id, topic(2));
+        scheduler.complete_clean(targets[0]);
+        assert!(scheduler.next_due().is_none());
+    }
+
+    #[test]
+    fn groups_due_targets() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(1), topic(1), false);
+        scheduler.schedule_now(peer(1), topic(2), false);
+        scheduler.schedule_now(peer(1), topic(3), false);
+        scheduler.schedule_now(peer(2), topic(1), false);
+
+        let due = scheduler.due_targets(8, 2);
+
+        assert_eq!(due.len(), 2);
+        let (first_peer, first_targets) = &due[0];
+        assert_eq!(*first_peer, peer(1));
+        assert_eq!(first_targets.len(), 2);
+        let (second_peer, second_targets) = &due[1];
+        assert_eq!(*second_peer, peer(2));
+        assert_eq!(second_targets.len(), 1);
+
+        // Targets handed out stay in flight until completed, and a peer taking
+        // its turn is not given a second one.
+        assert!(scheduler.due_targets(8, 8).is_empty());
+    }
+
+    #[test]
+    fn capped_failure_backoff() {
+        let scheduler = ResyncScheduler::default();
+        let peer_id = peer(3);
+        let topic_id = topic(4);
+        scheduler.schedule_now(peer_id, topic_id, false);
+        let mut due = scheduler.due_targets(8, 8);
+        assert_eq!(due.len(), 1);
+
+        scheduler.complete_failed(
+            due.remove(0).1[0],
+            Duration::from_secs(1),
+            Duration::from_secs(600),
+        );
+        let first_delay = scheduler
+            .next_due()
+            .unwrap()
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(first_delay <= Duration::from_secs(1));
+
+        for _ in 0..16 {
+            // Each failure needs its own claim: a completion must own one.
+            scheduler.schedule_now(peer_id, topic_id, true);
+            let mut due = scheduler.due_targets(8, 8);
+            assert_eq!(due.len(), 1);
+            scheduler.complete_failed(
+                due.remove(0).1[0],
+                Duration::from_secs(1),
+                Duration::from_secs(600),
+            );
+        }
+        let capped_delay = scheduler
+            .next_due()
+            .unwrap()
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(capped_delay <= Duration::from_secs(600));
+    }
+
+    /// A claim for the single due target of one peer.
+    fn one_claim(scheduler: &ResyncScheduler) -> ResyncTarget {
+        let mut due = scheduler.due_targets(8, 8);
+        assert_eq!(due.len(), 1);
+        let targets = due.remove(0).1;
+        assert_eq!(targets.len(), 1);
+        targets[0]
+    }
+
+    /// A panic between taking a claim and recording its result must not leave
+    /// the target owned by nobody: the guard hands the claim back on unwind, so
+    /// the target becomes dispatchable again.
+    #[test]
+    fn panic_returns_claim() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(71), topic(72), false);
+        let claim = one_claim(&scheduler);
+        let mut lease = scheduler.lease(vec![claim], BACKOFF);
+        let key = ResyncTargetKey {
+            peer_id: peer(71),
+            topic_id: topic(72),
+        };
+
+        let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = lease.take_claim(&key).expect("claim");
+            assert_eq!(guard.key(), key);
+            panic!("result recording failed");
+        }));
+        assert!(taken.is_err(), "the work between take and settle panicked");
+
+        let (active, _, _) = scheduler
+            .target_state(peer(71), topic(72))
+            .expect("the target must survive");
+        assert!(
+            active.is_none(),
+            "an orphan claim would leave the target owned forever"
+        );
+        // It is dispatchable again rather than stuck in flight.
+        assert!(scheduler.next_due().is_some());
+    }
+
+    /// A drained collection releases every claim it still holds when the task
+    /// finishing them unwinds part way through.
+    #[test]
+    fn panic_returns_drained() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(73), topic(74), false);
+        scheduler.schedule_now(peer(73), topic(75), false);
+        let mut due = scheduler.due_targets(8, 8);
+        let claims = due.remove(0).1;
+        assert_eq!(claims.len(), 2);
+        let mut lease = scheduler.lease(claims, BACKOFF);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let drained = lease.drain_claims();
+            assert_eq!(drained.len(), 2);
+            panic!("failed part way through the drained claims");
+        }));
+        assert!(result.is_err());
+
+        for topic_id in [topic(74), topic(75)] {
+            let (active, _, _) = scheduler
+                .target_state(peer(73), topic_id)
+                .expect("target survives");
+            assert!(active.is_none(), "every drained claim is handed back");
+        }
+    }
+
+    /// A peer waiting behind a full set of slots is served as soon as one
+    /// frees, and peers still taking a turn are never claimed twice.
+    #[test]
+    fn slot_serves_waiter() {
+        let scheduler = ResyncScheduler::default();
+        let waiting = MAX_RESYNC_PEERS + 1;
+        for index in 0..waiting {
+            scheduler.schedule_now(peer(50 + index as u8), topic(60), false);
+        }
+
+        let first = scheduler.due_targets(MAX_RESYNC_PEERS, MAX_RESYNC_TOPICS);
+        assert_eq!(first.len(), MAX_RESYNC_PEERS, "every slot is filled");
+        assert!(
+            scheduler.due_targets(0, MAX_RESYNC_TOPICS).is_empty(),
+            "no slot is free, so nothing more is claimed"
+        );
+
+        // The first peer finishes; the waiting peer takes the freed slot.
+        let (done_peer, claims) = first.into_iter().next().expect("one claimed peer");
+        for claim in claims {
+            scheduler.complete_clean(claim);
+        }
+        let next = scheduler.due_targets(1, MAX_RESYNC_TOPICS);
+        assert_eq!(next.len(), 1, "the freed slot is refilled at once");
+        assert_ne!(
+            next[0].0, done_peer,
+            "the finished peer is not reclaimed for work it completed"
+        );
+        assert_eq!(
+            next[0].0,
+            peer(50 + MAX_RESYNC_PEERS as u8),
+            "the peer that was waiting is the one served"
+        );
+    }
+
+    /// Work that arrives while an attempt is in flight must survive that
+    /// attempt's clean completion, and repeated reevaluation must not keep
+    /// inventing work revisions.
+    #[test]
+    fn publish_survives_clean() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(41), topic(42), false);
+        let claim = one_claim(&scheduler);
+
+        // Reevaluating the same evidence adds no work.
+        for _ in 0..8 {
+            scheduler.reconsider(peer(41), topic(42));
+        }
+        // A publish during the attempt does.
+        scheduler.schedule_now(peer(41), topic(42), false);
+        scheduler.complete_clean(claim);
+
+        let (active, failures, _) = scheduler
+            .target_state(peer(41), topic(42))
+            .expect("work from mid-attempt must survive a clean completion");
+        assert!(active.is_none(), "the attempt is finished");
+        assert_eq!(failures, 0, "surviving work is not a failure");
+
+        // The next dispatch serves it, and completing that removes the target.
+        let again = one_claim(&scheduler);
+        assert_eq!(again.key.topic_id, topic(42));
+        scheduler.complete_clean(again);
+        assert!(
+            scheduler.target_state(peer(41), topic(42)).is_none(),
+            "a completion covering the newest request clears the target"
+        );
+    }
+
+    /// A page cut to the message share keeps a causal prefix and says more
+    /// remains, instead of silently dropping the tail or the page result.
+    #[test]
+    fn page_fits_messages() {
+        let node = Irokle::in_memory().unwrap();
+        let topic = node
+            .create_topic::<Ping>(crate::TopicConfig::default())
+            .unwrap();
+        for _ in 0..(3 * MAX_DATA_OPS) {
+            topic.publish(Ping).unwrap();
+        }
+        let ops = crate::oplog::topological(node.storage(), &topic.id()).unwrap();
+        let whole = crate::net::sync_data_page(topic.id(), ops.clone(), 8, usize::MAX).unwrap();
+        assert!(!whole.cut);
+        assert_eq!(whole.messages.len(), 4);
+
+        let cut = crate::net::sync_data_page(topic.id(), ops.clone(), 2, usize::MAX).unwrap();
+        assert!(cut.cut, "a cut page must report the rest");
+        assert!(cut.messages.len() <= 2);
+        let sent = cut
+            .messages
+            .iter()
+            .flat_map(|message| match message {
+                SyncMessage::Data(data) => data.ops.clone(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert!(!sent.is_empty());
+        assert_eq!(sent, ops[..sent.len()], "the kept part is a prefix");
+    }
+
+    /// A topic settled during a batch leaves the lease, so the batch deadline
+    /// recovers only the claims still unfinished. A completed topic keeps its
+    /// one terminal result instead of being reinserted as a forced retry.
+    #[test]
+    fn timeout_spares_settled() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(31), topic(32), false);
+        scheduler.schedule_now(peer(31), topic(33), false);
+        let mut due = scheduler.due_targets(8, 8);
+        assert_eq!(due.len(), 1);
+        let claims = due.remove(0).1;
+        assert_eq!(claims.len(), 2);
+        let mut lease = scheduler.lease(claims, BACKOFF);
+
+        // The first topic finishes cleanly inside the batch.
+        let done = lease
+            .take_claim(&ResyncTargetKey {
+                peer_id: peer(31),
+                topic_id: topic(32),
+            })
+            .expect("first claim");
+        scheduler.complete_clean(done.settle());
+        assert!(
+            scheduler.target_state(peer(31), topic(32)).is_none(),
+            "a clean completion removes the target"
+        );
+
+        // The deadline then expires while the second topic is still in flight.
+        let timed_out_claims = lease.drain_claims();
+        assert_eq!(
+            timed_out_claims.len(),
+            1,
+            "only unfinished work is recovered"
+        );
+        assert_eq!(timed_out_claims[0].key().topic_id, topic(33));
+        let mut recovered = timed_out_claims;
+        scheduler.complete_failed(
+            recovered.remove(0).settle(),
+            BACKOFF,
+            Duration::from_secs(600),
+        );
+        assert!(
+            scheduler.target_state(peer(31), topic(32)).is_none(),
+            "the settled topic must not be reinserted by the timeout"
+        );
+        let (_, failures, force) = scheduler.target_state(peer(31), topic(33)).unwrap();
+        assert_eq!(failures, 1);
+        assert!(force.is_some(), "the unfinished topic retries");
+    }
+
+    /// A bounded page that really advanced is served again after a short turn.
+    /// It must not grow the network backoff or count as a failed attempt: that
+    /// is what turned working catch-up into a failing peer.
+    #[test]
+    fn progress_keeps_backoff() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(21), topic(22), false);
+        let advancing = one_claim(&scheduler);
+        scheduler.complete_dirty(advancing, RESYNC_PROGRESS_TURN);
+        let (active, failures, _) = scheduler.target_state(peer(21), topic(22)).unwrap();
+        assert!(active.is_none(), "the attempt is finished");
+        assert_eq!(failures, 0, "progress must not grow the network backoff");
+
+        // A no-progress exchange does back off, so repeats cannot spin.
+        let blocked_scheduler = ResyncScheduler::default();
+        blocked_scheduler.schedule_now(peer(23), topic(24), false);
+        let blocked = one_claim(&blocked_scheduler);
+        blocked_scheduler.complete_failed(blocked, BACKOFF, Duration::from_secs(600));
+        let (_, failures, _) = blocked_scheduler.target_state(peer(23), topic(24)).unwrap();
+        assert_eq!(failures, 1, "a no-progress exchange must back off");
+    }
+
+    #[test]
+    fn keeps_force_request() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(5), topic(6), false);
+        let claim = one_claim(&scheduler);
+
+        // A force request that arrives during the attempt is not covered by it.
+        scheduler.schedule_now(peer(5), topic(6), true);
+        scheduler.complete_clean(claim);
+
+        assert!(scheduler.next_due().is_some());
+        let (active, _, force) = scheduler.target_state(peer(5), topic(6)).unwrap();
+        assert_eq!(active, None);
+        assert!(force.is_some());
+    }
+
+    #[test]
+    fn ignores_stale_failure() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(7), topic(8), false);
+        let claim = one_claim(&scheduler);
+
+        scheduler.complete_clean(claim);
+        scheduler.complete_failed(claim, Duration::from_secs(1), Duration::from_secs(600));
+
+        assert!(scheduler.next_due().is_none());
+        assert_eq!(scheduler.target_state(peer(7), topic(8)), None);
+    }
+
+    #[test]
+    fn ignores_stale_completion() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(9), topic(10), false);
+        let stale = one_claim(&scheduler);
+        scheduler.complete_clean(stale);
+        scheduler.schedule_now(peer(9), topic(10), true);
+        let live = one_claim(&scheduler);
+
+        scheduler.complete_dirty(stale, Duration::from_secs(5));
+        scheduler.complete_clean(stale);
+        scheduler.complete_failed(stale, Duration::from_secs(1), Duration::from_secs(600));
+
+        assert!(scheduler.due_targets(8, 8).is_empty());
+        assert!(scheduler.next_due().is_none());
+        let (active, failures, force) = scheduler.target_state(peer(9), topic(10)).unwrap();
+        assert_eq!(active, Some(live.attempt));
+        assert_eq!(failures, 0);
+        assert_eq!(force, live.force);
+    }
+
+    #[test]
+    fn panic_releases_lease() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(13), topic(14), false);
+        let claim = one_claim(&scheduler);
+        let lease = scheduler.lease(vec![claim], Duration::ZERO);
+
+        let batch = std::thread::spawn(move || {
+            let _lease = lease;
+            panic!("batch task panicked");
+        });
+        assert!(batch.join().is_err());
+
+        let released = one_claim(&scheduler);
+        assert_ne!(released.attempt, claim.attempt);
+    }
+
+    #[test]
+    fn timeout_spares_completed() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(15), topic(1), false);
+        scheduler.schedule_now(peer(15), topic(2), false);
+        let mut due = scheduler.due_targets(8, 8);
+        assert_eq!(due.len(), 1);
+        let mut lease = scheduler.lease(due.remove(0).1, Duration::ZERO);
+        let done = lease
+            .take_claim(&ResyncTargetKey {
+                peer_id: peer(15),
+                topic_id: topic(1),
+            })
+            .unwrap();
+        scheduler.complete_clean(done.settle());
+
+        let unfinished = lease.drain_claims();
+
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].key().topic_id, topic(2));
+        for claim in unfinished {
+            scheduler.complete_failed(
+                claim.settle(),
+                Duration::from_secs(1),
+                Duration::from_secs(600),
+            );
+        }
+        assert_eq!(scheduler.target_state(peer(15), topic(1)), None);
+        let (active, failures, _) = scheduler.target_state(peer(15), topic(2)).unwrap();
+        assert_eq!(active, None);
+        assert_eq!(failures, 1);
+    }
+
+    /// A node whose iroh endpoint matches its signer, for the scheduler paths
+    /// that need a real `IrohNet`.
+    async fn test_net() -> Arc<IrohNet<MemoryStorage>> {
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let node = Irokle::builder()
+            .with_iroh_secret_key(endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        Arc::new(IrohNet::new(endpoint, node).unwrap())
+    }
+
+    /// A net over gated storage, with no loops running.
+    async fn stale_net() -> (
+        Arc<IrohNet<crate::tests::support::StaleReadStorage>>,
+        crate::tests::support::StaleReadStorage,
+    ) {
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let storage = crate::tests::support::StaleReadStorage::new(MemoryStorage::new());
+        let node = Irokle::builder()
+            .with_storage(storage.clone())
+            .with_iroh_secret_key(endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        // A peer that went away fails a dial quickly; nothing here measures it.
+        let runtime = IrohRuntimeConfig {
+            connect_timeout: Duration::from_secs(2),
+            ..IrohRuntimeConfig::default()
+        };
+        let net = IrohNet::new_with_config(endpoint, node, runtime).unwrap();
+        (Arc::new(net), storage)
+    }
+
+    /// On a one-worker runtime, a control job completes while every bulk permit
+    /// is taken, one of them by a job held inside a storage read.
+    #[tokio::test]
+    async fn control_passes_bulk() {
+        use crate::tests::support::{Gate, GatePoint, Note, node};
+
+        let (net, storage) = stale_net().await;
+        let remote = node(61);
+        let topic_id = net
+            .node
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [remote.peer_id()].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Heads(topic_id), Arc::clone(&gate));
+        let held = {
+            let net = Arc::clone(&net);
+            tokio::spawn(async move {
+                net.run_job(Lane::Bulk, move |shared| {
+                    shared.node.storage().heads(&topic_id).map(drop)
+                })
+                .await
+            })
+        };
+        let (waiting, parked) = std::sync::mpsc::channel::<()>();
+        let filler = {
+            let net = Arc::clone(&net);
+            tokio::spawn(async move {
+                net.run_job(Lane::Bulk, move |_| {
+                    let _ = parked.recv_timeout(Duration::from_secs(60));
+                })
+                .await
+            })
+        };
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while net.bulk_lane.available_permits() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bulk lane never filled");
+
+        let open = vec![SyncMessage::Open(remote.sync_open(topic_id))];
+        let endpoint = endpoint_addr(remote.peer_id()).unwrap().id;
+        let replies = tokio::time::timeout(
+            Duration::from_secs(60),
+            net.run_job(Lane::Control, move |shared| {
+                shared.handle_messages(endpoint, open)
+            }),
+        )
+        .await
+        .expect("control work waited behind bulk work")
+        .unwrap()
+        .unwrap();
+        assert!(matches!(replies.messages(), [SyncMessage::Summary(_)]));
+        assert!(
+            !gate.has_left(),
+            "control work finished only after bulk work"
+        );
+
+        drop(release);
+        drop(waiting);
+        held.await.unwrap().unwrap().unwrap();
+        filler.await.unwrap().unwrap();
+        net.shutdown().await;
+    }
+
+    /// A requester that goes away does not stop a started bulk job: it still
+    /// commits, keeps its permit until it ends, and shutdown waits for it. A
+    /// requester dropped before its first poll starts nothing.
+    #[tokio::test]
+    async fn cancelled_job_commits() {
+        use crate::tests::support::{Gate, GatePoint, chain_source};
+
+        let (net, storage) = stale_net().await;
+        let (source, topic_id, ops) = chain_source(62, net.node.peer_id());
+        let admit = |net: &Arc<IrohNet<crate::tests::support::StaleReadStorage>>| {
+            let net = Arc::clone(net);
+            let source_peer = source.peer_id();
+            let data = crate::sync::SyncData {
+                topic_id,
+                ops: ops.clone(),
+            };
+            tokio::spawn(async move {
+                net.run_job(Lane::Bulk, move |shared| {
+                    shared.node.storage().heads(&topic_id)?;
+                    shared.node.receive_sync_data_from(source_peer, data)
+                })
+                .await
+            })
+        };
+
+        let unpolled = admit(&net);
+        unpolled.abort();
+        assert!(unpolled.await.unwrap_err().is_cancelled());
+        assert_eq!(net.bulk_lane.available_permits(), BULK_JOBS);
+        assert_eq!(net.tasks.running(), 0);
+        assert!(storage.topic_state(&topic_id).unwrap().is_none());
+
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Heads(topic_id), Arc::clone(&gate));
+        let requester = admit(&net);
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+        requester.abort();
+        assert!(requester.await.unwrap_err().is_cancelled());
+        assert_eq!(net.bulk_lane.available_permits(), BULK_JOBS - 1);
+
+        let outcome = net.shutdown_with_timeout(Duration::from_millis(200)).await;
+        assert!(
+            matches!(outcome, ShutdownOutcome::Incomplete { running } if running >= 1),
+            "{outcome:?}"
+        );
+        drop(release);
+        assert_eq!(
+            net.shutdown_with_timeout(Duration::from_secs(60)).await,
+            ShutdownOutcome::Complete
+        );
+        assert_eq!(net.bulk_lane.available_permits(), BULK_JOBS);
+        assert_eq!(
+            storage.list_op_ids(&topic_id).unwrap().len(),
+            ops.len(),
+            "the job committed after its requester left"
+        );
+    }
+
+    /// End to end, a manual attempt that started first but finishes last
+    /// cannot overwrite the status of a newer attempt that already finished,
+    /// though its failure still counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_attempt_loses() {
+        use crate::tests::support::{Gate, GatePoint, Note};
+        use futures::StreamExt;
+        use iroh::Watcher;
+
+        let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let alice = Irokle::builder()
+            .with_iroh_secret_key(alice_endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        let alice_net = Arc::new(IrohNet::new(alice_endpoint, alice.clone()).unwrap());
+        alice_net.start_accept_loop().unwrap();
+        let mut alice_addr = alice_net.endpoint().addr();
+        let mut addrs = alice_net.endpoint().watch_addr().stream();
+        while alice_addr.addrs.is_empty() {
+            alice_addr = tokio::time::timeout(Duration::from_secs(60), addrs.next())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let (bob_net, storage) = stale_net().await;
+        let topic = alice
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [bob_net.node.peer_id()].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap();
+        topic.publish(Note { text: "one".into() }).unwrap();
+        let topic_id = topic.id();
+        let ops = crate::oplog::topological(alice.storage(), &topic_id).unwrap();
+        bob_net
+            .node
+            .receive_sync_data_from(alice.peer_id(), crate::sync::SyncData { topic_id, ops })
+            .unwrap();
+
+        // The older attempt pauses while preparing its fingerprints, at the open's
+        // live state read after the digest's snapshot, so the newer one can read.
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read_after(GatePoint::Topic(topic_id), 1, Arc::clone(&gate));
+        let older = {
+            let net = Arc::clone(&bob_net);
+            let addr = alice_addr.clone();
+            tokio::spawn(async move { net.sync_now(addr, topic_id).await })
+        };
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+
+        bob_net.sync_now(alice_addr, topic_id).await.unwrap();
+        let newer = bob_net.node.sync_status(topic_id).unwrap().remove(0);
+        assert_eq!(newer.state, crate::SyncPeerState::Healthy);
+
+        // The older attempt now fails against a peer that has gone away.
+        alice_net.shutdown().await;
+        drop(release);
+        assert!(older.await.unwrap().is_err());
+        let status = bob_net.node.sync_status(topic_id).unwrap().remove(0);
+        assert_eq!(status.state, crate::SyncPeerState::Healthy, "{status:?}");
+        assert_eq!(status.latest_attempt, newer.latest_attempt);
+        assert_eq!((status.successful_attempts, status.failed_attempts), (1, 1));
+        bob_net.shutdown().await;
+    }
+
+    /// Shutdown before any loop subscribes must still be recorded. The watch
+    /// channel has no receivers at that point, so a plain send would drop the
+    /// intent and let a loop started later run as if the net were live.
+    #[tokio::test]
+    async fn shutdown_without_receivers() {
+        let net = test_net().await;
+        assert!(!net.is_shutdown());
+        net.shutdown().await;
+        assert!(
+            net.is_shutdown(),
+            "terminal shutdown must be retained with no watch receivers"
+        );
+
+        // Repeating it is safe and stays terminal.
+        net.shutdown().await;
+        assert!(net.is_shutdown());
+        assert!(
+            !dispatch_due_resyncs(
+                &Arc::downgrade(&net),
+                &mut tokio::task::JoinSet::new(),
+                IrohRuntimeConfig::default(),
+            ),
+            "a terminally closed net must not dispatch new work"
+        );
+    }
+
+    /// A new resync loop must not take back a claim a live lease still holds.
+    #[tokio::test]
+    async fn restart_keeps_claims() {
+        let net = test_net().await;
+        let scheduler = &net.resync_scheduler;
+        scheduler.schedule_now(peer(16), topic(17), false);
+        let claim = one_claim(scheduler);
+        let _lease = scheduler.lease(vec![claim], Duration::ZERO);
+        // A second due target shows when the new loop has dispatched.
+        scheduler.schedule_now(peer(18), topic(17), false);
+        let idle = scheduler.target_state(peer(18), topic(17));
+
+        let resync = net
+            .spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("loop starts");
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while scheduler.target_state(peer(18), topic(17)) == idle {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the new loop never dispatched");
+
+        assert_eq!(
+            scheduler
+                .target_state(peer(16), topic(17))
+                .map(|state| state.0),
+            Some(Some(claim.attempt)),
+            "the new loop took over a claim a live lease holds"
+        );
+        resync.abort();
+        let _ = resync.await;
+        net.shutdown().await;
+    }
+
+    /// A slow maintenance topic must not hold the resync loop: durable work for
+    /// a healthy topic is scheduled and dispatched while quarantine of the
+    /// first topic is held inside a storage read.
+    #[tokio::test]
+    async fn sweep_isolates_quarantine() {
+        use crate::tests::support::{Gate, GatePoint, Note, StaleReadStorage};
+
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let storage = StaleReadStorage::new(MemoryStorage::new());
+        let node = Irokle::with_storage(
+            storage.clone(),
+            crate::NodeConfig {
+                signer: crate::Ed25519Signer::from_iroh_secret_key(endpoint.secret_key()),
+                default_write_concern: crate::WriteConcern::Local,
+                ..crate::NodeConfig::default()
+            },
+        )
+        .unwrap();
+        let remote = crate::Signer::peer_id(&crate::Ed25519Signer::from_bytes(&[41; 32]));
+        // Topics are visited in id order, so the held topic must sort first: two
+        // fixed ids, sorted, decide which topic is held and which is healthy.
+        let mut ids = [
+            crate::TopicId::hash(b"sweep held"),
+            crate::TopicId::hash(b"sweep healthy"),
+        ];
+        ids.sort();
+        let [slow, healthy] = ids;
+        let log = crate::oplog::Oplog::with_storage(storage.clone());
+        for (topic_id, peers) in [(slow, vec![]), (healthy, vec![remote])] {
+            let members = peers.into_iter().chain([node.peer_id()]);
+            let genesis = crate::TopicGenesis::new(<Note as crate::Event>::TYPE_ID, members);
+            let actor = crate::actor_id_for(topic_id, node.peer_id());
+            log.create_topic_genesis(topic_id, actor, genesis, node.signer())
+                .unwrap();
+        }
+        let genesis = storage
+            .topic_state(&healthy)
+            .unwrap()
+            .map(|state| state.genesis);
+        let mut clock = crate::ActorClock::new();
+        clock.observe(crate::actor_id_for(healthy, node.peer_id()), 1);
+        storage
+            .put_sync_obligation(
+                crate::storage::SyncObligation::clock(remote, healthy, clock),
+                genesis,
+            )
+            .unwrap();
+
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Heads(slow), Arc::clone(&gate));
+        let net = Arc::new(IrohNet::new(endpoint, node).unwrap());
+        net.spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("loop starts");
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !net
+                .resync_scheduler
+                .target_state(remote, healthy)
+                .is_some_and(|(active, failures, _)| active.is_some() || failures > 0)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the healthy target was not dispatched while maintenance was held");
+        assert!(
+            !gate.has_left(),
+            "the target was dispatched only after maintenance"
+        );
+
+        drop(release);
+        net.shutdown().await;
+    }
+
+    /// Manual syncs and resync batches share the outbound peer slots: with
+    /// every slot held the loop claims nothing, and a running manual sync holds
+    /// a slot the loop cannot use.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_shares_slots() {
+        use crate::tests::support::{Note, node};
+
+        let (net, _storage) = stale_net().await;
+        let remote = node(74).peer_id();
+        let topic_id = net
+            .node
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [remote].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+        let runtime = net.runtime_config();
+        let weak = Arc::downgrade(&net);
+        let mut syncs = tokio::task::JoinSet::new();
+
+        let held = Arc::clone(&net.outbound)
+            .acquire_many_owned(MAX_RESYNC_PEERS as u32)
+            .await
+            .unwrap();
+        let manual = tokio::spawn({
+            let net = Arc::clone(&net);
+            async move { net.sync_peer_now(remote, topic_id).await }
+        });
+        net.schedule_resync(remote, topic_id);
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, runtime));
+        assert!(syncs.is_empty(), "the loop dispatched without a free slot");
+        assert!(
+            !manual.is_finished(),
+            "a manual sync ran without a free slot"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while net.outbound.available_permits() == MAX_RESYNC_PEERS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the manual sync never took a slot");
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, runtime));
+        assert!(syncs.len() < MAX_RESYNC_PEERS);
+        let _ = manual.await.unwrap();
+        syncs.abort_all();
+        while syncs.join_next().await.is_some() {}
+        assert_eq!(net.outbound.available_permits(), MAX_RESYNC_PEERS);
+        net.shutdown().await;
+    }
+
+    /// Target discovery held inside its storage read does not hold dispatch: a
+    /// target scheduled meanwhile is claimed while the sweep still waits.
+    #[tokio::test]
+    async fn sweep_discovery_isolated() {
+        use crate::tests::support::{Gate, GatePoint, Note, node};
+
+        let (net, storage) = stale_net().await;
+        let remote = node(73).peer_id();
+        let healthy = net
+            .node
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [remote].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Topics, Arc::clone(&gate));
+        net.spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("loop starts");
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+
+        net.schedule_resync(remote, healthy);
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !net
+                .resync_scheduler
+                .target_state(remote, healthy)
+                .is_some_and(|(active, failures, _)| active.is_some() || failures > 0)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the target was not dispatched while discovery was held");
+        assert!(
+            !gate.has_left(),
+            "the target was dispatched only after discovery"
+        );
+
+        drop(release);
+        net.shutdown().await;
+    }
+
+    /// Aborting the accept loop before its first poll still clears its latch.
+    #[tokio::test]
+    async fn accept_abort_replaces() {
+        let net = test_net().await;
+        let first = net
+            .spawn_accept_loop()
+            .unwrap()
+            .expect("the first accept loop starts");
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        assert!(net.spawn_accept_loop().unwrap().is_some());
+        net.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn refills_free_slots() {
+        let net = test_net().await;
+        let weak = Arc::downgrade(&net);
+        let mut syncs = tokio::task::JoinSet::new();
+        net.resync_scheduler.schedule_now(peer(20), topic(1), false);
+        net.resync_scheduler.schedule_now(peer(21), topic(1), false);
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, net.runtime));
+        assert_eq!(syncs.len(), 2);
+
+        // A peer that becomes due while other turns run takes a free slot now.
+        net.resync_scheduler.schedule_now(peer(22), topic(1), false);
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, net.runtime));
+
+        assert_eq!(syncs.len(), 3);
+        let (active, _, _) = net
+            .resync_scheduler
+            .target_state(peer(22), topic(1))
+            .unwrap();
+        assert!(active.is_some());
+    }
+
+    #[test]
+    fn full_slots_park() {
+        let scheduler = ResyncScheduler::default();
+        scheduler.schedule_now(peer(24), topic(1), false);
+
+        let armed = next_resync_wake(&scheduler, MAX_RESYNC_PEERS - 1);
+        let parked = next_resync_wake(&scheduler, MAX_RESYNC_PEERS);
+
+        assert!(armed <= tokio::time::Instant::now());
+        assert!(parked > tokio::time::Instant::now() + Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn skips_busy_peers() {
+        let net = test_net().await;
+        let weak = Arc::downgrade(&net);
+        let mut syncs = tokio::task::JoinSet::new();
+        net.resync_scheduler.schedule_now(peer(23), topic(1), false);
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, net.runtime));
+        assert_eq!(syncs.len(), 1);
+
+        // More work for a peer mid-turn waits for its next turn instead of
+        // opening a second exchange or spinning on its expired deadline.
+        net.resync_scheduler.schedule_now(peer(23), topic(2), false);
+        assert!(dispatch_due_resyncs(&weak, &mut syncs, net.runtime));
+
+        assert_eq!(syncs.len(), 1);
+        let (active, _, _) = net
+            .resync_scheduler
+            .target_state(peer(23), topic(2))
+            .unwrap();
+        assert_eq!(active, None);
+        assert!(net.resync_scheduler.next_due().is_none());
+    }
+
+    #[tokio::test]
+    async fn ack_preserves_claim() {
+        let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let alice = Irokle::builder()
+            .with_iroh_secret_key(alice_endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        let bob = Irokle::builder()
+            .with_iroh_secret_key(bob_endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        let net = IrohNet::new(alice_endpoint, alice.clone()).unwrap();
+        let topic = alice
+            .create_topic::<Ping>(crate::TopicConfig {
+                initial_peers: [bob.peer_id()].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap();
+        net.resync_scheduler
+            .schedule_now(bob.peer_id(), topic.id(), false);
+        let failed = one_claim(&net.resync_scheduler);
+        net.resync_scheduler
+            .complete_failed(failed, BACKOFF, Duration::from_secs(600));
+        net.resync_scheduler
+            .schedule_now(bob.peer_id(), topic.id(), true);
+        let claim = one_claim(&net.resync_scheduler);
+
+        let mut ack = crate::sync::SyncAck {
+            topic_id: topic.id(),
+            peer_id: bob.peer_id(),
+            genesis: alice
+                .storage()
+                .topic_state(&topic.id())
+                .unwrap()
+                .map(|state| state.genesis),
+            accepted: BTreeSet::new(),
+            heads: BTreeSet::new(),
+            clock: crate::ActorClock::new(),
+            signature: None,
+        };
+        ack.sign(bob.signer()).unwrap();
+        net.handle_messages(
+            bob_endpoint.id(),
+            vec![
+                SyncMessage::Open(crate::sync::SyncEngine::<MemoryStorage>::open(
+                    topic.id(),
+                    bob.peer_id(),
+                    Some(<Ping as crate::Event>::TYPE_ID.into()),
+                )),
+                SyncMessage::Ack(ack),
+            ],
+        )
+        .unwrap();
+
+        assert!(net.resync_scheduler.due_targets(8, 8).is_empty());
+        assert_eq!(
+            net.resync_scheduler.target_state(bob.peer_id(), topic.id()),
+            Some((Some(claim.attempt), 1, claim.force))
+        );
+        net.resync_scheduler
+            .complete_failed(claim, BACKOFF, Duration::from_secs(600));
+        let delay = net
+            .resync_scheduler
+            .next_due()
+            .expect("the target stays scheduled")
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(delay > BACKOFF, "peer evidence reset the failure backoff");
+    }
+
+    /// Evidence migrated without a branch certifies nothing, so a clock it
+    /// carries must not mark the target as synchronized.
+    #[tokio::test]
+    async fn legacy_ack_resyncs() {
+        let net = test_net().await;
+        let peer_id = peer(90);
+        let topic = net
+            .node
+            .create_topic::<Ping>(crate::TopicConfig {
+                initial_peers: [peer_id].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap();
+        let clock = net.node.storage().actor_clock(&topic.id()).unwrap();
+        net.node.storage().put_raw_ack(crate::storage::PeerAck {
+            peer_id,
+            topic_id: topic.id(),
+            genesis: None,
+            heads: net.node.storage().heads(&topic.id()).unwrap(),
+            clock,
+        });
+        assert!(
+            net.target_needs_sync(peer_id, topic.id()).unwrap(),
+            "an uncertified clock hid work the peer still needs"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_keeps_permit() {
+        let scheduler = ResyncScheduler::default();
+        let notify = scheduler.notifier();
+        assert!(scheduler.due_targets(8, 8).is_empty());
+
+        scheduler.schedule_now(peer(11), topic(12), false);
+        tokio::time::timeout(Duration::from_secs(60), notify.notified())
+            .await
+            .expect("a schedule after an empty scan must leave a wake permit");
+
+        assert_eq!(scheduler.due_targets(8, 8).len(), 1);
+    }
+
+    /// Shutdown while the accept loop sits at its connection cap also ends
+    /// the handshakes still pending: no owned task is left and the latch clears.
+    #[tokio::test]
+    async fn capacity_shutdown_reaps() {
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let node = Irokle::builder()
+            .with_iroh_secret_key(endpoint.secret_key())
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        let runtime = IrohRuntimeConfig {
+            connect_timeout: Duration::from_secs(600),
+            sync_io_timeout: Duration::from_secs(600),
+            ..IrohRuntimeConfig::default()
+        };
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut net = IrohNet::new_with_config(endpoint, node, runtime).unwrap();
+        net.accept_hooks = AcceptHooks {
+            connections: Some(1),
+            handshakes: Some(Arc::clone(&hold)),
+        };
+        let net = Arc::new(net);
+        let accept = net
+            .spawn_accept_loop()
+            .unwrap()
+            .expect("accept loop starts");
+        let addr = {
+            use futures::StreamExt;
+            use iroh::Watcher;
+            let mut addr = net.endpoint().addr();
+            let mut addrs = net.endpoint().watch_addr().stream();
+            while addr.addrs.is_empty() {
+                addr = tokio::time::timeout(Duration::from_secs(60), addrs.next())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            addr
+        };
+        let held_by_net = Arc::strong_count(&hold);
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let client = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                .bind()
+                .await
+                .unwrap();
+            let addr = addr.clone();
+            clients.push(tokio::spawn(async move {
+                let connection = client.connect(addr, IROKLE_SYNC_ALPN).await;
+                (client, connection)
+            }));
+        }
+        /// Waits for observable progress, with a generous lost-progress cap.
+        async fn settle(condition: impl Fn() -> bool) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            while !condition() {
+                assert!(tokio::time::Instant::now() < deadline, "lost progress");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        // Both handshakes wait on the hold, owned by the net.
+        settle(|| Arc::strong_count(&hold) == held_by_net + 2 && net.tasks.running() == 3).await;
+
+        // One handshake finishes into the only connection slot; the other stays
+        // pending while the loop waits at capacity.
+        hold.add_permits(1);
+        settle(|| {
+            Arc::strong_count(&hold) == held_by_net + 1
+                && net.tasks.running() == 3
+                && clients.iter().any(|client| client.is_finished())
+        })
+        .await;
+
+        // The loop must have ended its handshakes by the time it reports done,
+        // not leave them to be cancelled after it.
+        let stopping = {
+            let net = Arc::clone(&net);
+            tokio::spawn(async move { net.shutdown_with_timeout(Duration::from_secs(60)).await })
+        };
+        accept.await.unwrap();
+        let alive_at_exit = Arc::strong_count(&hold);
+        assert_eq!(stopping.await.unwrap(), ShutdownOutcome::Complete);
+        assert_eq!(
+            alive_at_exit,
+            held_by_net - 1,
+            "a handshake outlived the loop"
+        );
+        assert_eq!(net.tasks.running(), 0);
+        // The loop's own copy of the hold is gone too.
+        assert_eq!(
+            Arc::strong_count(&hold),
+            held_by_net - 1,
+            "a handshake outlived the loop"
+        );
+        assert!(!net.accept_started.load(Ordering::SeqCst));
+        for client in clients {
+            client.abort();
+            let _ = client.await;
+        }
+    }
+
+    /// Aborting the resync loop does not orphan the storage job its batch
+    /// started: the job stays owned, shutdown reports it until it ends, and
+    /// the target is not left owned by the aborted batch.
+    #[tokio::test]
+    async fn abort_keeps_child() {
+        use crate::tests::support::{Gate, GatePoint, Note, node};
+
+        let (net, storage) = stale_net().await;
+        let remote = node(71).peer_id();
+        let topic_id = net
+            .node
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [remote].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::View(topic_id), Arc::clone(&gate));
+        let resync = net
+            .spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("loop starts");
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+
+        resync.abort();
+        assert!(resync.await.unwrap_err().is_cancelled());
+        assert!(!net.resync_started.load(Ordering::SeqCst));
+        assert!(net.tasks.running() >= 1, "the held job lost its owner");
+        let outcome = net.shutdown_with_timeout(Duration::from_millis(200)).await;
+        assert!(
+            matches!(outcome, ShutdownOutcome::Incomplete { running } if running >= 1),
+            "{outcome:?}"
+        );
+
+        drop(release);
+        assert_eq!(
+            net.shutdown_with_timeout(Duration::from_secs(60)).await,
+            ShutdownOutcome::Complete
+        );
+        assert_eq!(net.tasks.running(), 0);
+        assert!(
+            net.resync_scheduler
+                .target_state(remote, topic_id)
+                .is_none_or(|(active, _, _)| active.is_none()),
+            "the aborted batch still owns its target"
+        );
+    }
+
+    /// Loops that end without shutdown, because the endpoint closed, clear
+    /// their latches and leave no owned task, so they can be started again.
+    #[tokio::test]
+    async fn restart_after_exit() {
+        let net = test_net().await;
+        let accept = net
+            .spawn_accept_loop()
+            .unwrap()
+            .expect("accept loop starts");
+        let resync = net
+            .spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("resync loop starts");
+
+        net.endpoint().close().await;
+        net.resync_scheduler.notifier().notify_one();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            accept.await.unwrap();
+            resync.await.unwrap();
+        })
+        .await
+        .expect("loops did not exit after the endpoint closed");
+        assert!(!net.is_shutdown());
+        tokio::time::timeout(Duration::from_secs(60), net.tasks.wait_idle())
+            .await
+            .expect("a task outlived its loop");
+
+        for replacement in [
+            net.spawn_accept_loop().unwrap(),
+            net.spawn_resync_loop(BACKOFF).unwrap(),
+        ] {
+            let replacement = replacement.expect("an exited loop can be started again");
+            replacement.await.unwrap();
+        }
+    }
+
+    /// Once shutdown completes no caller can start network-owned work: every
+    /// root entry point refuses, a loop start runs no startup storage job, and
+    /// nothing new is registered. A repeated shutdown still completes.
+    #[tokio::test]
+    async fn closed_refuses_roots() {
+        use crate::tests::support::{Gate, GatePoint, Note, node};
+
+        let (net, storage) = stale_net().await;
+        let remote = node(72).peer_id();
+        let topic_id = net
+            .node
+            .create_topic::<Note>(crate::TopicConfig {
+                initial_peers: [remote].into(),
+                ..crate::TopicConfig::default()
+            })
+            .unwrap()
+            .id();
+        assert_eq!(
+            net.shutdown_with_timeout(Duration::from_secs(60)).await,
+            ShutdownOutcome::Complete
+        );
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::View(topic_id), Arc::clone(&gate));
+        let refused = |error: io::Error| error.kind() == io::ErrorKind::NotConnected;
+        assert!(net.spawn_resync_loop(BACKOFF).is_err_and(refused));
+        assert!(net.spawn_accept_loop().is_err_and(refused));
+        let addr = endpoint_addr(remote).unwrap();
+        assert!(
+            net.sync_now(addr.clone(), topic_id)
+                .await
+                .is_err_and(refused)
+        );
+        assert!(net.sync_with(addr, &[]).await.is_err_and(refused));
+        assert!(net.accept_one().await.is_err_and(refused));
+        let endpoint_id = iroh::EndpointId::from_bytes(remote.as_bytes()).unwrap();
+        assert!(
+            net.handle_messages(endpoint_id, Vec::new())
+                .is_err_and(refused)
+        );
+        assert_eq!(net.tasks.running(), 0);
+        assert!(
+            !gate.arrived(),
+            "a storage job ran after shutdown completed"
+        );
+        drop(release);
+        assert_eq!(
+            net.shutdown_with_timeout(Duration::from_secs(60)).await,
+            ShutdownOutcome::Complete
+        );
+    }
+
+    /// Callers racing shutdown are either registered before the seal and
+    /// drained by it, or refused; none is left running after completion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registration_races_shutdown() {
+        let net = test_net().await;
+        let peer = iroh::SecretKey::generate().public();
+        let barrier = Arc::new(tokio::sync::Barrier::new(33));
+        let callers = (0..32)
+            .map(|_| {
+                let net = Arc::clone(&net);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    net.handle_messages(peer, Vec::new()).map(drop)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait().await;
+        assert_eq!(
+            net.shutdown_with_timeout(Duration::from_secs(60)).await,
+            ShutdownOutcome::Complete
+        );
+        assert_eq!(net.tasks.running(), 0);
+        for caller in callers {
+            if let Err(error) = caller.await.unwrap() {
+                assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+            }
+        }
+        assert_eq!(net.tasks.running(), 0);
+        assert!(net.handle_messages(peer, Vec::new()).is_err());
+    }
+
+    /// A loop that panics clears its latch on unwind and leaves no owned
+    /// task, so it can be started again.
+    #[tokio::test]
+    async fn restart_after_panic() {
+        let net = test_net().await;
+        // A poisoned scheduler makes the loop's next dispatch panic.
+        let scheduler = net.resync_scheduler.clone();
+        let poisoned = std::thread::spawn(move || {
+            let _held = scheduler.inner.lock().unwrap();
+            panic!("poison the resync scheduler");
+        });
+        assert!(poisoned.join().is_err());
+
+        let resync = net
+            .spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("loop starts");
+        let ended = tokio::time::timeout(Duration::from_secs(60), resync)
+            .await
+            .expect("the loop did not reach its dispatch");
+        assert!(ended.unwrap_err().is_panic());
+        assert!(!net.resync_started.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(60), net.tasks.wait_idle())
+            .await
+            .expect("a task outlived the panicked loop");
+
+        let replacement = net
+            .spawn_resync_loop(BACKOFF)
+            .unwrap()
+            .expect("a panicked loop can be started again");
+        replacement.abort();
+        let _ = replacement.await;
+        net.shutdown().await;
+    }
+}

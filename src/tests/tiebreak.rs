@@ -1,4 +1,4 @@
-use super::support::*;
+use crate::tests::support::*;
 
 use crate::TopicEviction;
 use crate::oplog::Oplog;
@@ -113,7 +113,7 @@ fn assert_fork_converged(fork: &Fork) {
 }
 
 #[test]
-fn fork_resolves_to_smaller_genesis() {
+fn smaller_genesis_wins() {
     let fork = build_fork(1, 2);
     assert_fork_converged(&fork);
 
@@ -136,8 +136,46 @@ fn fork_resolves_to_smaller_genesis() {
     );
 }
 
+/// A tie-break paused inside its resolution on one store must not hold up a
+/// tie-break on an unrelated store.
 #[test]
-fn sync_receive_data_returns_genesis_eviction() {
+fn unrelated_genesis_proceeds() {
+    let topic_id = TopicId::hash(b"slow-genesis-topic");
+    let peer = |seed: u8| Ed25519Signer::from_bytes(&[seed; 32]).peer_id();
+    let stale = || StaleReadStorage::new(MemoryStorage::new());
+    let (log_a, signer_a, g_a, e_a) = forked_side(stale(), topic_id, 5, [peer(6)], "a");
+    let (log_b, signer_b, g_b, e_b) = forked_side(stale(), topic_id, 6, [peer(5)], "b");
+    let (loser, loser_event, winner_peer, winner_ops) = if g_a.id < g_b.id {
+        (log_b, e_b, signer_a.peer_id(), vec![g_a, e_a])
+    } else {
+        (log_a, e_a, signer_b.peer_id(), vec![g_b, e_b])
+    };
+
+    // The loser reads its discarded event while resolving, and waits there.
+    let gate = Arc::new(Gate::default());
+    let release = gate.releaser();
+    loser
+        .storage()
+        .arm_read(GatePoint::Meta(loser_event.id), Arc::clone(&gate));
+    let slow =
+        thread::spawn(move || loser.receive_ops_from_peer_evicting(Some(winner_peer), winner_ops));
+    gate.wait_arrival();
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let unrelated = thread::spawn(move || sender.send(build_fork(7, 8)).unwrap());
+    let fork = receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("an unrelated store's tie-break waited behind a paused one");
+    assert_fork_converged(&fork);
+    unrelated.join().unwrap();
+
+    drop(release);
+    let slow = slow.join().unwrap().unwrap();
+    assert_eq!(slow.evictions.len(), 1);
+}
+
+#[test]
+fn receive_genesis_eviction() {
     let topic_id = TopicId::hash(b"genesis-fork-sync-receive");
     let (oplog_a, signer_a, g_a, e_a) = seed_side(topic_id, 1, 2, "a-branch");
     let (oplog_b, signer_b, g_b, e_b) = seed_side(topic_id, 2, 1, "b-branch");
@@ -191,7 +229,7 @@ fn sync_receive_data_returns_genesis_eviction() {
 }
 
 #[test]
-fn node_receive_sync_data_from_returns_genesis_eviction() {
+fn node_reports_eviction() {
     let topic_id = TopicId::hash(b"genesis-fork-node-receive");
     let (_, signer_a, g_a, e_a) = seed_side(topic_id, 1, 2, "a-branch");
     let (_, signer_b, g_b, e_b) = seed_side(topic_id, 2, 1, "b-branch");
@@ -234,7 +272,7 @@ fn node_receive_sync_data_from_returns_genesis_eviction() {
 }
 
 #[test]
-fn non_member_smaller_genesis_does_not_reset() {
+fn nonmember_no_reset() {
     let topic_id = TopicId::hash(b"genesis-fork-topic");
     // Local chain with no other members, so its membership is exactly {local}.
     let local_signer = Ed25519Signer::from_bytes(&[1; 32]);
@@ -265,7 +303,7 @@ fn non_member_smaller_genesis_does_not_reset() {
         .unwrap();
 
     // A non-member foreign genesis whose id is smaller than the local one, so
-    // only the membership gate — not id ordering — keeps the local chain.
+    // only the membership gate (not id ordering) keeps the local chain.
     let (foreign_signer, foreign_genesis) = (2..=255_u8)
         .find_map(|seed| {
             let signer = Ed25519Signer::from_bytes(&[seed; 32]);
@@ -321,7 +359,7 @@ fn non_member_smaller_genesis_does_not_reset() {
 }
 
 #[test]
-fn fork_resolution_is_symmetric() {
+fn fork_symmetric() {
     // Deterministic ed25519 signing makes genesis ids stable, so scanning seed
     // pairs surfaces both orderings (each physical side wins at least once).
     let mut saw_a_win = false;
@@ -342,7 +380,7 @@ fn fork_resolution_is_symmetric() {
 }
 
 #[test]
-fn reset_completeness_lets_acks_converge() {
+fn reset_acks_converge() {
     let fork = build_fork(1, 2);
     assert_fork_converged(&fork);
 
@@ -409,11 +447,10 @@ fn reset_completeness_lets_acks_converge() {
 }
 
 #[test]
-fn winner_purges_losing_pending() {
-    // `build_fork` feeds the loser's [genesis, event] to the winner in one
-    // batch. The winner keeps its own smaller genesis and filters the loser
-    // genesis, so the loser event lands in pending waiting on a genesis that
-    // will never arrive. The resolution must purge it.
+fn winner_purges_pending() {
+    // `build_fork` feeds the loser's [genesis, event] in one batch.
+    // The winner filters the loser genesis, so its event waits on an id that never arrives.
+    // Resolution must purge that pending event.
     let fork = build_fork(1, 2);
     assert_fork_converged(&fork);
 
@@ -449,7 +486,7 @@ fn winner_purges_losing_pending() {
 }
 
 #[test]
-fn adoption_preserves_partial_winner_pending() {
+fn adoption_partial_pending() {
     // The winning chain can arrive partially: a descendant whose parent is not
     // in the batch must survive in pending through the adoption reset instead
     // of being wiped by it.
@@ -537,7 +574,7 @@ fn adoption_preserves_partial_winner_pending() {
 }
 
 #[test]
-fn resending_winner_genesis_is_a_noop() {
+fn winner_genesis_noop() {
     let fork = build_fork(1, 2);
     let before = admitted_ids(&fork.winner_oplog, &fork.topic_id);
     let again = fork
@@ -553,7 +590,7 @@ fn resending_winner_genesis_is_a_noop() {
 }
 
 #[test]
-fn fresh_topic_genesis_admits_without_resolution() {
+fn fresh_genesis_admits() {
     let signer = Ed25519Signer::from_bytes(&[1; 32]);
     let topic_id = TopicId::hash(b"fresh-topic");
     let actor = actor_id_for(topic_id, signer.peer_id());
@@ -589,7 +626,7 @@ fn fresh_topic_genesis_admits_without_resolution() {
 }
 
 #[test]
-fn structurally_invalid_genesis_is_rejected_without_reset() {
+fn invalid_genesis_unchanged() {
     let fork = build_fork(1, 2);
     let winner_genesis = fork.winner_genesis.id;
 
@@ -644,7 +681,7 @@ fn assert_dag_whole(oplog: &Oplog, topic_id: &TopicId) {
 }
 
 #[test]
-fn reset_defers_stale_dependents() {
+fn reset_defers_dependents() {
     // The reset path reads dep presence before it wipes the topic. An op whose
     // dependency only exists in the chain about to be discarded must be
     // buffered, never admitted against storage that is one step from empty.
@@ -688,7 +725,7 @@ fn reset_defers_stale_dependents() {
 }
 
 #[test]
-fn reset_keeps_dag_whole() {
+fn reset_preserves_dag() {
     let fork = build_fork(13, 14);
     assert_dag_whole(&fork.winner_oplog, &fork.topic_id);
     assert_dag_whole(&fork.loser_oplog, &fork.topic_id);
@@ -821,23 +858,28 @@ fn assert_quarantines_orphan<S: Corrupt>(storage: S) {
         [lost_genesis.id].into()
     );
 
-    // Ordinary anti-entropy against the peer that still holds the replaced
-    // chain must not merge its genesis back into the winner.
+    // Anti-entropy against the peer that still holds the replaced chain offers
+    // the winning branch and asks nothing of the loser; even a served explicit
+    // want of the replaced genesis must not merge it back into the winner.
     let plan = holder
         .negotiate_sync(
             keeper_node.peer_id(),
             &keeper_node.sync_summary(topic_id).unwrap(),
         )
         .unwrap();
-    assert!(plan.need.contains(&lost_genesis.id));
+    assert!(plan.need.is_empty() && plan.actor_range_hints.is_empty());
+    assert_eq!(plan.send[0].id, won_genesis.id);
     let data = keeper_node
         .plan_sync_response_data(
             holder.peer_id(),
             &crate::sync::SyncRequest {
                 topic_id,
-                known: plan.common,
-                wants: plan.need,
-                actor_range_hints: plan.actor_range_hints,
+                known: BTreeSet::new(),
+                wants: [lost_genesis.id].into(),
+                actor_range_hints: Vec::new(),
+                genesis: None,
+                credit: Default::default(),
+                window: crate::sync::ActorWindow::default(),
             },
         )
         .unwrap();
@@ -927,4 +969,185 @@ fn memory_quarantines_orphan() {
 fn fjall_quarantines_orphan() {
     let dir = tempfile::tempdir().unwrap();
     assert_quarantines_orphan(crate::storage::FjallStorage::open(dir.path()).unwrap());
+}
+
+/// Evidence signed on a branch that genesis replacement discarded must not
+/// certify the replacement branch, even though the actor keeps its identity and
+/// reaches the same sequence numbers there.
+#[test]
+fn rejects_stale_incarnation() {
+    let topic_id = TopicId::hash(b"genesis-fork-topic");
+    let (oplog_a, signer_a, g_a, e_a) = seed_side(topic_id, 1, 2, "a-branch");
+    let (oplog_b, signer_b, g_b, e_b) = seed_side(topic_id, 2, 1, "b-branch");
+
+    // The loser is the side whose genesis loses the tie-break and resets.
+    let a_won = g_a.id < g_b.id;
+    let (loser_oplog, loser_signer, loser_genesis, loser_event, winner_signer, winner_ops) =
+        if a_won {
+            (oplog_b, signer_b, g_b, e_b, signer_a, vec![g_a, e_a])
+        } else {
+            (oplog_a, signer_a, g_a, e_a, signer_b, vec![g_b, e_b])
+        };
+    let loser_peer = loser_signer.peer_id();
+    let winner_peer = winner_signer.peer_id();
+    let loser_actor = actor_id_for(topic_id, loser_peer);
+
+    // The winner acknowledges the loser's old branch at actor sequence two.
+    let mut old_clock = ActorClock::new();
+    old_clock.observe(loser_actor, 2);
+    let mut stale_ack = sync::SyncAck {
+        topic_id,
+        peer_id: winner_peer,
+        genesis: Some(loser_genesis.id),
+        accepted: BTreeSet::new(),
+        heads: [loser_event.id].into(),
+        clock: old_clock,
+        signature: None,
+    };
+    stale_ack.sign(&winner_signer).unwrap();
+
+    // Genesis replacement discards that branch.
+    let sync_loser = SyncEngine::new(loser_oplog.clone(), loser_peer);
+    loser_oplog
+        .receive_ops_from_peer_evicting(Some(winner_peer), winner_ops)
+        .unwrap();
+    assert_ne!(
+        loser_oplog
+            .storage()
+            .topic_state(&topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis,
+        loser_genesis.id
+    );
+
+    // The loser reaches actor sequence two again on the replacement branch.
+    let mut replacement = Vec::new();
+    for text in ["new-one", "new-two"] {
+        replacement.push(
+            loser_oplog
+                .create_event_op(
+                    topic_id,
+                    loser_actor,
+                    EventEnvelope::encode_event(&Note { text: text.into() }).unwrap(),
+                    &loser_signer,
+                )
+                .unwrap(),
+        );
+    }
+    let newest = replacement.last().unwrap().id;
+    assert_eq!(
+        loser_oplog
+            .storage()
+            .actor_clock(&topic_id)
+            .unwrap()
+            .get(&loser_actor),
+        2
+    );
+    sync_loser
+        .put_obligation(winner_peer, topic_id, [newest].into())
+        .unwrap();
+
+    // Replaying the old-branch acknowledgement must not satisfy that work.
+    let replayed = sync_loser.apply_ack(&stale_ack);
+    assert!(
+        replayed.is_err(),
+        "old-branch ack was accepted on the replacement branch"
+    );
+    let obligations = loser_oplog.storage().all_sync_obligations().unwrap();
+    assert!(
+        obligations
+            .iter()
+            .any(|obligation| obligation.peer_id == winner_peer
+                && obligation_covers(
+                    loser_oplog.storage(),
+                    std::slice::from_ref(obligation),
+                    &newest
+                )),
+        "replayed old-branch ack cleared work owed on the replacement branch"
+    );
+}
+
+/// A topic holding one op no head reaches, the shape quarantine removes.
+fn orphaned_topic<S: Corrupt>(storage: &S, seed: u8) -> TopicId {
+    let topic_id = TopicId::hash([b"orphaned-topic".as_slice(), &[seed]].concat());
+    let (source, _, genesis, event) = forked_side(MemoryStorage::new(), topic_id, seed, [], "lost");
+    Oplog::with_storage(storage.clone())
+        .receive_ops(vec![genesis])
+        .unwrap();
+    let meta = source.storage().get_meta(&event.id).unwrap().unwrap();
+    storage.orphan_op(&event, &meta);
+    topic_id
+}
+
+/// A maintenance pass returns the evictions of the topics before a failing
+/// one, and their journal records survive a restart: a later pass neither
+/// drops nor repeats them, and only `clear_eviction` releases one.
+fn assert_eviction_recovers<S: Corrupt>(storage: S, reopen: impl FnOnce(S) -> S) {
+    let config = NodeConfig {
+        signer: Ed25519Signer::from_bytes(&[211; 32]),
+        default_write_concern: WriteConcern::Local,
+        ..NodeConfig::default()
+    };
+    let mut topics = [orphaned_topic(&storage, 212), orphaned_topic(&storage, 213)];
+    topics.sort();
+    let [first, failing] = topics;
+    assert!(storage.seal_topic(&failing).unwrap());
+
+    let holder = Irokle::with_storage(storage.clone(), config.clone()).unwrap();
+    let evictions = holder.quarantine_topics().unwrap();
+    assert_eq!(evictions.len(), 1);
+    assert_eq!(evictions[0].topic_id, first);
+    let eviction = evictions[0].clone();
+    assert_eq!(storage.pending_evictions().unwrap(), vec![eviction.clone()]);
+    drop(holder);
+
+    let storage = reopen(storage);
+    let holder = Irokle::with_storage(storage.clone(), config).unwrap();
+    assert_eq!(holder.pending_evictions().unwrap(), vec![eviction.clone()]);
+    assert!(holder.quarantine_topics().unwrap().is_empty());
+    assert_eq!(holder.pending_evictions().unwrap(), vec![eviction.clone()]);
+
+    assert!(holder.unseal_topic(failing).unwrap());
+    let later = holder.quarantine_topics().unwrap();
+    assert_eq!(later.len(), 1);
+    assert_eq!(later[0].topic_id, failing);
+    assert_eq!(holder.pending_evictions().unwrap().len(), 2);
+    holder.clear_eviction(&eviction.key()).unwrap();
+    assert_eq!(holder.pending_evictions().unwrap(), later);
+}
+
+#[test]
+fn memory_eviction_recovers() {
+    assert_eviction_recovers(MemoryStorage::new(), |storage| storage);
+}
+
+#[cfg(feature = "fjall")]
+#[test]
+fn fjall_eviction_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+    assert_eviction_recovers(storage, |storage| {
+        drop(storage);
+        crate::storage::FjallStorage::open(dir.path()).unwrap()
+    });
+}
+
+/// A quarantine rebuild retried after a lost commit checks each surviving
+/// op's signature once.
+#[test]
+fn quarantine_retry_once() {
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let topic_id = orphaned_topic(&storage, 214);
+    let log = Oplog::with_storage(storage.clone());
+    let survivors = log.storage().list_op_ids(&topic_id).unwrap().len() - 1;
+    storage.conflict_writes(2);
+    let before = crate::op::VERIFICATIONS.with(std::cell::Cell::get);
+    assert!(log.quarantine_orphans(&topic_id).unwrap().is_some());
+    assert_eq!(
+        storage.conflicts.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    let checks = crate::op::VERIFICATIONS.with(std::cell::Cell::get) - before;
+    assert_eq!(checks, survivors);
 }

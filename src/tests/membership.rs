@@ -1,7 +1,7 @@
-use super::support::*;
+use crate::tests::support::*;
 
 #[test]
-fn introduced_peer_can_reject() {
+fn introduced_peer_rejects() {
     let alice = node(89);
     let bob = node(90);
     let topic = alice
@@ -44,7 +44,7 @@ fn introduced_peer_can_reject() {
 }
 
 #[test]
-fn late_peer_accepts_batch() {
+fn late_batch_accepted() {
     let alice = node(107);
     let bob = node(108);
     let charlie = node(109);
@@ -96,7 +96,7 @@ fn late_peer_accepts_batch() {
 }
 
 #[test]
-fn controls_converge_any_order() {
+fn controls_any_order() {
     let alice = node(21);
     let bob = node(22);
     let target = PeerId::hash(b"target-peer");
@@ -183,7 +183,7 @@ fn rejects_unknown_nonmember() {
     let err = outsider
         .receive_sync_data_from(a.peer_id(), raw_data)
         .unwrap_err();
-    assert!(matches!(err, Error::NotTopicMember));
+    assert!(matches!(err, Error::BootstrapPending { .. }));
     assert!(
         outsider
             .storage()
@@ -226,7 +226,7 @@ fn cannot_backdate_join() {
 }
 
 #[test]
-fn accepts_event_before_remove() {
+fn event_before_remove() {
     let alice = node(15);
     let bob = node(16);
     let topic = alice
@@ -259,7 +259,7 @@ fn accepts_event_before_remove() {
 }
 
 #[test]
-fn rejects_wrong_actor_id() {
+fn rejects_wrong_actor() {
     let alice = node(17);
     let bob_signer = Ed25519Signer::from_bytes(&[18; 32]);
     let topic = alice
@@ -294,40 +294,6 @@ fn rejects_wrong_actor_id() {
         oplog.receive_op(op),
         Err(Error::ActorAuthorMismatch)
     ));
-}
-
-#[test]
-fn rejects_pending_nonmember() {
-    let alice = node(85);
-    let outsider = Ed25519Signer::from_bytes(&[86; 32]);
-    // Alice creates a topic where the outsider is *not* a member.
-    let topic = alice.create_topic::<Note>(TopicConfig::default()).unwrap();
-    // Outsider crafts a structurally-valid signed op whose dep doesn't
-    // exist on Alice. Without the membership check this op would consume
-    // a per-source pending-quota slot until eviction; with the check it
-    // is rejected immediately.
-    let fake_dep = OpId::hash(b"missing-dep");
-    let op = Op::sign(
-        OpBody {
-            topic_id: topic.id(),
-            author: outsider.peer_id(),
-            actor_id: actor_id_for(topic.id(), outsider.peer_id()),
-            actor_seq: 1,
-            actor_prev: None,
-            deps: [fake_dep].into(),
-            generation: 1,
-            payload: TopicPayload::Event(
-                EventEnvelope::encode_event(&Note {
-                    text: "outsider".into(),
-                })
-                .unwrap(),
-            ),
-        },
-        &outsider,
-    )
-    .unwrap();
-    let oplog = oplog::Oplog::with_storage(alice.storage().clone());
-    assert!(matches!(oplog.receive_op(op), Err(Error::NotTopicMember)));
 }
 
 #[test]

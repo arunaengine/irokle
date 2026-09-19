@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-#[cfg(feature = "iroh")]
-use crate::Error;
 use crate::storage::{MemoryStorage, Storage};
 use crate::{Ed25519Signer, PeerId, Result};
 
-use super::{Irokle, IrokleBuilder, NodeConfig, WriteConcern};
+use crate::node::{Irokle, IrokleBuilder, NodeConfig, WriteConcern};
 
 impl Irokle<MemoryStorage> {
     pub fn builder() -> IrokleBuilder<MemoryStorage> {
@@ -15,15 +13,7 @@ impl Irokle<MemoryStorage> {
             signer_explicit: false,
             write_concern_explicit: false,
             #[cfg(feature = "iroh")]
-            endpoint: None,
-            #[cfg(feature = "iroh")]
-            alpns: Vec::new(),
-            #[cfg(feature = "iroh")]
-            auto_accept: true,
-            #[cfg(feature = "iroh")]
-            iroh_runtime: crate::net::IrohRuntimeConfig::default(),
-            #[cfg(feature = "iroh")]
-            eviction_sink: None,
+            iroh: Default::default(),
         }
     }
 
@@ -44,15 +34,7 @@ impl<S: Storage> IrokleBuilder<S> {
             signer_explicit: self.signer_explicit,
             write_concern_explicit: self.write_concern_explicit,
             #[cfg(feature = "iroh")]
-            endpoint: self.endpoint,
-            #[cfg(feature = "iroh")]
-            alpns: self.alpns,
-            #[cfg(feature = "iroh")]
-            auto_accept: self.auto_accept,
-            #[cfg(feature = "iroh")]
-            iroh_runtime: self.iroh_runtime,
-            #[cfg(feature = "iroh")]
-            eviction_sink: self.eviction_sink,
+            iroh: self.iroh,
         }
     }
 
@@ -88,73 +70,6 @@ impl<S: Storage> IrokleBuilder<S> {
         self
     }
 
-    #[cfg(feature = "iroh")]
-    pub fn with_iroh_runtime_config(mut self, runtime: crate::net::IrohRuntimeConfig) -> Self {
-        self.iroh_runtime = runtime;
-        self
-    }
-
-    /// Forward genesis tie-break evictions produced by the builder-managed Iroh
-    /// transport to `sink`.
-    #[cfg(feature = "iroh")]
-    pub fn with_eviction_sink(
-        mut self,
-        sink: tokio::sync::mpsc::UnboundedSender<crate::TopicEviction>,
-    ) -> Self {
-        self.eviction_sink = Some(sink);
-        self
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn with_iroh_secret_key(mut self, secret_key: &iroh::SecretKey) -> Self {
-        self.config.signer = Ed25519Signer::from_iroh_secret_key(secret_key);
-        self.signer_explicit = true;
-        self
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn with_net(mut self, endpoint: iroh::Endpoint) -> Self {
-        if !self.signer_explicit {
-            self.config.signer = Ed25519Signer::from_iroh_secret_key(endpoint.secret_key());
-        }
-        if !self.write_concern_explicit {
-            self.config.default_write_concern = WriteConcern::AsyncReplication;
-        }
-        self.endpoint = Some(endpoint);
-        self.auto_accept = true;
-        self
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn with_alpn(mut self, alpn: impl AsRef<[u8]>) -> Self {
-        let alpn = alpn.as_ref().to_vec();
-        if !self.alpns.contains(&alpn) {
-            self.alpns.push(alpn);
-        }
-        self
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn with_alpns<I, A>(mut self, alpns: I) -> Self
-    where
-        I: IntoIterator<Item = A>,
-        A: AsRef<[u8]>,
-    {
-        for alpn in alpns {
-            let alpn = alpn.as_ref().to_vec();
-            if !self.alpns.contains(&alpn) {
-                self.alpns.push(alpn);
-            }
-        }
-        self
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn without_auto_accept(mut self) -> Self {
-        self.auto_accept = false;
-        self
-    }
-
     #[cfg(feature = "fjall")]
     pub fn with_fjall_path(
         self,
@@ -166,30 +81,14 @@ impl<S: Storage> IrokleBuilder<S> {
     #[cfg(feature = "fjall")]
     /// Use Fjall storage with an explicit transaction persist mode.
     ///
-    /// The default `with_fjall_path` uses `SyncAll`. `Buffer` avoids a
-    /// foreground fsync per Irokle transaction when the caller has a separate
-    /// durability boundary.
+    /// `with_fjall_path` uses `SyncAll`; `Buffer` lets the caller set the durability boundary.
     pub fn with_fjall_path_and_persist_mode(
         self,
         path: impl AsRef<std::path::Path>,
         persist_mode: fjall::PersistMode,
     ) -> Result<IrokleBuilder<crate::FjallStorage>> {
-        Ok(IrokleBuilder {
-            storage: crate::FjallStorage::open_with_persist_mode(path, persist_mode)?,
-            config: self.config,
-            signer_explicit: self.signer_explicit,
-            write_concern_explicit: self.write_concern_explicit,
-            #[cfg(feature = "iroh")]
-            endpoint: self.endpoint,
-            #[cfg(feature = "iroh")]
-            alpns: self.alpns,
-            #[cfg(feature = "iroh")]
-            auto_accept: self.auto_accept,
-            #[cfg(feature = "iroh")]
-            iroh_runtime: self.iroh_runtime,
-            #[cfg(feature = "iroh")]
-            eviction_sink: self.eviction_sink,
-        })
+        let storage = crate::FjallStorage::open_with_persist_mode(path, persist_mode)?;
+        Ok(self.with_storage(storage))
     }
 
     #[cfg(feature = "fjall")]
@@ -207,50 +106,15 @@ impl<S: Storage> IrokleBuilder<S> {
         db: fjall::OptimisticTxDatabase,
         persist_mode: fjall::PersistMode,
     ) -> Result<IrokleBuilder<crate::FjallStorage>> {
-        Ok(IrokleBuilder {
-            storage: crate::FjallStorage::from_database_with_persist_mode(db, persist_mode)?,
-            config: self.config,
-            signer_explicit: self.signer_explicit,
-            write_concern_explicit: self.write_concern_explicit,
-            #[cfg(feature = "iroh")]
-            endpoint: self.endpoint,
-            #[cfg(feature = "iroh")]
-            alpns: self.alpns,
-            #[cfg(feature = "iroh")]
-            auto_accept: self.auto_accept,
-            #[cfg(feature = "iroh")]
-            iroh_runtime: self.iroh_runtime,
-            #[cfg(feature = "iroh")]
-            eviction_sink: self.eviction_sink,
-        })
+        let storage = crate::FjallStorage::from_database_with_persist_mode(db, persist_mode)?;
+        Ok(self.with_storage(storage))
     }
 
     pub fn build(self) -> Result<Irokle<S>> {
         #[cfg(feature = "iroh")]
-        if let Some(endpoint) = self.endpoint {
-            let node = Irokle::with_storage(self.storage, self.config)?;
-            let net = std::sync::Arc::new(
-                crate::net::IrohNet::new_with_alpns_config_and_sink(
-                    endpoint,
-                    node.clone(),
-                    self.alpns,
-                    self.iroh_runtime,
-                    self.eviction_sink,
-                )
-                .map_err(|err| Error::Storage(format!("failed to configure iroh: {err}")))?,
-            );
-            if self.auto_accept {
-                net.start_accept_loop().map_err(|err| {
-                    Error::Storage(format!("failed to start iroh accept loop: {err}"))
-                })?;
-            }
-            net.start_configured_resync_loop().map_err(|err| {
-                Error::Storage(format!("failed to start iroh resync loop: {err}"))
-            })?;
-            return Ok(node.with_net(net));
+        if self.iroh.endpoint.is_some() {
+            return self.build_attached();
         }
-
-        let node = Irokle::with_storage(self.storage, self.config)?;
-        Ok(node)
+        Irokle::with_storage(self.storage, self.config)
     }
 }

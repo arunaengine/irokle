@@ -14,6 +14,8 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
+      - run: python3 -B -m unittest discover -s scripts -v
+      - run: python3 -B scripts/style.py
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
@@ -21,7 +23,7 @@ jobs:
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - run: cargo test --locked --all-features --lib --test derive
       - run: cargo test --locked --all-features --doc
-      - run: cargo doc --locked --all-features --no-deps
+      - run: RUSTDOCFLAGS='-D warnings' cargo doc --locked --all-features --no-deps
 
   patchbay:
     runs-on: ubuntu-latest

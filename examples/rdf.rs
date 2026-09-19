@@ -8,6 +8,30 @@ use irokle::reducer::{EventRecord, Reducer};
 use irokle::{ActorClock, Ed25519Signer, Irokle, TopicConfig};
 use serde::{Deserialize, Serialize};
 
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let node = Irokle::builder()
+        .with_signer(Ed25519Signer::from_bytes(&[3; 32]))
+        .build()?;
+    let topic = node.create_topic::<RdfEvent>(TopicConfig::default())?;
+    let quad = Quad::new("note:1", "tag", "local-first").in_graph("notes");
+
+    topic.publish(RdfEvent::AddQuad { quad: quad.clone() })?;
+    topic.publish(RdfEvent::RemoveQuad { quad })?;
+
+    let mut state = RdfState::default();
+    let mut reducer = RdfReducer;
+    for record in topic.history(HistoryOrder::OldestFirst)? {
+        reducer.apply(&mut state, &record)?;
+    }
+
+    println!(
+        "visible quads after observed remove: {}",
+        quads(&state).len()
+    );
+
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 struct Quad {
     subject: String,
@@ -92,28 +116,4 @@ fn quads(state: &RdfState) -> Vec<Quad> {
         .iter()
         .filter_map(|(quad, entry)| entry.is_present().then_some(quad.clone()))
         .collect()
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let node = Irokle::builder()
-        .with_signer(Ed25519Signer::from_bytes(&[3; 32]))
-        .build()?;
-    let topic = node.create_topic::<RdfEvent>(TopicConfig::default())?;
-    let quad = Quad::new("note:1", "tag", "local-first").in_graph("notes");
-
-    topic.publish(RdfEvent::AddQuad { quad: quad.clone() })?;
-    topic.publish(RdfEvent::RemoveQuad { quad })?;
-
-    let mut state = RdfState::default();
-    let mut reducer = RdfReducer;
-    for record in topic.history(HistoryOrder::OldestFirst)? {
-        reducer.apply(&mut state, &record)?;
-    }
-
-    println!(
-        "visible quads after observed remove: {}",
-        quads(&state).len()
-    );
-
-    Ok(())
 }

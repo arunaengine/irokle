@@ -1,6 +1,6 @@
-use super::support::*;
 use crate::storage as crate_storage;
 use crate::sync as crate_sync;
+use crate::tests::support::*;
 
 #[test]
 fn transfers_missing_ops() {
@@ -46,7 +46,7 @@ fn transfers_missing_ops() {
 }
 
 #[test]
-fn create_topic_with_event_replicates() {
+fn topic_event_replication() {
     let a = node(53);
     let b = node(54);
     let (topic, record) = a
@@ -209,7 +209,8 @@ fn request_converges() {
         .unwrap();
 
     assert_eq!(data_for_bob.ops.len(), 1);
-    assert_eq!(request_for_alice.wants.len(), 1);
+    // Bob's tip is ahead of alice's clock, so it is asked for by range.
+    assert!(request_for_alice.wants.is_empty());
     assert_eq!(request_for_alice.actor_range_hints.len(), 1);
 
     let bob_ack = bob
@@ -299,7 +300,7 @@ fn batches_preserve_order() {
     assert!(data.ops.len() > net::MAX_SYNC_DATA_OPS_PER_MESSAGE);
 
     let expected_ids = data.ops.iter().map(|op| op.id).collect::<Vec<_>>();
-    let batches = net::sync_data_messages(data.topic_id, data.ops);
+    let batches = net::sync_data_messages(data.topic_id, data.ops).unwrap();
     assert!(batches.len() > 1);
     let mut actual_ids = Vec::new();
     for batch in batches {
@@ -342,6 +343,9 @@ fn response_includes_closure() {
                     from_exclusive: 1,
                     to_inclusive: 3,
                 }],
+                genesis: None,
+                credit: Default::default(),
+                window: crate::sync::ActorWindow::default(),
             },
         )
         .unwrap();
@@ -351,7 +355,7 @@ fn response_includes_closure() {
 }
 
 #[test]
-fn accepts_out_of_order_batch() {
+fn unordered_batch_admitted() {
     let alice = node(40);
     let bob = node(41);
     let topic = alice
@@ -503,7 +507,7 @@ fn deterministic_overlap() {
 }
 
 #[test]
-fn receive_forwarding_obligates_other_selected_peers() {
+fn receive_forwarding_obligation() {
     let alice = node(90);
     let bob = node(91);
     let charlie = node(92);
@@ -556,7 +560,12 @@ fn receive_forwarding_obligates_other_selected_peers() {
         .unwrap()
         .into_iter()
         .filter(|obligation| {
-            obligation.topic_id == topic.id() && obligation.op_ids.contains(&record.meta.op_id)
+            obligation.topic_id == topic.id()
+                && obligation_covers(
+                    alice.storage(),
+                    std::slice::from_ref(obligation),
+                    &record.meta.op_id,
+                )
         })
         .map(|obligation| obligation.peer_id)
         .collect::<BTreeSet<_>>();
@@ -681,12 +690,17 @@ fn scopes_accepted_ops() {
             .all_sync_obligations()
             .unwrap()
             .iter()
-            .all(|obligation| !obligation.op_ids.contains(&buffered.meta.op_id))
+            .all(|obligation| obligation.topic_id != first.id()
+                || !obligation_covers(
+                    bob.storage(),
+                    std::slice::from_ref(obligation),
+                    &buffered.meta.op_id
+                ))
     );
 }
 
 #[test]
-fn omits_non_member_ops() {
+fn omits_nonmember_ops() {
     let a = node(8);
     let topic = a.create_topic::<Note>(TopicConfig::default()).unwrap();
     topic
@@ -725,11 +739,14 @@ fn report_filters_obligations() {
     assert_eq!(report.obligations.len(), 1);
     assert_eq!(report.obligations[0].peer_id, peer_a);
     assert_eq!(report.obligations[0].topic_id, topic_a);
-    assert!(report.obligations[0].op_ids.contains(&op_a));
+    assert_eq!(
+        report.obligations[0].target,
+        crate_storage::ObligationTarget::Repair([op_a].into())
+    );
 }
 
 #[test]
-fn rejects_other_topic_ops() {
+fn rejects_foreign_ops() {
     let alice = node(19);
     let bob = node(20);
     let topic_a = alice
@@ -814,7 +831,7 @@ fn exposes_sync_metadata() {
 }
 
 #[test]
-fn receive_schedules_forwarding_only_for_missing_selected_peers() {
+fn missing_peer_forwarding() {
     let alice = node(94);
     let bob = node(95);
     let charlie = node(96);
@@ -841,8 +858,11 @@ fn receive_schedules_forwarding_only_for_missing_selected_peers() {
         .apply_peer_ack(crate_storage::PeerAck {
             peer_id: charlie.peer_id(),
             topic_id: topic.id(),
+            // The branch bob is about to adopt: evidence names the incarnation
+            // it certifies, so it starts counting once that branch is local.
+            genesis: genesis_of(alice.storage(), &topic.id()),
             heads: [record.meta.op_id].into(),
-            clock,
+            clock: clock.clone(),
         })
         .unwrap();
 
@@ -870,12 +890,17 @@ fn receive_schedules_forwarding_only_for_missing_selected_peers() {
         .storage()
         .sync_obligations(&dana.peer_id(), &topic.id())
         .unwrap();
+    // Forwarded work coalesces into one clock target covering every accepted op.
     assert_eq!(dana_obligations.len(), 1);
-    assert_eq!(dana_obligations[0].op_ids, ack.accepted);
+    assert!(ack.accepted.contains(&record.meta.op_id));
+    assert!(matches!(
+        &dana_obligations[0].target,
+        crate_storage::ObligationTarget::Clock(target) if target.dominates(&clock)
+    ));
 }
 
 #[test]
-fn failed_sync_result_keeps_obligation_pending_for_retry() {
+fn retry_keeps_obligation() {
     let alice = node(98);
     let bob = node(99);
     let topic = alice
@@ -911,14 +936,14 @@ fn failed_sync_result_keeps_obligation_pending_for_retry() {
             .unwrap()
             .contains("dial timed out")
     );
-    assert_eq!(
-        alice
+    assert!(obligation_covers(
+        alice.storage(),
+        &alice
             .storage()
             .sync_obligations(&bob.peer_id(), &topic.id())
-            .unwrap()[0]
-            .op_ids,
-        [record.meta.op_id].into()
-    );
+            .unwrap(),
+        &record.meta.op_id
+    ));
 
     alice
         .record_sync_result(bob.peer_id(), topic.id(), Ok(()))
@@ -948,7 +973,7 @@ fn clamps_oversized_hint() {
 
     // A peer-supplied hint covering the entire u64 range must not blow up
     // or iterate u64::MAX times; clamping is bounded by what we locally
-    // have and by MAX_ACTOR_RANGE_HINT_SPAN.
+    // have and by MAX_RANGE_SPAN.
     let response = alice
         .plan_sync_response_data(
             bob.peer_id(),
@@ -961,6 +986,9 @@ fn clamps_oversized_hint() {
                     from_exclusive: 0,
                     to_inclusive: u64::MAX,
                 }],
+                genesis: None,
+                credit: Default::default(),
+                window: crate::sync::ActorWindow::default(),
             },
         )
         .unwrap();
@@ -996,6 +1024,9 @@ fn ignores_reversed_hint() {
                     from_exclusive: u64::MAX,
                     to_inclusive: u64::MAX,
                 }],
+                genesis: None,
+                credit: Default::default(),
+                window: crate::sync::ActorWindow::default(),
             },
         )
         .unwrap();
@@ -1003,20 +1034,20 @@ fn ignores_reversed_hint() {
 }
 
 #[test]
-fn unknown_topic_empty_plan() {
+fn unknown_topic_empty() {
     let alice = node(84);
     let unknown_topic = TopicId::hash(b"never-heard-of-this");
-    // A fabricated remote summary pointing at OpIds Alice doesn't have.
-    // The old code would surface remote.heads as `need`/`want`, letting a
-    // peer inject arbitrary OpIds into Alice's request set for a topic
-    // she cannot authenticate. The plan must now be empty.
+    // A fabricated summary points at OpIds Alice cannot authenticate.
+    // The plan must not expose those heads as `need` or `want`.
     let summary = crate_sync::SyncSummary {
         topic_id: unknown_topic,
         event_type_id: None,
+        genesis: None,
         fingerprint: [0; 32],
         heads: [OpId::hash(b"forged-head-1"), OpId::hash(b"forged-head-2")].into(),
         actor_clock: ActorClock::new(),
         actor_tips: std::collections::BTreeMap::new(),
+        staged: None,
     };
     let plan = alice
         .negotiate_sync(PeerId::hash(b"some-remote"), &summary)
@@ -1027,7 +1058,7 @@ fn unknown_topic_empty_plan() {
 }
 
 #[test]
-fn duplicate_sync_data_is_idempotent() {
+fn duplicate_sync_idempotent() {
     let alice = node(85);
     let bob = node(86);
     let topic = alice
@@ -1078,12 +1109,11 @@ fn duplicate_sync_data_is_idempotent() {
     );
 }
 
-/// Receive-side admission throughput for a backlog of unknown single-op
-/// topics, the hot path of a bulk drain. Wall time is dominated by op
-/// signature verification: each op must be verified exactly once even though
-/// the unknown-topic check and the real admission both inspect it.
+/// A backlog of unknown single-op topics exercises receive-side admission.
+/// Each op must be signature-verified once even though two admission paths inspect it.
+/// This protects the bulk-drain hot path.
 #[test]
-fn unknown_topic_backlog_admission_verifies_ops_once() {
+fn backlog_verify_once() {
     const TOPICS: usize = 1000;
     let alice = node(95);
     let bob = node(96);
@@ -1142,11 +1172,9 @@ fn stale_dedup_read() {
         .unwrap();
     assert_eq!(accepted.len(), 2);
 
-    // Simulate a concurrent admission racing the dedup check. The duplicate
-    // genesis models a mid-flight commit: its op record is not visible yet
-    // while its actor-index entry already is (fork-check duplicate path).
-    // The second op passes a stale `get_op` and a stale actor-index read and
-    // reaches the tip/seq check (seq-gap duplicate path).
+    // Simulate admission racing dedup: the genesis record is hidden while its
+    // actor index is visible (fork duplicate path). The second op hides both
+    // reads once (sequence duplicate path).
     storage.mid_commit_ops.lock().unwrap().insert(ops[0].id);
     storage.hidden_ops.lock().unwrap().insert(ops[1].id);
     storage.hidden_index.lock().unwrap().insert(ops[1].id);
@@ -1171,7 +1199,7 @@ fn stale_dedup_read() {
 }
 
 #[test]
-fn unknown_want_serves_the_rest() {
+fn unknown_want_remainder() {
     // A want we cannot resolve must not abort a whole batched exchange.
     let storage = MemoryStorage::new();
     let (_, topic_id, ops) = holed_store(&storage, 93, Damage::Meta);
@@ -1184,6 +1212,9 @@ fn unknown_want_serves_the_rest() {
         known: BTreeSet::new(),
         wants: [ops[0].id, OpId::hash(b"never-seen")].into(),
         actor_range_hints: Vec::new(),
+        genesis: None,
+        credit: Default::default(),
+        window: crate::sync::ActorWindow::default(),
     };
 
     let data = engine
@@ -1197,7 +1228,7 @@ fn unknown_want_serves_the_rest() {
 }
 
 #[test]
-fn dangling_dep_defers_dependents() {
+fn dangling_dep_deferred() {
     // The hole and the op standing on it are deferred; the genesis still ships.
     let storage = MemoryStorage::new();
     let (_, topic_id, ops) = holed_store(&storage, 94, Damage::Meta);
@@ -1373,6 +1404,9 @@ fn assert_repairs_hole<S: Corrupt>(storage: S, seed: u8, damage: Damage) {
                 known: plan.common,
                 wants: plan.need,
                 actor_range_hints: plan.actor_range_hints,
+                genesis: None,
+                credit: Default::default(),
+                window: plan.window,
             },
         )
         .unwrap();
@@ -1396,21 +1430,8 @@ fn memory_repairs_hole() {
     }
 }
 
-#[cfg(feature = "fjall")]
 #[test]
-fn fjall_repairs_hole() {
-    for (seed, damage) in [(111, Damage::Meta), (113, Damage::Op), (115, Damage::Both)] {
-        let dir = tempfile::tempdir().unwrap();
-        assert_repairs_hole(
-            crate_storage::FjallStorage::open(dir.path()).unwrap(),
-            seed,
-            damage,
-        );
-    }
-}
-
-#[test]
-fn repair_refetches_dangling_dep() {
+fn repair_dangling_dep() {
     // A store holding a hole must pull it from a peer over the ordinary
     // negotiate/request path and end up whole, even though its heads and clock
     // never revealed the gap.
@@ -1468,6 +1489,9 @@ fn repair_refetches_dangling_dep() {
                 known: plan.common,
                 wants: plan.need,
                 actor_range_hints: plan.actor_range_hints,
+                genesis: None,
+                credit: Default::default(),
+                window: plan.window,
             },
         )
         .unwrap();
@@ -1529,4 +1553,593 @@ fn recheck_finds_damage() {
         holder.topic_unresolved(topic_id).unwrap(),
         [ops[1].id].into()
     );
+}
+
+/// Two outcomes recorded for the same peer and topic at the same time, forced
+/// to interleave by a gate inside the obligation read every status update
+/// performs before it writes.
+#[test]
+fn retains_concurrent_counters() {
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[152; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let peer = PeerId::hash(b"concurrent-status-peer");
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let topic_id = topic.id();
+    storage.arm_gate(Arc::new(Rendezvous::new(2)));
+
+    let handles = [true, false].map(|success| {
+        let node = alice.clone();
+        thread::spawn(move || {
+            let failure = std::io::Error::other("concurrent sync failure");
+            let outcome = if success { Ok(()) } else { Err(&failure) };
+            node.record_sync_result(peer, topic_id, outcome).unwrap();
+        })
+    });
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let status = alice.sync_status(topic_id).unwrap();
+    assert_eq!(status.len(), 1);
+    assert_eq!(status[0].successful_attempts, 1);
+    assert_eq!(status[0].failed_attempts, 1);
+}
+
+fn assert_resolved_targets<S: Storage>(storage: S) {
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[153; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let peer = PeerId::hash(b"resolved-target-peer");
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let record = topic
+        .publish(Note {
+            text: "resolved".into(),
+        })
+        .unwrap();
+    let unknown = OpId::hash(b"resolved-target-unknown");
+
+    alice
+        .put_sync_obligation(peer, topic.id(), [record.meta.op_id, unknown].into())
+        .unwrap();
+
+    let obligations = storage.sync_obligations(&peer, &topic.id()).unwrap();
+    // The resolved id becomes a clock target at its actor position, and the
+    // unknown id an explicit repair want of its own.
+    let mut position = ActorClock::new();
+    position.observe(record.meta.actor_id, record.meta.actor_seq);
+    assert_eq!(
+        obligations,
+        vec![
+            crate_storage::SyncObligation::clock(peer, topic.id(), position),
+            crate_storage::SyncObligation::repair(peer, topic.id(), [unknown].into()),
+        ]
+    );
+}
+
+#[test]
+fn memory_resolved_targets() {
+    assert_resolved_targets(MemoryStorage::new());
+}
+
+/// Forwarding obligations are the durable part of a receive; a failed status
+/// write must not stop the peers that have not been filed yet.
+#[test]
+fn forwards_without_bookkeeping() {
+    let alice = node(154);
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let bob = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[155; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let charlie = node(156);
+    let dana = node(157);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id(), charlie.peer_id(), dana.peer_id()].into(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(8),
+        })
+        .unwrap();
+    topic.publish(Note { text: "fan".into() }).unwrap();
+    let data = crate_sync::SyncData {
+        topic_id: topic.id(),
+        ops: oplog::topological(alice.storage(), &topic.id()).unwrap(),
+    };
+    storage.fail_status(topic.id());
+
+    bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+
+    for peer in [charlie.peer_id(), dana.peer_id()] {
+        assert!(
+            !storage
+                .sync_obligations(&peer, &topic.id())
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn request_skips_bodies() {
+    // Request planning discards the send list, so it must not load op bodies
+    // for the closure the remote is missing.
+    let holder = Ed25519Signer::from_bytes(&[171; 32]);
+    let (source, topic_id, ops) = chain_source(170, holder.peer_id());
+    // A member that holds nothing yet: every local op is missing for it.
+    let remote = crate_sync::SyncSummary {
+        topic_id,
+        event_type_id: None,
+        genesis: None,
+        fingerprint: [0; 32],
+        heads: BTreeSet::new(),
+        actor_clock: ActorClock::new(),
+        actor_tips: std::collections::BTreeMap::new(),
+        staged: None,
+    };
+    // Each side gets its own store so both measurements start from the same
+    // cached state; a second call on one store would not rescan for holes.
+    let counted_engine = || {
+        let storage = StaleReadStorage::new(MemoryStorage::new());
+        let log = oplog::Oplog::with_storage(storage.clone());
+        log.receive_ops_from_peer(Some(source.peer_id()), ops.clone())
+            .unwrap();
+        let engine = crate_sync::SyncEngine::new(log, holder.peer_id());
+        (engine, storage)
+    };
+    let reads_since = |storage: &StaleReadStorage, before: usize| {
+        storage.op_reads.load(std::sync::atomic::Ordering::Relaxed) - before
+    };
+
+    let (engine, storage) = counted_engine();
+    let before = storage.op_reads.load(std::sync::atomic::Ordering::Relaxed);
+    let request = engine.plan_request(source.peer_id(), &remote).unwrap();
+    let request_reads = reads_since(&storage, before);
+    // Once the integrity scan is cached, a request reads no body at all.
+    let before = storage.op_reads.load(std::sync::atomic::Ordering::Relaxed);
+    engine.plan_request(source.peer_id(), &remote).unwrap();
+    assert_eq!(reads_since(&storage, before), 0);
+
+    let (engine, storage) = counted_engine();
+    let before = storage.op_reads.load(std::sync::atomic::Ordering::Relaxed);
+    let plan = engine.negotiate(source.peer_id(), &remote).unwrap();
+    let full_reads = reads_since(&storage, before);
+
+    assert_eq!(request.topic_id, topic_id);
+    assert_eq!(plan.send.len(), ops.len());
+    // Full negotiation loads every missing body and probes its resolvability;
+    // request planning walks no history, beyond the one integrity scan.
+    assert!(request_reads <= 2 * ops.len());
+    assert!(full_reads >= request_reads + ops.len());
+}
+
+#[test]
+fn request_matches_negotiation() {
+    // The request asks for exactly what the full negotiation found missing,
+    // for a plain chain and for a fork that merged, without walking history:
+    // served page by page it brings the requester to the remote frontier.
+    let alice = node(172);
+    let bob = node(173);
+    let same_request = |peer, remote: &crate_sync::SyncSummary| {
+        let plan = alice.negotiate_sync(peer, remote).unwrap();
+        let request = alice.plan_sync_request(peer, remote).unwrap();
+        assert!(request.known.is_empty());
+        assert_eq!(request.genesis, genesis_of(alice.storage(), &plan.topic_id));
+        let local = alice.storage().actor_clock(&plan.topic_id).unwrap();
+        let ahead = remote
+            .actor_clock
+            .iter()
+            .filter(|(actor, seq)| local.get(actor) < **seq)
+            .map(|(actor, seq)| (*actor, local.get(actor), *seq))
+            .collect::<Vec<_>>();
+        let ranges = request
+            .actor_range_hints
+            .iter()
+            .map(|hint| (hint.actor_id, hint.from_exclusive, hint.to_inclusive))
+            .collect::<Vec<_>>();
+        assert_eq!(ranges, ahead);
+        assert!(request.wants.is_subset(&plan.need));
+        request
+    };
+
+    let chain = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    chain.publish(Note { text: "one".into() }).unwrap();
+    chain.publish(Note { text: "two".into() }).unwrap();
+    same_request(bob.peer_id(), &bob.sync_summary(chain.id()).unwrap());
+
+    let forked = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    forked
+        .publish(Note {
+            text: "base".into(),
+        })
+        .unwrap();
+    let data = alice
+        .plan_sync_data(bob.peer_id(), &bob.sync_summary(forked.id()).unwrap())
+        .unwrap();
+    bob.receive_sync_data_from(alice.peer_id(), data).unwrap();
+    let bob_forked = bob.open_topic::<Note>(forked.id()).unwrap();
+    // Concurrent publishes fork the topic; alice then merges both sides.
+    bob_forked.publish(Note { text: "bob".into() }).unwrap();
+    forked
+        .publish(Note {
+            text: "alice".into(),
+        })
+        .unwrap();
+    let data = bob
+        .plan_sync_data(alice.peer_id(), &alice.sync_summary(forked.id()).unwrap())
+        .unwrap();
+    alice.receive_sync_data_from(bob.peer_id(), data).unwrap();
+    forked
+        .publish(Note {
+            text: "merge".into(),
+        })
+        .unwrap();
+    bob_forked
+        .publish(Note {
+            text: "later".into(),
+        })
+        .unwrap();
+
+    let bob_summary = bob.sync_summary(forked.id()).unwrap();
+    let request = same_request(bob.peer_id(), &bob_summary);
+    assert!(!request.actor_range_hints.is_empty());
+    let data = bob
+        .plan_sync_response_data(alice.peer_id(), &request)
+        .unwrap();
+    alice.receive_sync_data_from(bob.peer_id(), data).unwrap();
+    let alice_clock = alice.storage().actor_clock(&forked.id()).unwrap();
+    assert!(alice_clock.dominates(&bob_summary.actor_clock));
+}
+
+/// Runtime reachability reaches production selection: a preferred peer that
+/// keeps failing is passed over for another permitted peer without a new
+/// publish, and is selected again once it answers.
+#[test]
+fn health_selects_alternate() {
+    let alice = node(150);
+    let members = (151..=154u8)
+        .map(|seed| Ed25519Signer::from_bytes(&[seed; 32]).peer_id())
+        .collect::<BTreeSet<_>>();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: members.clone(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(1),
+        })
+        .unwrap();
+    let state = alice.storage().topic_state(&topic.id()).unwrap().unwrap();
+
+    let selected = alice.sync_peers(topic.id(), &state);
+    assert_eq!(selected.len(), 1, "fanout one selects one target");
+    let preferred = selected[0];
+
+    // Unreachable attempts only; nothing new is published in between.
+    for _ in 0..node::PEER_FAILURE_LIMIT {
+        alice.peer_health().record_failure(preferred);
+    }
+    let failover = alice.sync_peers(topic.id(), &state);
+    assert_eq!(failover.len(), 1);
+    assert_ne!(
+        failover[0], preferred,
+        "a peer past its retry budget must not stay the only target"
+    );
+    assert!(
+        members.contains(&failover[0]),
+        "the alternate must be a permitted member"
+    );
+
+    // Recovery restores the preferred peer.
+    alice.peer_health().record_success(&preferred);
+    assert_eq!(alice.peer_health().failures(&preferred), 0);
+    assert_eq!(alice.sync_peers(topic.id(), &state), vec![preferred]);
+}
+
+/// An attempt neither reached nor unreachable, such as a refused exchange, must
+/// not demote a peer; an unreachable attempt adds one failure, and reaching the
+/// peer clears them even when other topics of that attempt failed.
+#[cfg(feature = "iroh")]
+#[test]
+fn refusal_keeps_health() {
+    let alice = node(155);
+    let bob = node(156);
+    for _ in 0..node::PEER_FAILURE_LIMIT {
+        assert!(!alice.note_peer_outcome(bob.peer_id(), false, false));
+    }
+    assert_eq!(alice.peer_health().failures(&bob.peer_id()), 0);
+
+    assert!(alice.note_peer_outcome(bob.peer_id(), false, true));
+    assert_eq!(
+        alice.peer_health().failures(&bob.peer_id()),
+        1,
+        "one failed connection is one health failure"
+    );
+
+    assert!(alice.note_peer_outcome(bob.peer_id(), true, true));
+    assert_eq!(alice.peer_health().failures(&bob.peer_id()), 0);
+}
+
+/// One topic whose records cannot be read is a per-topic outcome: maintenance
+/// still visits the topics after it, and work owed for a healthy topic is still
+/// scheduled rather than being lost with the first failure.
+#[test]
+fn faulting_topic_isolated() {
+    let storage = StaleReadStorage::new(MemoryStorage::new());
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[160; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let peer = Ed25519Signer::from_bytes(&[161; 32]).peer_id();
+
+    let mut topics = Vec::new();
+    for _ in 0..2 {
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        topics.push(topic);
+    }
+    // Fault the topic enumeration reaches first.
+    let order = alice.list_topics().unwrap();
+    let faulting = order[0].topic_id;
+    let healthy = order[1].topic_id;
+    let healthy_topic = topics
+        .iter()
+        .find(|topic| topic.id() == healthy)
+        .expect("healthy topic");
+    let record = healthy_topic
+        .publish(Note {
+            text: "owed".into(),
+        })
+        .unwrap();
+    alice
+        .put_sync_obligation(peer, healthy, [record.meta.op_id].into())
+        .unwrap();
+    storage.fail_heads(faulting);
+
+    // Maintenance reports no global failure and leaves the bad topic for later.
+    assert!(
+        alice.quarantine_topics().unwrap().is_empty(),
+        "a topic-local read failure must not abort the pass"
+    );
+
+    // The healthy topic's durable work is still there to be scheduled.
+    let owed = storage
+        .all_sync_obligations()
+        .unwrap()
+        .into_iter()
+        .filter(|obligation| obligation.topic_id == healthy)
+        .count();
+    assert_eq!(owed, 1, "healthy work must survive a topic-local failure");
+    assert!(
+        alice.storage().heads(&healthy).is_ok(),
+        "the healthy topic stays readable"
+    );
+}
+
+/// Forwarded receives of N and then 2N ops keep one clock record per peer owed
+/// the work, and their status bookkeeping decodes no obligation record.
+fn assert_forwards_coalesce<S: Storage>(storage: S, counters: impl Fn() -> crate::CounterSnapshot) {
+    let bob_signer = Ed25519Signer::from_bytes(&[172; 32]);
+    let carol = Ed25519Signer::from_bytes(&[173; 32]).peer_id();
+    let alice = node(171);
+    let bob = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: bob_signer.clone(),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob_signer.peer_id(), carol].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let topic_id = topic.id();
+    let alice_actor = actor_id_for(topic_id, alice.peer_id());
+    let rounds = 8;
+
+    let mut sent = BTreeSet::new();
+    for round in 1..=2 {
+        for index in 0..rounds {
+            topic
+                .publish(Note {
+                    text: format!("{round}-{index}"),
+                })
+                .unwrap();
+        }
+        let ops = oplog::topological(alice.storage(), &topic_id)
+            .unwrap()
+            .into_iter()
+            .filter(|op| sent.insert(op.id))
+            .collect::<Vec<_>>();
+        let before = counters().obligation_reads;
+        bob.receive_sync_data_from(alice.peer_id(), sync::SyncData { topic_id, ops })
+            .unwrap();
+        assert_eq!(counters().obligation_reads, before, "round {round}");
+
+        assert_eq!(
+            storage.topic_obligation_counts(&topic_id).unwrap(),
+            [(carol, 1)].into(),
+            "round {round}"
+        );
+        let records = storage.sync_obligations(&carol, &topic_id).unwrap();
+        assert!(matches!(
+            &records[..],
+            [crate::storage::SyncObligation {
+                target: crate::storage::ObligationTarget::Clock(clock),
+                ..
+            }] if clock.get(&alice_actor) == 1 + round * rounds
+        ));
+        let status = bob.sync_status(topic_id).unwrap();
+        assert!(
+            status
+                .iter()
+                .any(|status| status.peer_id == carol && status.pending_obligations == 1)
+        );
+    }
+}
+
+#[test]
+fn memory_forwards_coalesce() {
+    let storage = MemoryStorage::new();
+    let counters = storage.clone();
+    assert_forwards_coalesce(storage, move || counters.counters());
+}
+
+/// Status state follows the typed attempt outcome, so a partial pull with
+/// nothing owed outbound stays behind, and an older attempt changes nothing.
+fn assert_outcome_states<S: Storage>(storage: S) {
+    let alice = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: Ed25519Signer::from_bytes(&[176; 32]),
+            default_write_concern: WriteConcern::Local,
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
+    let peer = Ed25519Signer::from_bytes(&[177; 32]).peer_id();
+    let topic_id = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap()
+        .id();
+    let epoch = storage.next_attempt_epoch().unwrap();
+    let steps = [
+        (
+            crate::AttemptOutcome::Advanced,
+            crate_storage::SyncPeerState::Behind,
+            None,
+        ),
+        (
+            crate::AttemptOutcome::Blocked("credit spent".into()),
+            crate_storage::SyncPeerState::Behind,
+            Some("credit spent"),
+        ),
+        (
+            crate::AttemptOutcome::Failed("dial failed".into()),
+            crate_storage::SyncPeerState::Failed,
+            Some("dial failed"),
+        ),
+        (
+            crate::AttemptOutcome::ReopenRequired("reopen store".into()),
+            crate_storage::SyncPeerState::Behind,
+            Some("reopen store"),
+        ),
+        (
+            crate::AttemptOutcome::Complete,
+            crate_storage::SyncPeerState::Healthy,
+            None,
+        ),
+    ];
+    for (sequence, (outcome, state, error)) in (1..).zip(steps) {
+        alice
+            .record_attempt_result(peer, topic_id, (epoch, sequence), &outcome, true)
+            .unwrap();
+        let status = alice.sync_status(topic_id).unwrap().remove(0);
+        assert_eq!(status.pending_obligations, 0);
+        assert_eq!(status.state, state, "{outcome:?}");
+        assert_eq!(status.last_error.as_deref(), error, "{outcome:?}");
+    }
+    let old = alice
+        .record_attempt_result(
+            peer,
+            topic_id,
+            (epoch, 2),
+            &crate::AttemptOutcome::Failed("late".into()),
+            true,
+        )
+        .unwrap();
+    assert_eq!(old.state, crate_storage::SyncPeerState::Healthy);
+    assert_eq!((old.successful_attempts, old.failed_attempts), (2, 3));
+}
+
+#[test]
+fn memory_outcome_states() {
+    assert_outcome_states(MemoryStorage::new());
+}
+
+#[cfg(feature = "fjall")]
+mod fjall {
+    use crate::tests::sync::*;
+
+    #[test]
+    fn repairs_hole() {
+        for (seed, damage) in [(111, Damage::Meta), (113, Damage::Op), (115, Damage::Both)] {
+            let dir = tempfile::tempdir().unwrap();
+            assert_repairs_hole(
+                crate_storage::FjallStorage::open(dir.path()).unwrap(),
+                seed,
+                damage,
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_resolved_targets(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn forwards_coalesce() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        let counters = storage.clone();
+        assert_forwards_coalesce(storage, move || counters.counters());
+    }
+
+    #[test]
+    fn outcome_states() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_outcome_states(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
 }

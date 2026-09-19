@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Public facade and re-exports for Irokle's signed topic operation log.
+//! Public facade and re-exports for Irokle's signed topic operation log. Start with [`Irokle`].
+//! Iroh sync speaks [`sync::SYNC_PROTOCOL`]; unknown topic data is staged, see [`ReceiveOutcome`].
 
 pub mod clock;
 pub mod crypto;
@@ -26,12 +27,19 @@ pub use error::{Error, Result};
 pub use event::{Event, EventEnvelope};
 pub use ids::{ActorId, EvictionKey, IdParseError, OpId, PeerId, TopicId, actor_id_for};
 pub use irokle_derive::Event;
-pub use node::{Irokle, IrokleBuilder, NodeConfig, PublishOptions, RawTopic, Topic, WriteConcern};
+pub use node::{
+    Irokle, IrokleBuilder, NodeConfig, PublishOptions, RawTopic, ReceiveOutcome, Topic,
+    WriteConcern,
+};
 pub use op::{Op, OpBody, SignedOp};
 pub use oplog::{Admitted, EvictedOp, TopicEviction};
+#[doc(hidden)]
+pub use serde as __serde;
 #[cfg(feature = "fjall")]
 pub use storage::FjallStorage;
-pub use storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
+pub use storage::{
+    AttemptOutcome, CounterSnapshot, MemoryStorage, Storage, SyncPeerState, SyncPeerStatus,
+};
 pub use topic::{
     ReplicationPolicy, TopicConfig, TopicControl, TopicGenesis, TopicInfo, TopicPayload,
 };

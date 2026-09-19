@@ -6,20 +6,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod bootstrap;
 mod builder;
+#[cfg(feature = "iroh")]
+mod network;
 mod peers;
 mod topic;
 
-pub(crate) use peers::select_sync_peers;
+#[cfg(test)]
+pub(crate) use peers::{PEER_FAILURE_LIMIT, select_sync_peers};
+use peers::{PeerHealthStore, select_sync_targets};
 pub use topic::{RawTopic, Topic};
 
 use crate::ActorClock;
 use crate::history::{DagQuery, HistoryOrder, ordered};
-use crate::oplog::{Oplog, topological, topological_subset};
+use crate::oplog::{Oplog, topological_subset_entries};
 use crate::reducer::EventRecord;
-#[cfg(feature = "iroh")]
-use crate::storage::{AdmissionEffects, OpMeta, SyncObligation, TopicState};
-use crate::storage::{MemoryStorage, Storage, SyncPeerState, SyncPeerStatus};
+use crate::storage::{AdmissionEffects, OpMeta, StagedTopic, SyncObligation, TopicState};
+use crate::storage::{
+    MemoryStorage, Storage, SyncPeerState, SyncPeerStatus, SyncStateUpdate, SyncStatusUpdate,
+};
 use crate::sync::{
     SyncAck, SyncData, SyncEngine, SyncFingerprint, SyncOpen, SyncPlan, SyncReport, SyncRequest,
     SyncSummary,
@@ -30,9 +36,28 @@ use crate::{
 };
 
 static TOPIC_NONCE: AtomicU64 = AtomicU64::new(0);
-const SYNC_PEER_SHARED_OVERLAP: usize = 2;
-#[cfg(feature = "iroh")]
-const SYNC_TOPIC_CONCURRENCY: usize = 8;
+
+const SHARED_OVERLAP: usize = 2;
+
+/// What receiving sync data did.
+#[derive(Clone, Debug)]
+pub enum ReceiveOutcome {
+    /// The data reached the active topic; the signed ack speaks for it.
+    Acked {
+        ack: Box<SyncAck>,
+        evictions: Vec<TopicEviction>,
+    },
+    /// The topic is not held here and the history staged from this source does
+    /// not prove membership yet. This is no ack and certifies nothing.
+    Staged(StagedTopic),
+}
+
+/// Where data for a possibly unknown topic stands.
+enum Bootstrap {
+    /// The topic is active, with the ids a promotion just admitted.
+    Active(BTreeSet<OpId>),
+    Staged(StagedTopic),
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum WriteConcern {
@@ -77,6 +102,8 @@ pub struct Irokle<S: Storage = MemoryStorage> {
     sync: SyncEngine<S>,
     config: NodeConfig,
     peer_whitelist: Arc<RwLock<Option<BTreeSet<PeerId>>>>,
+    peer_health: Arc<PeerHealthStore>,
+    bootstraps: Arc<bootstrap::Bootstraps>,
     #[cfg(feature = "iroh")]
     net: Option<Arc<crate::net::IrohNet<S>>>,
 }
@@ -87,15 +114,7 @@ pub struct IrokleBuilder<S = MemoryStorage> {
     signer_explicit: bool,
     write_concern_explicit: bool,
     #[cfg(feature = "iroh")]
-    endpoint: Option<iroh::Endpoint>,
-    #[cfg(feature = "iroh")]
-    alpns: Vec<Vec<u8>>,
-    #[cfg(feature = "iroh")]
-    auto_accept: bool,
-    #[cfg(feature = "iroh")]
-    iroh_runtime: crate::net::IrohRuntimeConfig,
-    #[cfg(feature = "iroh")]
-    eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
+    iroh: network::IrohSettings,
 }
 
 impl<S: Storage> Irokle<S> {
@@ -103,23 +122,36 @@ impl<S: Storage> Irokle<S> {
         let oplog = Oplog::with_storage(storage);
         oplog.reconcile_pending_ops()?;
         let sync = SyncEngine::new(oplog.clone(), config.signer.peer_id());
-        Ok(Self {
+        let node = Self {
             oplog,
             sync,
             peer_whitelist: Arc::new(RwLock::new(config.peer_whitelist.clone())),
+            peer_health: Arc::new(PeerHealthStore::default()),
+            bootstraps: Arc::default(),
             config,
             #[cfg(feature = "iroh")]
             net: None,
-        })
+        };
+        // A bootstrap proven or begun before a restart becomes the topic now.
+        node.resume_bootstraps()?;
+        Ok(node)
     }
 
-    #[cfg(feature = "iroh")]
-    pub(crate) fn with_net(mut self, net: Arc<crate::net::IrohNet<S>>) -> Self {
-        self.net = Some(net);
-        self
-    }
     pub fn storage(&self) -> &S {
         self.oplog.storage()
+    }
+
+    /// Select sync targets for `topic_id` from one replication-policy and peer-health view.
+    pub(crate) fn sync_peers(&self, topic_id: TopicId, state: &TopicState) -> Vec<PeerId> {
+        self.peer_health
+            .with_view(|health| select_sync_targets(topic_id, self.peer_id(), state, health).peers)
+    }
+
+    /// Runtime reachability observations, updated from real attempt outcomes by
+    /// [`Irokle::record_sync_result`].
+    #[cfg(test)]
+    pub(crate) fn peer_health(&self) -> &PeerHealthStore {
+        &self.peer_health
     }
     pub fn signer(&self) -> &Ed25519Signer {
         &self.config.signer
@@ -128,117 +160,8 @@ impl<S: Storage> Irokle<S> {
         self.config.signer.peer_id()
     }
 
-    #[cfg(feature = "iroh")]
-    pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
-        self.net.as_ref().map(|net| net.endpoint())
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn iroh_runtime_config(&self) -> Option<crate::net::IrohRuntimeConfig> {
-        self.net.as_ref().map(|net| net.runtime_config())
-    }
-
-    #[cfg(feature = "iroh")]
-    pub async fn shutdown_iroh(&self) {
-        if let Some(net) = &self.net {
-            net.shutdown().await;
-        }
-    }
-
-    #[cfg(feature = "iroh")]
-    pub fn start_accept_loop(&self) -> std::io::Result<()> {
-        self.net
-            .as_ref()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
-            })?
-            .start_accept_loop()
-    }
-
-    #[cfg(feature = "iroh")]
-    pub async fn accept_one(&self) -> std::io::Result<Option<iroh::EndpointId>> {
-        self.net
-            .as_ref()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
-            })?
-            .accept_one()
-            .await
-    }
-
-    #[cfg(feature = "iroh")]
-    pub async fn sync_now(&self, peer_id: PeerId, topic_id: TopicId) -> std::io::Result<()> {
-        self.net
-            .as_ref()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
-            })?
-            .sync_peer_now(peer_id, topic_id)
-            .await
-    }
-
-    #[cfg(feature = "iroh")]
-    pub async fn sync_addr_now(
-        &self,
-        addr: iroh::EndpointAddr,
-        topic_id: TopicId,
-    ) -> std::io::Result<()> {
-        self.net
-            .as_ref()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
-            })?
-            .sync_now(addr, topic_id)
-            .await
-    }
-
-    #[cfg(feature = "iroh")]
-    pub async fn sync_endpoint_now(
-        &self,
-        endpoint_id: iroh::EndpointId,
-        topic_id: TopicId,
-    ) -> std::io::Result<()> {
-        self.net
-            .as_ref()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
-            })?
-            .sync_endpoint_now(endpoint_id, topic_id)
-            .await
-    }
-
-    #[cfg(feature = "iroh")]
-    pub async fn sync_topic_now(&self, topic_id: TopicId) -> std::io::Result<()> {
-        let net = self.net.as_ref().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
-        })?;
-        let state = self
-            .storage()
-            .topic_state(&topic_id)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "topic not found"))?;
-        let peers = select_sync_peers(topic_id, self.peer_id(), &state);
-        let mut syncs = tokio::task::JoinSet::new();
-        let mut first_error = None;
-        for peer in peers {
-            while syncs.len() >= SYNC_TOPIC_CONCURRENCY {
-                if let Some(result) = syncs.join_next().await {
-                    record_sync_topic_join_result(result, &mut first_error);
-                }
-            }
-            let net = Arc::clone(net);
-            syncs.spawn(async move { (peer, net.sync_peer_now(peer, topic_id).await) });
-        }
-        while let Some(result) = syncs.join_next().await {
-            record_sync_topic_join_result(result, &mut first_error);
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
-    }
-
     pub fn create_topic<E: Event>(&self, mut config: TopicConfig) -> Result<Topic<E, S>> {
+        self.validate_concern(&self.config.default_write_concern)?;
         config.initial_peers.insert(self.peer_id());
         let topic_id = self.next_topic_id::<E>()?;
         let actor_id = actor_id_for(topic_id, self.peer_id());
@@ -247,32 +170,26 @@ impl<S: Storage> Irokle<S> {
             initial_peers: config.initial_peers,
             replication_policy: config.replication_policy,
         };
-        #[cfg(feature = "iroh")]
-        let op = self.oplog.create_topic_genesis_with_effects(
+        let op = self.oplog.create_topic_effects(
             topic_id,
             actor_id,
             genesis,
             &self.config.signer,
-            |op, meta, state| {
+            |_op, meta, state| {
                 self.replication_admission_effects(
                     topic_id,
-                    op.id,
                     meta,
                     state,
                     &self.config.default_write_concern,
                 )
             },
         )?;
-        #[cfg(not(feature = "iroh"))]
-        self.oplog
-            .create_topic_genesis(topic_id, actor_id, genesis, &self.config.signer)?;
-        #[cfg(feature = "iroh")]
         self.wake_async_replication(
             topic_id,
             op.id,
             &self.config.default_write_concern,
             "topic genesis replication wake failed",
-        )?;
+        );
         Ok(Topic::new(self.clone(), topic_id, actor_id))
     }
 
@@ -282,6 +199,7 @@ impl<S: Storage> Irokle<S> {
         mut config: TopicConfig,
         event: E,
     ) -> Result<(Topic<E, S>, EventRecord<E>)> {
+        self.validate_concern(&self.config.default_write_concern)?;
         config.initial_peers.insert(self.peer_id());
         let topic_id = self.next_topic_id::<E>()?;
         let actor_id = actor_id_for(topic_id, self.peer_id());
@@ -291,36 +209,21 @@ impl<S: Storage> Irokle<S> {
             replication_policy: config.replication_policy,
         };
         let envelope = EventEnvelope::encode_event(&event)?;
-        #[cfg(feature = "iroh")]
-        let (_, event_op) = self.oplog.create_topic_genesis_with_event_with_effects(
+        let (_, (event_op, meta)) = self.oplog.create_genesis_effects(
             topic_id,
             actor_id,
             genesis,
             envelope,
             &self.config.signer,
-            |op, meta, state| {
+            |_op, meta, state| {
                 self.replication_admission_effects(
                     topic_id,
-                    op.id,
                     meta,
                     state,
                     &self.config.default_write_concern,
                 )
             },
         )?;
-        #[cfg(not(feature = "iroh"))]
-        let (_, event_op) = self.oplog.create_topic_genesis_with_event(
-            topic_id,
-            actor_id,
-            genesis,
-            envelope,
-            &self.config.signer,
-        )?;
-        let meta = self
-            .oplog
-            .storage()
-            .get_meta(&event_op.id)?
-            .ok_or(Error::Storage("missing op meta after publish".into()))?;
         let record = EventRecord::new(
             event,
             event_op.id,
@@ -328,13 +231,12 @@ impl<S: Storage> Irokle<S> {
             meta.actor_seq,
             meta.observed_clock,
         );
-        #[cfg(feature = "iroh")]
         self.wake_async_replication(
             topic_id,
             event_op.id,
             &self.config.default_write_concern,
             "topic genesis replication wake failed",
-        )?;
+        );
         Ok((Topic::new(self.clone(), topic_id, actor_id), record))
     }
 
@@ -438,21 +340,14 @@ impl<S: Storage> Irokle<S> {
         self.oplog.recheck_topics()
     }
 
-    /// Discard ops of `topic_id` that no head reaches and rebuild the topic from
-    /// the ops that remain. A store damaged by the pre-`reset_topic_and_admit`
-    /// genesis reset can hold a descendant whose ancestry belongs to the
-    /// replaced chain; no peer can supply that ancestry under the current
-    /// genesis, so the topic stays unresolved until the descendant goes. The
-    /// returned payloads are the embedder's to re-emit.
+    /// Discard unreachable ops of `topic_id` and rebuild it from the remaining heads.
+    /// Replaced-genesis descendants stay unresolved; returned payloads belong to the embedder.
     pub fn quarantine_orphans(&self, topic_id: TopicId) -> Result<Option<TopicEviction>> {
         self.oplog.quarantine_orphans(&topic_id)
     }
 
-    /// Evictions this node recorded durably and no consumer has acknowledged
-    /// yet. Each was written in the same transaction that discarded the
-    /// payloads, so this is what a restart must drain before it can treat
-    /// eviction recovery as complete: an eviction delivered only through the
-    /// in-memory sink and lost to a crash is still here.
+    /// Return durable evictions awaiting acknowledgement. The transaction writes each record
+    /// with discarded payloads, so restart recovery survives a lost in-memory delivery.
     pub fn pending_evictions(&self) -> Result<Vec<TopicEviction>> {
         self.storage().pending_evictions()
     }
@@ -474,19 +369,62 @@ impl<S: Storage> Irokle<S> {
         self.storage().clear_eviction(key)
     }
 
-    /// Run [`Irokle::quarantine_orphans`] over every local topic.
+    /// Quarantine orphaned ops in every local topic and return committed evictions.
+    /// Per-topic failures leave other topics running; only enumeration failure is global.
     pub fn quarantine_topics(&self) -> Result<Vec<TopicEviction>> {
         let mut quarantined = Vec::new();
         for info in self.list_topics()? {
-            if let Some(eviction) = self.oplog.quarantine_orphans(&info.topic_id)? {
-                quarantined.push(eviction);
+            match self.oplog.quarantine_orphans(&info.topic_id) {
+                Ok(Some(eviction)) => quarantined.push(eviction),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    topic_id = %info.topic_id,
+                    %error,
+                    "leaving topic quarantine for a later sweep"
+                ),
             }
         }
         Ok(quarantined)
     }
 
+    /// The whole missing closure against `remote`, unbounded: an export of
+    /// history, not a sync step. Sync uses [`Self::negotiate_page`].
     pub fn negotiate_sync(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncPlan> {
         self.sync.negotiate(peer_id, remote)
+    }
+
+    /// Bounded push page and request against `remote`; see
+    /// [`crate::sync::SyncEngine::negotiate_page`].
+    pub fn negotiate_page(
+        &self,
+        peer_id: PeerId,
+        remote: &SyncSummary,
+        budget: crate::sync::PageBudget,
+    ) -> Result<(SyncPlan, bool)> {
+        self.sync.negotiate_page(peer_id, remote, budget)
+    }
+
+    /// Plans one bounded response page for `request` that fits `budget`; see
+    /// [`crate::sync::SyncEngine::response_page`]. A transport repeats request and page until the
+    /// page reports no more, as `tests/paging.rs` shows.
+    pub fn response_page(
+        &self,
+        peer_id: PeerId,
+        request: &SyncRequest,
+        budget: crate::sync::PageBudget,
+    ) -> Result<crate::sync::PlannedPage> {
+        self.sync.response_page(peer_id, request, budget)
+    }
+
+    /// Serve with the authenticated peer's current branch or staging summary.
+    pub fn response_with(
+        &self,
+        peer_id: PeerId,
+        request: &crate::sync::SyncRequest,
+        budget: crate::sync::PageBudget,
+        summary: &SyncSummary,
+    ) -> Result<crate::sync::PlannedPage> {
+        self.sync.response_with(peer_id, request, budget, summary)
     }
 
     pub fn plan_sync_data(&self, peer_id: PeerId, remote: &SyncSummary) -> Result<SyncData> {
@@ -497,6 +435,16 @@ impl<S: Storage> Irokle<S> {
         self.sync.plan_request(peer_id, remote)
     }
 
+    /// Continue one peer/topic/branch/session; reset knowledge when that scope changes.
+    pub fn plan_request_with(
+        &self,
+        peer_id: PeerId,
+        remote: &SyncSummary,
+        knowledge: &crate::sync::RequestKnowledge,
+    ) -> Result<SyncRequest> {
+        self.sync.plan_request_with(peer_id, remote, knowledge)
+    }
+
     pub fn plan_sync_response_data(
         &self,
         peer_id: PeerId,
@@ -505,8 +453,9 @@ impl<S: Storage> Irokle<S> {
         self.sync.plan_response_data(peer_id, request)
     }
 
-    /// Admit sync data from `source_peer_id` and return the signed ack payload
-    /// plus any topic evictions produced by genesis tie-break resolution.
+    /// Admit sync data from `source_peer_id` and return the signed ack plus any
+    /// genesis tie-break evictions. Data for a topic this node does not hold
+    /// fails with [`Error::BootstrapPending`] while it stays staged.
     pub fn receive_sync_data_from(
         &self,
         source_peer_id: PeerId,
@@ -515,18 +464,32 @@ impl<S: Storage> Irokle<S> {
         self.receive_sync_data_from_evicting(source_peer_id, data)
     }
 
-    /// Alias for [`Self::receive_sync_data_from`] with an explicit name for
-    /// callers handling genesis tie-break evictions. The embedder consumes
-    /// evictions to re-emit discarded payloads under the winning genesis;
-    /// re-emission itself is out of scope for irokle.
+    /// Alias for [`Self::receive_sync_data_from`] with an explicit name for callers that
+    /// handle genesis tie-break evictions. The embedder re-emits discarded payloads under
+    /// the winning genesis; irokle does not re-emit them.
     pub fn receive_sync_data_from_evicting(
         &self,
         source_peer_id: PeerId,
         data: SyncData,
     ) -> Result<(SyncAck, Vec<TopicEviction>)> {
-        // Verify each op once up front; both the unknown-topic dry run and
-        // the real admission below reuse the result instead of re-running
-        // the ed25519 verification per pass.
+        match self.receive_sync_outcome(source_peer_id, data)? {
+            ReceiveOutcome::Acked { ack, evictions } => Ok((*ack, evictions)),
+            ReceiveOutcome::Staged(staged) => Err(Error::BootstrapPending {
+                staged: staged.clock,
+            }),
+        }
+    }
+
+    /// Receive sync data. Data for a topic this node does not hold is staged
+    /// per source until the staged history makes this node and the source
+    /// members; then the whole history is admitted atomically and acked.
+    pub fn receive_sync_outcome(
+        &self,
+        source_peer_id: PeerId,
+        data: SyncData,
+    ) -> Result<ReceiveOutcome> {
+        // Verify each op once up front; staging and the real admission below
+        // reuse the result instead of re-running the ed25519 verification.
         for op in &data.ops {
             if op.signed.body.topic_id != data.topic_id {
                 return Err(Error::TopicMismatch);
@@ -537,28 +500,51 @@ impl<S: Storage> Irokle<S> {
             op.validate()?;
             verified.insert(op.id);
         }
-        self.check_unknown_topic(source_peer_id, &data, &verified)?;
-        let removals = data
-            .ops
-            .iter()
-            .filter_map(|op| match &op.signed.body.payload {
-                crate::TopicPayload::Control(TopicControl::RemovePeer { peer }) => {
-                    Some((op.id, *peer))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let (mut ack, evictions) =
-            self.sync
-                .receive_data_preverified(source_peer_id, self.peer_id(), data, &verified)?;
-        for (op_id, peer) in removals {
-            if peer != self.peer_id() && ack.accepted.contains(&op_id) {
-                self.storage().clear_peer_sync_state(&peer, &ack.topic_id)?;
-            }
+        let forwarded = std::cell::RefCell::new(BTreeSet::new());
+        let forward = |source: Option<PeerId>, entries: &[(Op, OpMeta)], state: &TopicState| {
+            forwarded.borrow_mut().insert(state.topic_id);
+            self.forward_effects(source, entries, state)
+        };
+        let promoted = match self.bootstrap_unknown(source_peer_id, &data, &verified)? {
+            Bootstrap::Active(promoted) => promoted,
+            Bootstrap::Staged(staged) => return Ok(ReceiveOutcome::Staged(staged)),
+        };
+        let received = self.sync.receive_data_preverified(
+            source_peer_id,
+            self.peer_id(),
+            data,
+            &verified,
+            Some(&forward),
+        );
+        for topic_id in forwarded.borrow().iter() {
+            self.recheck_topic(*topic_id, "forwarded replication wake failed");
         }
-        self.put_receive_forward_obligations(source_peer_id, ack.topic_id, &ack.accepted)?;
-        ack.sign(&self.config.signer)?;
-        Ok((ack, evictions))
+        for topic_id in forwarded.borrow().iter() {
+            self.note_forwarded(source_peer_id, *topic_id);
+        }
+        let (mut ack, evictions) = match received {
+            Ok(received) => received,
+            Err(error) => {
+                if let Error::ReceiveCommitted { ack, .. } = &error {
+                    self.resync_committed(source_peer_id, ack.topic_id);
+                }
+                return Err(error);
+            }
+        };
+        ack.accepted
+            .extend(promoted.intersection(&verified).copied());
+        if let Err(source) = ack.sign(&self.config.signer) {
+            self.resync_committed(source_peer_id, ack.topic_id);
+            return Err(Error::ReceiveCommitted {
+                ack: Box::new(ack),
+                evictions,
+                source: Box::new(source),
+            });
+        }
+        Ok(ReceiveOutcome::Acked {
+            ack: Box::new(ack),
+            evictions,
+        })
     }
 
     pub fn receive_sync_data_as_local(
@@ -568,7 +554,13 @@ impl<S: Storage> Irokle<S> {
         let (mut ack, evictions) = self
             .sync
             .receive_data(self.peer_id(), self.peer_id(), data)?;
-        ack.sign(&self.config.signer)?;
+        if let Err(source) = ack.sign(&self.config.signer) {
+            return Err(Error::ReceiveCommitted {
+                ack: Box::new(ack),
+                evictions,
+                source: Box::new(source),
+            });
+        }
         Ok((ack, evictions))
     }
 
@@ -625,61 +617,6 @@ impl<S: Storage> Irokle<S> {
         Ok(())
     }
 
-    #[cfg(feature = "iroh")]
-    pub(crate) fn record_peer_synced(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
-        self.sync.record_peer_synced(peer_id, topic_id)
-    }
-
-    #[cfg(feature = "iroh")]
-    pub(crate) fn ensure_iroh_peer_whitelisted(
-        &self,
-        source_peer_id: PeerId,
-        data: &SyncData,
-    ) -> Result<()> {
-        if self.storage().topic_state(&data.topic_id)?.is_some() {
-            return Ok(());
-        }
-        let peer_allowed = {
-            let peer_whitelist = self
-                .peer_whitelist
-                .read()
-                .map_err(|_| Error::Storage("peer whitelist read lock poisoned".into()))?;
-            match &*peer_whitelist {
-                Some(peer_whitelist) => peer_whitelist.contains(&source_peer_id),
-                None => true,
-            }
-        };
-        if !peer_allowed {
-            return Err(Error::PeerNotWhitelisted(source_peer_id));
-        }
-        Ok(())
-    }
-
-    fn check_unknown_topic(
-        &self,
-        source_peer_id: PeerId,
-        data: &SyncData,
-        verified: &BTreeSet<crate::OpId>,
-    ) -> Result<()> {
-        if self.storage().topic_state(&data.topic_id)?.is_some() {
-            return Ok(());
-        }
-        let dry_storage = MemoryStorage::new();
-        let dry_oplog = Oplog::with_storage(dry_storage.clone());
-        dry_oplog.receive_ops_from_peer_preverified(
-            Some(source_peer_id),
-            data.ops.clone(),
-            verified,
-        )?;
-        let Some(state) = dry_storage.topic_state(&data.topic_id)? else {
-            return Err(Error::InvalidGenesis);
-        };
-        if !state.members.contains(&self.peer_id()) || !state.members.contains(&source_peer_id) {
-            return Err(Error::NotTopicMember);
-        }
-        Ok(())
-    }
-
     pub fn peer_reached_op(&self, peer_id: PeerId, op_id: OpId) -> Result<bool> {
         self.storage().peer_reached_op(&peer_id, &op_id)
     }
@@ -695,120 +632,101 @@ impl<S: Storage> Irokle<S> {
         op_ids: BTreeSet<OpId>,
     ) -> Result<()> {
         self.sync.put_obligation(peer_id, topic_id, op_ids)?;
-        #[cfg(feature = "iroh")]
-        if let Some(net) = &self.net {
-            net.schedule_resync(peer_id, topic_id);
-        }
+        self.schedule_resync(peer_id, topic_id);
         Ok(())
     }
 
-    fn put_receive_forward_obligations(
+    /// Forwarding work a received batch commits with its ops: one coalesced
+    /// clock target per selected peer other than the source and this node.
+    /// Storage skips a peer whose certified ack already covers the target.
+    fn forward_effects(
         &self,
-        source_peer_id: PeerId,
-        topic_id: TopicId,
-        accepted: &BTreeSet<OpId>,
-    ) -> Result<()> {
-        if accepted.is_empty() {
-            return Ok(());
+        source: Option<PeerId>,
+        entries: &[(Op, OpMeta)],
+        state: &TopicState,
+    ) -> Result<AdmissionEffects> {
+        let mut target_clock = ActorClock::new();
+        for (_, meta) in entries {
+            target_clock.observe(meta.actor_id, meta.actor_seq);
         }
-        let state = self
-            .storage()
-            .topic_state(&topic_id)?
-            .ok_or(Error::TopicNotFound)?;
-        for peer_id in select_sync_peers(topic_id, self.peer_id(), &state) {
-            if peer_id == source_peer_id || peer_id == self.peer_id() {
-                continue;
-            }
-            let mut missing = BTreeSet::new();
-            for op_id in accepted {
-                if !self.peer_reached_op(peer_id, *op_id)? {
-                    missing.insert(*op_id);
+        Ok(AdmissionEffects {
+            sync_obligations: self
+                .sync_peers(state.topic_id, state)
+                .into_iter()
+                .filter(|peer_id| Some(*peer_id) != source && *peer_id != self.peer_id())
+                .map(|peer_id| SyncObligation::clock(peer_id, state.topic_id, target_clock.clone()))
+                .collect(),
+        })
+    }
+
+    /// Status bookkeeping for peers owed forwarded work on `topic_id`. Its
+    /// failure must not fail the receive that already committed the work.
+    fn note_forwarded(&self, source_peer_id: PeerId, topic_id: TopicId) {
+        let result = (|| -> Result<()> {
+            let Some(state) = self.storage().topic_state(&topic_id)? else {
+                return Ok(());
+            };
+            for peer_id in self.sync_peers(topic_id, &state) {
+                if peer_id != source_peer_id
+                    && peer_id != self.peer_id()
+                    && self.storage().has_sync_obligations(&peer_id, &topic_id)?
+                {
+                    self.record_replication_scheduled(peer_id, topic_id)?;
                 }
             }
-            if !missing.is_empty() {
-                self.put_sync_obligation(peer_id, topic_id, missing)?;
-                self.record_replication_scheduled(peer_id, topic_id)?;
-            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(%topic_id, %error, "forward replication bookkeeping failed");
+        }
+    }
+
+    fn validate_concern(&self, concern: &WriteConcern) -> Result<()> {
+        if matches!(concern, WriteConcern::AsyncReplication) && !self.network_attached() {
+            return Err(Error::ReplicationUnavailable);
         }
         Ok(())
     }
 
-    #[cfg(feature = "iroh")]
     fn replication_admission_effects(
         &self,
         topic_id: TopicId,
-        op_id: OpId,
         meta: &OpMeta,
         state: &TopicState,
         write_concern: &WriteConcern,
     ) -> Result<AdmissionEffects> {
-        if !matches!(write_concern, WriteConcern::AsyncReplication) || self.net.is_none() {
+        if !matches!(write_concern, WriteConcern::AsyncReplication) {
             return Ok(AdmissionEffects::default());
         }
 
         let mut target_clock = ActorClock::new();
         target_clock.observe(meta.actor_id, meta.actor_seq);
         Ok(AdmissionEffects {
-            sync_obligations: select_sync_peers(topic_id, self.peer_id(), state)
+            sync_obligations: self
+                .sync_peers(topic_id, state)
                 .into_iter()
-                .map(|peer_id| SyncObligation {
-                    peer_id,
-                    topic_id,
-                    op_ids: [op_id].into(),
-                    target_clock: target_clock.clone(),
-                })
+                .map(|peer_id| SyncObligation::clock(peer_id, topic_id, target_clock.clone()))
                 .collect(),
         })
     }
 
-    #[cfg(feature = "iroh")]
-    fn wake_async_replication(
-        &self,
-        topic_id: TopicId,
-        _op_id: OpId,
-        write_concern: &WriteConcern,
-        wake_failed_message: &'static str,
-    ) -> Result<()> {
-        let Some(net) = &self.net else {
-            return Ok(());
-        };
-
-        let state = self
-            .storage()
-            .topic_state(&topic_id)?
-            .ok_or(Error::TopicNotFound)?;
-        let peers = select_sync_peers(topic_id, self.peer_id(), &state);
-
-        if matches!(write_concern, WriteConcern::AsyncReplication) {
-            for peer_id in peers.iter().copied() {
-                self.record_replication_scheduled(peer_id, topic_id)?;
-            }
-        }
-
-        net.schedule_topic_recheck(topic_id).map_err(|error| {
-            tracing::warn!(%topic_id, %error, "{}", wake_failed_message);
-            Error::Storage(format!("failed to schedule iroh resync: {error}"))
-        })?;
-
-        Ok(())
-    }
-
     fn record_replication_scheduled(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
-        let mut status = self
-            .storage()
-            .sync_statuses(&topic_id)?
-            .into_iter()
-            .find(|status| status.peer_id == peer_id)
-            .unwrap_or(SyncPeerStatus {
-                peer_id,
-                topic_id,
-                ..SyncPeerStatus::default()
-            });
-        status.pending_obligations = self.storage().sync_obligations(&peer_id, &topic_id)?.len();
-        if status.pending_obligations > 0 && status.state != SyncPeerState::Failed {
-            status.state = SyncPeerState::Behind;
-        }
-        self.storage().put_sync_status(status)
+        let pending = self.storage().sync_obligation_count(&peer_id, &topic_id)?;
+        let state = if pending > 0 {
+            SyncStateUpdate::BehindUnlessFailed
+        } else {
+            SyncStateUpdate::Keep
+        };
+        self.storage().update_sync_status(
+            &peer_id,
+            &topic_id,
+            &SyncStatusUpdate {
+                pending_obligations: Some(pending),
+                state,
+                ..SyncStatusUpdate::default()
+            },
+        )?;
+        Ok(())
     }
 
     pub fn sync_report(&self, peer_id: PeerId, topic_id: TopicId) -> Result<SyncReport> {
@@ -826,21 +744,16 @@ impl<S: Storage> Irokle<S> {
             status.pending_obligations = 0;
         }
 
-        for obligation in self
-            .storage()
-            .all_sync_obligations()?
-            .into_iter()
-            .filter(|obligation| obligation.topic_id == topic_id)
-        {
+        for (peer_id, pending) in self.storage().topic_obligation_counts(&topic_id)? {
             by_peer
-                .entry(obligation.peer_id)
+                .entry(peer_id)
                 .or_insert_with(|| SyncPeerStatus {
-                    peer_id: obligation.peer_id,
+                    peer_id,
                     topic_id,
                     state: SyncPeerState::Behind,
                     ..SyncPeerStatus::default()
                 })
-                .pending_obligations += 1;
+                .pending_obligations = pending;
         }
 
         let mut statuses = by_peer.into_values().collect::<Vec<_>>();
@@ -860,43 +773,91 @@ impl<S: Storage> Irokle<S> {
         Ok(counts)
     }
 
+    /// Record how attempt `attempt` ended. Only its first completion, `first`, counts; a repeat
+    /// returns the stored status. Complete and Advanced are successes, and Blocked, ReopenRequired
+    /// and Failed are failures; a partial pull stays `Behind`. Peer health is left to the caller.
     #[cfg(any(feature = "iroh", test))]
+    pub(crate) fn record_attempt_result(
+        &self,
+        peer_id: PeerId,
+        topic_id: TopicId,
+        attempt: (u64, u64),
+        outcome: &crate::AttemptOutcome,
+        first: bool,
+    ) -> Result<SyncPeerStatus> {
+        if !first {
+            return self.storage().update_sync_status(
+                &peer_id,
+                &topic_id,
+                &SyncStatusUpdate::default(),
+            );
+        }
+        let attempt_ms = now_millis()?;
+        let pending = self.storage().sync_obligation_count(&peer_id, &topic_id)?;
+        let (state, error) = match outcome {
+            crate::AttemptOutcome::Complete => (SyncPeerState::Healthy, None),
+            crate::AttemptOutcome::Advanced => (SyncPeerState::Behind, None),
+            crate::AttemptOutcome::Blocked(reason)
+            | crate::AttemptOutcome::ReopenRequired(reason) => {
+                (SyncPeerState::Behind, Some(reason.clone()))
+            }
+            crate::AttemptOutcome::Failed(reason) => (SyncPeerState::Failed, Some(reason.clone())),
+        };
+        let advanced = matches!(
+            outcome,
+            crate::AttemptOutcome::Complete | crate::AttemptOutcome::Advanced
+        );
+        self.storage().update_sync_status(
+            &peer_id,
+            &topic_id,
+            &SyncStatusUpdate {
+                successful_attempts: u64::from(advanced),
+                failed_attempts: u64::from(!advanced),
+                state: SyncStateUpdate::Set(state),
+                pending_obligations: Some(pending),
+                last_attempt_ms: Some(attempt_ms),
+                last_success_ms: advanced.then_some(attempt_ms),
+                last_error: Some(error),
+                attempt: Some(attempt),
+                ..SyncStatusUpdate::default()
+            },
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn record_sync_result(
         &self,
         peer_id: PeerId,
         topic_id: TopicId,
         result: std::result::Result<(), &std::io::Error>,
     ) -> Result<()> {
-        let mut status = self
-            .storage()
-            .sync_statuses(&topic_id)?
-            .into_iter()
-            .find(|status| status.peer_id == peer_id)
-            .unwrap_or(SyncPeerStatus {
-                peer_id,
-                topic_id,
-                ..SyncPeerStatus::default()
-            });
-        status.last_attempt_ms = Some(now_millis()?);
-        status.pending_obligations = self.storage().sync_obligations(&peer_id, &topic_id)?.len();
+        let attempt_ms = now_millis()?;
+        let pending = self.storage().sync_obligation_count(&peer_id, &topic_id)?;
+        let mut update = SyncStatusUpdate {
+            pending_obligations: Some(pending),
+            last_attempt_ms: Some(attempt_ms),
+            ..SyncStatusUpdate::default()
+        };
         match result {
             Ok(()) => {
-                status.successful_attempts = status.successful_attempts.saturating_add(1);
-                status.last_success_ms = status.last_attempt_ms;
-                status.last_error = None;
-                status.state = if status.pending_obligations == 0 {
+                update.successful_attempts = 1;
+                update.last_success_ms = Some(attempt_ms);
+                update.last_error = Some(None);
+                update.state = SyncStateUpdate::Set(if pending == 0 {
                     SyncPeerState::Healthy
                 } else {
                     SyncPeerState::Behind
-                };
+                });
             }
             Err(error) => {
-                status.failed_attempts = status.failed_attempts.saturating_add(1);
-                status.last_error = Some(error.to_string());
-                status.state = SyncPeerState::Failed;
+                update.failed_attempts = 1;
+                update.last_error = Some(Some(error.to_string()));
+                update.state = SyncStateUpdate::Set(SyncPeerState::Failed);
             }
         }
-        self.storage().put_sync_status(status)
+        self.storage()
+            .update_sync_status(&peer_id, &topic_id, &update)?;
+        Ok(())
     }
 
     pub(crate) fn publish_event<E: Event>(
@@ -906,32 +867,17 @@ impl<S: Storage> Irokle<S> {
         event: E,
         options: PublishOptions,
     ) -> Result<EventRecord<E>> {
+        self.validate_concern(&options.write_concern)?;
         let envelope = EventEnvelope::encode_event(&event)?;
-        #[cfg(feature = "iroh")]
-        let op = self.oplog.create_event_op_with_effects(
+        let (op, meta) = self.oplog.create_event_effects(
             topic_id,
             actor_id,
             envelope,
             &self.config.signer,
-            |op, meta, state| {
-                self.replication_admission_effects(
-                    topic_id,
-                    op.id,
-                    meta,
-                    state,
-                    &options.write_concern,
-                )
+            |_op, meta, state| {
+                self.replication_admission_effects(topic_id, meta, state, &options.write_concern)
             },
         )?;
-        #[cfg(not(feature = "iroh"))]
-        let op = self
-            .oplog
-            .create_event_op(topic_id, actor_id, envelope, &self.config.signer)?;
-        let meta = self
-            .oplog
-            .storage()
-            .get_meta(&op.id)?
-            .ok_or(Error::Storage("missing op meta after publish".into()))?;
         let record = EventRecord::new(
             event,
             op.id,
@@ -939,15 +885,12 @@ impl<S: Storage> Irokle<S> {
             meta.actor_seq,
             meta.observed_clock,
         );
-        #[cfg(not(feature = "iroh"))]
-        let _ = &options;
-        #[cfg(feature = "iroh")]
         self.wake_async_replication(
             topic_id,
             op.id,
             &options.write_concern,
             "async replication wake failed",
-        )?;
+        );
         Ok(record)
     }
 
@@ -957,41 +900,27 @@ impl<S: Storage> Irokle<S> {
         actor_id: ActorId,
         control: TopicControl,
     ) -> Result<()> {
-        let removed_peer = match &control {
-            TopicControl::RemovePeer { peer } => Some(*peer),
-            _ => None,
-        };
-        #[cfg(feature = "iroh")]
-        let op = self.oplog.create_control_op_with_effects(
+        self.validate_concern(&self.config.default_write_concern)?;
+        let op = self.oplog.create_control_effects(
             topic_id,
             actor_id,
             control,
             &self.config.signer,
-            |op, meta, state| {
+            |_op, meta, state| {
                 self.replication_admission_effects(
                     topic_id,
-                    op.id,
                     meta,
                     state,
                     &self.config.default_write_concern,
                 )
             },
         )?;
-        #[cfg(not(feature = "iroh"))]
-        self.oplog
-            .create_control_op(topic_id, actor_id, control, &self.config.signer)?;
-        #[cfg(feature = "iroh")]
         self.wake_async_replication(
             topic_id,
             op.id,
             &self.config.default_write_concern,
             "topic control replication wake failed",
-        )?;
-        if let Some(peer) = removed_peer
-            && peer != self.peer_id()
-        {
-            self.storage().clear_peer_sync_state(&peer, &topic_id)?;
-        }
+        );
         Ok(())
     }
 
@@ -1000,14 +929,15 @@ impl<S: Storage> Irokle<S> {
         topic_id: TopicId,
         order: HistoryOrder,
     ) -> Result<Vec<EventRecord<E>>> {
+        let storage = self.oplog.storage();
+        let ids = storage.list_op_ids(&topic_id)?;
+        let entries = topological_subset_entries(storage, &ids)?;
+        if entries.len() != ids.len() || !self.oplog.topic_unresolved(&topic_id)?.is_empty() {
+            return Err(Error::Storage("incomplete topic history".into()));
+        }
         let mut records = Vec::new();
-        for op in topological(self.oplog.storage(), &topic_id)? {
+        for (op, meta) in entries {
             if let crate::TopicPayload::Event(envelope) = &op.signed.body.payload {
-                let meta = self
-                    .oplog
-                    .storage()
-                    .get_meta(&op.id)?
-                    .ok_or(Error::Storage("missing op meta".into()))?;
                 records.push(EventRecord::new(
                     envelope.decode_event::<E>()?,
                     op.id,
@@ -1020,7 +950,7 @@ impl<S: Storage> Irokle<S> {
         Ok(ordered(records, order))
     }
 
-    pub(crate) fn topic_history_after_clock<E: Event>(
+    pub(crate) fn history_after_clock<E: Event>(
         &self,
         topic_id: TopicId,
         clock: &ActorClock,
@@ -1028,7 +958,6 @@ impl<S: Storage> Irokle<S> {
     ) -> Result<Vec<EventRecord<E>>> {
         let storage = self.oplog.storage();
         let mut seen = BTreeSet::new();
-        let mut needed = BTreeSet::new();
         let mut queue = storage
             .heads(&topic_id)?
             .into_iter()
@@ -1039,24 +968,24 @@ impl<S: Storage> Irokle<S> {
                 continue;
             }
             let meta = storage
-                .get_meta(&op_id)?
+                .get_position(&op_id)?
                 .ok_or_else(|| Error::Storage(format!("missing op meta for {op_id}")))?;
             if meta.topic_id != topic_id {
                 return Err(Error::TopicMismatch);
             }
-            if clock.get(&meta.actor_id) >= meta.actor_seq {
-                continue;
-            }
-            needed.insert(op_id);
             queue.extend(meta.deps);
         }
 
+        let entries = topological_subset_entries(storage, &seen)?;
+        if entries.len() != seen.len() || !self.oplog.topic_unresolved(&topic_id)?.is_empty() {
+            return Err(Error::Storage("incomplete topic history".into()));
+        }
         let mut records = Vec::new();
-        for op in topological_subset(storage, &needed)? {
+        for (op, meta) in entries {
+            if clock.get(&meta.actor_id) >= meta.actor_seq {
+                continue;
+            }
             if let crate::TopicPayload::Event(envelope) = &op.signed.body.payload {
-                let meta = storage
-                    .get_meta(&op.id)?
-                    .ok_or(Error::Storage("missing op meta".into()))?;
                 records.push(EventRecord::new(
                     envelope.decode_event::<E>()?,
                     op.id,
@@ -1087,21 +1016,48 @@ impl<S: Storage> Irokle<S> {
 
     pub(crate) fn topic_observed_clock(&self, topic_id: TopicId) -> Result<ActorClock> {
         let storage = self.oplog.storage();
-        let state = storage
-            .topic_state(&topic_id)?
+        let view = storage
+            .topic_view(&topic_id, None)?
             .ok_or(Error::TopicNotFound)?;
+        let state = view.state;
         let local_peer = self.peer_id();
-        let mut clock = storage.actor_clock(&topic_id)?;
+        let mut clock = view.clock;
         for peer in &state.members {
             if *peer == local_peer {
                 continue;
             }
+            // Only evidence certified for this branch says what a peer holds.
             match storage.peer_ack(peer, &topic_id)? {
-                Some(ack) => clock = clock.intersect(&ack.clock),
-                None => return Ok(ActorClock::new()),
+                Some(ack) if ack.genesis == Some(state.genesis) => {
+                    clock = clock.intersect(&ack.clock)
+                }
+                _ => return Ok(ActorClock::new()),
             }
         }
         Ok(clock)
+    }
+}
+
+/// Without Iroh no transport is attached, so the network hooks do nothing.
+#[cfg(not(feature = "iroh"))]
+impl<S: Storage> Irokle<S> {
+    fn wake_async_replication(
+        &self,
+        _topic_id: TopicId,
+        _op_id: OpId,
+        _write_concern: &WriteConcern,
+        _wake_failed_message: &'static str,
+    ) {
+    }
+
+    fn recheck_topic(&self, _topic_id: TopicId, _message: &'static str) {}
+
+    fn resync_committed(&self, _peer_id: PeerId, _topic_id: TopicId) {}
+
+    fn schedule_resync(&self, _peer_id: PeerId, _topic_id: TopicId) {}
+
+    fn network_attached(&self) -> bool {
+        false
     }
 }
 
@@ -1119,7 +1075,7 @@ impl Irokle<crate::FjallStorage> {
     }
 }
 
-#[cfg(any(feature = "iroh", test))]
+/// Whether `error` is a failure of the store rather than of the data.
 fn now_millis() -> Result<u64> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1128,24 +1084,4 @@ fn now_millis() -> Result<u64> {
     millis
         .try_into()
         .map_err(|_| Error::Storage("system time does not fit in u64 milliseconds".into()))
-}
-
-#[cfg(feature = "iroh")]
-fn record_sync_topic_join_result(
-    result: std::result::Result<(PeerId, std::io::Result<()>), tokio::task::JoinError>,
-    first_error: &mut Option<std::io::Error>,
-) {
-    match result {
-        Ok((_, Ok(()))) => {}
-        Ok((_, Err(error))) => {
-            if first_error.is_none() {
-                *first_error = Some(error);
-            }
-        }
-        Err(error) => {
-            if first_error.is_none() {
-                *first_error = Some(std::io::Error::other(error.to_string()));
-            }
-        }
-    }
 }
