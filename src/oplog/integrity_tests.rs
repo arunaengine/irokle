@@ -107,14 +107,6 @@ fn memory_steps_resume() {
     assert_steps_resume(MemoryStorage::new(), MemoryStorage::counters);
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_steps_resume() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    assert_steps_resume(storage, crate::storage::FjallStorage::counters);
-}
-
 /// A topic whose newest op depends on `width` concurrent ops of as many members.
 fn wide_topic<S: Corrupt>(storage: &S, width: u8) -> (Oplog<S>, TopicId, Vec<Op>, Op) {
     let source = node(81);
@@ -192,13 +184,6 @@ fn memory_wide_resumes() {
     assert_wide_resumes(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_wide_resumes() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_wide_resumes(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// A buffered op waiting on a missing dependency keeps the topic uncertified
 /// although its scan is whole, until the dependency arrives.
 fn assert_pending_counts<S: Corrupt>(storage: S) {
@@ -218,13 +203,6 @@ fn assert_pending_counts<S: Corrupt>(storage: S) {
 #[test]
 fn memory_pending_counts() {
     assert_pending_counts(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_pending_counts() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_pending_counts(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Ops admitted while a scan is under way do not restart it: it completes
@@ -247,14 +225,6 @@ fn assert_appends_continue<S: Corrupt>(storage: S, counters: fn(&S) -> CounterSn
 #[test]
 fn memory_appends_continue() {
     assert_appends_continue(MemoryStorage::new(), MemoryStorage::counters);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_appends_continue() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    assert_appends_continue(storage, crate::storage::FjallStorage::counters);
 }
 
 /// A reset by another handle between steps changes the data epoch, so the next
@@ -285,27 +255,6 @@ fn assert_reset_restarts<S: Corrupt>(storage: S) {
 #[test]
 fn memory_reset_restarts() {
     assert_reset_restarts(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_reset_restarts() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_reset_restarts(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
-/// The saved place of `topic_id`'s scan, which no step may hold now.
-#[cfg(feature = "fjall")]
-fn saved<S: Storage>(log: &Oplog<S>, topic_id: &TopicId) -> Cursor {
-    match &log.integrity.topics().unwrap()[topic_id].state {
-        State::Scanning {
-            cursor,
-            stepping: None,
-            ..
-        } => *cursor,
-        State::Scanning { .. } => panic!("a step still holds the scan"),
-        State::Incomplete(_) | State::Whole => panic!("the scan already ended"),
-    }
 }
 
 /// Reads of a snapshot that panic at a header read once `left` reads passed,
@@ -370,92 +319,6 @@ impl SnapshotRead for Faulty<'_> {
     ) -> Result<Vec<OpId>> {
         self.read.topic_ids_after(topic_id, after, limit)
     }
-}
-
-/// A step that panics ends its claim, and the scan goes on from the place the
-/// last finished step saved. Fjall snapshots hold no lock a panic could poison.
-#[cfg(feature = "fjall")]
-#[test]
-fn panic_releases_claim() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    let (log, topic_id, _) = seeded(&storage, 40, 41);
-    log.set_step_reads(8);
-    assert!(matches!(ask(&log, &topic_id), Integrity::Scanning(_)));
-    let place = saved(&log, &topic_id);
-    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        log.storage().read_snapshot(|read| {
-            let view = read.topic_view(&topic_id, None)?.unwrap();
-            let left = std::cell::Cell::new(3);
-            log.integrity_in(
-                &Faulty {
-                    read,
-                    left,
-                    absent: false,
-                },
-                &view,
-            )
-        })
-    }));
-    assert!(panicked.is_err());
-    assert_eq!(saved(&log, &topic_id), place);
-    let counters = crate::storage::FjallStorage::counters;
-    assert_eq!(finish(&log, &topic_id, counters).0, Integrity::Whole);
-}
-
-/// While one step is paused inside its snapshot, another question neither waits
-/// for it nor reads the claimed scan; the scan resumes once the step ends.
-#[cfg(feature = "fjall")]
-#[test]
-fn blocked_step_owns() {
-    use crate::tests::support::{Gate, GatePoint, StaleReadStorage};
-    let dir = tempfile::tempdir().unwrap();
-    let storage = StaleReadStorage::new(crate::storage::FjallStorage::open(dir.path()).unwrap());
-    let (log, topic_id, ops) = seeded(&storage, 40, 41);
-    log.set_step_reads(8);
-    let first = ops.iter().map(|op| op.id).min().unwrap();
-    let gate = std::sync::Arc::new(Gate::default());
-    let release = gate.releaser();
-    storage.arm_read(GatePoint::Meta(first), std::sync::Arc::clone(&gate));
-    let blocked = std::thread::spawn({
-        let log = log.clone();
-        move || ask(&log, &topic_id)
-    });
-    gate.wait_arrival();
-    let held = matches!(
-        log.integrity.topics().unwrap()[&topic_id].state,
-        State::Scanning {
-            stepping: Some(_),
-            ..
-        }
-    );
-    assert!(held, "the paused step holds no claim");
-    assert_eq!(ask(&log, &topic_id), Integrity::Unknown);
-    drop(release);
-    assert!(matches!(blocked.join().unwrap(), Integrity::Scanning(_)));
-    assert_eq!(log.inspect(&topic_id).unwrap().unwrap().1, Integrity::Whole);
-}
-
-/// A reopened store keeps no cursor or verdict: its scan starts over and finds
-/// the loss the interrupted scan had not reached.
-#[cfg(feature = "fjall")]
-#[test]
-fn reopen_scans_again() {
-    let dir = tempfile::tempdir().unwrap();
-    let (topic_id, ops) = {
-        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-        let (log, topic_id, ops) = seeded(&storage, 40, 41);
-        damage_op(&storage, &ops[10].id, Damage::Op);
-        log.set_step_reads(8);
-        assert!(matches!(ask(&log, &topic_id), Integrity::Scanning(_)));
-        (topic_id, ops)
-    };
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    let log = Oplog::with_storage(storage);
-    let generation = ops[10].signed.body.generation;
-    let expected = Holes::from([(ops[10].id, Some(generation))]);
-    let integrity = log.inspect(&topic_id).unwrap().unwrap().1;
-    assert_eq!(integrity, Integrity::Incomplete(expected));
 }
 
 /// A fixed topic for pure scan tests: each listed id with its generation and
@@ -573,75 +436,6 @@ fn memory_body_repaired() {
 #[test]
 fn memory_meta_repaired() {
     assert_repair_visible(MemoryStorage::new(), Damage::Meta);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_body_repaired() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    assert_repair_visible(storage, Damage::Op);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_meta_repaired() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    assert_repair_visible(storage, Damage::Meta);
-}
-
-/// A one-op scan step pauses in its Fjall snapshot while the repair of `lost`
-/// commits; the released step records `lost` missing, yet the next question is whole.
-/// With `known`, an earlier step published `lost` and the paused one reads its dependent.
-#[cfg(feature = "fjall")]
-fn assert_overlap_healed(known: bool) {
-    use crate::tests::support::{Gate, GatePoint, StaleReadStorage};
-    let dir = tempfile::tempdir().unwrap();
-    let storage = StaleReadStorage::new(crate::storage::FjallStorage::open(dir.path()).unwrap());
-    let (log, topic_id, ops) = seeded(&storage, 40, 41);
-    // A chain op whose dependent sorts after it, so a scan meets it first.
-    let index = (1..40).find(|&i| ops[i].id < ops[i + 1].id).unwrap();
-    let (lost, dependent) = (ops[index].clone(), ops[index + 1].id);
-    storage.inner.drop_op_record(&lost.id);
-    log.set_step_reads(2);
-    let paused = if known { dependent } else { lost.id };
-    let gate = std::sync::Arc::new(Gate::default());
-    let release = gate.releaser();
-    storage.arm_read(GatePoint::Meta(paused), std::sync::Arc::clone(&gate));
-    let scanning = std::thread::spawn({
-        let log = log.clone();
-        move || loop {
-            let integrity = ask(&log, &topic_id);
-            if integrity.is_complete() {
-                return integrity;
-            }
-        }
-    });
-    gate.wait_arrival();
-    let published = log.integrity.topics().unwrap()[&topic_id]
-        .holes()
-        .is_some_and(|holes| holes.contains_key(&lost.id));
-    assert_eq!(published, known, "the lost op was published: {published}");
-    log.receive_ops(vec![lost.clone()]).unwrap();
-    assert!(storage.inner.dep_resolvable(&lost.id).unwrap());
-    drop(release);
-    let finished = scanning.join().unwrap();
-    assert!(finished.is_complete());
-    assert_eq!(ask(&log, &topic_id), Integrity::Whole);
-    assert!(log.topic_unresolved(&topic_id).unwrap().is_empty());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn overlap_unpublished_heals() {
-    assert_overlap_healed(false);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn overlap_known_heals() {
-    assert_overlap_healed(true);
 }
 
 /// A view of the fixed topic under `epoch`.
@@ -769,4 +563,203 @@ fn recheck_error_typed() {
     });
     assert!(matches!(failed, Err(Error::Storage(_))), "{failed:?}");
     assert_eq!(log.topic_unresolved(&topic_id).unwrap(), hole);
+}
+
+#[cfg(feature = "fjall")]
+mod with_fjall {
+    use crate::oplog::integrity::tests::*;
+
+    #[test]
+    fn steps_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        assert_steps_resume(storage, crate::storage::FjallStorage::counters);
+    }
+
+    #[test]
+    fn wide_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_wide_resumes(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn pending_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_pending_counts(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn appends_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        assert_appends_continue(storage, crate::storage::FjallStorage::counters);
+    }
+
+    #[test]
+    fn reset_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_reset_restarts(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    /// The saved place of `topic_id`'s scan, which no step may hold now.
+    fn saved<S: Storage>(log: &Oplog<S>, topic_id: &TopicId) -> Cursor {
+        match &log.integrity.topics().unwrap()[topic_id].state {
+            State::Scanning {
+                cursor,
+                stepping: None,
+                ..
+            } => *cursor,
+            State::Scanning { .. } => panic!("a step still holds the scan"),
+            State::Incomplete(_) | State::Whole => panic!("the scan already ended"),
+        }
+    }
+
+    /// A step that panics ends its claim, and the scan goes on from the place the
+    /// last finished step saved. Fjall snapshots hold no lock a panic could poison.
+    #[test]
+    fn panic_releases_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        let (log, topic_id, _) = seeded(&storage, 40, 41);
+        log.set_step_reads(8);
+        assert!(matches!(ask(&log, &topic_id), Integrity::Scanning(_)));
+        let place = saved(&log, &topic_id);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log.storage().read_snapshot(|read| {
+                let view = read.topic_view(&topic_id, None)?.unwrap();
+                let left = std::cell::Cell::new(3);
+                log.integrity_in(
+                    &Faulty {
+                        read,
+                        left,
+                        absent: false,
+                    },
+                    &view,
+                )
+            })
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(saved(&log, &topic_id), place);
+        let counters = crate::storage::FjallStorage::counters;
+        assert_eq!(finish(&log, &topic_id, counters).0, Integrity::Whole);
+    }
+
+    /// While one step is paused inside its snapshot, another question neither waits
+    /// for it nor reads the claimed scan; the scan resumes once the step ends.
+    #[test]
+    fn blocked_step_owns() {
+        use crate::tests::support::{Gate, GatePoint, StaleReadStorage};
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            StaleReadStorage::new(crate::storage::FjallStorage::open(dir.path()).unwrap());
+        let (log, topic_id, ops) = seeded(&storage, 40, 41);
+        log.set_step_reads(8);
+        let first = ops.iter().map(|op| op.id).min().unwrap();
+        let gate = std::sync::Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Meta(first), std::sync::Arc::clone(&gate));
+        let blocked = std::thread::spawn({
+            let log = log.clone();
+            move || ask(&log, &topic_id)
+        });
+        gate.wait_arrival();
+        let held = matches!(
+            log.integrity.topics().unwrap()[&topic_id].state,
+            State::Scanning {
+                stepping: Some(_),
+                ..
+            }
+        );
+        assert!(held, "the paused step holds no claim");
+        assert_eq!(ask(&log, &topic_id), Integrity::Unknown);
+        drop(release);
+        assert!(matches!(blocked.join().unwrap(), Integrity::Scanning(_)));
+        assert_eq!(log.inspect(&topic_id).unwrap().unwrap().1, Integrity::Whole);
+    }
+
+    /// A reopened store keeps no cursor or verdict: its scan starts over and finds
+    /// the loss the interrupted scan had not reached.
+    #[test]
+    fn reopen_scans_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (topic_id, ops) = {
+            let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+            let (log, topic_id, ops) = seeded(&storage, 40, 41);
+            damage_op(&storage, &ops[10].id, Damage::Op);
+            log.set_step_reads(8);
+            assert!(matches!(ask(&log, &topic_id), Integrity::Scanning(_)));
+            (topic_id, ops)
+        };
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        let log = Oplog::with_storage(storage);
+        let generation = ops[10].signed.body.generation;
+        let expected = Holes::from([(ops[10].id, Some(generation))]);
+        let integrity = log.inspect(&topic_id).unwrap().unwrap().1;
+        assert_eq!(integrity, Integrity::Incomplete(expected));
+    }
+
+    #[test]
+    fn body_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        assert_repair_visible(storage, Damage::Op);
+    }
+
+    #[test]
+    fn meta_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        assert_repair_visible(storage, Damage::Meta);
+    }
+
+    /// A one-op scan step pauses in its Fjall snapshot while the repair of `lost`
+    /// commits; the released step records `lost` missing, yet the next question is whole.
+    /// With `known`, an earlier step published `lost` and the paused one reads its dependent.
+    fn assert_overlap_healed(known: bool) {
+        use crate::tests::support::{Gate, GatePoint, StaleReadStorage};
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            StaleReadStorage::new(crate::storage::FjallStorage::open(dir.path()).unwrap());
+        let (log, topic_id, ops) = seeded(&storage, 40, 41);
+        // A chain op whose dependent sorts after it, so a scan meets it first.
+        let index = (1..40).find(|&i| ops[i].id < ops[i + 1].id).unwrap();
+        let (lost, dependent) = (ops[index].clone(), ops[index + 1].id);
+        storage.inner.drop_op_record(&lost.id);
+        log.set_step_reads(2);
+        let paused = if known { dependent } else { lost.id };
+        let gate = std::sync::Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Meta(paused), std::sync::Arc::clone(&gate));
+        let scanning = std::thread::spawn({
+            let log = log.clone();
+            move || loop {
+                let integrity = ask(&log, &topic_id);
+                if integrity.is_complete() {
+                    return integrity;
+                }
+            }
+        });
+        gate.wait_arrival();
+        let published = log.integrity.topics().unwrap()[&topic_id]
+            .holes()
+            .is_some_and(|holes| holes.contains_key(&lost.id));
+        assert_eq!(published, known, "the lost op was published: {published}");
+        log.receive_ops(vec![lost.clone()]).unwrap();
+        assert!(storage.inner.dep_resolvable(&lost.id).unwrap());
+        drop(release);
+        let finished = scanning.join().unwrap();
+        assert!(finished.is_complete());
+        assert_eq!(ask(&log, &topic_id), Integrity::Whole);
+        assert!(log.topic_unresolved(&topic_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn overlap_unpublished_heals() {
+        assert_overlap_healed(false);
+    }
+
+    #[test]
+    fn overlap_known_heals() {
+        assert_overlap_healed(true);
+    }
 }
