@@ -95,13 +95,6 @@ fn memory_concurrent_fragments() {
     assert_concurrent_fragments(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_concurrent_fragments() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_concurrent_fragments(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// The final fragment commits but its activation fails. The staged history
 /// still owes an activation: finishing the bootstrap activates the topic with
 /// no further data, and the ack names the whole history.
@@ -140,52 +133,6 @@ fn assert_activation_retried<S: Storage>(inner: S) {
 #[test]
 fn memory_activation_retried() {
     assert_activation_retried(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_activation_retried() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_activation_retried(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
-/// A reopen after the final staging commit but before its activation activates
-/// the topic while the node is built, with no further data or pull.
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_reopen_activates() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = node(144);
-    let reader_peer = Ed25519Signer::from_bytes(&[145; 32]).peer_id();
-    let (topic_id, ops) = late_invite(&source, reader_peer, 30);
-    {
-        let storage =
-            StaleReadStorage::new(crate::storage::FjallStorage::open(dir.path()).unwrap());
-        storage
-            .failed_activations
-            .store(1, std::sync::atomic::Ordering::SeqCst);
-        let reader = reader_node(storage.clone(), 145);
-        for fragment in ops.chunks(8) {
-            let _ = reader.receive_sync_outcome(
-                source.peer_id(),
-                SyncData {
-                    topic_id,
-                    ops: fragment.to_vec(),
-                },
-            );
-        }
-        assert!(storage.topic_state(&topic_id).unwrap().is_none());
-        assert_eq!(storage.provisional_topics().unwrap().len(), 1);
-    }
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    let reader = reader_node(storage.clone(), 145);
-    assert!(storage.topic_state(&topic_id).unwrap().is_some());
-    assert!(storage.provisional_topics().unwrap().is_empty());
-    assert_eq!(
-        storage.list_op_ids(&topic_id).unwrap(),
-        source.storage().list_op_ids(&topic_id).unwrap()
-    );
-    reader.open_topic::<Note>(topic_id).unwrap();
 }
 
 /// Fixed-size fragments cost the same storage work however long the staged
@@ -332,23 +279,9 @@ impl Limited for MemoryStorage {
     }
 }
 
-#[cfg(feature = "fjall")]
-impl Limited for crate::storage::FjallStorage {
-    fn with_limits(self, limits: crate::storage::StagingLimits) -> Self {
-        self.with_staging_limits(limits)
-    }
-}
-
 #[test]
 fn memory_reclaim_behind() {
     assert_reclaim_behind(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_reclaim_behind() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_reclaim_behind(crate::storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// A history whose genesis already names the reader and the source is admitted
@@ -416,13 +349,6 @@ fn memory_direct_genesis() {
     assert_direct_genesis(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_direct_genesis() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_direct_genesis(crate::storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// Invitations beyond both old fixed caps (65,536 ops and 32 MiB per session),
 /// with non-inviting fragments crossing each, staged in frame-sized messages.
 /// Run explicitly: `cargo test --features fjall --lib invite_beyond_caps -- --ignored`.
@@ -477,20 +403,6 @@ fn assert_invite_caps<S: Storage>(storage: S) {
     assert_eq!(storage.list_op_ids(&topic_id).unwrap().len(), ops.len());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-#[ignore = "stages about 40 MiB of signed history, run explicitly"]
-fn fjall_invite_caps() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_invite_caps(
-        crate::storage::FjallStorage::open_with_persist_mode(
-            dir.path(),
-            fjall::PersistMode::Buffer,
-        )
-        .unwrap(),
-    );
-}
-
 #[test]
 #[ignore = "stages about 40 MiB of signed history, run explicitly"]
 fn memory_invite_caps() {
@@ -504,184 +416,269 @@ fn memory_invite_caps() {
     );
 }
 
-/// Two nodes over Iroh: `source` serves streams, `reader` over `storage`
-/// trusts it for unknown topics.
-#[cfg(feature = "iroh")]
-async fn pull_pair<S: Storage>(
-    storage: S,
-) -> (Irokle, Arc<net::IrohNet<MemoryStorage>>, Irokle<S>) {
-    let bind = || async {
-        iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-            .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
-            .bind()
-            .await
-            .unwrap()
-    };
-    let (source_endpoint, reader_endpoint) = (bind().await, bind().await);
-    let source = Irokle::builder()
-        .with_iroh_secret_key(source_endpoint.secret_key())
-        .build()
-        .unwrap();
-    let source_net = Arc::new(net::IrohNet::new(source_endpoint, source.clone()).unwrap());
-    source_net.start_accept_loop().unwrap();
-    let reader = Irokle::builder()
-        .with_storage(storage)
-        .with_peer_whitelist(vec![source.peer_id()])
-        .with_net(reader_endpoint)
-        .without_auto_accept()
-        .build()
-        .unwrap();
-    (source, source_net, reader)
-}
+#[cfg(feature = "fjall")]
+mod with_fjall {
+    use crate::tests::staging::*;
 
-/// Pull `topic_id` from `source_net` until it completes, within a few attempts.
-#[cfg(feature = "iroh")]
-async fn pull_until_done<S: Storage>(
-    reader: &Irokle<S>,
-    source_net: &net::IrohNet<MemoryStorage>,
-    topic_id: TopicId,
-) {
-    let addr = crate::tests::iroh::ready_addr(source_net.endpoint()).await;
-    for _ in 0..8 {
-        match reader.sync_addr_now(addr.clone(), topic_id).await {
-            Ok(()) => return,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => panic!("the pull failed: {error}"),
+    #[test]
+    fn concurrent_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_concurrent_fragments(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn activation_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_activation_retried(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    /// A reopen after the final staging commit but before its activation activates
+    /// the topic while the node is built, with no further data or pull.
+    #[test]
+    fn reopen_activates() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = node(144);
+        let reader_peer = Ed25519Signer::from_bytes(&[145; 32]).peer_id();
+        let (topic_id, ops) = late_invite(&source, reader_peer, 30);
+        {
+            let storage =
+                StaleReadStorage::new(crate::storage::FjallStorage::open(dir.path()).unwrap());
+            storage
+                .failed_activations
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+            let reader = reader_node(storage.clone(), 145);
+            for fragment in ops.chunks(8) {
+                let _ = reader.receive_sync_outcome(
+                    source.peer_id(),
+                    SyncData {
+                        topic_id,
+                        ops: fragment.to_vec(),
+                    },
+                );
+            }
+            assert!(storage.topic_state(&topic_id).unwrap().is_none());
+            assert_eq!(storage.provisional_topics().unwrap().len(), 1);
+        }
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        let reader = reader_node(storage.clone(), 145);
+        assert!(storage.topic_state(&topic_id).unwrap().is_some());
+        assert!(storage.provisional_topics().unwrap().is_empty());
+        assert_eq!(
+            storage.list_op_ids(&topic_id).unwrap(),
+            source.storage().list_op_ids(&topic_id).unwrap()
+        );
+        reader.open_topic::<Note>(topic_id).unwrap();
+    }
+
+    impl Limited for crate::storage::FjallStorage {
+        fn with_limits(self, limits: crate::storage::StagingLimits) -> Self {
+            self.with_staging_limits(limits)
         }
     }
-    panic!("the pull did not finish");
-}
 
-/// The reader stages 100 ops before the source moves to a smaller genesis inviting it at op 2.
-/// Its pull replaces the staged branch instead of comparing old positions with the shorter clock.
-/// Only the reader initiates the replacement.
-#[cfg(feature = "iroh")]
-async fn assert_replaced_pull<S: Storage>(storage: S) {
-    let (source, source_net, reader) = pull_pair(storage).await;
-    let topic_id = TopicId::hash(b"staging-replaced-pull");
-    let signer = source.signer().clone();
-    let actor = actor_id_for(topic_id, source.peer_id());
-    let genesis = |peers: BTreeSet<PeerId>| {
-        let log = oplog::Oplog::new();
-        let op = log
-            .create_topic_genesis(
-                topic_id,
-                actor,
-                TopicGenesis::new(Note::TYPE_ID, peers),
-                &signer,
-            )
-            .unwrap();
-        (log, op)
-    };
-    let third = node(150).peer_id();
-    let fourth = node(151).peer_id();
-    let first = genesis([third].into());
-    let second = genesis([third, fourth].into());
-    let ((old_log, old), (new_log, new)) = if first.1.id > second.1.id {
-        (first, second)
-    } else {
-        (second, first)
-    };
-    for index in 0..99 {
-        old_log
-            .create_event_op(
-                topic_id,
-                actor,
-                EventEnvelope::encode_event(&Note {
-                    text: format!("{index}"),
-                })
-                .unwrap(),
-                &signer,
-            )
-            .unwrap();
+    #[test]
+    fn reclaim_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_reclaim_behind(crate::storage::FjallStorage::open(dir.path()).unwrap());
     }
-    new_log
-        .create_control_op(
-            topic_id,
-            actor,
-            TopicControl::AddPeer {
-                peer: reader.peer_id(),
-            },
-            &signer,
-        )
-        .unwrap();
-    let old_ops = oplog::topological(old_log.storage(), &topic_id).unwrap();
-    let new_ops = oplog::topological(new_log.storage(), &topic_id).unwrap();
-    assert_eq!((old_ops.len(), new_ops.len()), (100, 2));
-    let staged = staged(
-        reader
-            .receive_sync_outcome(
-                source.peer_id(),
-                SyncData {
-                    topic_id,
-                    ops: old_ops,
-                },
+
+    #[test]
+    fn direct_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_direct_genesis(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    #[ignore = "stages about 40 MiB of signed history, run explicitly"]
+    fn invite_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_invite_caps(
+            crate::storage::FjallStorage::open_with_persist_mode(
+                dir.path(),
+                fjall::PersistMode::Buffer,
             )
             .unwrap(),
-    );
-    assert_eq!(staged.genesis, Some(old.id));
-    oplog::Oplog::with_storage(source.storage().clone())
-        .receive_ops(new_ops.clone())
-        .unwrap();
-
-    pull_until_done(&reader, &source_net, topic_id).await;
-    assert_eq!(genesis_of(reader.storage(), &topic_id), Some(new.id));
-    assert_eq!(
-        reader.storage().list_op_ids(&topic_id).unwrap(),
-        new_ops.iter().map(|op| op.id).collect()
-    );
-    source_net.shutdown().await;
-    reader.shutdown_iroh().await;
+        );
+    }
 }
 
 #[cfg(feature = "iroh")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn memory_replaced_pull() {
-    assert_replaced_pull(MemoryStorage::new()).await;
-}
+mod with_iroh {
+    use crate::tests::staging::*;
 
-#[cfg(all(feature = "iroh", feature = "fjall"))]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fjall_replaced_pull() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_replaced_pull(crate::storage::FjallStorage::open(dir.path()).unwrap()).await;
-}
+    /// Two nodes over Iroh: `source` serves streams, `reader` over `storage`
+    /// trusts it for unknown topics.
+    async fn pull_pair<S: Storage>(
+        storage: S,
+    ) -> (Irokle, Arc<net::IrohNet<MemoryStorage>>, Irokle<S>) {
+        let bind = || async {
+            iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
+                .bind()
+                .await
+                .unwrap()
+        };
+        let (source_endpoint, reader_endpoint) = (bind().await, bind().await);
+        let source = Irokle::builder()
+            .with_iroh_secret_key(source_endpoint.secret_key())
+            .build()
+            .unwrap();
+        let source_net = Arc::new(net::IrohNet::new(source_endpoint, source.clone()).unwrap());
+        source_net.start_accept_loop().unwrap();
+        let reader = Irokle::builder()
+            .with_storage(storage)
+            .with_peer_whitelist(vec![source.peer_id()])
+            .with_net(reader_endpoint)
+            .without_auto_accept()
+            .build()
+            .unwrap();
+        (source, source_net, reader)
+    }
 
-/// The final fragment's activation fails after its staging commit. A pull
-/// that finds nothing left to fetch finishes that activation instead of
-/// reporting the topic unreachable.
-#[cfg(feature = "iroh")]
-async fn assert_pull_activates<S: Storage>(inner: S) {
-    let storage = StaleReadStorage::new(inner);
-    let (source, source_net, reader) = pull_pair(storage.clone()).await;
-    let (topic_id, ops) = late_invite(&source, reader.peer_id(), 12);
-    storage
-        .failed_activations
-        .store(1, std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        reader
-            .receive_sync_outcome(source.peer_id(), SyncData { topic_id, ops })
-            .is_err()
-    );
-    assert!(storage.topic_state(&topic_id).unwrap().is_none());
-    pull_until_done(&reader, &source_net, topic_id).await;
-    assert_eq!(
-        storage.list_op_ids(&topic_id).unwrap(),
-        source.storage().list_op_ids(&topic_id).unwrap()
-    );
-    source_net.shutdown().await;
-    reader.shutdown_iroh().await;
-}
+    /// Pull `topic_id` from `source_net` until it completes, within a few attempts.
+    async fn pull_until_done<S: Storage>(
+        reader: &Irokle<S>,
+        source_net: &net::IrohNet<MemoryStorage>,
+        topic_id: TopicId,
+    ) {
+        let addr = crate::tests::iroh::ready_addr(source_net.endpoint()).await;
+        for _ in 0..8 {
+            match reader.sync_addr_now(addr.clone(), topic_id).await {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the pull failed: {error}"),
+            }
+        }
+        panic!("the pull did not finish");
+    }
 
-#[cfg(feature = "iroh")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn memory_pull_activates() {
-    assert_pull_activates(MemoryStorage::new()).await;
-}
+    /// The reader stages 100 ops before the source moves to a smaller genesis inviting it at op 2.
+    /// Its pull replaces the staged branch instead of comparing old positions with the shorter clock.
+    /// Only the reader initiates the replacement.
+    async fn assert_replaced_pull<S: Storage>(storage: S) {
+        let (source, source_net, reader) = pull_pair(storage).await;
+        let topic_id = TopicId::hash(b"staging-replaced-pull");
+        let signer = source.signer().clone();
+        let actor = actor_id_for(topic_id, source.peer_id());
+        let genesis = |peers: BTreeSet<PeerId>| {
+            let log = oplog::Oplog::new();
+            let op = log
+                .create_topic_genesis(
+                    topic_id,
+                    actor,
+                    TopicGenesis::new(Note::TYPE_ID, peers),
+                    &signer,
+                )
+                .unwrap();
+            (log, op)
+        };
+        let third = node(150).peer_id();
+        let fourth = node(151).peer_id();
+        let first = genesis([third].into());
+        let second = genesis([third, fourth].into());
+        let ((old_log, old), (new_log, new)) = if first.1.id > second.1.id {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        for index in 0..99 {
+            old_log
+                .create_event_op(
+                    topic_id,
+                    actor,
+                    EventEnvelope::encode_event(&Note {
+                        text: format!("{index}"),
+                    })
+                    .unwrap(),
+                    &signer,
+                )
+                .unwrap();
+        }
+        new_log
+            .create_control_op(
+                topic_id,
+                actor,
+                TopicControl::AddPeer {
+                    peer: reader.peer_id(),
+                },
+                &signer,
+            )
+            .unwrap();
+        let old_ops = oplog::topological(old_log.storage(), &topic_id).unwrap();
+        let new_ops = oplog::topological(new_log.storage(), &topic_id).unwrap();
+        assert_eq!((old_ops.len(), new_ops.len()), (100, 2));
+        let staged = staged(
+            reader
+                .receive_sync_outcome(
+                    source.peer_id(),
+                    SyncData {
+                        topic_id,
+                        ops: old_ops,
+                    },
+                )
+                .unwrap(),
+        );
+        assert_eq!(staged.genesis, Some(old.id));
+        oplog::Oplog::with_storage(source.storage().clone())
+            .receive_ops(new_ops.clone())
+            .unwrap();
 
-#[cfg(all(feature = "iroh", feature = "fjall"))]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fjall_pull_activates() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_pull_activates(crate::storage::FjallStorage::open(dir.path()).unwrap()).await;
+        pull_until_done(&reader, &source_net, topic_id).await;
+        assert_eq!(genesis_of(reader.storage(), &topic_id), Some(new.id));
+        assert_eq!(
+            reader.storage().list_op_ids(&topic_id).unwrap(),
+            new_ops.iter().map(|op| op.id).collect()
+        );
+        source_net.shutdown().await;
+        reader.shutdown_iroh().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_replaced_pull() {
+        assert_replaced_pull(MemoryStorage::new()).await;
+    }
+
+    /// The final fragment's activation fails after its staging commit. A pull
+    /// that finds nothing left to fetch finishes that activation instead of
+    /// reporting the topic unreachable.
+    async fn assert_pull_activates<S: Storage>(inner: S) {
+        let storage = StaleReadStorage::new(inner);
+        let (source, source_net, reader) = pull_pair(storage.clone()).await;
+        let (topic_id, ops) = late_invite(&source, reader.peer_id(), 12);
+        storage
+            .failed_activations
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            reader
+                .receive_sync_outcome(source.peer_id(), SyncData { topic_id, ops })
+                .is_err()
+        );
+        assert!(storage.topic_state(&topic_id).unwrap().is_none());
+        pull_until_done(&reader, &source_net, topic_id).await;
+        assert_eq!(
+            storage.list_op_ids(&topic_id).unwrap(),
+            source.storage().list_op_ids(&topic_id).unwrap()
+        );
+        source_net.shutdown().await;
+        reader.shutdown_iroh().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_pull_activates() {
+        assert_pull_activates(MemoryStorage::new()).await;
+    }
+
+    #[cfg(feature = "fjall")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fjall_replaced_pull() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_replaced_pull(crate::storage::FjallStorage::open(dir.path()).unwrap()).await;
+    }
+
+    #[cfg(feature = "fjall")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fjall_pull_activates() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_pull_activates(crate::storage::FjallStorage::open(dir.path()).unwrap()).await;
+    }
 }

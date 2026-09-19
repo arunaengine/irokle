@@ -48,7 +48,7 @@ def cases():
     for name in ("pending::fjall_drains_complete", "planning::catch_up_costs",
                  "planning::pull_hundred_thousand", "progress::window_chain_boundary",
                  "requests::real_join_finishes",
-                 "staging::fjall_invite_caps", "staging::memory_invite_caps"):
+                 "staging::with_fjall::invite_caps", "staging::memory_invite_caps"):
         exact = f"tests::{name}"
         result.append({"label": f"ignored-{name.split('::')[-1]}", "timeout": 7200,
                        "argv": ["cargo", "test", "--locked", "--all-features", "--lib", exact,
