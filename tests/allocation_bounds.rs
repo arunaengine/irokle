@@ -44,7 +44,7 @@ mod tests {
     }
 }
 
-#[path = "../src/clock.rs"]
+#[path = "../src/clock/mod.rs"]
 mod clock;
 
 #[path = "../src/sync/space.rs"]

@@ -13,7 +13,6 @@ use std::sync::{Arc, Weak};
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "fjall")]
-#[path = "clock_scan.rs"]
 pub(crate) mod scan;
 
 /// Actor positions in a persistent trie over actor-ID nibbles. Clones share nodes;
