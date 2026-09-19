@@ -22,7 +22,6 @@ use crate::storage::{
     topic_fingerprint_for, validate_batch, validate_heads,
 };
 
-#[cfg(feature = "fjall")]
 #[derive(Clone)]
 pub struct FjallStorage {
     pub(super) db: fjall::OptimisticTxDatabase,
@@ -68,15 +67,11 @@ pub(crate) enum Hook {
 #[cfg(test)]
 type HookFn = std::sync::Arc<dyn Fn(Hook) -> Result<()> + Send + Sync>;
 
-#[cfg(feature = "fjall")]
 const FJALL_SCHEMA_VERSION: u32 = 2;
 /// Eviction journal records. No other keyspace begins with `e`, so this is the
 /// whole prefix: unlike `ob`, it cannot be shadowed by a single-letter prefix.
-#[cfg(feature = "fjall")]
 const EVICTION_PREFIX: &[u8] = b"ev";
-#[cfg(feature = "fjall")]
 const SEALED_TOPIC_PREFIX: &[u8] = b"se";
-#[cfg(feature = "fjall")]
 const SCHEMA_VERSION_KEY: &[u8] = b"sv";
 /// Where an unfinished schema 2 upgrade continues, see [`ClockMigration`].
 const CLOCK_MIGRATION: &[u8] = b"sm";
@@ -87,30 +82,23 @@ const MIGRATION_RECORDS: usize = 1024;
 const MIGRATION_ENTRIES: usize = 1 << 20;
 /// Stored acknowledgements, keyed on `ak<topic><peer>` since schema 2. No
 /// other key starts with `ak`, so this is the whole prefix.
-#[cfg(feature = "fjall")]
 const PEER_ACK_PREFIX: &[u8] = b"ak";
 /// Sync obligations, keyed on `ob<topic><peer><kind>` since schema 2. An op
 /// key `o<id>` with an id starting with `b` shares the prefix, so bare scans
 /// check the key length.
-#[cfg(feature = "fjall")]
 const OBLIGATION_PREFIX: &[u8] = b"ob";
-#[cfg(feature = "fjall")]
 const OBLIGATION_KEY_LEN: usize = 2 + TopicId::LEN + PeerId::LEN + 1;
 /// Pending payload records, keyed on `po<op id>`.
-#[cfg(feature = "fjall")]
 const PENDING_OP_PREFIX: &[u8] = b"po";
 /// Destructive data epoch per topic, keyed on `ep<topic id>`. A reset keeps
 /// and advances it.
-#[cfg(feature = "fjall")]
 const TOPIC_EPOCH_PREFIX: &[u8] = b"ep";
 /// The durable attempt epoch, one `u64` under exactly this key.
-#[cfg(feature = "fjall")]
 const ATTEMPT_EPOCH_KEY: &[u8] = b"ae";
 
 /// Schema 1 layout of a stored acknowledgement, which did not name the branch
 /// it certified. Kept only to read those records during the upgrade; postcard
 /// is not self-describing, so the old bytes need the old field order.
-#[cfg(feature = "fjall")]
 #[derive(Deserialize)]
 struct LegacyPeerAck {
     peer_id: PeerId,
@@ -121,7 +109,6 @@ struct LegacyPeerAck {
 
 /// Sync status layout before attempt identities. Postcard is not
 /// self-describing, so such records decode only with this shape.
-#[cfg(feature = "fjall")]
 #[derive(Deserialize)]
 struct LegacyPeerStatus {
     peer_id: PeerId,
@@ -136,7 +123,6 @@ struct LegacyPeerStatus {
 }
 
 /// Decode a status record in the current or the earlier layout.
-#[cfg(feature = "fjall")]
 fn decode_status(bytes: &[u8]) -> Result<SyncPeerStatus> {
     if let Ok(status) = postcard::from_bytes(bytes) {
         return Ok(status);
@@ -159,7 +145,6 @@ fn decode_status(bytes: &[u8]) -> Result<SyncPeerStatus> {
 
 /// Schema 1 layout of a sync obligation, which kept resolved and
 /// unresolved wants in one shape told apart only by empty fields.
-#[cfg(feature = "fjall")]
 #[derive(Deserialize)]
 struct LegacyObligation {
     peer_id: PeerId,
@@ -168,7 +153,6 @@ struct LegacyObligation {
     target_clock: ActorClock,
 }
 
-#[cfg(feature = "fjall")]
 impl FjallStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_persist_mode(path, fjall::PersistMode::SyncAll)
@@ -1386,7 +1370,6 @@ impl FjallStorage {
     }
 }
 
-#[cfg(feature = "fjall")]
 impl Storage for FjallStorage {
     fn read_snapshot<R>(&self, read: impl FnOnce(&dyn SnapshotRead) -> Result<R>) -> Result<R> {
         read(&FjallSnapshot {
@@ -2014,7 +1997,6 @@ impl Storage for FjallStorage {
 /// A stored [`OpMeta`]: a small observed clock held inline, a larger one
 /// named by the hash of its root node, whose nodes the op's topic keeps under
 /// [`CLOCK_NODE`].
-#[cfg(feature = "fjall")]
 #[derive(Serialize, Deserialize)]
 struct StoredMeta {
     id: OpId,
@@ -2045,7 +2027,6 @@ struct MetaWrite<'a> {
     missing_deps: &'a BTreeSet<OpId>,
 }
 
-#[cfg(feature = "fjall")]
 #[derive(Serialize, Deserialize)]
 enum StoredClock {
     Inline(ActorClock),
@@ -2054,11 +2035,9 @@ enum StoredClock {
 
 /// Entries a stored clock holds inline at most. Each op's record stays within
 /// a fixed size, and a small clock costs no node records to write, read or copy.
-#[cfg(feature = "fjall")]
 const INLINE_CLOCK_ENTRIES: usize = 32;
 
 /// The next metadata records the schema 2 upgrade rewrites: those after `after`.
-#[cfg(feature = "fjall")]
 #[derive(Default, Serialize, Deserialize)]
 struct ClockMigration {
     after: Option<Vec<u8>>,
@@ -2066,15 +2045,12 @@ struct ClockMigration {
 
 /// Clock nodes, by topic and node hash. Nodes are immutable and shared by
 /// every clock of the topic that holds them; a topic reset removes them.
-#[cfg(feature = "fjall")]
 pub(super) const CLOCK_NODE: &[u8] = b"cn";
 
-#[cfg(feature = "fjall")]
 fn clock_node_key(topic_id: &TopicId, hash: &[u8; 32]) -> Vec<u8> {
     [CLOCK_NODE, topic_id.as_ref(), hash].concat()
 }
 
-#[cfg(feature = "fjall")]
 impl FjallStorage {
     /// Store `meta` in `records`, a large observed clock with the nodes
     /// `records` does not hold yet, in the same transaction.
@@ -2240,7 +2216,6 @@ pub(crate) fn write_legacy_metas(
 
 /// The leading fields of a [`StoredMeta`], in its field order. Postcard
 /// decodes them and leaves the observed clock after them unread.
-#[cfg(feature = "fjall")]
 #[derive(Deserialize)]
 struct MetaPrefix {
     _id: OpId,
@@ -2371,7 +2346,6 @@ fn validation_root(bytes: &[u8]) -> Result<Option<&[u8; 32]>> {
     Ok(root)
 }
 
-#[cfg(feature = "fjall")]
 impl From<MetaPrefix> for OpPosition {
     fn from(prefix: MetaPrefix) -> Self {
         Self {
@@ -2385,7 +2359,6 @@ impl From<MetaPrefix> for OpPosition {
     }
 }
 
-#[cfg(feature = "fjall")]
 /// One read transaction seen through [`SnapshotRead`].
 struct FjallSnapshot<'a> {
     tx: fjall::Snapshot,

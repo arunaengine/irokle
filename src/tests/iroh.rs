@@ -1,6 +1,5 @@
 use crate::tests::support::*;
 
-#[cfg(feature = "iroh")]
 #[tokio::test]
 async fn builder_sets_net() {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -19,7 +18,6 @@ async fn builder_sets_net() {
     assert!(irokle.list_topics().unwrap().is_empty());
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test]
 async fn builder_sets_runtime() {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -42,7 +40,6 @@ async fn builder_sets_runtime() {
     assert_eq!(irokle.iroh_runtime_config(), Some(runtime));
 }
 
-#[cfg(feature = "iroh")]
 #[test]
 fn runtime_default_intervals() {
     let runtime = net::IrohRuntimeConfig::default();
@@ -66,7 +63,6 @@ fn runtime_default_intervals() {
     );
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resync_unaccepted() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -118,7 +114,6 @@ async fn resync_unaccepted() {
     bob_endpoint.close().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn defaults_async_replication() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -154,7 +149,6 @@ async fn defaults_async_replication() {
     bob_endpoint.close().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test]
 async fn resync_accept_once() {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -188,7 +182,6 @@ async fn resync_accept_once() {
     net.shutdown().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test]
 async fn abort_allows_replacement() {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -223,7 +216,7 @@ async fn abort_allows_replacement() {
     net.shutdown().await;
 }
 
-#[cfg(all(feature = "iroh", feature = "fjall"))]
+#[cfg(feature = "fjall")]
 #[tokio::test]
 async fn builder_selects_fjall() {
     let dir = tempfile::tempdir().unwrap();
@@ -243,7 +236,6 @@ async fn builder_selects_fjall() {
     assert!(irokle.list_topics().unwrap().is_empty());
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sync_now_records() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -312,7 +304,6 @@ async fn sync_now_records() {
     );
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_status_scheduled() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -362,7 +353,6 @@ async fn async_status_scheduled() {
     assert_eq!(status[0].pending_obligations, 1);
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_obligation_schedule() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -415,7 +405,7 @@ async fn async_obligation_schedule() {
     );
 }
 
-#[cfg(all(feature = "iroh", feature = "fjall"))]
+#[cfg(feature = "fjall")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fjall_genesis_obligation() {
     let dir = tempfile::tempdir().unwrap();
@@ -458,7 +448,6 @@ async fn fjall_genesis_obligation() {
     );
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn open_hides_outsider() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -489,7 +478,6 @@ async fn open_hides_outsider() {
     assert!(responses.is_empty());
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn former_member_fingerprint() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -553,7 +541,6 @@ async fn former_member_fingerprint() {
     }));
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn whitelist_controls_bootstrap() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -667,7 +654,6 @@ async fn whitelist_controls_bootstrap() {
     assert!(bob.storage().topic_state(&topic.id()).unwrap().is_some());
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ack_before_data() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -758,7 +744,6 @@ async fn ack_before_data() {
     assert!(peer_ack.heads.contains(&bob_record.meta.op_id));
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resync_backlog_bound() {
     const TOPICS: usize = 1000;
@@ -836,7 +821,6 @@ async fn resync_backlog_bound() {
     bob.shutdown_iroh().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn genesis_eviction_sink() {
     use crate::TopicEviction;
@@ -982,7 +966,6 @@ async fn genesis_eviction_sink() {
     alice.shutdown_iroh().await;
 }
 
-#[cfg(feature = "iroh")]
 pub(super) async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr {
     use futures::StreamExt;
     use iroh::Watcher;
@@ -1004,7 +987,6 @@ pub(super) async fn ready_addr(endpoint: &iroh::Endpoint) -> iroh::EndpointAddr 
     .expect("iroh endpoint produced a dialable address")
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bad_ack_isolated() {
     // A rejected ack must not discard the other acks batched into the same
@@ -1101,7 +1083,6 @@ async fn bad_ack_isolated() {
     );
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn equal_fingerprint_repairs() {
     // Two stores with identical heads and clocks, one missing a non-head
@@ -1190,7 +1171,6 @@ async fn equal_fingerprint_repairs() {
     alice.shutdown_iroh().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_topic_retries() {
     // A topic whose data the peer could not admit must come back as an explicit
@@ -1292,7 +1272,6 @@ async fn failed_topic_retries() {
     alice.shutdown_iroh().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_peer_ack() {
     // An ack bound to another peer must fail its own topic only; the valid ack
@@ -1389,7 +1368,6 @@ async fn wrong_peer_ack() {
 /// Shutdown owns the stream tasks it spawned: while one is held inside a
 /// storage read the timed variant reports it running, and once released the
 /// plain shutdown completes and stays complete.
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_awaits_tasks() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -1469,7 +1447,6 @@ async fn shutdown_awaits_tasks() {
 /// With sweeps off and no new publish, a failing preferred peer must hand its
 /// topic to an allowed alternate: the health change itself schedules the work.
 /// The preferred peer's own obligation stays outstanding for when it returns.
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fallback_gets_work() {
     let lookup = iroh::address_lookup::memory::MemoryLookup::new();
@@ -1551,7 +1528,6 @@ async fn fallback_gets_work() {
 }
 /// Offline async publishes of N and then 2N events keep one clock record per
 /// peer, not one per publish.
-#[cfg(feature = "iroh")]
 async fn assert_publishes_coalesce<S: Storage>(storage: S) {
     let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
         .bind()
@@ -1601,13 +1577,12 @@ async fn assert_publishes_coalesce<S: Storage>(storage: S) {
     alice.shutdown_iroh().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn memory_publishes_coalesce() {
     assert_publishes_coalesce(MemoryStorage::new()).await;
 }
 
-#[cfg(all(feature = "iroh", feature = "fjall"))]
+#[cfg(feature = "fjall")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fjall_publishes_coalesce() {
     let dir = tempfile::tempdir().unwrap();
@@ -1684,7 +1659,6 @@ fn assert_bootstrapped(alice: &Irokle, bob: &Irokle, topic_id: TopicId) {
     assert_eq!(ack.clock, alice.storage().actor_clock(&topic_id).unwrap());
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_spans_frames() {
     let (alice, alice_net, bob, bob_addr) = bootstrap_pair(true).await;
@@ -1726,7 +1700,6 @@ async fn bootstrap_spans_frames() {
     bob.shutdown_iroh().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_spans_pages() {
     let (alice, alice_net, bob, bob_addr) = bootstrap_pair(true).await;
@@ -1751,7 +1724,6 @@ async fn bootstrap_spans_pages() {
 
 /// A member invited after the history pulls the topic it does not hold, page
 /// by page. A topic neither side holds leaves nothing to do.
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invited_pulls_topic() {
     let (alice, alice_net, bob, _) = bootstrap_pair(true).await;
@@ -1780,7 +1752,6 @@ async fn invited_pulls_topic() {
 }
 
 /// A source outside the whitelist is never asked for a topic this node lacks.
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unlisted_never_pulls() {
     let (alice, alice_net, bob, _) = bootstrap_pair(false).await;
@@ -1800,7 +1771,6 @@ async fn unlisted_never_pulls() {
     bob.shutdown_iroh().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unlisted_never_stages() {
     let (alice, alice_net, bob, bob_addr) = bootstrap_pair(false).await;
@@ -1890,13 +1860,12 @@ async fn pull_fills_hole(bob_fjall: bool) {
     alice_net.shutdown().await;
 }
 
-#[cfg(feature = "iroh")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn memory_pull_hole() {
     pull_fills_hole(false).await;
 }
 
-#[cfg(all(feature = "iroh", feature = "fjall"))]
+#[cfg(feature = "fjall")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fjall_pull_hole() {
     pull_fills_hole(true).await;
