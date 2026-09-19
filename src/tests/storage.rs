@@ -2300,10 +2300,10 @@ fn fjall_pending_bytes() {
     assert_pending_bytes(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
-/// Rewrite a current database into the schema 2 layout that predates byte counters:
-/// peer-first acks and obligations, legacy obligation shapes and whole pending records.
+/// Rewrite a current database into the schema 1 layout: peer-first acks without a
+/// branch, peer-first legacy obligations and whole pending records without byte counters.
 #[cfg(feature = "fjall")]
-fn downgrade_schema_two(
+fn downgrade_schema_one(
     db: &fjall::OptimisticTxDatabase,
     topic_id: TopicId,
     peer: PeerId,
@@ -2383,7 +2383,8 @@ fn downgrade_schema_two(
                 ack.topic_id.as_ref(),
             ]
             .concat();
-            tx.insert(&records, old_key, value);
+            let old = (ack.peer_id, ack.topic_id, &ack.heads, &ack.clock);
+            tx.insert(&records, old_key, postcard::to_allocvec(&old).unwrap());
         }
     }
     for (index, (op_ids, clock)) in legacy.iter().enumerate() {
@@ -2400,17 +2401,17 @@ fn downgrade_schema_two(
     tx.insert(
         &records,
         b"sv".to_vec(),
-        postcard::to_allocvec(&2u32).unwrap(),
+        postcard::to_allocvec(&1u32).unwrap(),
     );
     tx.commit().unwrap().unwrap();
 }
 
-/// A schema 2 file is upgraded by every facade that opens it at once, exactly
-/// once: obligations take their explicit kinds, acks move keys, and the pending
-/// byte counters it never had are rebuilt instead of reading as an empty pool.
+/// A schema 1 file is upgraded by every facade that opens it at once, exactly
+/// once: obligations take their explicit kinds, acks move keys and certify nothing,
+/// and the byte counters it never had are rebuilt instead of reading as an empty pool.
 #[cfg(feature = "fjall")]
 #[test]
-fn fjall_upgrade_two() {
+fn fjall_upgrade_one() {
     let dir = tempfile::tempdir().unwrap();
     let source = node(140);
     let peer = PeerId::hash(b"upgrade-peer");
@@ -2471,7 +2472,7 @@ fn fjall_upgrade_two() {
         let db = fjall::OptimisticTxDatabase::builder(dir.path())
             .open()
             .unwrap();
-        downgrade_schema_two(
+        downgrade_schema_one(
             &db,
             topic.id(),
             peer,
@@ -2512,7 +2513,7 @@ fn fjall_upgrade_two() {
         ]
     );
     let ack = facades[1].peer_ack(&peer, &topic.id()).unwrap().unwrap();
-    assert_eq!(ack.genesis, Some(genesis));
+    assert_eq!(ack.genesis, None);
     assert_eq!(
         storage.pending_usage(&source.peer_id()),
         (1, charge, 1, charge),
@@ -2534,7 +2535,7 @@ fn fjall_upgrade_two() {
 }
 
 /// A malformed legacy record fails the upgrade as a whole: the file stays at
-/// schema 2 with nothing half moved, and a future version is refused outright.
+/// schema 1 with nothing half moved, and a future version is refused outright.
 #[cfg(feature = "fjall")]
 #[test]
 fn fjall_refuses_schema() {
@@ -2547,7 +2548,7 @@ fn fjall_refuses_schema() {
         let db = fjall::OptimisticTxDatabase::builder(dir.path())
             .open()
             .unwrap();
-        downgrade_schema_two(
+        downgrade_schema_one(
             &db,
             topic_id,
             peer,
@@ -2580,7 +2581,7 @@ fn fjall_refuses_schema() {
             .keyspace("records", fjall::KeyspaceCreateOptions::default)
             .unwrap();
         let version = records.get(b"sv").unwrap().unwrap();
-        assert_eq!(postcard::from_bytes::<u32>(&version).unwrap(), 2);
+        assert_eq!(postcard::from_bytes::<u32>(&version).unwrap(), 1);
         assert_eq!(
             db.read_tx()
                 .iter(&records)

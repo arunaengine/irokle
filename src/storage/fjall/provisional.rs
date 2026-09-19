@@ -39,18 +39,6 @@ struct NamespaceRecord {
     slot: u32,
 }
 
-/// Schema 5 layout of a namespace record, without revision and bytes.
-#[derive(Deserialize)]
-struct LegacyNamespaceRecord {
-    source: PeerId,
-    topic_id: TopicId,
-    genesis: OpId,
-    session: u64,
-    updated_ms: u64,
-    activating: bool,
-    slot: u32,
-}
-
 /// The charge a clearing slot carries over from its ended session.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(super) struct ClearingCharge {
@@ -669,43 +657,5 @@ impl FjallStorage {
             }
             Ok(())
         })
-    }
-
-    /// Rewrite schema 5 namespace records in `tx` with a first revision and
-    /// the bytes their keyspace's counters hold.
-    pub(super) fn tx_migrate_namespaces(&self, tx: &mut Tx) -> Result<()> {
-        let mut legacy = Vec::new();
-        for item in fjall::Readable::prefix(tx, &self.records, NAMESPACE) {
-            let (key, value) = item.into_inner()?;
-            legacy.push((
-                key.to_vec(),
-                postcard::from_bytes::<LegacyNamespaceRecord>(value.as_ref())?,
-            ));
-        }
-        for (key, record) in legacy {
-            let store = self.slot_records(record.slot)?;
-            let admitted: u64 = Self::tx_get(tx, &store, ADMITTED_BYTES)?.unwrap_or_default();
-            let bytes = admitted + Self::tx_pending_bytes(tx, &store)?;
-            let provisional = ProvisionalTopic {
-                source: record.source,
-                topic_id: record.topic_id,
-                genesis: record.genesis,
-                session: record.session,
-                updated_ms: record.updated_ms,
-                activating: record.activating,
-                revision: 0,
-                bytes,
-            };
-            Self::tx_put(
-                tx,
-                &self.records,
-                key,
-                &NamespaceRecord {
-                    provisional,
-                    slot: record.slot,
-                },
-            )?;
-        }
-        Ok(())
     }
 }

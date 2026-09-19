@@ -92,7 +92,7 @@ fn upgrades_schema_one() {
     let m = Manifest::read(dir.path());
     let path = dir.path().join("db");
     drop(FjallStorage::open(&path).unwrap());
-    assert_eq!(stored_version(&path), 7);
+    assert_eq!(stored_version(&path), 2);
     let storage = FjallStorage::open(&path).unwrap();
 
     let topic: TopicId = m.id("topic");
@@ -237,7 +237,7 @@ fn concurrent_open_agrees() {
         .collect::<Vec<_>>();
     assert_eq!(seen[0], seen[1]);
     drop(db);
-    assert_eq!(stored_version(&dir.path().join("db")), 7);
+    assert_eq!(stored_version(&dir.path().join("db")), 2);
 }
 
 /// A buffered record the upgrade cannot decode aborts it with nothing
@@ -258,7 +258,7 @@ fn upgrade_rolls_back() {
 
     raw_write(&path, &key, value);
     drop(FjallStorage::open(&path).unwrap());
-    assert_eq!(stored_version(&path), 7);
+    assert_eq!(stored_version(&path), 2);
 }
 
 #[test]
@@ -449,7 +449,7 @@ fn upgrade_resumes() {
         let dir = fixture_copy(FIXTURE);
         let path = dir.path().join("db");
         FjallStorage::open_interrupted(&path, steps).unwrap();
-        assert_eq!(stored_version(&path), 7);
+        assert_eq!(stored_version(&path), 2);
         let stopped = raw_records(&path).contains_key(b"sm".as_slice());
         let storage = FjallStorage::open(&path).unwrap();
         assert!(!storage.migrating().unwrap(), "{steps} steps");

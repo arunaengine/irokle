@@ -1,7 +1,0 @@
-Stored metadata names its observed clock by the hash of a trie node instead of
-holding every entry, so a clock one position ahead of another shares all but a
-path of nodes with it. The version moves to 7 with a cursor first, which an
-older binary refuses; bounded steps then rewrite the records of the main
-keyspace and of every slot keyspace, and the step that removes the cursor
-completes the layout. Opening a store continues a step sequence an interruption
-left.
