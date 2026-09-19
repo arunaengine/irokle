@@ -785,7 +785,7 @@ async fn planning_holds_group() {
     for topic_id in &topics {
         assert_eq!(clock(&bob, *topic_id), clock(&alice, *topic_id));
     }
-    let peak = net.planned_peak.load(Ordering::Relaxed);
+    let peak = net.probes.planned_peak.load(Ordering::Relaxed);
     assert!(peak > 0);
     assert!(
         peak <= 2 * limits.bytes,

@@ -277,7 +277,7 @@ pub struct IrohNet<S: Storage = MemoryStorage> {
     quarantine_started: AtomicBool,
     outbound_streams: AtomicU64,
     shared: Arc<SharedNet<S>>,
-    #[cfg(test)]
+    /// Accept loop knobs a test sets; empty outside tests.
     accept_hooks: AcceptHooks,
 }
 
@@ -297,7 +297,6 @@ impl<S: Storage> IrohNet<S> {
             quarantine_started,
             outbound_streams,
             shared,
-            #[cfg(test)]
             accept_hooks,
         } = &self;
         check(pool);
@@ -306,7 +305,6 @@ impl<S: Storage> IrohNet<S> {
         check(quarantine_started);
         check(outbound_streams);
         check(shared);
-        #[cfg(test)]
         check(accept_hooks);
         self
     }
@@ -319,6 +317,33 @@ impl<S: Storage> IrohNet<S> {
 struct AcceptHooks {
     connections: Option<usize>,
     handshakes: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+#[cfg(test)]
+impl AcceptHooks {
+    fn max_connections(&self) -> usize {
+        self.connections.unwrap_or(MAX_ACCEPT_CONNECTIONS)
+    }
+
+    fn handshake_hold(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.handshakes.clone()
+    }
+}
+
+/// Outside tests the accept loop uses its fixed cap and holds no handshake.
+#[cfg(not(test))]
+#[derive(Default)]
+struct AcceptHooks(());
+
+#[cfg(not(test))]
+impl AcceptHooks {
+    fn max_connections(&self) -> usize {
+        MAX_ACCEPT_CONNECTIONS
+    }
+
+    fn handshake_hold(&self) -> Option<Arc<tokio::sync::Semaphore>> {
+        None
+    }
 }
 
 /// The part of a net that storage jobs use off the async executor.
@@ -344,11 +369,8 @@ pub struct SharedNet<S: Storage> {
     // Optional sink for remote genesis evictions; the journal remains the
     // recovery path when no sink is configured.
     eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
-    /// Most framed bytes of planned topic messages held at once.
-    #[cfg(test)]
-    planned_peak: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
-    lane_times: [LaneTimes; 2],
+    /// Measurements a test reads; empty outside tests.
+    probes: TestProbes,
 }
 
 impl<S: Storage> std::ops::Deref for IrohNet<S> {
@@ -363,7 +385,7 @@ impl<S: Storage> std::ops::Deref for IrohNet<S> {
 impl<S: Storage> SharedNet<S> {
     /// Timings of the control and the bulk lane so far.
     pub(crate) fn lane_times(&self) -> &[LaneTimes; 2] {
-        &self.lane_times
+        &self.probes.lane_times
     }
 }
 
@@ -383,6 +405,63 @@ pub(crate) struct LaneTimes {
     pub(crate) jobs: AtomicU64,
     pub(crate) waited_max_micros: AtomicU64,
     pub(crate) ran_max_micros: AtomicU64,
+}
+
+/// The most framed bytes of planned topic messages held at once, and the
+/// timings of the control and the bulk lane.
+#[cfg(test)]
+#[derive(Default)]
+struct TestProbes {
+    planned_peak: std::sync::atomic::AtomicUsize,
+    lane_times: [LaneTimes; 2],
+}
+
+#[cfg(test)]
+impl TestProbes {
+    fn now(&self) -> Option<std::time::Instant> {
+        Some(std::time::Instant::now())
+    }
+
+    /// Count a job of `lane` that waited since `queued` for its permit.
+    fn waited(&self, lane: Lane, queued: Option<std::time::Instant>) {
+        let times = &self.lane_times[lane as usize];
+        times.jobs.fetch_add(1, Ordering::Relaxed);
+        let waited = queued.map_or(0, |queued| queued.elapsed().as_micros() as u64);
+        times.waited_max_micros.fetch_max(waited, Ordering::Relaxed);
+    }
+
+    fn ran(&self, lane: Lane, started: Option<std::time::Instant>) {
+        let ran = started.map_or(0, |started| started.elapsed().as_micros() as u64);
+        self.lane_times[lane as usize]
+            .ran_max_micros
+            .fetch_max(ran, Ordering::Relaxed);
+    }
+
+    fn planned(&self, bytes: usize) {
+        self.planned_peak.fetch_max(bytes, Ordering::Relaxed);
+    }
+}
+
+/// Outside tests nothing is measured, and no clock is read.
+#[cfg(not(test))]
+#[derive(Default)]
+struct TestProbes(());
+
+#[cfg(not(test))]
+impl TestProbes {
+    #[inline(always)]
+    fn now(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    #[inline(always)]
+    fn waited(&self, _lane: Lane, _queued: Option<std::time::Instant>) {}
+
+    #[inline(always)]
+    fn ran(&self, _lane: Lane, _started: Option<std::time::Instant>) {}
+
+    #[inline(always)]
+    fn planned(&self, _bytes: usize) {}
 }
 
 impl<S: Storage> IrohNet<S> {
@@ -440,7 +519,6 @@ impl<S: Storage> IrohNet<S> {
             resync_started: AtomicBool::new(false),
             quarantine_started: AtomicBool::new(false),
             outbound_streams: AtomicU64::new(0),
-            #[cfg(test)]
             accept_hooks: AcceptHooks::default(),
             shared: Arc::new(SharedNet {
                 node,
@@ -460,10 +538,7 @@ impl<S: Storage> IrohNet<S> {
                 bulk_lane: Arc::new(tokio::sync::Semaphore::new(BULK_JOBS)),
                 attempt_epoch,
                 eviction_sink,
-                #[cfg(test)]
-                planned_peak: Default::default(),
-                #[cfg(test)]
-                lane_times: Default::default(),
+                probes: TestProbes::default(),
             }),
         }
         .checked_threads())
@@ -489,20 +564,12 @@ impl<S: Storage> IrohNet<S> {
             Lane::Control => &self.control_lane,
             Lane::Bulk => &self.bulk_lane,
         };
-        #[cfg(test)]
-        let queued = std::time::Instant::now();
+        let queued = self.probes.now();
         let permit = Arc::clone(permits)
             .acquire_owned()
             .await
             .map_err(|_| io::Error::other("storage job lane closed"))?;
-        #[cfg(test)]
-        let times = {
-            let times = &self.lane_times[lane as usize];
-            times.jobs.fetch_add(1, Ordering::Relaxed);
-            let waited = queued.elapsed().as_micros() as u64;
-            times.waited_max_micros.fetch_max(waited, Ordering::Relaxed);
-            (Arc::clone(&self.shared), lane as usize)
-        };
+        self.probes.waited(lane, queued);
         let task = self.tasks.track();
         let count = self.budget.job();
         let shared = Arc::clone(&self.shared);
@@ -511,13 +578,9 @@ impl<S: Storage> IrohNet<S> {
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let _count = count;
-            #[cfg(test)]
-            let started = std::time::Instant::now();
+            let started = shared.probes.now();
             let result = job(&shared);
-            #[cfg(test)]
-            times.0.lane_times[times.1]
-                .ran_max_micros
-                .fetch_max(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            shared.probes.ran(lane, started);
             (result, task)
         })
         .await
@@ -700,15 +763,8 @@ impl<S: Storage> IrohNet<S> {
             latch: |net| &net.accept_started,
         };
         let tracker = Arc::clone(&self.tasks);
-        #[cfg(not(test))]
-        let max_connections = MAX_ACCEPT_CONNECTIONS;
-        #[cfg(test)]
-        let max_connections = self
-            .accept_hooks
-            .connections
-            .unwrap_or(MAX_ACCEPT_CONNECTIONS);
-        #[cfg(test)]
-        let hold = self.accept_hooks.handshakes.clone();
+        let max_connections = self.accept_hooks.max_connections();
+        let hold = self.accept_hooks.handshake_hold();
         let endpoint = self.endpoint().clone();
         let mut shutdown = self.shutdown.subscribe();
         Ok(Some(handle.spawn(async move {
@@ -839,11 +895,9 @@ impl<S: Storage> IrohNet<S> {
                     continue;
                 }
                 let task = tracker.track();
-                #[cfg(test)]
                 let hold = hold.clone();
                 handshakes.spawn(async move {
                     let _task = task;
-                    #[cfg(test)]
                     if let Some(hold) = hold {
                         let _ = hold.acquire_owned().await.map(|permit| permit.forget());
                     }
@@ -2060,9 +2114,7 @@ impl<S: Storage> SharedNet<S> {
                     || messages + planned.messages.len() > limits.batch_messages
                     || responses + planned.estimated_responses > limits.batch_messages)
             {
-                #[cfg(test)]
-                self.planned_peak
-                    .fetch_max(bytes + size, std::sync::atomic::Ordering::Relaxed);
+                self.probes.planned(bytes + size);
                 planned_group.next = Some(planned);
                 break;
             }
@@ -2071,9 +2123,7 @@ impl<S: Storage> SharedNet<S> {
             responses += planned.estimated_responses;
             planned_group.group.push(planned);
         }
-        #[cfg(test)]
-        self.planned_peak
-            .fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.probes.planned(bytes);
         planned_group.rest = queue;
         planned_group
     }
