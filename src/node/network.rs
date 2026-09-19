@@ -4,7 +4,11 @@
 
 use crate::node::{Irokle, IrokleBuilder, WriteConcern};
 use crate::storage::Storage;
-use crate::{Ed25519Signer, Error, Result, TopicEviction};
+use crate::{Ed25519Signer, Error, PeerId, Result, TopicEviction, TopicId};
+use std::sync::Arc;
+
+/// Topics `sync_topic_now` synchronizes at once.
+const SYNC_TOPIC_CONCURRENCY: usize = 8;
 
 /// The Iroh transport settings of an [`IrokleBuilder`].
 pub(crate) struct IrohSettings {
@@ -124,5 +128,132 @@ impl<S: Storage> IrokleBuilder<S> {
         net.start_configured_resync_loop()
             .map_err(|err| Error::Storage(format!("failed to start iroh resync loop: {err}")))?;
         Ok(node.with_net(net))
+    }
+}
+
+impl<S: Storage> Irokle<S> {
+    pub(crate) fn with_net(mut self, net: Arc<crate::net::IrohNet<S>>) -> Self {
+        self.net = Some(net);
+        self
+    }
+
+    pub fn endpoint(&self) -> Option<&iroh::Endpoint> {
+        self.net.as_ref().map(|net| net.endpoint())
+    }
+
+    pub fn iroh_runtime_config(&self) -> Option<crate::net::IrohRuntimeConfig> {
+        self.net.as_ref().map(|net| net.runtime_config())
+    }
+
+    pub async fn shutdown_iroh(&self) {
+        if let Some(net) = &self.net {
+            net.shutdown().await;
+        }
+    }
+
+    pub fn start_accept_loop(&self) -> std::io::Result<()> {
+        self.net
+            .as_ref()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
+            })?
+            .start_accept_loop()
+    }
+
+    pub async fn accept_one(&self) -> std::io::Result<Option<iroh::EndpointId>> {
+        self.net
+            .as_ref()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
+            })?
+            .accept_one()
+            .await
+    }
+
+    pub async fn sync_now(&self, peer_id: PeerId, topic_id: TopicId) -> std::io::Result<()> {
+        self.net
+            .as_ref()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
+            })?
+            .sync_peer_now(peer_id, topic_id)
+            .await
+    }
+
+    pub async fn sync_addr_now(
+        &self,
+        addr: iroh::EndpointAddr,
+        topic_id: TopicId,
+    ) -> std::io::Result<()> {
+        self.net
+            .as_ref()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
+            })?
+            .sync_now(addr, topic_id)
+            .await
+    }
+
+    pub async fn sync_endpoint_now(
+        &self,
+        endpoint_id: iroh::EndpointId,
+        topic_id: TopicId,
+    ) -> std::io::Result<()> {
+        self.net
+            .as_ref()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
+            })?
+            .sync_endpoint_now(endpoint_id, topic_id)
+            .await
+    }
+
+    pub async fn sync_topic_now(&self, topic_id: TopicId) -> std::io::Result<()> {
+        let net = self.net.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "iroh is not configured")
+        })?;
+        let state = self
+            .storage()
+            .topic_state(&topic_id)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "topic not found"))?;
+        let peers = self.sync_peers(topic_id, &state);
+        let mut syncs = tokio::task::JoinSet::new();
+        let mut first_error = None;
+        for peer in peers {
+            while syncs.len() >= SYNC_TOPIC_CONCURRENCY {
+                if let Some(result) = syncs.join_next().await {
+                    record_sync_join(result, &mut first_error);
+                }
+            }
+            let net = Arc::clone(net);
+            syncs.spawn(async move { (peer, net.sync_peer_now(peer, topic_id).await) });
+        }
+        while let Some(result) = syncs.join_next().await {
+            record_sync_join(result, &mut first_error);
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+fn record_sync_join(
+    result: std::result::Result<(PeerId, std::io::Result<()>), tokio::task::JoinError>,
+    first_error: &mut Option<std::io::Error>,
+) {
+    match result {
+        Ok((_, Ok(()))) => {}
+        Ok((_, Err(error))) => {
+            if first_error.is_none() {
+                *first_error = Some(error);
+            }
+        }
+        Err(error) => {
+            if first_error.is_none() {
+                *first_error = Some(std::io::Error::other(error.to_string()));
+            }
+        }
     }
 }
