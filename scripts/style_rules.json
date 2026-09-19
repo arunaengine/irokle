@@ -124,51 +124,6 @@
       "source": "tests/fixtures/README.md"
     },
     {
-      "prefix": "tests/fixtures/fjall-schema2-54db4f9",
-      "rules": [
-        "content",
-        "layout"
-      ],
-      "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
-      "source": "tests/fixtures/README.md"
-    },
-    {
-      "prefix": "tests/fixtures/fjall-schema2-fb5ea2b",
-      "rules": [
-        "content",
-        "layout"
-      ],
-      "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
-      "source": "tests/fixtures/README.md"
-    },
-    {
-      "prefix": "tests/fixtures/fjall-schema4-e112523",
-      "rules": [
-        "content",
-        "layout"
-      ],
-      "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
-      "source": "tests/fixtures/README.md"
-    },
-    {
-      "prefix": "tests/fixtures/fjall-schema5-68e4c19",
-      "rules": [
-        "content",
-        "layout"
-      ],
-      "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
-      "source": "tests/fixtures/README.md"
-    },
-    {
-      "prefix": "tests/fixtures/fjall-schema6-512b158",
-      "rules": [
-        "content",
-        "layout"
-      ],
-      "reason": "Frozen historical schema fixture paths and bytes are compatibility inputs.",
-      "source": "tests/fixtures/README.md"
-    },
-    {
       "prefix": "tests/fixtures/contracts",
       "rules": [
         "content",
