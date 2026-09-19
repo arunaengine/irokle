@@ -1797,7 +1797,7 @@ async fn memory_pull_hole() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::tests::iroh::*;
 
     #[tokio::test]

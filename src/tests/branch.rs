@@ -669,7 +669,7 @@ fn memory_reset_pauses() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::tests::branch::*;
 
     #[test]
@@ -708,7 +708,7 @@ mod with_fjall {
 }
 
 #[cfg(feature = "iroh")]
-mod with_iroh {
+mod iroh {
     use crate::tests::branch::*;
 
     fn assert_bound_admission<S: Storage>(storage: S) {

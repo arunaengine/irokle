@@ -1233,11 +1233,6 @@ pub(super) mod fjall {
         assert_eq!(storage.slot_bytes().unwrap(), before);
         assert!(storage.provisional_topics().unwrap().is_empty());
     }
-}
-
-#[cfg(feature = "fjall")]
-mod with_fjall {
-    use crate::tests::ownership::*;
 
     #[test]
     fn stale_view() {

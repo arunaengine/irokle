@@ -1962,7 +1962,7 @@ fn memory_repair_limit() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::tests::storage::*;
 
     #[test]
@@ -2002,7 +2002,7 @@ mod with_fjall {
         let dir = tempfile::tempdir().unwrap();
         let storage = crate_storage::FjallStorage::open_with_persist_mode(
             dir.path(),
-            fjall::PersistMode::Buffer,
+            ::fjall::PersistMode::Buffer,
         )
         .unwrap();
         assert_journal_bound(storage);
@@ -2022,7 +2022,7 @@ mod with_fjall {
     #[test]
     fn builder_accepts_fjall() {
         let dir = tempfile::tempdir().unwrap();
-        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+        let db = ::fjall::OptimisticTxDatabase::builder(dir.path())
             .open()
             .unwrap();
         let irokle = Irokle::builder()
@@ -2258,11 +2258,11 @@ mod with_fjall {
         let topic_id = TopicId::hash(b"legacy-status-topic");
         drop(crate_storage::FjallStorage::open(dir.path()).unwrap());
         {
-            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            let db = ::fjall::OptimisticTxDatabase::builder(dir.path())
                 .open()
                 .unwrap();
             let records = db
-                .keyspace("records", fjall::KeyspaceCreateOptions::default)
+                .keyspace("records", ::fjall::KeyspaceCreateOptions::default)
                 .unwrap();
             let legacy = (
                 peer,
@@ -2365,7 +2365,7 @@ mod with_fjall {
                 .unwrap();
         }
         {
-            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            let db = ::fjall::OptimisticTxDatabase::builder(dir.path())
                 .open()
                 .unwrap();
             downgrade_schema_one(
@@ -2381,7 +2381,7 @@ mod with_fjall {
             );
         }
 
-        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+        let db = ::fjall::OptimisticTxDatabase::builder(dir.path())
             .open()
             .unwrap();
         let barrier = Arc::new(Barrier::new(2));
@@ -2433,29 +2433,29 @@ mod with_fjall {
     /// Rewrite a current database into the schema 1 layout: peer-first acks without a
     /// branch, peer-first legacy obligations and whole pending records without byte counters.
     fn downgrade_schema_one(
-        db: &fjall::OptimisticTxDatabase,
+        db: &::fjall::OptimisticTxDatabase,
         topic_id: TopicId,
         peer: PeerId,
         legacy: &[(BTreeSet<OpId>, ActorClock)],
     ) {
         let records = db
-            .keyspace("records", fjall::KeyspaceCreateOptions::default)
+            .keyspace("records", ::fjall::KeyspaceCreateOptions::default)
             .unwrap();
         let mut tx = db.write_tx().unwrap();
         crate_storage::write_legacy_metas(&mut tx, &records).unwrap();
         let mut pending = Vec::new();
-        for item in fjall::Readable::prefix(&tx, &records, b"pm") {
+        for item in ::fjall::Readable::prefix(&tx, &records, b"pm") {
             let (key, value) = item.into_inner().unwrap();
             let record: (PeerId, TopicId, BTreeSet<OpId>, u64) =
                 postcard::from_bytes(&value).unwrap();
             let payload =
-                fjall::Readable::get(&tx, &records, [b"pp".as_slice(), &key[2..]].concat())
+                ::fjall::Readable::get(&tx, &records, [b"pp".as_slice(), &key[2..]].concat())
                     .unwrap()
                     .unwrap();
             pending.push((record, postcard::from_bytes::<Op>(&payload).unwrap()));
         }
         for prefix in [b"pp".as_slice(), b"pm", b"pt", b"pr", b"pu", b"pc", b"ps"] {
-            let keys = fjall::Readable::prefix(&tx, &records, prefix)
+            let keys = ::fjall::Readable::prefix(&tx, &records, prefix)
                 .map(|item| item.key().unwrap().to_vec())
                 .collect::<Vec<_>>();
             for key in keys {
@@ -2496,7 +2496,7 @@ mod with_fjall {
         }
         let mut removed = Vec::new();
         for prefix in [b"ak".as_slice(), b"ob", b"pb", b"pq"] {
-            for item in fjall::Readable::prefix(&tx, &records, prefix) {
+            for item in ::fjall::Readable::prefix(&tx, &records, prefix) {
                 let (key, value) = item.into_inner().unwrap();
                 if prefix == b"ob" && key.len() == 33 {
                     continue;
@@ -2541,13 +2541,13 @@ mod with_fjall {
     /// schema 1 with nothing half moved, and a future version is refused outright.
     #[test]
     fn refuses_schema() {
-        use fjall::Readable;
+        use ::fjall::Readable;
         let dir = tempfile::tempdir().unwrap();
         let peer = PeerId::hash(b"refuse-peer");
         let topic_id = TopicId::hash(b"refuse-topic");
         drop(crate_storage::FjallStorage::open(dir.path()).unwrap());
         let unchanged = {
-            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            let db = ::fjall::OptimisticTxDatabase::builder(dir.path())
                 .open()
                 .unwrap();
             downgrade_schema_one(
@@ -2557,7 +2557,7 @@ mod with_fjall {
                 &[(BTreeSet::new(), clock_at(ActorId::hash(b"a"), 1))],
             );
             let records = db
-                .keyspace("records", fjall::KeyspaceCreateOptions::default)
+                .keyspace("records", ::fjall::KeyspaceCreateOptions::default)
                 .unwrap();
             let mut tx = db.write_tx().unwrap();
             tx.insert(
@@ -2576,11 +2576,11 @@ mod with_fjall {
         };
         assert!(crate_storage::FjallStorage::open(dir.path()).is_err());
         {
-            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            let db = ::fjall::OptimisticTxDatabase::builder(dir.path())
                 .open()
                 .unwrap();
             let records = db
-                .keyspace("records", fjall::KeyspaceCreateOptions::default)
+                .keyspace("records", ::fjall::KeyspaceCreateOptions::default)
                 .unwrap();
             let version = records.get(b"sv").unwrap().unwrap();
             assert_eq!(postcard::from_bytes::<u32>(&version).unwrap(), 1);
@@ -2606,11 +2606,11 @@ mod with_fjall {
             crate_storage::FjallStorage::open(dir.path()),
             Err(Error::Storage(message)) if message.contains("unsupported")
         ));
-        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+        let db = ::fjall::OptimisticTxDatabase::builder(dir.path())
             .open()
             .unwrap();
         let records = db
-            .keyspace("records", fjall::KeyspaceCreateOptions::default)
+            .keyspace("records", ::fjall::KeyspaceCreateOptions::default)
             .unwrap();
         let mut expected = unchanged;
         let (_, version) = expected.iter_mut().find(|(key, _)| key == b"sv").unwrap();

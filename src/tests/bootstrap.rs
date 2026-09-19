@@ -511,7 +511,7 @@ fn memory_replaced_branch() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::tests::bootstrap::*;
 
     #[test]

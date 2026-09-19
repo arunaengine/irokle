@@ -566,7 +566,7 @@ fn recheck_error_typed() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::oplog::integrity::tests::*;
 
     #[test]

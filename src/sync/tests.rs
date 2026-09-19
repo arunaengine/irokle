@@ -333,7 +333,7 @@ fn memory_repair_completion() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::sync::tests::*;
 
     #[test]
@@ -360,7 +360,7 @@ mod with_fjall {
 }
 
 #[cfg(feature = "iroh")]
-mod with_iroh {
+mod iroh {
     use crate::sync::tests::*;
 
     /// A response over a snapshot its caller holds admits the same snapshot, clock

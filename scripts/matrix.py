@@ -47,10 +47,10 @@ def cases():
               for name, args in commands]
     result.insert(0, {"label": "style", "timeout": 120,
                       "argv": [sys.executable, "-B", "scripts/style.py"]})
-    for name in ("pending::with_fjall::drains_complete", "planning::catch_up_costs",
+    for name in ("pending::fjall::drains_complete", "planning::catch_up_costs",
                  "planning::pull_hundred_thousand", "progress::window_chain_boundary",
                  "requests::real_join_finishes",
-                 "staging::with_fjall::invite_caps", "staging::memory_invite_caps"):
+                 "staging::fjall::invite_caps", "staging::memory_invite_caps"):
         exact = f"tests::{name}"
         result.append({"label": f"ignored-{name.split('::')[-1]}", "timeout": 7200,
                        "argv": ["cargo", "test", "--locked", "--all-features", "--lib", exact,

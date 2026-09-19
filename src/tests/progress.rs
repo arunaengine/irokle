@@ -851,7 +851,7 @@ fn finite_goals_progress() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::tests::progress::*;
 
     #[test]

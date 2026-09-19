@@ -220,7 +220,7 @@ fn memory_evidence_heals() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::tests::holes::*;
 
     #[test]
@@ -251,13 +251,13 @@ mod with_fjall {
 }
 
 #[cfg(feature = "iroh")]
-mod with_iroh {
+mod iroh {
     use crate::tests::holes::*;
 
     /// An endpoint whose id is the peer id of `Ed25519Signer::from_bytes(&[seed; 32])`.
-    async fn keyed_endpoint(seed: u8) -> iroh::Endpoint {
-        iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-            .secret_key(iroh::SecretKey::from_bytes(&[seed; 32]))
+    async fn keyed_endpoint(seed: u8) -> ::iroh::Endpoint {
+        ::iroh::Endpoint::builder(::iroh::endpoint::presets::N0DisableRelay)
+            .secret_key(::iroh::SecretKey::from_bytes(&[seed; 32]))
             .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
             .bind()
             .await
@@ -438,7 +438,7 @@ mod with_iroh {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn holes_repair_sliced() {
         let bind = || async {
-            iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            ::iroh::Endpoint::builder(::iroh::endpoint::presets::N0DisableRelay)
                 .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
                 .bind()
                 .await

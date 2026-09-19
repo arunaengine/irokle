@@ -1325,7 +1325,7 @@ mod sessions {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::tests::requests::*;
 
     #[test]

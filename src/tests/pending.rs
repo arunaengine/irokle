@@ -800,7 +800,7 @@ fn memory_retained_drain() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::tests::pending::*;
 
     #[test]
@@ -839,7 +839,7 @@ mod with_fjall {
     }
 
     /// The same on a durable store, where every admission is a synced commit.
-    /// Run explicitly: `cargo test --features fjall --lib with_fjall::drains_complete -- --ignored`.
+    /// Run explicitly: `cargo test --features fjall --lib pending::fjall::drains_complete -- --ignored`.
     #[test]
     #[ignore = "about two minutes of synced commits, run explicitly"]
     fn drains_complete() {
@@ -853,7 +853,7 @@ mod with_fjall {
         assert_retained_drain(
             crate::storage::FjallStorage::open_with_persist_mode(
                 dir.path(),
-                fjall::PersistMode::Buffer,
+                ::fjall::PersistMode::Buffer,
             )
             .unwrap(),
         );

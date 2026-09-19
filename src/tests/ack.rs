@@ -919,7 +919,7 @@ fn shared_failure(error: Error) {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::storage as crate_storage;
     use crate::tests::ack::*;
 
@@ -1062,11 +1062,11 @@ mod with_fjall {
         // Rewrite the stored record in the schema 1 layout, which had no genesis
         // field, and mark the database as schema 1 again.
         {
-            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            let db = ::fjall::OptimisticTxDatabase::builder(dir.path())
                 .open()
                 .unwrap();
             let records = db
-                .keyspace("records", fjall::KeyspaceCreateOptions::default)
+                .keyspace("records", ::fjall::KeyspaceCreateOptions::default)
                 .unwrap();
             let mut clock = ActorClock::new();
             clock.observe(actor_id, actor_seq);
@@ -1092,7 +1092,7 @@ mod with_fjall {
                 );
             }
             let nodes = [b"cn".as_slice(), topic_id.as_ref()].concat();
-            let node_keys = fjall::Readable::prefix(&tx, &records, nodes)
+            let node_keys = ::fjall::Readable::prefix(&tx, &records, nodes)
                 .map(|item| item.key().unwrap().to_vec())
                 .collect::<Vec<_>>();
             for key in node_keys {
@@ -1164,11 +1164,11 @@ mod with_fjall {
         // An obligation record nothing can decode makes the clearing step fail
         // after the ack row of the middle topic was staged.
         {
-            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            let db = ::fjall::OptimisticTxDatabase::builder(dir.path())
                 .open()
                 .unwrap();
             let records = db
-                .keyspace("records", fjall::KeyspaceCreateOptions::default)
+                .keyspace("records", ::fjall::KeyspaceCreateOptions::default)
                 .unwrap();
             let mut tx = db.write_tx().unwrap();
             tx.insert(
@@ -1214,14 +1214,14 @@ mod with_fjall {
     #[test]
     fn backend_causes_survive() {
         for error in [
-            Error::ReopenRequired(fjall::Error::Poisoned),
+            Error::ReopenRequired(::fjall::Error::Poisoned),
             Error::StoragePressure("disk headroom".into()),
             Error::StorageBuffer {
                 required: 10,
                 limit: 1,
             },
             Error::StorageProbe(std::io::Error::other("probe unavailable")),
-            Error::Fjall(fjall::Error::Poisoned),
+            Error::Fjall(::fjall::Error::Poisoned),
         ] {
             shared_failure(error);
         }
@@ -1237,7 +1237,7 @@ mod with_fjall {
             let before = storage.list_op_ids(&topics[0]).unwrap();
             *storage.ack_fault.lock().unwrap() = Some(AckFault {
                 committed: true,
-                error: Error::ReopenRequired(fjall::Error::Poisoned),
+                error: Error::ReopenRequired(::fjall::Error::Poisoned),
             });
             let result = if batch {
                 node.apply_sync_acks(&acks[..1]).pop().unwrap()

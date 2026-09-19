@@ -2108,7 +2108,7 @@ fn memory_outcome_states() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::tests::sync::*;
 
     #[test]

@@ -417,7 +417,7 @@ fn memory_invite_caps() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::tests::staging::*;
 
     #[test]
@@ -495,7 +495,7 @@ mod with_fjall {
         assert_invite_caps(
             crate::storage::FjallStorage::open_with_persist_mode(
                 dir.path(),
-                fjall::PersistMode::Buffer,
+                ::fjall::PersistMode::Buffer,
             )
             .unwrap(),
         );
@@ -503,7 +503,7 @@ mod with_fjall {
 }
 
 #[cfg(feature = "iroh")]
-mod with_iroh {
+mod iroh {
     use crate::tests::staging::*;
 
     /// Two nodes over Iroh: `source` serves streams, `reader` over `storage`
@@ -512,7 +512,7 @@ mod with_iroh {
         storage: S,
     ) -> (Irokle, Arc<net::IrohNet<MemoryStorage>>, Irokle<S>) {
         let bind = || async {
-            iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            ::iroh::Endpoint::builder(::iroh::endpoint::presets::N0DisableRelay)
                 .alpns(vec![crate::net::IROKLE_SYNC_ALPN.to_vec()])
                 .bind()
                 .await

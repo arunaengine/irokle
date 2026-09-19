@@ -578,7 +578,7 @@ fn unsupported_capture_blocks() {
 }
 
 #[cfg(feature = "fjall")]
-mod with_fjall {
+mod fjall {
     use crate::tests::snapshot::*;
 
     #[test]
@@ -688,7 +688,7 @@ mod with_fjall {
 }
 
 #[cfg(feature = "iroh")]
-mod with_iroh {
+mod iroh {
     use crate::tests::snapshot::*;
 
     /// Topic reads of a sync attempt before its push is planned: the digest's
@@ -700,7 +700,7 @@ mod with_iroh {
     /// nothing selected from the state after its removal.
     async fn assert_push_excluded<S: Storage>(inner: S, isolation: Isolation) {
         let bind = || async {
-            iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            ::iroh::Endpoint::builder(::iroh::endpoint::presets::N0DisableRelay)
                 .bind()
                 .await
                 .unwrap()
