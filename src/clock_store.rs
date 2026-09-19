@@ -2,6 +2,115 @@
 //! Stored clock nodes: their encoding and hashes, a clock loaded from its root
 //! node, and the cache that shares loaded nodes between clocks.
 
+use crate::clock::{ActorClock, ClockCache, ClockRecord, Node};
+use crate::ids::ActorId;
+use serde::de::Deserializer;
+use std::collections::BTreeMap;
+
+impl ActorClock {
+    #[cfg(test)]
+    pub(crate) fn decode_selected(
+        bytes: &[u8],
+        actors: &std::collections::BTreeSet<ActorId>,
+    ) -> crate::Result<Self> {
+        Self::decode_counted(bytes, actors).map(|(clock, _)| clock)
+    }
+
+    pub(crate) fn decode_counted(
+        bytes: &[u8],
+        actors: &std::collections::BTreeSet<ActorId>,
+    ) -> crate::Result<(Self, usize)> {
+        struct Selected<'a>(&'a std::collections::BTreeSet<ActorId>);
+        impl<'de> serde::de::Visitor<'de> for Selected<'_> {
+            type Value = (ActorClock, usize);
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("actor positions")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut selected = BTreeMap::new();
+                let mut count = 0;
+                while let Some((actor, seq)) = map.next_entry::<ActorId, u64>()? {
+                    count += 1;
+                    if self.0.contains(&actor) {
+                        selected.insert(actor, seq);
+                    }
+                }
+                let mut clock = ActorClock::new();
+                for (actor, seq) in selected {
+                    clock.put(actor, Some(seq));
+                }
+                Ok((clock, count))
+            }
+        }
+        let mut decoder = postcard::Deserializer::from_bytes(bytes);
+        let selected = decoder.deserialize_map(Selected(actors))?;
+        if !decoder.finalize()?.is_empty() {
+            return Err(crate::Error::Storage(
+                "trailing bytes in stored clock".into(),
+            ));
+        }
+        Ok(selected)
+    }
+
+    /// The hash naming this clock's stored root node; `None` when empty.
+    pub(crate) fn root_hash(&self) -> Option<[u8; 32]> {
+        self.root.as_deref().map(Node::hash)
+    }
+
+    /// The stored form of every node of this clock that `stored` does not
+    /// report as held, by hash and parents first. The subtree of a held node
+    /// is held too, so it is not visited.
+    #[cfg(test)]
+    pub(crate) fn unstored_nodes(
+        &self,
+        mut stored: impl FnMut(&[u8; 32]) -> crate::Result<bool>,
+    ) -> crate::Result<Vec<([u8; 32], Vec<u8>)>> {
+        let mut out = Vec::new();
+        self.visit_nodes(|record| {
+            if stored(&record.hash)? {
+                return Ok(true);
+            }
+            out.push((record.hash, postcard::to_allocvec(&record)?));
+            Ok(false)
+        })?;
+        Ok(out)
+    }
+
+    /// Visit missing nodes without collecting their encoded bodies in memory.
+    pub(crate) fn visit_nodes(
+        &self,
+        mut visit: impl FnMut(ClockRecord<'_>) -> crate::Result<bool>,
+    ) -> crate::Result<()> {
+        let mut stack = Vec::new();
+        stack.extend(self.root.as_deref());
+        while let Some(node) = stack.pop() {
+            let hash = node.hash();
+            if visit(ClockRecord { node, hash })? {
+                continue;
+            }
+            if let Node::Branch { children, .. } = node {
+                stack.extend(children.iter().map(|child| &**child));
+            }
+        }
+        Ok(())
+    }
+
+    /// The clock whose stored root node is `root`, reading nodes through
+    /// `fetch` and sharing every node `cache` still holds. A node whose bytes
+    /// do not hash to its name, or that breaks the trie's shape, is refused.
+    pub(crate) fn load(
+        root: &[u8; 32],
+        cache: &ClockCache,
+        mut fetch: impl FnMut(&[u8; 32]) -> crate::Result<Option<Vec<u8>>>,
+    ) -> crate::Result<Self> {
+        let root = cache.node(root, &mut fetch, None)?;
+        Ok(Self { root: Some(root) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::clock::*;
