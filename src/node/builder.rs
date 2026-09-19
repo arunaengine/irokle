@@ -5,7 +5,7 @@ use crate::Error;
 use crate::storage::{MemoryStorage, Storage};
 use crate::{Ed25519Signer, PeerId, Result};
 
-use super::{Irokle, IrokleBuilder, NodeConfig, WriteConcern};
+use crate::node::{Irokle, IrokleBuilder, NodeConfig, WriteConcern};
 
 impl Irokle<MemoryStorage> {
     pub fn builder() -> IrokleBuilder<MemoryStorage> {

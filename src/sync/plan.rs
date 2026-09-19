@@ -10,12 +10,12 @@ use crate::clock::ClockCursor;
 use crate::storage::{DependencyCursor, OpHeader, SnapshotRead, Storage};
 use crate::{ActorClock, ActorId, Error, Op, OpId, Result, TopicId};
 
-use super::request::need;
-use super::{
+use crate::sync::request::need;
+use crate::sync::{
     ActorScope, MAX_PAGE_BYTES, MAX_PAGE_MISSING, PageBudget, PlannedPage, RangeHead, SyncEngine,
 };
 
-use super::slice::{PageWork, Slice};
+use crate::sync::slice::{PageWork, Slice};
 
 /// A planned page, the actors whose positions it needed by the lowest
 /// generation needing each, and the frontier of a slice that stopped with work left.
@@ -36,7 +36,7 @@ enum ActorState {
 
 /// Retained traversal state, with a separate reservation for operation records.
 pub(super) struct Frontier {
-    pub(super) repair: Option<super::repair::Repair>,
+    pub(super) repair: Option<crate::sync::repair::Repair>,
     pub(super) evictable: bool,
     revision: u64,
     offered: Vec<Offered>,
@@ -60,7 +60,7 @@ pub(super) struct Frontier {
     missing: BTreeSet<OpId>,
     positions: BTreeMap<ActorId, u64>,
     checked: BTreeMap<OpId, DependencyScan>,
-    pub(super) records: super::records::Records,
+    pub(super) records: crate::sync::records::Records,
 }
 
 #[derive(Clone, Copy)]
@@ -104,7 +104,7 @@ struct Offered {
 /// another actor's position is suspended outside that set, so waiting heads never fill it.
 struct Pager<'a> {
     revision: u64,
-    repair: Option<super::repair::Repair>,
+    repair: Option<crate::sync::repair::Repair>,
     pending: VecDeque<HeadScan>,
     updates: VecDeque<Update>,
     slice: &'a mut Slice,
@@ -137,7 +137,7 @@ struct Pager<'a> {
     positions: BTreeMap<ActorId, u64>,
     more: bool,
     checked: BTreeMap<OpId, DependencyScan>,
-    records: super::records::Records,
+    records: crate::sync::records::Records,
 }
 
 impl<S: Storage> SyncEngine<S> {
@@ -245,8 +245,8 @@ impl<S: Storage> SyncEngine<S> {
     ) -> Result<PlannedPage> {
         slice.charge_preparation(
             frontier.offer_positions.len() + frontier.offer_missing.len(),
-            super::space::tree_bytes::<ActorId, u64>(frontier.offer_positions.len())
-                + super::space::tree_bytes::<OpId, ()>(frontier.offer_missing.len()),
+            crate::sync::space::tree_bytes::<ActorId, u64>(frontier.offer_positions.len())
+                + crate::sync::space::tree_bytes::<OpId, ()>(frontier.offer_missing.len()),
         )?;
         let mut page = PlannedPage {
             more: true,
@@ -283,8 +283,8 @@ impl<S: Storage> SyncEngine<S> {
                     page.missing.insert(offer.id);
                     break;
                 }
-                Err(super::records::LoadError::Yield) => break,
-                Err(super::records::LoadError::Failed(error)) => return Err(error),
+                Err(crate::sync::records::LoadError::Yield) => break,
+                Err(crate::sync::records::LoadError::Failed(error)) => return Err(error),
             };
             let body = &record.op.signed.body;
             if record.op.id != offer.id
@@ -328,7 +328,7 @@ impl Frontier {
         peer: &ActorClock,
         scope: &ActorScope<'_>,
         window: usize,
-        records: super::records::Records,
+        records: crate::sync::records::Records,
     ) -> Self {
         Self {
             repair: None,
@@ -387,12 +387,14 @@ impl Frontier {
         }
         let required = self
             .bytes()
-            .saturating_add(super::space::vector_bytes::<Offered>(ops.len()))
-            .saturating_add(super::space::tree_bytes::<ActorId, ()>(
+            .saturating_add(crate::sync::space::vector_bytes::<Offered>(ops.len()))
+            .saturating_add(crate::sync::space::tree_bytes::<ActorId, ()>(
                 page.positions.len(),
             ))
-            .saturating_add(super::space::tree_bytes::<OpId, ()>(page.missing.len()));
-        if required > super::slice::MAX_CONTINUATION_BYTES {
+            .saturating_add(crate::sync::space::tree_bytes::<OpId, ()>(
+                page.missing.len(),
+            ));
+        if required > crate::sync::slice::MAX_CONTINUATION_BYTES {
             return Err(Error::SyncCapacity(
                 "offered page identifiers exceed retained workspace".into(),
             ));
@@ -427,7 +429,7 @@ impl Frontier {
 
     pub(super) fn confirm_offer(
         &mut self,
-        request: &super::SyncRequest,
+        request: &crate::sync::SyncRequest,
         held: Option<&ActorClock>,
         full: bool,
     ) {
@@ -502,7 +504,7 @@ impl Frontier {
         }
     }
 
-    pub(super) fn confirm(&mut self, request: &super::SyncRequest, local: &ActorClock) {
+    pub(super) fn confirm(&mut self, request: &crate::sync::SyncRequest, local: &ActorClock) {
         for hint in &request.actor_range_hints {
             let known = hint.from_exclusive.min(local.get(&hint.actor_id));
             if self.positions.remove(&hint.actor_id).is_some() {
@@ -525,13 +527,15 @@ impl Frontier {
 
     /// A conservative estimate of the bytes the frontier holds.
     pub(super) fn bytes(&self) -> usize {
-        use super::space::{tree_bytes, vector_bytes};
+        use crate::sync::space::{tree_bytes, vector_bytes};
         let suspended = self
             .suspended
             .values()
             .map(|waiting| vector_bytes::<(u64, RangeHead)>(waiting.capacity()))
             .sum::<usize>();
-        self.repair.as_ref().map_or(0, super::repair::Repair::bytes)
+        self.repair
+            .as_ref()
+            .map_or(0, crate::sync::repair::Repair::bytes)
             + vector_bytes::<Offered>(self.offered.capacity())
             + tree_bytes::<ActorId, ()>(self.offer_positions.len())
             + tree_bytes::<OpId, ()>(self.offer_missing.len())
@@ -648,12 +652,12 @@ impl Pager<'_> {
                     self.block(actor_id, id);
                     continue;
                 }
-                Err(super::records::LoadError::Yield) => {
+                Err(crate::sync::records::LoadError::Yield) => {
                     self.active.push(Reverse(head));
                     self.ended = true;
                     break;
                 }
-                Err(super::records::LoadError::Failed(error)) => return Err(error),
+                Err(crate::sync::records::LoadError::Failed(error)) => return Err(error),
             };
             match self.wait_for(&record.op)? {
                 Wait::Yield | Wait::Unknown => {
@@ -709,7 +713,7 @@ impl Pager<'_> {
             || self
                 .repair
                 .as_ref()
-                .is_some_and(super::repair::Repair::pending)
+                .is_some_and(crate::sync::repair::Repair::pending)
             || !self.resumable.is_empty()
             || self.suspended.values().any(|waiting| !waiting.is_empty())
             || !self.deferred.is_empty();
@@ -722,7 +726,7 @@ impl Pager<'_> {
             || self
                 .repair
                 .as_ref()
-                .is_some_and(super::repair::Repair::pending))
+                .is_some_and(crate::sync::repair::Repair::pending))
             && (ops.is_empty() || !self.remainder)
             && too_large.is_none())
         .then(|| {
@@ -1394,8 +1398,8 @@ impl Pager<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::oplog::Oplog;
+    use crate::sync::plan::*;
     use crate::sync::{ActorRangeHint, SyncRequest};
     use crate::tests::support::*;
 
@@ -1579,7 +1583,7 @@ mod tests {
                 assert!(after.edges - before.edges <= 4);
                 assert!(after.visits - before.visits <= 4);
                 assert!(
-                    after.kept_bytes <= super::super::slice::MAX_CONTINUATION_BYTES as u64 + 65536
+                    after.kept_bytes <= crate::sync::slice::MAX_CONTINUATION_BYTES as u64 + 65536
                 );
                 if page.ops.is_empty() {
                     assert!(page.more && page.continued);

@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use crate::storage::RequestView;
 use crate::{ActorClock, ActorId, Error, OpId, PeerId, Result, TopicId};
 
-use super::plan::Frontier;
-use super::slice::MAX_CONTINUATION_BYTES;
-use super::{ActorWindow, SyncRequest, SyncSummary};
+use crate::sync::plan::Frontier;
+use crate::sync::slice::MAX_CONTINUATION_BYTES;
+use crate::sync::{ActorWindow, SyncRequest, SyncSummary};
 
 /// Plans one engine keeps at once.
 pub(crate) const MAX_CONTINUATIONS: usize = 16;
@@ -160,7 +160,7 @@ impl Continuation {
                 .frontier
                 .repair
                 .as_ref()
-                .is_some_and(super::repair::Repair::offered);
+                .is_some_and(crate::sync::repair::Repair::offered);
         self.frontier.confirm_offer(request, held, full);
         true
     }
@@ -168,9 +168,9 @@ impl Continuation {
     /// A conservative estimate of the bytes this plan holds.
     pub(super) fn bytes(&self) -> usize {
         let window = self.window.behind.as_ref().map_or(0, |behind| {
-            super::space::vector_bytes::<u8>(behind.bits.capacity())
+            crate::sync::space::vector_bytes::<u8>(behind.bits.capacity())
         });
-        super::space::vector_bytes::<(ActorId, u64)>(self.named.capacity())
+        crate::sync::space::vector_bytes::<(ActorId, u64)>(self.named.capacity())
             + window
             + self.frontier.bytes()
     }
@@ -197,7 +197,7 @@ impl ClockClaim {
             )));
         }
         let added = bytes.saturating_sub(self.bytes);
-        if !super::space::reserve_bytes(&self.pool, added, CLOCK_POOL_BYTES) {
+        if !crate::sync::space::reserve_bytes(&self.pool, added, CLOCK_POOL_BYTES) {
             return Err(Error::SyncCapacity(
                 "captured clock pool is occupied".into(),
             ));
@@ -218,7 +218,7 @@ pub(super) struct Continuations {
     entries: BTreeMap<(PeerId, TopicId), Continuation>,
     capacity: usize,
     clocks: Arc<AtomicUsize>,
-    records: Arc<super::records::RecordPool>,
+    records: Arc<crate::sync::records::RecordPool>,
 }
 
 impl Continuations {
@@ -263,8 +263,8 @@ impl Continuations {
         Ok(claim)
     }
 
-    pub(super) fn records(&self) -> super::records::Records {
-        super::records::Records::new(Arc::clone(&self.records))
+    pub(super) fn records(&self) -> crate::sync::records::Records {
+        crate::sync::records::Records::new(Arc::clone(&self.records))
     }
 
     pub(super) fn captured(
@@ -348,7 +348,9 @@ impl Continuations {
             + if self.entries.is_empty() {
                 0
             } else {
-                super::space::tree_bytes::<(PeerId, TopicId), Continuation>(self.entries.len())
+                crate::sync::space::tree_bytes::<(PeerId, TopicId), Continuation>(
+                    self.entries.len(),
+                )
             }
             + self.clocks.load(Ordering::Acquire)
             + self.records.bytes()
@@ -380,7 +382,7 @@ fn peer_scope(summary: &SyncSummary, genesis: OpId) -> ((bool, Option<u64>), Opt
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::sync::continuation::*;
 
     #[test]
     fn captured_lease_survives() {
@@ -413,7 +415,7 @@ mod tests {
         };
         let frontier = Frontier::new(
             &clock,
-            &super::super::ActorScope::whole(),
+            &crate::sync::ActorScope::whole(),
             1,
             plans.records(),
         );

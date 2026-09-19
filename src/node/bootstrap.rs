@@ -13,7 +13,7 @@ use crate::storage::{
 use crate::sync::SyncData;
 use crate::{ActorClock, Error, OpId, PeerId, Result, Storage, TopicId, TopicPayload};
 
-use super::{Bootstrap, Irokle, now_millis};
+use crate::node::{Bootstrap, Irokle, now_millis};
 
 /// Owner locks per topic. They only spare redundant work between callers of
 /// one node: the store checks every namespace write and activation itself.
@@ -356,7 +356,7 @@ fn staged_of<S: Storage>(provisional: &ProvisionalTopic, store: &S) -> Result<St
 
 #[cfg(test)]
 mod tests {
-    use super::reclaim_count;
+    use crate::node::bootstrap::reclaim_count;
 
     /// Weaker stagings are discarded only as far as the incoming bytes need,
     /// and not at all when discarding every one would not make room.

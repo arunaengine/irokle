@@ -13,6 +13,11 @@ mod storage {
     pub use irokle::storage::{OpMeta, SnapshotRead, TopicView};
 }
 
+/// The library paths `crate::sync::...` that the included sync modules name.
+mod sync {
+    pub(crate) use crate::{MAX_PAGE_BYTES, records, slice, space};
+}
+
 #[path = "../src/sync/slice.rs"]
 #[allow(dead_code)]
 mod slice;

@@ -8,13 +8,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{ActorId, Error, OpId, PeerId, Result, TopicId};
 
-use super::super::{
-    AdmissionEffects, ProvisionalTopic, StagingLimits, StagingQuota, TopicState, ack_covers,
-    check_namespaces, merged_obligation,
-};
-use super::{
+use crate::storage::memory::{
     MemoryInner, MemoryStorage, MetadataPlan, ObligationKind, put_obligation_locked,
     topic_state_locked,
+};
+use crate::storage::{
+    AdmissionEffects, ProvisionalTopic, StagingLimits, StagingQuota, TopicState, ack_covers,
+    check_namespaces, merged_obligation,
 };
 
 /// Registered provisional namespaces with their records. Lock order: this
@@ -151,7 +151,7 @@ impl MemoryStorage {
         check_namespaces(&self.limits, staging.namespaces.len(), from_source)?;
         let budget = Arc::clone(&self.lock()?.budget);
         let namespace_charge = Some(Arc::new(
-            budget.reserve(super::MemoryDomain::Metadata, 4096)?,
+            budget.reserve(crate::storage::memory::MemoryDomain::Metadata, 4096)?,
         ));
         staging.sessions += 1;
         let provisional = ProvisionalTopic {
@@ -278,8 +278,11 @@ impl MemoryStorage {
                 .map_or(0, |charge| charge.bytes);
         let _copy = inner
             .budget
-            .reserve(super::MemoryDomain::Activation, copy_bytes)?;
-        let _effects = super::metadata::merge_workspace(&inner, effects.sync_obligations.iter())?;
+            .reserve(crate::storage::memory::MemoryDomain::Activation, copy_bytes)?;
+        let _effects = crate::storage::memory::metadata::merge_workspace(
+            &inner,
+            effects.sync_obligations.iter(),
+        )?;
         let mut changes = BTreeMap::new();
         for obligation in effects.sync_obligations {
             let ack = inner.peer_acks.get(&(obligation.peer_id, topic_id));
@@ -345,7 +348,7 @@ impl MemoryStorage {
 
 /// Copy every record of `topic_id` from a namespace store into `inner`.
 fn copy_topic_locked(staged: &MemoryInner, inner: &mut MemoryInner, topic_id: &TopicId) {
-    let key = super::MetadataKey::Topic(*topic_id);
+    let key = crate::storage::memory::MetadataKey::Topic(*topic_id);
     if let Some(charge) = staged.metadata.get(&key) {
         inner.metadata.insert(key, Arc::clone(charge));
     }

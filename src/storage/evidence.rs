@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::{OpPosition, TopicState};
+use crate::storage::{OpPosition, TopicState};
 use crate::{ActorClock, OpId, PeerId, Result, TopicId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,7 +143,7 @@ pub struct SyncStatusUpdate {
     pub last_error: Option<Option<String>>,
     pub expected_attempts: Option<u64>,
     /// `(epoch, sequence)` of the attempt this outcome belongs to. The epoch
-    /// comes from [`super::Storage::next_attempt_epoch`], so identities are never
+    /// comes from [`crate::storage::Storage::next_attempt_epoch`], so identities are never
     /// reused across restarts.
     pub attempt: Option<(u64, u64)>,
 }

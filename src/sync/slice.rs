@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Error, Result};
 
-use super::MAX_PAGE_BYTES;
+use crate::sync::MAX_PAGE_BYTES;
 
 /// Storage reads one page plan makes before it ends its work slice.
 pub(super) const MAX_PAGE_VISITS: usize = 65_536;

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::{
+use crate::storage::{
     MAX_PENDING_BYTES_PER_SOURCE as MAX_SOURCE_BYTES,
     MAX_PENDING_BYTES_PER_TOPIC as MAX_TOPIC_BYTES, MAX_PENDING_BYTES_TOTAL as MAX_TOTAL_BYTES,
     MAX_PENDING_OPS_PER_SOURCE as MAX_SOURCE_OPS, MAX_PENDING_OPS_PER_TOPIC as MAX_TOPIC_OPS,
@@ -112,7 +112,7 @@ pub struct TopicState {
 }
 
 /// Diagnostic counts of work a backend performed: op records and metadata
-/// read through [`super::Storage`], buffered payloads and obligation records decoded
+/// read through [`crate::storage::Storage`], buffered payloads and obligation records decoded
 /// and write transactions attempted.
 #[derive(Debug, Default)]
 pub struct StorageCounters {
@@ -192,7 +192,7 @@ pub struct TopicView {
     /// Tip of every actor the topic stores.
     pub tips: BTreeMap<ActorId, (u64, OpId)>,
     pub fingerprint: [u8; 32],
-    /// Destructive data epoch, see [`super::Storage::topic_view`].
+    /// Destructive data epoch, see [`crate::storage::Storage::topic_view`].
     pub epoch: u64,
     /// Dependencies that buffered ops of this topic still wait for.
     pub pending_missing: BTreeSet<OpId>,
@@ -374,7 +374,7 @@ pub(crate) fn check_pending_quota(
 }
 
 /// Reject an entry whose dependency is incomplete in the transaction that writes it.
-/// `stored_dep` must apply [`super::Storage::dep_resolvable`] inside that transaction,
+/// `stored_dep` must apply [`crate::storage::Storage::dep_resolvable`] inside that transaction,
 /// so admission, retries, and genesis reset never commit dangling DAG edges.
 pub(crate) fn ensure_deps_resolvable(
     entries: &[(Op, OpMeta)],

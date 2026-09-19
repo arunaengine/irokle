@@ -1115,7 +1115,7 @@ impl<'de> Deserialize<'de> for ActorClock {
 mod tests {
     #[test]
     fn cursor_keeps_snapshot() {
-        use super::*;
+        use crate::clock::*;
         let mut clock = ActorClock::new();
         for index in 0_u32..65_537 {
             clock.observe(ActorId::hash(index.to_le_bytes()), u64::from(index));
@@ -1203,7 +1203,7 @@ mod tests {
         }
     }
 
-    use super::*;
+    use crate::clock::*;
 
     /// The clock this type replaced, kept as the reference its behavior must match.
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -84,7 +84,7 @@ impl Records {
         &mut self,
         read: &dyn SnapshotRead,
         id: &OpId,
-        slice: &mut super::slice::Slice,
+        slice: &mut crate::sync::slice::Slice,
     ) -> std::result::Result<Option<Record>, LoadError> {
         if let Some(mut record) = self.records.remove(id) {
             self.bytes -= record.claim.bytes;
@@ -97,7 +97,7 @@ impl Records {
         let mut claim = None;
         let mut denied = None;
         let op = read.get_reserved_op(id, &mut |bytes| {
-            if bytes > super::MAX_PAGE_BYTES {
+            if bytes > crate::sync::MAX_PAGE_BYTES {
                 return Err(Error::SyncCapacity(
                     "operation exceeds page capacity".into(),
                 ));
@@ -111,7 +111,7 @@ impl Records {
             }
             let bytes = charge(bytes);
             loop {
-                if super::space::reserve_bytes(&self.pool.live, bytes, POOL_BYTES) {
+                if crate::sync::space::reserve_bytes(&self.pool.live, bytes, POOL_BYTES) {
                     break;
                 }
                 if !self.evict() {
@@ -168,8 +168,8 @@ impl Records {
         }
         while self.bytes + record.claim.bytes > CACHE_BYTES && self.evict() {}
         // Idle caches leave room for both bulk workers' largest decoded records.
-        let cache_limit = POOL_BYTES - 2 * charge(super::MAX_PAGE_BYTES);
-        if !super::space::reserve_bytes(&self.pool.cached, record.claim.bytes, cache_limit) {
+        let cache_limit = POOL_BYTES - 2 * charge(crate::sync::MAX_PAGE_BYTES);
+        if !crate::sync::space::reserve_bytes(&self.pool.cached, record.claim.bytes, cache_limit) {
             return;
         }
         record.claim.cached = true;
@@ -206,7 +206,7 @@ impl Drop for Claim {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::sync::records::*;
     use crate::tests::support::*;
 
     fn read_record(
@@ -214,7 +214,7 @@ mod tests {
         read: &dyn SnapshotRead,
         id: &OpId,
     ) -> crate::Result<Option<Record>> {
-        let mut slice = super::super::slice::Slice::new(Arc::default(), 1024, 0)?;
+        let mut slice = crate::sync::slice::Slice::new(Arc::default(), 1024, 0)?;
         match records.take(read, id, &mut slice) {
             Ok(record) => Ok(record),
             Err(LoadError::Failed(error)) => Err(error),
@@ -319,8 +319,8 @@ mod tests {
         let bytes = postcard::experimental::serialized_size(&op).unwrap();
         let pool = Arc::new(RecordPool::default());
         let mut records = Records::new(Arc::clone(&pool));
-        let work = Arc::new(super::super::slice::PageWork::default());
-        let mut slice = super::super::slice::Slice::new(Arc::clone(&work), 16, 0)
+        let work = Arc::new(crate::sync::slice::PageWork::default());
+        let mut slice = crate::sync::slice::Slice::new(Arc::clone(&work), 16, 0)
             .unwrap()
             .with_decode_limit(bytes);
         store
@@ -343,13 +343,13 @@ mod tests {
                 ));
                 assert_eq!(probe.decoded.get(), 1, "exhaustion must precede decoding");
                 assert_eq!(pool.bytes(), 0);
-                let mut resumed = super::super::slice::Slice::new(Arc::clone(&work), 16, 0)?
+                let mut resumed = crate::sync::slice::Slice::new(Arc::clone(&work), 16, 0)?
                     .with_decode_limit(bytes);
                 let record = records.take(&probe, &id, &mut resumed).unwrap().unwrap();
                 assert_eq!(probe.decoded.get(), 2);
                 assert_eq!(record.op, op);
                 drop(record);
-                let mut small = super::super::slice::Slice::new(Arc::clone(&work), 16, 0)?
+                let mut small = crate::sync::slice::Slice::new(Arc::clone(&work), 16, 0)?
                     .with_decode_limit(bytes - 1);
                 assert!(matches!(
                     records.take(&probe, &id, &mut small),

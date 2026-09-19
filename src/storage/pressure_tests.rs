@@ -1,4 +1,4 @@
-use super::*;
+use crate::storage::pressure::*;
 
 #[test]
 fn refusal_precedes_encoding() {

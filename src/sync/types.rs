@@ -11,7 +11,7 @@ use crate::{
     ActorClock, ActorId, Error, Op, OpId, PeerId, Result, Signer, TopicId, canonical_bytes, verify,
 };
 
-use super::{ACK_SIGNING_DOMAIN, MAX_PAGE_BYTES, MAX_PAGE_OPS};
+use crate::sync::{ACK_SIGNING_DOMAIN, MAX_PAGE_BYTES, MAX_PAGE_OPS};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SyncOpen {
@@ -59,7 +59,7 @@ pub struct ActorWindow {
     pub after: Option<ActorId>,
     pub through: Option<ActorId>,
     /// The actors outside the interval the requester is behind on, when their
-    /// filter fits [`MAX_ACTOR_FILTER_BYTES`](super::MAX_ACTOR_FILTER_BYTES).
+    /// filter fits [`MAX_ACTOR_FILTER_BYTES`](crate::sync::MAX_ACTOR_FILTER_BYTES).
     pub behind: Option<ActorFilter>,
 }
 

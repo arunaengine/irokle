@@ -9,7 +9,7 @@ use crate::reducer::EventRecord;
 use crate::storage::{MemoryStorage, Storage};
 use crate::{ActorClock, ActorId, Error, Event, Op, OpId, PeerId, Result, TopicControl, TopicId};
 
-use super::{Irokle, PublishOptions};
+use crate::node::{Irokle, PublishOptions};
 
 #[derive(Clone)]
 pub struct Topic<E: Event, S: Storage = MemoryStorage> {

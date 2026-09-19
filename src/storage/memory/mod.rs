@@ -8,7 +8,7 @@ use crate::{
     TopicInfo,
 };
 
-use super::{
+use crate::storage::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
     MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS, MAX_PENDING_WAITERS_PER_DEP as MAX_WAITERS,
     MAX_REJECTED_PER_TOPIC as MAX_REJECTED, ObligationTarget, OpMeta, OpPosition, PeerAck,
@@ -902,23 +902,23 @@ impl SnapshotRead for MemorySnapshot<'_> {
         &self,
         topic: &TopicId,
         peer: &PeerId,
-        reserve: &mut dyn FnMut(super::SnapshotCharge) -> Result<()>,
-    ) -> Result<Option<super::RequestView>> {
-        reserve(super::SnapshotCharge::Read { bytes: 0 })?;
+        reserve: &mut dyn FnMut(crate::storage::SnapshotCharge) -> Result<()>,
+    ) -> Result<Option<crate::storage::RequestView>> {
+        reserve(crate::storage::SnapshotCharge::Read { bytes: 0 })?;
         self.counters.count_meta();
         let Some(state) = self.inner.topics.get(topic) else {
             return Ok(None);
         };
-        reserve(super::SnapshotCharge::Members(1))?;
+        reserve(crate::storage::SnapshotCharge::Members(1))?;
         let member = state.members.contains(peer);
-        reserve(super::SnapshotCharge::Read { bytes: 0 })?;
+        reserve(crate::storage::SnapshotCharge::Read { bytes: 0 })?;
         let epoch = self
             .inner
             .topic_epochs
             .get(topic)
             .copied()
             .unwrap_or_default();
-        Ok(Some(super::RequestView {
+        Ok(Some(crate::storage::RequestView {
             genesis: state.genesis,
             epoch,
             member,
@@ -930,14 +930,14 @@ impl SnapshotRead for MemorySnapshot<'_> {
         &self,
         topic: &TopicId,
         actors: Option<&BTreeSet<ActorId>>,
-        reserve: &mut dyn FnMut(super::SnapshotCharge) -> Result<()>,
+        reserve: &mut dyn FnMut(crate::storage::SnapshotCharge) -> Result<()>,
     ) -> Result<ActorClock> {
-        reserve(super::SnapshotCharge::Read { bytes: 0 })?;
+        reserve(crate::storage::SnapshotCharge::Read { bytes: 0 })?;
         self.counters.count_meta();
         let Some(clock) = self.inner.actor_clock.get(topic) else {
             return Ok(ActorClock::new());
         };
-        reserve(super::SnapshotCharge::Clock {
+        reserve(crate::storage::SnapshotCharge::Clock {
             entries: clock.len(),
             workspace: actors.map_or(0, |actors| ActorClock::allocation_bound(actors.len())),
         })?;
@@ -963,24 +963,25 @@ impl SnapshotRead for MemorySnapshot<'_> {
         reserve(postcard::experimental::serialized_size(op)?)?;
         Ok(Some(op.clone()))
     }
-    fn get_observation(&self, id: &OpId) -> Result<Option<(super::OpHeader, ActorClock)>> {
+    fn get_observation(&self, id: &OpId) -> Result<Option<(crate::storage::OpHeader, ActorClock)>> {
         self.counters.count_meta();
-        Ok(self
-            .inner
-            .meta
-            .get(id)
-            .map(|meta| (super::OpHeader::from(meta), meta.observed_clock.clone())))
+        Ok(self.inner.meta.get(id).map(|meta| {
+            (
+                crate::storage::OpHeader::from(meta),
+                meta.observed_clock.clone(),
+            )
+        }))
     }
 
-    fn get_header(&self, id: &OpId) -> Result<Option<super::OpHeader>> {
+    fn get_header(&self, id: &OpId) -> Result<Option<crate::storage::OpHeader>> {
         self.counters.count_meta();
-        Ok(self.inner.meta.get(id).map(super::OpHeader::from))
+        Ok(self.inner.meta.get(id).map(crate::storage::OpHeader::from))
     }
 
     fn dependency_ids(
         &self,
         id: &OpId,
-        cursor: super::DependencyCursor,
+        cursor: crate::storage::DependencyCursor,
         limit: usize,
     ) -> Result<Option<Vec<OpId>>> {
         use std::ops::Bound::{Excluded, Unbounded};
@@ -1014,7 +1015,7 @@ impl SnapshotRead for MemorySnapshot<'_> {
         topic_id: &TopicId,
         peer_id: &PeerId,
         actors: &BTreeSet<ActorId>,
-    ) -> Result<Option<super::RequestView>> {
+    ) -> Result<Option<crate::storage::RequestView>> {
         let Some(state) = self.inner.topics.get(topic_id) else {
             return Ok(None);
         };
@@ -1024,7 +1025,7 @@ impl SnapshotRead for MemorySnapshot<'_> {
             .get(topic_id)
             .map(|local| local.selected(actors))
             .unwrap_or_default();
-        Ok(Some(super::RequestView {
+        Ok(Some(crate::storage::RequestView {
             genesis: state.genesis,
             epoch: self
                 .inner
@@ -1722,7 +1723,7 @@ impl From<std::sync::PoisonError<std::sync::MutexGuard<'_, MemoryInner>>> for Er
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::storage::memory::*;
     use crate::tests::support::*;
 
     #[test]

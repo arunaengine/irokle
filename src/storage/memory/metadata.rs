@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::budget::{Charge, NodePlan};
-use super::{MemoryDomain, MemoryInner, ObligationKind};
+use crate::storage::memory::budget::{Charge, NodePlan};
+use crate::storage::memory::{MemoryDomain, MemoryInner, ObligationKind};
 use crate::storage::{ObligationTarget, PeerAck, SyncObligation, SyncPeerStatus};
 use crate::{ActorClock, EvictionKey, PeerId, Result, TopicId};
 

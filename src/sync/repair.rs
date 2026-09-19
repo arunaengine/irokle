@@ -8,10 +8,10 @@ use std::ops::Bound::{Excluded, Unbounded};
 use crate::storage::SnapshotRead;
 use crate::{ActorClock, ActorId, Op, OpId, Result, TopicId};
 
-use super::records::{LoadError, Records};
-use super::slice::Slice;
-use super::space::tree_bytes;
-use super::{ActorScope, MAX_PAGE_MISSING, PageBudget, SyncRequest};
+use crate::sync::records::{LoadError, Records};
+use crate::sync::slice::Slice;
+use crate::sync::space::tree_bytes;
+use crate::sync::{ActorScope, MAX_PAGE_MISSING, PageBudget, SyncRequest};
 
 #[derive(Clone, Copy, Default)]
 struct Scan {
@@ -61,9 +61,9 @@ pub(super) struct RepairPage {
 impl Repair {
     pub(super) fn root_limit() -> usize {
         // Leave a quarter of a kept plan's bytes for independent forward progress.
-        let limit = super::slice::MAX_CONTINUATION_BYTES * 3 / 4;
+        let limit = crate::sync::slice::MAX_CONTINUATION_BYTES * 3 / 4;
         let mut low = 0;
-        let mut high = super::MAX_REQUEST_ITEMS;
+        let mut high = crate::sync::MAX_REQUEST_ITEMS;
         while low < high {
             let roots = low + (high - low).div_ceil(2);
             let bytes = 4 * tree_bytes::<OpId, ()>(roots)
@@ -414,7 +414,7 @@ fn need_position(
         }
         slice.reserve(tree_bytes::<ActorId, u64>(count + 1) - tree_bytes::<ActorId, u64>(count))?;
     }
-    super::request::need(&mut page.positions, actor, generation);
+    crate::sync::request::need(&mut page.positions, actor, generation);
     Ok(true)
 }
 

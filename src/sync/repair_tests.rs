@@ -3,7 +3,7 @@
 use crate::oplog::Oplog;
 use crate::tests::support::*;
 
-use super::super::{ActorRangeHint, PageBudget, SyncEngine, SyncRequest};
+use crate::sync::{ActorRangeHint, PageBudget, SyncEngine, SyncRequest};
 
 fn repair_slices<S: Storage>(storage: S) {
     let owner = Ed25519Signer::from_bytes(&[221; 32]);
@@ -108,7 +108,7 @@ fn repair_slices<S: Storage>(storage: S) {
             assert!(after.authorization_reads - before.authorization_reads <= 16);
             assert!(
                 after.preparation - before.preparation
-                    <= 16 * super::super::MAX_REQUEST_ITEMS as u64
+                    <= 16 * crate::sync::MAX_REQUEST_ITEMS as u64
             );
             let mut restarted = false;
             let mut admitted = BTreeSet::from([genesis.id]);
@@ -117,7 +117,7 @@ fn repair_slices<S: Storage>(storage: S) {
                 let before = responder.page_work();
                 let budget = PageBudget {
                     ops: 1,
-                    bytes: super::super::MAX_PAGE_BYTES,
+                    bytes: crate::sync::MAX_PAGE_BYTES,
                 };
                 let page = if informed {
                     responder.response_with(
@@ -317,7 +317,7 @@ fn unconfirmed_holes_replay() {
             for _ in 0..64 {
                 let budget = PageBudget {
                     ops: 1,
-                    bytes: super::super::MAX_PAGE_BYTES,
+                    bytes: crate::sync::MAX_PAGE_BYTES,
                 };
                 let page = if informed {
                     responder.response_with(

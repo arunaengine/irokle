@@ -10,8 +10,9 @@ use crate::{
     TopicInfo,
 };
 
-use super::super::pressure::{Pressure, Transaction};
-use super::super::{
+use crate::storage::fjall::provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
+use crate::storage::pressure::{Pressure, Transaction};
+use crate::storage::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
     ObligationTarget, OpMeta, OpPosition, PeerAck, ProvisionalTopic, SnapshotRead, StagingLimits,
     Storage, StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState,
@@ -20,7 +21,6 @@ use super::super::{
     new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
     topic_fingerprint_for, validate_batch, validate_heads,
 };
-use super::provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
 
 #[cfg(feature = "fjall")]
 #[derive(Clone)]
@@ -126,7 +126,7 @@ struct LegacyPeerAck {
 struct LegacyPeerStatus {
     peer_id: PeerId,
     topic_id: TopicId,
-    state: super::super::SyncPeerState,
+    state: crate::storage::SyncPeerState,
     pending_obligations: usize,
     failed_attempts: u64,
     successful_attempts: u64,
@@ -201,7 +201,7 @@ impl FjallStorage {
     /// Install pressure admission before creating or migrating Irokle records.
     pub fn open_with_pressure(
         path: impl AsRef<Path>,
-        pressure: super::super::StoragePressure,
+        pressure: crate::storage::StoragePressure,
     ) -> Result<Self> {
         let db = fjall::OptimisticTxDatabase::builder(path).open()?;
         Self::from_database_policy(db, fjall::PersistMode::SyncAll, Some(pressure))
@@ -210,7 +210,7 @@ impl FjallStorage {
     /// Use caller-managed database allocation with pressure admission during migration.
     pub fn from_database_pressure(
         db: fjall::OptimisticTxDatabase,
-        pressure: super::super::StoragePressure,
+        pressure: crate::storage::StoragePressure,
     ) -> Result<Self> {
         Self::from_database_policy(db, fjall::PersistMode::SyncAll, Some(pressure))
     }
@@ -218,7 +218,7 @@ impl FjallStorage {
     fn from_database_policy(
         db: fjall::OptimisticTxDatabase,
         persist_mode: fjall::PersistMode,
-        policy: Option<super::super::StoragePressure>,
+        policy: Option<crate::storage::StoragePressure>,
     ) -> Result<Self> {
         let records = db.keyspace("records", fjall::KeyspaceCreateOptions::default)?;
         let pressure = Pressure::shared(records.path())?;
@@ -561,13 +561,13 @@ impl FjallStorage {
     }
 
     /// Set one shared policy for every facade of this database while writes are idle.
-    pub fn with_storage_pressure(self, policy: super::super::StoragePressure) -> Result<Self> {
+    pub fn with_storage_pressure(self, policy: crate::storage::StoragePressure) -> Result<Self> {
         self.pressure.configure(policy)?;
         Ok(self)
     }
 
     /// Reservations and backend measurements, including hidden copies and journal data.
-    pub fn storage_usage(&self) -> Result<super::super::StorageUsage> {
+    pub fn storage_usage(&self) -> Result<crate::storage::StorageUsage> {
         let mut usage = self.pressure.usage()?;
         usage.database_bytes = self.db.inner().disk_space()?;
         usage.journal_bytes = self.db.inner().journal_disk_space()?;
@@ -2263,16 +2263,16 @@ struct HeaderPrefix {
     actor_prev: Option<OpId>,
 }
 
-fn decode_header(bytes: &[u8]) -> Result<super::super::OpHeader> {
+fn decode_header(bytes: &[u8]) -> Result<crate::storage::OpHeader> {
     Ok(header_tail(bytes)?.0)
 }
 
-fn header_tail(bytes: &[u8]) -> Result<(super::super::OpHeader, &[u8])> {
+fn header_tail(bytes: &[u8]) -> Result<(crate::storage::OpHeader, &[u8])> {
     let (prefix, rest): (HeaderPrefix, _) = postcard::take_from_bytes(bytes)?;
     let rest = skip_ids(rest)?;
     let (generation, rest): (u64, _) = postcard::take_from_bytes(rest)?;
     Ok((
-        super::super::OpHeader {
+        crate::storage::OpHeader {
             topic_id: prefix.topic_id,
             actor_id: prefix.actor_id,
             actor_seq: prefix.actor_seq,
@@ -2295,7 +2295,7 @@ fn skip_ids(bytes: &[u8]) -> Result<&[u8]> {
 
 fn dependency_slice(
     bytes: &[u8],
-    cursor: super::super::DependencyCursor,
+    cursor: crate::storage::DependencyCursor,
     limit: usize,
 ) -> Result<Vec<OpId>> {
     let (_, rest): (HeaderPrefix, _) = postcard::take_from_bytes(bytes)?;
@@ -2401,11 +2401,11 @@ impl FjallSnapshot<'_> {
         prefix: &[u8],
         topic: &TopicId,
         limit: usize,
-        reserve: &mut dyn FnMut(super::super::SnapshotCharge) -> Result<()>,
+        reserve: &mut dyn FnMut(crate::storage::SnapshotCharge) -> Result<()>,
     ) -> Result<Option<fjall::UserValue>> {
         // Fjall may allocate an oversized raw value inside get; this envelope
         // bounds admitted records and decoding, not that backend allocation.
-        reserve(super::super::SnapshotCharge::Read { bytes: limit })?;
+        reserve(crate::storage::SnapshotCharge::Read { bytes: limit })?;
         self.store.counters.count_meta();
         let value = fjall::Readable::get(
             &self.tx,
@@ -2437,13 +2437,13 @@ impl SnapshotRead for FjallSnapshot<'_> {
         &self,
         topic: &TopicId,
         peer: &PeerId,
-        reserve: &mut dyn FnMut(super::super::SnapshotCharge) -> Result<()>,
-    ) -> Result<Option<super::super::RequestView>> {
+        reserve: &mut dyn FnMut(crate::storage::SnapshotCharge) -> Result<()>,
+    ) -> Result<Option<crate::storage::RequestView>> {
         let limit = (crate::sync::MAX_PAGE_BYTES - 1024) / 2;
         let Some(bytes) = self.sync_record(b"ts", topic, limit, reserve)? else {
             return Ok(None);
         };
-        reserve(super::super::SnapshotCharge::State {
+        reserve(crate::storage::SnapshotCharge::State {
             entries: bytes.len() / PeerId::LEN + 1,
             workspace: bytes
                 .len()
@@ -2460,7 +2460,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
             .map(|bytes| postcard::from_bytes(&bytes))
             .transpose()?
             .unwrap_or_default();
-        Ok(Some(super::super::RequestView {
+        Ok(Some(crate::storage::RequestView {
             genesis: state.genesis,
             epoch,
             member,
@@ -2472,7 +2472,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
         &self,
         topic: &TopicId,
         actors: Option<&BTreeSet<ActorId>>,
-        reserve: &mut dyn FnMut(super::super::SnapshotCharge) -> Result<()>,
+        reserve: &mut dyn FnMut(crate::storage::SnapshotCharge) -> Result<()>,
     ) -> Result<ActorClock> {
         let limit = (crate::sync::MAX_PAGE_BYTES - 1024) / 2;
         let Some(bytes) = self.sync_record(b"ac", topic, limit, reserve)? else {
@@ -2487,7 +2487,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
             kept.saturating_mul(4 * size_of::<(ActorId, u64)>() + 128)
                 .saturating_add(256),
         );
-        reserve(super::super::SnapshotCharge::Clock { entries, workspace })?;
+        reserve(crate::storage::SnapshotCharge::Clock { entries, workspace })?;
         match actors {
             Some(actors) => ActorClock::decode_counted(&bytes, actors).map(|(clock, _)| clock),
             None => postcard::from_bytes(&bytes).map_err(Error::from),
@@ -2532,7 +2532,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
         let op: Op = postcard::from_bytes(&bytes)?;
         Ok(self.shown(&op.signed.body.topic_id)?.then_some(op))
     }
-    fn get_observation(&self, id: &OpId) -> Result<Option<(super::super::OpHeader, ActorClock)>> {
+    fn get_observation(&self, id: &OpId) -> Result<Option<(crate::storage::OpHeader, ActorClock)>> {
         self.store.counters.count_meta();
         let Some(bytes) = fjall::Readable::get(
             &self.tx,
@@ -2553,7 +2553,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
         Ok(Some((header, clock)))
     }
 
-    fn get_header(&self, id: &OpId) -> Result<Option<super::super::OpHeader>> {
+    fn get_header(&self, id: &OpId) -> Result<Option<crate::storage::OpHeader>> {
         self.store.counters.count_meta();
         let header = fjall::Readable::get(
             &self.tx,
@@ -2571,7 +2571,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
     fn dependency_ids(
         &self,
         id: &OpId,
-        cursor: super::super::DependencyCursor,
+        cursor: crate::storage::DependencyCursor,
         limit: usize,
     ) -> Result<Option<Vec<OpId>>> {
         if limit == 0 {
@@ -2600,7 +2600,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
         topic_id: &TopicId,
         peer_id: &PeerId,
         actors: &BTreeSet<ActorId>,
-    ) -> Result<Option<super::super::RequestView>> {
+    ) -> Result<Option<crate::storage::RequestView>> {
         let state: Option<TopicState> = FjallStorage::tx_get(
             &self.tx,
             &self.store.records,
@@ -2624,7 +2624,7 @@ impl SnapshotRead for FjallSnapshot<'_> {
         .transpose()?
         .unwrap_or_default();
         self.counted.set(Some((*topic_id, count)));
-        Ok(Some(super::super::RequestView {
+        Ok(Some(crate::storage::RequestView {
             genesis: state.genesis,
             epoch,
             member: state.members.contains(peer_id),
@@ -2772,11 +2772,15 @@ fn clear_satisfied_tx(
 
 #[cfg(test)]
 mod tests {
-    fn replace_state(storage: &super::FjallStorage, topic: &crate::TopicId, bytes: &[u8]) {
+    fn replace_state(
+        storage: &crate::storage::fjall::store::FjallStorage,
+        topic: &crate::TopicId,
+        bytes: &[u8],
+    ) {
         let mut tx = storage.db.write_tx().unwrap();
         tx.insert(
             &storage.records,
-            super::FjallStorage::key_id(b"ts", topic),
+            crate::storage::fjall::store::FjallStorage::key_id(b"ts", topic),
             bytes,
         );
         tx.commit().unwrap().unwrap();
@@ -2907,8 +2911,8 @@ mod tests {
 
     #[test]
     fn dependency_corruption_refused() {
-        use super::*;
         use crate::storage::DependencyCursor;
+        use crate::storage::fjall::store::*;
         let meta = StoredMeta {
             id: OpId::hash(b"dependency slicing"),
             topic_id: TopicId::hash(b"topic"),
@@ -2963,7 +2967,7 @@ mod tests {
 
     #[test]
     fn root_matches_clock() {
-        use super::*;
+        use crate::storage::fjall::store::*;
         for count in [0_u32, 1, 31, 32, 33, 257] {
             let mut clock = ActorClock::new();
             for index in 0..count {
@@ -2996,7 +3000,7 @@ mod tests {
 
     #[test]
     fn header_matches_fields() {
-        use super::*;
+        use crate::storage::fjall::store::*;
         for count in [0, 1, 127, 128, 255, 256, 257, 65_537] {
             let meta = StoredMeta {
                 id: OpId::hash(b"header"),
@@ -3048,7 +3052,7 @@ mod tests {
         }
     }
 
-    use super::*;
+    use crate::storage::fjall::store::*;
 
     #[test]
     fn scan_skips_collision() {

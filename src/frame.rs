@@ -4,7 +4,7 @@ use std::io;
 
 use crate::sync::SyncMessage;
 
-use super::invalid_data;
+use crate::net::invalid_data;
 
 pub(super) const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 pub const MAX_SYNC_DATA_OPS_PER_MESSAGE: usize = 256;

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{ActorClock, ActorId};
 
-use super::{
+use crate::sync::{
     ActorFilter, ActorRangeHint, ActorWindow, MAX_FILTER_BYTES, MAX_PAGE_MISSING, MAX_RANGE_SPAN,
 };
 
@@ -35,7 +35,7 @@ impl Default for RequestKnowledge {
 impl RequestKnowledge {
     #[cfg(feature = "iroh")]
     pub(crate) fn retained_bytes(&self) -> usize {
-        super::space::vector_bytes::<ActorId>(self.positions.capacity())
+        crate::sync::space::vector_bytes::<ActorId>(self.positions.capacity())
     }
     /// Knowledge keeping at most `capacity` needed positions.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
@@ -348,7 +348,7 @@ fn exact_filter(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::sync::request::*;
 
     fn actor(byte: u8) -> ActorId {
         ActorId::from_bytes([byte; 32])
@@ -521,7 +521,7 @@ mod tests {
     /// encoding and a full filter, fits one sync frame.
     #[test]
     fn largest_request_frames() {
-        let items = super::super::MAX_REQUEST_ITEMS;
+        let items = crate::sync::MAX_REQUEST_ITEMS;
         let hints = (0..items as u32 / 2)
             .map(|index| {
                 let mut bytes = [0xff_u8; 32];
@@ -576,7 +576,7 @@ mod tests {
     /// window, and a page naming the maximum positions still fits a small frame.
     #[test]
     fn ranges_real_limit() {
-        let items = super::super::MAX_REQUEST_ITEMS;
+        let items = crate::sync::MAX_REQUEST_ITEMS;
         let id = |index: u32| {
             let mut bytes = [0_u8; 32];
             bytes[..4].copy_from_slice(&index.to_be_bytes());

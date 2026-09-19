@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 
 use crate::{PeerId, TopicId};
 
-use super::SHARED_OVERLAP;
+use crate::node::SHARED_OVERLAP;
 
 /// Consecutive failed attempts a peer may collect before selection passes it over.
 pub(crate) const PEER_FAILURE_LIMIT: u64 = 2;
@@ -149,7 +149,7 @@ struct CandidateOrder {
 }
 
 /// Select sync targets for `local_peer` without attempt history; production
-/// selection adds runtime health through [`super::Irokle::sync_peers`].
+/// selection adds runtime health through [`crate::node::Irokle::sync_peers`].
 #[cfg(test)]
 pub(crate) fn select_sync_peers(
     topic_id: TopicId,
@@ -328,7 +328,7 @@ fn sync_peer_score(topic_id: TopicId, local_peer: PeerId, peer: PeerId) -> [u8; 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::node::peers::*;
 
     use crate::storage::TopicState;
     use crate::topic::ReplicationPolicy;

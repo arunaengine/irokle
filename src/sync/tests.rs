@@ -2,7 +2,7 @@
 //! Response entry points: authorization and finite clock capture precede bounded page
 //! traversal, and completion covers repair bodies and the requested forward goal together.
 
-use super::*;
+use crate::sync::*;
 use crate::tests::support::{Note, StaleReadStorage, forked_side};
 use crate::{
     Ed25519Signer, Event, EventEnvelope, MemoryStorage, Signer, TopicControl, TopicGenesis,
@@ -315,7 +315,7 @@ fn repair_completion<S: Storage>(storage: S) {
                         bytes: if exact_bytes {
                             postcard::experimental::serialized_size(&chain[1]).unwrap() as u64
                         } else {
-                            super::MAX_PAGE_BYTES as u64
+                            crate::sync::MAX_PAGE_BYTES as u64
                         },
                     };
                     let mut request = SyncRequest {
@@ -333,7 +333,7 @@ fn repair_completion<S: Storage>(storage: S) {
                     };
                     let mut exchanges = 0;
                     if later && forward {
-                        assert!(super::forward_remaining(
+                        assert!(crate::sync::forward_remaining(
                             &request,
                             &engine.summary(topic).unwrap().actor_clock,
                             &chain[2..],

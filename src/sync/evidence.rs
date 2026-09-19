@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use crate::storage::{PeerAck, SnapshotRead, Storage, SyncObligation, TopicState};
 use crate::{ActorClock, Error, OpId, PeerId, Result, TopicId, actor_id_for};
 
-use super::{SyncAck, SyncEngine, SyncReport};
+use crate::sync::{SyncAck, SyncEngine, SyncReport};
 
 impl<S: Storage> SyncEngine<S> {
     /// Heads and clock an ack may certify, read from one view with their genesis. A topic

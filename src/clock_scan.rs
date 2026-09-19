@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::{
+use crate::clock::{
     ActorClock, ActorId, CACHE_BYTES, ClockCache, corrupt, digest, first_difference, nibble,
 };
 
@@ -175,8 +175,8 @@ impl ClockScan {
 
 #[cfg(test)]
 mod tests {
-    use super::super::Encoded;
-    use super::*;
+    use crate::clock::Encoded;
+    use crate::clock::scan::*;
     use std::collections::BTreeMap;
 
     fn history() -> (BTreeMap<[u8; 32], Vec<u8>>, Vec<ActorClock>) {
