@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod bootstrap;
 mod builder;
+#[cfg(feature = "iroh")]
+mod network;
 mod peers;
 mod topic;
 
@@ -114,15 +116,7 @@ pub struct IrokleBuilder<S = MemoryStorage> {
     signer_explicit: bool,
     write_concern_explicit: bool,
     #[cfg(feature = "iroh")]
-    endpoint: Option<iroh::Endpoint>,
-    #[cfg(feature = "iroh")]
-    alpns: Vec<Vec<u8>>,
-    #[cfg(feature = "iroh")]
-    auto_accept: bool,
-    #[cfg(feature = "iroh")]
-    iroh_runtime: crate::net::IrohRuntimeConfig,
-    #[cfg(feature = "iroh")]
-    eviction_sink: Option<tokio::sync::mpsc::UnboundedSender<TopicEviction>>,
+    iroh: network::IrohSettings,
 }
 
 impl<S: Storage> Irokle<S> {

@@ -67,6 +67,7 @@
       "members": [
         "bootstrap.rs",
         "builder.rs",
+        "network.rs",
         "peers.rs",
         "topic.rs",
         "peer_selection.md",
@@ -151,7 +152,7 @@
       "source": "Ed25519Signer public API and From<&iroh::SecretKey> adapter"
     },
     {
-      "path": "src/node/builder.rs",
+      "path": "src/node/network.rs",
       "rule": "name_terms",
       "name": "with_iroh_runtime_config",
       "kind": "function",
@@ -159,7 +160,7 @@
       "source": "IrokleBuilder public Iroh runtime configuration API"
     },
     {
-      "path": "src/node/builder.rs",
+      "path": "src/node/network.rs",
       "rule": "name_terms",
       "name": "with_iroh_secret_key",
       "kind": "function",
