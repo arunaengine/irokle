@@ -1,7 +1,7 @@
 //! Pages serve causal prefixes of a goal within their budget, over many
 //! actors, joins, large ops and repair wants.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use crate::oplog::Oplog;
 use crate::sync::{PageBudget, SyncCredit, SyncEngine, SyncRequest};

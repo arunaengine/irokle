@@ -5,13 +5,13 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use super::support::*;
 use crate::oplog::Oplog;
 use crate::storage::{
     AdmissionEffects, AdmittedBatch, FjallStorage, OpMeta, PeerAck, SnapshotRead, SyncObligation,
     SyncStatusUpdate, TopicState, TopicView,
 };
 use crate::sync::{PageBudget, SyncData, SyncEngine};
+use crate::tests::support::*;
 use crate::{EvictionKey, SyncPeerStatus, TopicEviction, TopicInfo};
 
 const REPS: usize = 3;
@@ -755,12 +755,12 @@ fn membership_projection() {
 /// A reader holding only the genesis pages through `source` with the default
 /// credit. The walk is timed; reads are the responder's.
 fn walk_pages<S: Storage + PayloadReads>(
-    source: &super::pages::Source<Counting<S>>,
+    source: &crate::tests::pages::Source<Counting<S>>,
     storage: &Counting<S>,
 ) -> Sample {
     let before = storage.snapshot();
     let started = Interval::new::<S>("window");
-    let pages = super::pages::page_through(source, crate::sync::SyncCredit::default());
+    let pages = crate::tests::pages::page_through(source, crate::sync::SyncCredit::default());
     let ms = started.millis();
     let mut counters = vec![("pages", pages as u64)];
     counters.extend(read_delta(before, storage.snapshot()));
@@ -769,7 +769,7 @@ fn walk_pages<S: Storage + PayloadReads>(
 
 /// Writers beyond the page actor window, one of them a dependency of the rest.
 fn window_walk<S: Storage + PayloadReads>(storage: Counting<S>) -> Sample {
-    let source = super::pages::late_dependency(storage.clone(), 4097);
+    let source = crate::tests::pages::late_dependency(storage.clone(), 4097);
     fixture("window_pages", &storage, std::iter::once(source.topic_id));
     walk_pages(&source, &storage)
 }
@@ -785,11 +785,12 @@ fn window_progress() {
 /// them from explicit wants, page by page. Only the responder's reads count.
 fn repair_walk<S: Storage + PayloadReads>(storage: Counting<S>, lost: usize) -> Sample {
     let reader_id = signer(60).peer_id();
-    let (genesis, chains) = super::pages::independent_chains(&Oplog::new(), reader_id, &[8192]);
+    let (genesis, chains) =
+        crate::tests::pages::independent_chains(&Oplog::new(), reader_id, &[8192]);
     load(&storage, std::slice::from_ref(&genesis));
     load(&storage, &chains[0]);
     let log = Oplog::with_storage(storage.clone());
-    let source = super::pages::Source {
+    let source = crate::tests::pages::Source {
         engine: SyncEngine::new(log.clone(), signer(244).peer_id()),
         log,
         topic_id: genesis.signed.body.topic_id,
@@ -809,7 +810,7 @@ fn repair_walk<S: Storage + PayloadReads>(storage: Counting<S>, lost: usize) -> 
     let started = Instant::now();
     let mut pages = 0;
     loop {
-        let request = super::pages::request_for(&source, &reader, credit);
+        let request = crate::tests::pages::request_for(&source, &reader, credit);
         if request.actor_range_hints.is_empty() && request.wants.is_empty() {
             break;
         }

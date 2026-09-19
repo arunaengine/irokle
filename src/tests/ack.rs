@@ -1,6 +1,6 @@
-use super::support::*;
 #[cfg(feature = "fjall")]
 use crate::storage as crate_storage;
+use crate::tests::support::*;
 
 fn assert_clears_satisfied<S: Storage>(storage: S) {
     let ack_signer = Ed25519Signer::from_bytes(&[99; 32]);

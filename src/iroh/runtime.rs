@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::Storage;
 
-use super::IrohNet;
+use crate::net::iroh::IrohNet;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);

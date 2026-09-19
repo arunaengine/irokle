@@ -6,7 +6,7 @@ use std::io;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
-use super::{IROKLE_SYNC_ALPN, other, timed_out};
+use crate::net::iroh::{IROKLE_SYNC_ALPN, other, timed_out};
 
 #[derive(Clone)]
 pub(super) struct ConnectionPool {

@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::sync::{SyncMessage, SyncSummary};
 use crate::{Irokle, MemoryStorage, PeerId, ReceiveOutcome, Storage, TopicEviction};
 
-use super::frame::MAX_SYNC_DATA_OPS_PER_MESSAGE as MAX_DATA_OPS;
-use super::{_message_type_name, IROKLE_SYNC_ALPN, invalid_data};
+use crate::net::frame::MAX_SYNC_DATA_OPS_PER_MESSAGE as MAX_DATA_OPS;
+use crate::net::{_message_type_name, IROKLE_SYNC_ALPN, invalid_data};
 
 mod budget;
 mod exchange;
@@ -2042,7 +2042,7 @@ impl<S: Storage> SharedNet<S> {
                 }
             };
             let size = match planned.messages.iter().try_fold(0usize, |bytes, message| {
-                super::framed_message_len(message).map(|len| bytes.saturating_add(len))
+                crate::net::framed_message_len(message).map(|len| bytes.saturating_add(len))
             }) {
                 Ok(size) if size <= limits.bytes => size,
                 Ok(_) => {
@@ -2183,9 +2183,9 @@ impl<S: Storage> SharedNet<S> {
         // The pushed page is cut to what one stream holds beside this topic's controls.
         let mut control_bytes = 0_usize;
         for message in &controls {
-            control_bytes = control_bytes.saturating_add(super::framed_message_len(message)?);
+            control_bytes = control_bytes.saturating_add(crate::net::framed_message_len(message)?);
         }
-        let data = super::sync_data_page(
+        let data = crate::net::sync_data_page(
             topic_id,
             send,
             self.limits.messages.saturating_sub(controls.len()),
@@ -2929,12 +2929,12 @@ impl<S: Storage> SharedNet<S> {
         for (topic_id, ops) in pages {
             let replies = followups.entry(topic_id).or_default();
             let mut used =
-                super::framed_message_len(&SyncMessage::Open(self.node.sync_open(topic_id)));
+                crate::net::framed_message_len(&SyncMessage::Open(self.node.sync_open(topic_id)));
             for reply in replies.iter() {
-                used = used.and_then(|used| Ok(used + super::framed_message_len(reply)?));
+                used = used.and_then(|used| Ok(used + crate::net::framed_message_len(reply)?));
             }
             let data = used.and_then(|used| {
-                super::sync_data_page(
+                crate::net::sync_data_page(
                     topic_id,
                     ops,
                     self.limits.messages.saturating_sub(replies.len() + 1),
@@ -3944,7 +3944,7 @@ fn timed_out(message: &'static str) -> io::Error {
 fn clone_error(error: &io::Error) -> io::Error {
     if let Some(source) = error
         .get_ref()
-        .and_then(|source| source.downcast_ref::<super::SharedError>())
+        .and_then(|source| source.downcast_ref::<crate::net::SharedError>())
     {
         return io::Error::new(error.kind(), source.clone());
     }
@@ -3955,7 +3955,7 @@ fn clone_error(error: &io::Error) -> io::Error {
 }
 
 fn other(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
-    io::Error::other(super::SharedError::new(error))
+    io::Error::other(crate::net::SharedError::new(error))
 }
 
 #[cfg(test)]
@@ -3968,8 +3968,8 @@ mod budget_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::TopicId;
+    use crate::net::iroh::*;
 
     #[test]
     fn typed_decisions() {
@@ -4625,11 +4625,11 @@ mod tests {
             topic.publish(Ping).unwrap();
         }
         let ops = crate::oplog::topological(node.storage(), &topic.id()).unwrap();
-        let whole = super::super::sync_data_page(topic.id(), ops.clone(), 8, usize::MAX).unwrap();
+        let whole = crate::net::sync_data_page(topic.id(), ops.clone(), 8, usize::MAX).unwrap();
         assert!(!whole.cut);
         assert_eq!(whole.messages.len(), 4);
 
-        let cut = super::super::sync_data_page(topic.id(), ops.clone(), 2, usize::MAX).unwrap();
+        let cut = crate::net::sync_data_page(topic.id(), ops.clone(), 2, usize::MAX).unwrap();
         assert!(cut.cut, "a cut page must report the rest");
         assert!(cut.messages.len() <= 2);
         let sent = cut

@@ -2,8 +2,8 @@
 //! quota pressure, competing activations beside a retained writer and a paused
 //! reader, and expiry beside admission. Every replacement stays exact.
 
-use super::ownership::{admit, assert_bytes_exact, bytes, history, reader_node};
-use super::support::*;
+use crate::tests::ownership::{admit, assert_bytes_exact, bytes, history, reader_node};
+use crate::tests::support::*;
 
 use crate::node::ReceiveOutcome;
 use crate::storage::StagingLimits;
@@ -82,10 +82,10 @@ fn fjall_expiry_frees() {
 mod fjall {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::super::ownership::fjall::{assert_hidden, pause_at, staged};
-    use super::super::ownership::{contents, listed, stage};
-    use super::*;
     use crate::storage::{AdmissionEffects, FjallStorage, Hook};
+    use crate::tests::integrated::*;
+    use crate::tests::ownership::fjall::{assert_hidden, pause_at, staged};
+    use crate::tests::ownership::{contents, listed, stage};
 
     /// Clearing beside staging at the total limit must preserve the new session.
     /// A view of the cleared session fails as stale, and all byte counts remain exact.

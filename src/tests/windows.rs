@@ -2,7 +2,7 @@
 //! windows. Each side keeps serving acks and controls, and a spent credit
 //! continues instead of ending in a mutual wait or a silent omission.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use std::time::Duration;
 
@@ -101,7 +101,7 @@ async fn duplex_small_windows() {
             .with_net(bind(&lookup, &keys[index]).await)
             .build()
             .unwrap();
-        lookup.add_endpoint_info(super::iroh::ready_addr(node.endpoint().unwrap()).await);
+        lookup.add_endpoint_info(crate::tests::iroh::ready_addr(node.endpoint().unwrap()).await);
         nodes.push(node);
     }
     let (alice, bob) = (nodes[0].clone(), nodes[1].clone());

@@ -8,13 +8,15 @@ use crate::{
     TopicId, TopicPayload, actor_id_for,
 };
 
-use super::admission::{checked_next, ensure_event_type, is_admission_race, next_actor_position};
-use super::membership::{apply_control, materialize_topic_state};
-use super::{
+use crate::oplog::admission::{
+    checked_next, ensure_event_type, is_admission_race, next_actor_position,
+};
+use crate::oplog::membership::{apply_control, materialize_topic_state};
+use crate::oplog::{
     AdmittedBatch, BatchOverlay, MAX_ADMISSION_RETRIES, OpAdmission, Oplog, conflict_pause,
 };
 
-impl<S: super::Storage> Oplog<S> {
+impl<S: crate::oplog::Storage> Oplog<S> {
     pub fn create_topic_genesis(
         &self,
         topic_id: TopicId,

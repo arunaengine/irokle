@@ -1,7 +1,7 @@
 //! Faults combined in one run: the captured goal still finishes or reports a
 //! real block, never a false success.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use std::time::Duration;
 

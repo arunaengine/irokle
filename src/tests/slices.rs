@@ -1,9 +1,9 @@
 //! Page plans end their work slice after a bounded number of storage reads. A
 //! slice that sent nothing keeps its plan, and the same request goes on from it.
 
-use super::pages::Source;
-use super::progress::reverse_chain;
-use super::support::*;
+use crate::tests::pages::Source;
+use crate::tests::progress::reverse_chain;
+use crate::tests::support::*;
 
 use crate::oplog::Oplog;
 use crate::sync::{MAX_CONTINUATIONS, PageBudget, RequestKnowledge, SyncEngine};
@@ -278,7 +278,7 @@ fn reset_drops_plan() {
 
 #[cfg(feature = "iroh")]
 mod sessions {
-    use super::*;
+    use crate::tests::slices::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queued_sessions_finish() {
@@ -312,7 +312,7 @@ mod sessions {
         let server =
             Arc::new(net::IrohNet::new_with_config(endpoint, alice.clone(), runtime).unwrap());
         server.start_accept_loop().unwrap();
-        let address = super::super::iroh::ready_addr(server.endpoint()).await;
+        let address = crate::tests::iroh::ready_addr(server.endpoint()).await;
         let held = server.hold_planners().await;
         let mut clients = Vec::new();
         let mut pulls = Vec::new();
@@ -431,7 +431,7 @@ mod sessions {
             .with_page_visits(VISITS);
         let alice_net = Arc::new(net::IrohNet::new(alice_endpoint, alice.clone()).unwrap());
         alice_net.start_accept_loop().unwrap();
-        let alice_addr = super::super::iroh::ready_addr(alice_net.endpoint()).await;
+        let alice_addr = crate::tests::iroh::ready_addr(alice_net.endpoint()).await;
 
         let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
             .secret_key(iroh::SecretKey::from_bytes(&[231; 32]))
@@ -492,7 +492,7 @@ mod sessions {
         let alice_net =
             Arc::new(net::IrohNet::new(bind(230).await.unwrap(), alice.clone()).unwrap());
         alice_net.start_accept_loop().unwrap();
-        let alice_addr = super::super::iroh::ready_addr(alice_net.endpoint()).await;
+        let alice_addr = crate::tests::iroh::ready_addr(alice_net.endpoint()).await;
         let bob_storage = MemoryStorage::new();
         Oplog::with_storage(bob_storage.clone())
             .receive_ops(vec![source.genesis.clone()])

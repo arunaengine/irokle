@@ -3,8 +3,8 @@
 use std::io::Write;
 use std::process::Command;
 
-use super::support::*;
 use crate::storage::FjallStorage;
+use crate::tests::support::*;
 
 #[repr(C)]
 struct Limits {
@@ -189,12 +189,12 @@ fn isolated(name: &str, child: impl FnOnce(&std::path::Path)) {
 }
 
 fn namespace_fault(path: &std::path::Path, point: crate::storage::Hook) {
-    use super::clock_staging::{assert_clocks, clock_nodes};
-    use super::ownership::fjall::{assert_hidden, staged};
     use crate::storage::{AdmissionEffects, Hook};
+    use crate::tests::clock_staging::{assert_clocks, clock_nodes};
+    use crate::tests::ownership::fjall::{assert_hidden, staged};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let source = super::progress::reverse_chain(MemoryStorage::new(), 1300);
+    let source = crate::tests::progress::reverse_chain(MemoryStorage::new(), 1300);
     let topic = source.topic_id;
     let ops = oplog::topological(source.log.storage(), &topic).unwrap();
     let db = ::fjall::OptimisticTxDatabase::builder(path).open().unwrap();
@@ -244,7 +244,7 @@ fn namespace_fault(path: &std::path::Path, point: crate::storage::Hook) {
         }
         assert_clocks(&source, &storage, &ops);
     }
-    let other = super::progress::reverse_chain(MemoryStorage::new(), 1);
+    let other = crate::tests::progress::reverse_chain(MemoryStorage::new(), 1);
     storage
         .open_provisional(other.reader, other.topic_id, other.genesis.id, 2_000)
         .unwrap();

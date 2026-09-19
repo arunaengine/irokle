@@ -306,7 +306,7 @@ fn full(pool: Pool) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::net::iroh::budget::*;
     use crate::sync::SyncMessage;
 
     #[test]
@@ -346,7 +346,7 @@ mod tests {
     /// a reply as large.
     #[test]
     fn legal_frames_fit() {
-        let limits = super::super::StreamLimits::default();
+        let limits = crate::net::iroh::StreamLimits::default();
         let budget = ByteBudget::new(limits.inbound_bytes, limits.session_bytes);
         for tag in 0..=u8::MAX {
             let (served, charge) = ByteBudget::inbound(MAX_FRAME_LEN, tag);

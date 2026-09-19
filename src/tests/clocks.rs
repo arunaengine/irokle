@@ -2,7 +2,7 @@
 //! Memory store computes for the same graph: forks, joins, ops that waited for
 //! their dependencies, a cold reopen, and a reset that removes the nodes.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use crate::oplog::Oplog;
 use crate::storage::FjallStorage;

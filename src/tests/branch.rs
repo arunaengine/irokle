@@ -1,7 +1,7 @@
 //! Evidence and effects must stay bound to the branch they were read from when
 //! a genesis reset commits in the middle of building them.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use crate::oplog::Oplog;
 use crate::sync::{SyncData, SyncEngine};

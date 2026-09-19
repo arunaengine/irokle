@@ -1,10 +1,10 @@
 //! Node-backed provisional clocks across activation, clearing and migration.
 
-use super::ownership::fjall::{assert_hidden, staged};
-use super::pages::Source;
-use super::progress::reverse_chain;
-use super::support::*;
 use crate::storage::{AdmissionEffects, FjallStorage, Hook};
+use crate::tests::ownership::fjall::{assert_hidden, staged};
+use crate::tests::pages::Source;
+use crate::tests::progress::reverse_chain;
+use crate::tests::support::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(super) fn clock_nodes(db: &fjall::OptimisticTxDatabase, space: &str, topic: TopicId) -> usize {
@@ -182,7 +182,7 @@ fn legacy_clocks_migrate() {
     let mut completed = false;
     for steps in 0..8 {
         let dir = tempfile::tempdir().unwrap();
-        super::upgrade::copy_dir(original.path(), dir.path());
+        crate::tests::upgrade::copy_dir(original.path(), dir.path());
         FjallStorage::open_interrupted(dir.path(), steps).unwrap();
         let pending = {
             let db = fjall::OptimisticTxDatabase::builder(dir.path())

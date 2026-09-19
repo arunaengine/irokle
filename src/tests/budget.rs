@@ -1,10 +1,12 @@
 //! Bytes a net owns while it works stay charged until their data is gone, and
 //! every public entry point is admitted through the same slots and pools.
 
-use super::scheduler_tests::{Lookup, client, publish, ready_addr, server, shared_topic};
-use super::*;
 use crate::TopicId;
 use crate::net::frame::MAX_FRAME_LEN;
+use crate::net::iroh::scheduler_tests::{
+    Lookup, client, publish, ready_addr, server, shared_topic,
+};
+use crate::net::iroh::*;
 use crate::sync::{SyncAck, SyncCredit, SyncData, SyncRequest};
 use crate::tests::support::{Gate, GatePoint, StaleReadStorage, clock_summary, genesis_of};
 

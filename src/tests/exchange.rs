@@ -1,7 +1,7 @@
 //! Whole exchanges over real endpoints: pages in either direction, both at
 //! once, under concurrent writes, and a peer that cannot deliver what it claims.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use std::time::Duration;
 

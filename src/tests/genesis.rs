@@ -1,8 +1,8 @@
 //! Two stores holding different genesis operations of one topic converge on
 //! the deterministic winner through ordinary sync, whichever side starts.
 
-use super::iroh::ready_addr;
-use super::support::*;
+use crate::tests::iroh::ready_addr;
+use crate::tests::support::*;
 
 struct Side {
     node: Irokle,

@@ -3,8 +3,8 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::str::FromStr;
 
-use super::support::*;
 use crate::storage::{self as crate_storage, FjallStorage, SyncObligation};
+use crate::tests::support::*;
 use crate::{SyncPeerState, SyncPeerStatus};
 
 /// A database written by a schema 1 commit, see `tests/fixtures/README.md`.

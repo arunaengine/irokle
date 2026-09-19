@@ -10,9 +10,9 @@ use crate::net::frame::MAX_SYNC_DATA_OPS_PER_MESSAGE as MAX_DATA_OPS;
 use crate::sync::SyncMessage;
 use crate::{PeerId, Storage};
 
-use super::budget::{ByteBudget, Charge, OwnedClass, Pool};
-use super::exchange::stream_fits;
-use super::{
+use crate::net::iroh::budget::{ByteBudget, Charge, OwnedClass, Pool};
+use crate::net::iroh::exchange::stream_fits;
+use crate::net::iroh::{
     IROKLE_SYNC_ALPN, SharedNet, StreamLimits, invalid_data, may_open_topic, message_topic_id,
     peer_from_endpoint,
 };
@@ -316,9 +316,9 @@ impl SyncSession {
                 let grant_left = granted.saturating_sub(held);
                 budget.ops = budget.ops.min(grant_left / (2 * size_of::<crate::Op>()));
                 let ops_bytes = ByteBudget::page_bound(0, budget.ops);
-                budget.bytes = budget
-                    .bytes
-                    .min(grant_left.saturating_sub(ops_bytes) / super::budget::DECODED_FACTOR);
+                budget.bytes = budget.bytes.min(
+                    grant_left.saturating_sub(ops_bytes) / crate::net::iroh::budget::DECODED_FACTOR,
+                );
                 let plan = |planner: &crate::sync::SyncEngine<S>| {
                     let mut page = match self.summaries.get(&topic_id) {
                         Some(summary) => planner.response_with(peer_id, &request, budget, summary),

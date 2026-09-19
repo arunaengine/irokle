@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use iroh::address_lookup::memory::MemoryLookup;
 
-use super::support::*;
 use crate::IrokleBuilder;
 use crate::storage::FjallStorage;
 use crate::sync::SyncData;
+use crate::tests::support::*;
 
 const REPS: usize = 3;
 /// Safety cap for one run. A run that reaches it is reported as incomplete.
@@ -38,7 +38,7 @@ impl Store for FjallStorage {
     const NAME: &'static str = "fjall";
     fn builder(dir: &Path, name: &str) -> IrokleBuilder<Self> {
         Irokle::builder()
-            .with_fjall_path_and_persist_mode(dir.join(name), super::bench::persist_mode())
+            .with_fjall_path_and_persist_mode(dir.join(name), crate::tests::bench::persist_mode())
             .unwrap()
     }
     fn attempts(&self) -> Option<u64> {
@@ -55,7 +55,10 @@ struct Run {
 /// One line per workload: elapsed and every value as median and max.
 fn report(name: &str, params: &str, runs: Vec<Run>) {
     let params = if params.contains("backend=fjall") {
-        format!("{params} durability={:?}", super::bench::persist_mode())
+        format!(
+            "{params} durability={:?}",
+            crate::tests::bench::persist_mode()
+        )
     } else {
         params.to_owned()
     };
@@ -263,7 +266,7 @@ async fn many_topics<S: Store>(topics: usize, ops: usize) -> Run {
             alice.storage().actor_clock(&topic.id()).unwrap(),
         ));
     }
-    super::bench::fixture(
+    crate::tests::bench::fixture(
         "small_topics",
         alice.storage(),
         goal.iter().map(|(topic, _)| *topic),
@@ -273,7 +276,7 @@ async fn many_topics<S: Store>(topics: usize, ops: usize) -> Run {
     let sent = (sent_bytes(net.endpoint()), sent_bytes(&bob_endpoint));
     let attempts = (alice.storage().attempts(), bob.storage().attempts());
 
-    let started = super::bench::Interval::new::<S>("small_topics");
+    let started = crate::tests::bench::Interval::new::<S>("small_topics");
     net.start_accept_loop().unwrap();
     net.start_configured_resync_loop().unwrap();
     let done = wait_until(CAP, || {
@@ -727,9 +730,11 @@ async fn slow_control(ops: usize) -> Run {
         .with_write_concern(WriteConcern::Local)
         .build()
         .unwrap();
-    let storage =
-        FjallStorage::open_with_persist_mode(dir.path().join("bob"), super::bench::persist_mode())
-            .unwrap();
+    let storage = FjallStorage::open_with_persist_mode(
+        dir.path().join("bob"),
+        crate::tests::bench::persist_mode(),
+    )
+    .unwrap();
     let bob = Irokle::builder()
         .with_storage(storage)
         .with_peer_whitelist([alice.peer_id()])
@@ -836,7 +841,7 @@ async fn held_sample(rep: usize, ops: usize, bytes: usize) {
         .unwrap();
     let alice_endpoint = alice.endpoint().unwrap().clone();
     let alice_addr = ready_addr(&alice_endpoint).await;
-    let chain = super::bench::signed_chain(
+    let chain = crate::tests::bench::signed_chain(
         alice.signer(),
         "bench-held-item/v1",
         &[bob.peer_id()],

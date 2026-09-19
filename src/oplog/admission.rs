@@ -6,10 +6,10 @@ use std::sync::Arc;
 use crate::storage::{AdmissionEffects, AdmittedBatch, OpMeta, TopicState};
 use crate::{Error, Op, OpBody, OpId, Result, TopicId, TopicPayload, actor_id_for};
 
-use super::membership::{apply_control, materialize_topic_state, merge_states};
-use super::pending::{PendingVerdict, pending_meta_for};
-use super::topology::topological_ops;
-use super::{
+use crate::oplog::membership::{apply_control, materialize_topic_state, merge_states};
+use crate::oplog::pending::{PendingVerdict, pending_meta_for};
+use crate::oplog::topology::topological_ops;
+use crate::oplog::{
     Admitted, BatchOverlay, MAX_ADMISSION_RETRIES, MAX_CACHED_PROJECTIONS, MembershipCache,
     OpAdmission, Oplog, ReceiveEffects, ResetPlan, TopicEviction, conflict_pause,
     is_structural_genesis,
@@ -38,7 +38,7 @@ struct BuiltBatch {
     projection_tips: BTreeSet<OpId>,
 }
 
-impl<S: super::Storage> Oplog<S> {
+impl<S: crate::oplog::Storage> Oplog<S> {
     pub(super) fn receive_ops_admission(
         &self,
         source_peer: Option<crate::PeerId>,

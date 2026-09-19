@@ -2,7 +2,7 @@
 //! store: a retained view, a stale scan or a second facade has no effect on
 //! the namespaces and topics that replaced what it saw.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use crate::node::ReceiveOutcome;
 use crate::oplog::Oplog;
@@ -695,8 +695,8 @@ fn fjall_raced_expiry() {
 pub(super) mod fjall {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::*;
     use crate::storage::{FjallStorage, Hook, TopicState};
+    use crate::tests::ownership::*;
 
     /// Pause the `nth` arrival at `point`, counting from zero, on `gate`.
     pub(in crate::tests) fn pause_at(

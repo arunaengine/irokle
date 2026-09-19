@@ -1,5 +1,5 @@
-use super::support::*;
 use crate::storage as crate_storage;
+use crate::tests::support::*;
 
 fn assert_actor_chain<S: Storage>(storage: S) {
     let config = NodeConfig {
@@ -2625,7 +2625,7 @@ fn fjall_refuses_schema() {
     );
 }
 fn assert_repair_limit<S: Storage>(storage: S) {
-    let (source, topic, ops) = super::ownership::history(181, 0, 0);
+    let (source, topic, ops) = crate::tests::ownership::history(181, 0, 0);
     oplog::Oplog::with_storage(storage.clone())
         .receive_ops(ops.clone())
         .unwrap();

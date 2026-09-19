@@ -2,8 +2,8 @@
 
 use std::collections::BTreeSet;
 
-use super::*;
 use crate::MemoryStorage;
+use crate::oplog::integrity::*;
 use crate::storage::{CounterSnapshot, Storage, TopicState};
 use crate::sync::SyncData;
 use crate::tests::support::{Corrupt, Damage, Irokle, Note, TopicConfig, damage_op, node};

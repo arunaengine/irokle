@@ -1,4 +1,4 @@
-use super::support::*;
+use crate::tests::support::*;
 
 #[test]
 fn introduced_peer_rejects() {

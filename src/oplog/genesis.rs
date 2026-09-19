@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::storage::TopicState;
 use crate::{Op, OpId, Result, TopicId, TopicPayload};
 
-use super::{GenesisResolution, Oplog, ResetPlan, TopicEviction};
+use crate::oplog::{GenesisResolution, Oplog, ResetPlan, TopicEviction};
 
 pub(crate) fn is_structural_genesis(op: &Op) -> bool {
     let body = &op.signed.body;
@@ -15,7 +15,7 @@ pub(crate) fn is_structural_genesis(op: &Op) -> bool {
         && body.deps.is_empty()
 }
 
-impl<S: super::Storage> Oplog<S> {
+impl<S: crate::oplog::Storage> Oplog<S> {
     /// Resolve a valid genesis collision, returning the ops to admit, an optional reset
     /// plan when the local topic loses, and an optional rejected genesis to purge.
     pub(super) fn resolve_genesis_collision(
@@ -107,7 +107,7 @@ impl<S: super::Storage> Oplog<S> {
     /// Return payloads for `ids` ordered by actor and sequence for re-emission.
     /// Missing metadata or payloads are logged and skipped, so one damaged record
     /// does not strand the topic.
-    pub(super) fn evicted_ops(&self, ids: &BTreeSet<OpId>) -> Result<Vec<super::EvictedOp>> {
+    pub(super) fn evicted_ops(&self, ids: &BTreeSet<OpId>) -> Result<Vec<crate::oplog::EvictedOp>> {
         let mut metas = Vec::new();
         for id in ids {
             match self.storage.get_meta(id)? {
@@ -122,7 +122,7 @@ impl<S: super::Storage> Oplog<S> {
                 tracing::warn!(id = %meta.id, "discarded op has no record to re-emit");
                 continue;
             };
-            evicted.push(super::EvictedOp {
+            evicted.push(crate::oplog::EvictedOp {
                 op_id: meta.id,
                 actor_id: meta.actor_id,
                 author: meta.author,

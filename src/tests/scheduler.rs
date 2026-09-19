@@ -1,9 +1,9 @@
 //! Real exchanges run through the resync scheduler's own claims, leases and
 //! batch path, with the scheduler state checked directly.
 
-use super::*;
 use crate::TopicId;
 use crate::net::frame::MAX_FRAME_LEN;
+use crate::net::iroh::*;
 use crate::tests::support::{Gate, GatePoint, Note, StaleReadStorage};
 
 /// Wide enough that a backoff step cannot pass while a test is running.

@@ -1,7 +1,7 @@
 //! Many repair holes behind a clock that already claims them: admitted in one
 //! batch, and repaired over a real exchange whose pages hold only a few ops.
 
-use super::support::*;
+use crate::tests::support::*;
 
 /// Holes on one actor chain arrive in one batch whose id order disagrees with
 /// their causal order. Each hole's ancestry walk passes the older holes, so
@@ -467,7 +467,7 @@ async fn holes_repair_sliced() {
             .with_stream_limits(limits),
     );
     bob_net.start_accept_loop().unwrap();
-    let bob_addr = super::iroh::ready_addr(bob_net.endpoint()).await;
+    let bob_addr = crate::tests::iroh::ready_addr(bob_net.endpoint()).await;
 
     let topic = bob
         .create_topic::<Note>(TopicConfig {

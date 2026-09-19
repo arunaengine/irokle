@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::*;
 use crate::Signer;
+use crate::net::iroh::exchange::*;
 
 fn payload_message() -> SyncMessage {
     let signer = crate::Ed25519Signer::from_bytes(&[214; 32]);
@@ -173,7 +173,7 @@ async fn cancelled_storage_retains() {
         .with_iroh_secret_key(endpoint.secret_key())
         .build()
         .unwrap();
-    let net = Arc::new(super::super::IrohNet::new(endpoint, node).unwrap());
+    let net = Arc::new(crate::net::iroh::IrohNet::new(endpoint, node).unwrap());
     let (messages, charge) = batch(&net.budget).into_session_charge(&net.budget).unwrap();
     let (started, arrival) = tokio::sync::oneshot::channel();
     let (release, gate) = std::sync::mpsc::channel();
@@ -181,7 +181,7 @@ async fn cancelled_storage_retains() {
     let worker = Arc::clone(&net);
     let task = tokio::spawn(async move {
         worker
-            .run_job(super::super::Lane::Bulk, move |_| {
+            .run_job(crate::net::iroh::Lane::Bulk, move |_| {
                 let retained = (messages, charge);
                 started.send(()).unwrap();
                 gate.recv_timeout(Duration::from_secs(60)).unwrap();
@@ -202,7 +202,7 @@ async fn cancelled_storage_retains() {
     );
     let control = tokio::time::timeout(
         Duration::from_secs(60),
-        net.run_job(super::super::Lane::Control, |_| 42),
+        net.run_job(crate::net::iroh::Lane::Control, |_| 42),
     )
     .await
     .unwrap()

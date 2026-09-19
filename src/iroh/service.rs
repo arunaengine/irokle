@@ -294,7 +294,7 @@ impl Drop for PlanWait {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::net::iroh::service::*;
     use crate::tests::support::*;
 
     #[test]

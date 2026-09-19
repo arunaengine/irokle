@@ -2,10 +2,10 @@
 //! branch replacement, concurrent fragments, a failed activation, a reopen and
 //! an expired namespace, and past the old fixed staging caps.
 
-use super::support::*;
 use crate::node::ReceiveOutcome;
 use crate::storage::StagedTopic;
 use crate::sync::SyncData;
+use crate::tests::support::*;
 
 fn staged(outcome: ReceiveOutcome) -> StagedTopic {
     match outcome {
@@ -541,7 +541,7 @@ async fn pull_until_done<S: Storage>(
     source_net: &net::IrohNet<MemoryStorage>,
     topic_id: TopicId,
 ) {
-    let addr = super::iroh::ready_addr(source_net.endpoint()).await;
+    let addr = crate::tests::iroh::ready_addr(source_net.endpoint()).await;
     for _ in 0..8 {
         match reader.sync_addr_now(addr.clone(), topic_id).await {
             Ok(()) => return,

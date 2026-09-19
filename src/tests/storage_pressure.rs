@@ -2,9 +2,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::ownership::{bytes, history, stage};
-use super::support::*;
 use crate::storage::{FjallStorage, StorageDomain, StoragePressure};
+use crate::tests::ownership::{bytes, history, stage};
+use crate::tests::support::*;
 
 #[test]
 fn pressure_preserves_recovery() {
@@ -58,11 +58,11 @@ fn pressure_preserves_recovery() {
 
 #[test]
 fn metadata_nodes_charged() {
-    let source = super::progress::reverse_chain(MemoryStorage::new(), 33);
+    let source = crate::tests::progress::reverse_chain(MemoryStorage::new(), 33);
     let ops = oplog::topological(source.log.storage(), &source.topic_id).unwrap();
     let directory = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(directory.path()).unwrap();
-    let (provisional, state) = super::ownership::fjall::staged(
+    let (provisional, state) = crate::tests::ownership::fjall::staged(
         &storage,
         source.genesis.signed.body.author,
         source.topic_id,
@@ -86,13 +86,13 @@ fn metadata_nodes_charged() {
 
 #[test]
 fn small_buffers_progress() {
-    let source = super::progress::reverse_chain(MemoryStorage::new(), 129);
+    let source = crate::tests::progress::reverse_chain(MemoryStorage::new(), 129);
     let topic = source.topic_id;
     let ops = oplog::topological(source.log.storage(), &topic).unwrap();
     let directory = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(directory.path()).unwrap();
     let (provisional, state) =
-        super::ownership::fjall::staged(&storage, ops[0].signed.body.author, topic, &ops);
+        crate::tests::ownership::fjall::staged(&storage, ops[0].signed.body.author, topic, &ops);
     let mut pressure = StoragePressure::default();
     pressure.buffer_bytes = 96 * 1024;
     pressure.recovery_buffer_bytes = 96 * 1024;
@@ -129,7 +129,7 @@ fn small_buffers_progress() {
 
 #[test]
 fn small_migration_progress() {
-    let source = super::progress::reverse_chain(MemoryStorage::new(), 129);
+    let source = crate::tests::progress::reverse_chain(MemoryStorage::new(), 129);
     let topic = source.topic_id;
     let ops = oplog::topological(source.log.storage(), &topic).unwrap();
     let directory = tempfile::tempdir().unwrap();

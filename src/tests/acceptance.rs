@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 
-use super::iroh::ready_addr;
-use super::support::*;
+use crate::tests::iroh::ready_addr;
+use crate::tests::support::*;
 
 #[cfg(feature = "fjall")]
 use crate::sync::{ActorRangeHint, SyncCredit, SyncData, SyncEngine, SyncMessage, SyncRequest};
@@ -140,7 +140,7 @@ async fn races_beside_topic() {
         received.difference(&before).collect::<Vec<_>>()
     );
 
-    let branches = super::branch::branches(97);
+    let branches = crate::tests::branch::branches(97);
     let replaced = branches.topic_id;
     oplog::Oplog::with_storage(storage.clone())
         .receive_ops_from_peer(
@@ -192,7 +192,7 @@ async fn races_beside_topic() {
         (GatePoint::View(replaced), 0),
         Isolation::Commits,
         move || serving.handle_messages(member_id, messages).unwrap(),
-        move || super::branch::reset_to_new(&writer, &branches),
+        move || crate::tests::branch::reset_to_new(&writer, &branches),
     );
     assert_eq!(genesis_of(&storage, &replaced), Some(new_genesis));
     let refused = replies.iter().any(

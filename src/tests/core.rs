@@ -1,4 +1,4 @@
-use super::support::*;
+use crate::tests::support::*;
 
 #[test]
 fn rejects_tampered_id() {

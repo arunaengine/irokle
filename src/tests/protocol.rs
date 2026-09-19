@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use super::iroh::ready_addr;
-use super::support::*;
 use crate::net::StreamLimits;
 use crate::sync::{ActorRangeHint, SyncCredit, SyncData, SyncMessage, SyncRequest};
+use crate::tests::iroh::ready_addr;
+use crate::tests::support::*;
 
 async fn bind(transport: Option<iroh::endpoint::QuicTransportConfig>) -> iroh::Endpoint {
     let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)

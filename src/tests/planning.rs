@@ -1,7 +1,7 @@
 //! Page planning cost grows with the pages sent, not with the history the
 //! peer already holds.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use crate::oplog::Oplog;
 use crate::sync::{SyncEngine, SyncRequest};

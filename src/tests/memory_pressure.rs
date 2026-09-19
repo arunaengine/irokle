@@ -1,8 +1,8 @@
 //! Memory reservations follow shared facades and survive failed publication.
 
-use super::ownership::{history, stage};
-use super::support::*;
 use crate::storage::{AdmissionEffects, MemoryDomain, MemoryLimits, PeerAck, SyncObligation};
+use crate::tests::ownership::{history, stage};
+use crate::tests::support::*;
 
 fn cap(storage: &MemoryStorage, limits: MemoryLimits) {
     storage.clone().with_memory_limits(limits).unwrap();
@@ -12,7 +12,7 @@ fn cap(storage: &MemoryStorage, limits: MemoryLimits) {
 fn metadata_refusal_atomic() {
     let (source, topic, ops) = history(169, 1, 32);
     let storage = source.storage();
-    let peer = super::ownership::reader();
+    let peer = crate::tests::ownership::reader();
     let before = storage.all_sync_obligations().unwrap();
     let held = storage.memory_usage().unwrap().reserved.values().sum();
     cap(
@@ -44,11 +44,11 @@ fn metadata_refusal_atomic() {
 
 #[test]
 fn nodes_follow_holders() {
-    let source = super::progress::reverse_chain(MemoryStorage::new(), 33);
+    let source = crate::tests::progress::reverse_chain(MemoryStorage::new(), 33);
     let storage = source.log.storage().clone();
     let clock = storage.actor_clock(&source.topic_id).unwrap();
     let before = storage.memory_usage().unwrap();
-    let peer = super::ownership::reader();
+    let peer = crate::tests::ownership::reader();
     storage
         .put_sync_obligation(
             SyncObligation::clock(peer, source.topic_id, clock.clone()),
@@ -172,7 +172,7 @@ fn merge_reserves_first() {
         },
     );
     let obligation = SyncObligation::clock(
-        super::ownership::reader(),
+        crate::tests::ownership::reader(),
         topic,
         store.actor_clock(&topic).unwrap(),
     );
@@ -212,7 +212,7 @@ fn bulk_leaves_control() {
         Err(Error::MemoryPressure { .. })
     ));
     assert_eq!(store.list_op_ids(&topic).unwrap().len(), ops.len());
-    let peer = super::ownership::reader();
+    let peer = crate::tests::ownership::reader();
     let ack = PeerAck {
         peer_id: peer,
         topic_id: topic,

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use super::*;
+use crate::net::iroh::session::*;
 use crate::tests::support::{forked_side, node};
 use crate::{MemoryStorage, Op, TopicId};
 
@@ -31,7 +31,7 @@ async fn replies_follow_branch() {
         .without_peer_whitelist()
         .build()
         .unwrap();
-    let net = super::super::IrohNet::new(endpoint, receiver).unwrap();
+    let net = crate::net::iroh::IrohNet::new(endpoint, receiver).unwrap();
     let author = node(210);
     let topic_id = TopicId::hash(b"session-branches");
     let (_, _, left, left_event) = forked_side(
@@ -53,7 +53,9 @@ async fn replies_follow_branch() {
     } else {
         ([right, right_event], [left, left_event])
     };
-    let remote = super::super::endpoint_addr(author.peer_id()).unwrap().id;
+    let remote = crate::net::iroh::endpoint_addr(author.peer_id())
+        .unwrap()
+        .id;
     let mut session = SyncSession::new(remote);
     session
         .handle(&net, SyncMessage::Open(author.sync_open(topic_id)))
@@ -228,8 +230,10 @@ async fn positions_keep_share() {
             ready,
         });
     }
-    let net = super::super::IrohNet::new(endpoint, author).unwrap();
-    let remote = super::super::endpoint_addr(reader.peer_id()).unwrap().id;
+    let net = crate::net::iroh::IrohNet::new(endpoint, author).unwrap();
+    let remote = crate::net::iroh::endpoint_addr(reader.peer_id())
+        .unwrap()
+        .id;
     let mut session = SyncSession::new(remote);
     for case in &cases {
         session

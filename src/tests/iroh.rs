@@ -1,4 +1,4 @@
-use super::support::*;
+use crate::tests::support::*;
 
 #[cfg(feature = "iroh")]
 #[tokio::test]

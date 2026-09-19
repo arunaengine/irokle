@@ -1,7 +1,7 @@
 //! Buffered ops are rejected only for immutable reasons and retained while a
 //! later arrival can still prove them.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use crate::oplog::Oplog;
 

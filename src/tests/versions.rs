@@ -1,6 +1,6 @@
 //! The same fixture driver runs in separately compiled Irokle revisions.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -35,7 +35,7 @@ fn history(case: &str, suffix: &str) -> Vec<Op> {
 fn write_fixtures() {
     let directory = path("IROKLE_FIXTURES");
     std::fs::create_dir(&directory).unwrap();
-    let chain = super::progress::reverse_chain(MemoryStorage::new(), 40);
+    let chain = crate::tests::progress::reverse_chain(MemoryStorage::new(), 40);
     let ops = oplog::topological(chain.log.storage(), &chain.topic_id).unwrap();
     for case in ["ordinary", "window", "reconnect", "collision", "fallback"] {
         for suffix in ["initial", "final"] {
@@ -67,7 +67,7 @@ fn write_fixtures() {
             &postcard::to_stdvec(&ops).unwrap(),
         );
     }
-    let branches = super::branch::branches(230);
+    let branches = crate::tests::branch::branches(230);
     for (suffix, pair) in [("initial", branches.old), ("final", branches.new)] {
         save(
             &directory.join(format!("branch-{suffix}.bin")),
@@ -135,7 +135,7 @@ async fn serve(node: Irokle, initial: &[Op], final_ops: &[Op]) {
     net.start_accept_loop().unwrap();
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     let ready = postcard::to_stdvec(&(
-        super::iroh::ready_addr(net.endpoint()).await,
+        crate::tests::iroh::ready_addr(net.endpoint()).await,
         listener.local_addr().unwrap(),
     ))
     .unwrap();

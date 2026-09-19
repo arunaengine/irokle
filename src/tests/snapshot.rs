@@ -3,14 +3,14 @@
 
 use std::collections::BTreeMap;
 
-use super::branch::{branches, reset_to_new};
-use super::support::*;
+use crate::tests::branch::{branches, reset_to_new};
+use crate::tests::support::*;
 
 use crate::oplog::Oplog;
 use crate::sync::{ActorRangeHint, PageBudget, SyncCredit, SyncEngine, SyncRequest, SyncSummary};
 
 fn assert_request_views<S: Storage>(storage: S) {
-    let source = super::progress::reverse_chain(storage, 40);
+    let source = crate::tests::progress::reverse_chain(storage, 40);
     let actors = source
         .log
         .storage()
@@ -516,7 +516,7 @@ async fn assert_push_excluded<S: Storage>(inner: S, isolation: Isolation) {
     let before = storage.list_op_ids(&topic_id).unwrap();
     let bob_net = Arc::new(net::IrohNet::new(bob_endpoint, bob.clone()).unwrap());
     bob_net.start_accept_loop().unwrap();
-    let bob_addr = super::iroh::ready_addr(bob_net.endpoint()).await;
+    let bob_addr = crate::tests::iroh::ready_addr(bob_net.endpoint()).await;
     let alice_net = Arc::new(net::IrohNet::new(alice_endpoint, alice.clone()).unwrap());
 
     let gate = Arc::new(Gate::default());
@@ -586,7 +586,7 @@ async fn fjall_push_excluded() {
 
 fn bounded_dependencies<S: Storage>(storage: S, counts: impl Fn(&S) -> crate::CounterSnapshot) {
     use crate::storage::DependencyCursor;
-    let source = super::progress::reverse_chain(storage.clone(), 128);
+    let source = crate::tests::progress::reverse_chain(storage.clone(), 128);
     let expected = storage.list_op_ids(&source.topic_id).unwrap();
     let signer = Ed25519Signer::from_bytes(&[230; 32]);
     let joined = Op::sign(
@@ -729,7 +729,7 @@ fn unsupported_dependencies_block() {
 }
 
 fn admission_first<S: Storage>(store: S, counters: fn(&S) -> crate::CounterSnapshot) {
-    let source = super::progress::reverse_chain(store.clone(), 4);
+    let source = crate::tests::progress::reverse_chain(store.clone(), 4);
     for clock in [false, true] {
         let before = counters(&store);
         let mut calls = 0;

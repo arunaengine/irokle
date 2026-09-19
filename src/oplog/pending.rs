@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::storage::{OpMeta, TopicState};
 use crate::{Error, Op, OpId, Result, TopicPayload, actor_id_for};
 
-use super::admission::checked_next;
-use super::{BatchOverlay, OpAdmission, Oplog};
+use crate::oplog::admission::checked_next;
+use crate::oplog::{BatchOverlay, OpAdmission, Oplog};
 use crate::storage::MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS;
 
 /// What happens to a buffered op whose admission failed.
@@ -17,7 +17,7 @@ pub(super) enum PendingVerdict {
     Retain,
 }
 
-impl<S: super::Storage> Oplog<S> {
+impl<S: crate::oplog::Storage> Oplog<S> {
     /// Whether a buffered op that failed admission with `error` can never be
     /// admitted on this branch. Only immutable facts reject: its own signed
     /// content and the stored records of its dependencies and actor slots.
@@ -148,7 +148,10 @@ impl<S: super::Storage> Oplog<S> {
                 // which is unknown while a dependency is missing; the source's
                 // pending quota bounds what an unproven author can buffer.
                 if let Some(state) = state {
-                    super::admission::ensure_event_type(&state.event_type_id, &envelope.type_id)?;
+                    crate::oplog::admission::ensure_event_type(
+                        &state.event_type_id,
+                        &envelope.type_id,
+                    )?;
                 }
             }
             TopicPayload::Control(_) => {

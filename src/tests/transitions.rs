@@ -1,6 +1,6 @@
 //! A captured network pull crosses a winning branch at controlled boundaries.
 
-use super::support::*;
+use crate::tests::support::*;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -38,12 +38,12 @@ async fn side<S: Storage>(store: S, seed: [u8; 32]) -> Side<S> {
             }),
     );
     net.start_accept_loop().unwrap();
-    let address = super::iroh::ready_addr(net.endpoint()).await;
+    let address = crate::tests::iroh::ready_addr(net.endpoint()).await;
     Side { node, net, address }
 }
 
 fn branches(provisional: bool) -> (Vec<Op>, Vec<Op>) {
-    let source = super::progress::reverse_chain(MemoryStorage::new(), 40);
+    let source = crate::tests::progress::reverse_chain(MemoryStorage::new(), 40);
     let original = oplog::topological(source.log.storage(), &source.topic_id).unwrap();
     let owner = Ed25519Signer::from_bytes(&[230; 32]);
     let mut signers = BTreeMap::from([(owner.peer_id(), owner.clone())]);

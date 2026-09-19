@@ -1,7 +1,7 @@
 //! Provisional bootstrap namespaces keep a candidate history apart from the
 //! active records until one transaction makes it the topic.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use crate::oplog::Oplog;
 use crate::storage::{

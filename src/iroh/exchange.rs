@@ -10,8 +10,8 @@ use crate::net::frame::{MAX_FRAME_LEN, MAX_SYNC_DATA_OPS_PER_MESSAGE as MAX_DATA
 use crate::net::{decode_sync_message, encode_sync_message, framed_message_len};
 use crate::sync::SyncMessage;
 
-use super::budget::{ByteBudget, Charge, DATA_TAG, OwnedClass, Pool};
-use super::{StreamLimits, invalid_data, other, timed_out};
+use crate::net::iroh::budget::{ByteBudget, Charge, DATA_TAG, OwnedClass, Pool};
+use crate::net::iroh::{StreamLimits, invalid_data, other, timed_out};
 
 /// Refuses messages a stream would refuse in either direction: a reply before
 /// any of it is written, or an embedder's input before any of it is handled.

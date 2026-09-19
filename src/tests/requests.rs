@@ -1,8 +1,8 @@
 //! Requests that name only part of the actors a reader is behind on: every
 //! page stays causal over what the reader holds, and paging still completes.
 
-use super::pages::{Source, late_dependency};
-use super::support::*;
+use crate::tests::pages::{Source, late_dependency};
+use crate::tests::support::*;
 
 use crate::oplog::Oplog;
 use crate::sync::{MAX_PAGE_MISSING, PageBudget, RequestKnowledge, SyncEngine};
@@ -281,7 +281,7 @@ fn memory_truncated_causal() {
 /// causal and the reader reaches the frontier in rounds that grow with actors.
 fn assert_beyond_windows<S: Storage>(open: impl Fn() -> S) {
     for (items, positions) in [(2, 1), (2, 2), (3, 1), (3, 2), (3, MAX_PAGE_MISSING)] {
-        let chain = super::progress::reverse_chain(open(), 12);
+        let chain = crate::tests::progress::reverse_chain(open(), 12);
         let reader = Oplog::new();
         reader.receive_ops(vec![chain.genesis.clone()]).unwrap();
         let paged = page_bounded(&chain, &reader, items, positions);
@@ -338,7 +338,7 @@ fn fjall_beyond_windows() {
 /// dependents can follow once they are served, not the nearest ones it met first.
 #[test]
 fn names_deepest_positions() {
-    let source = super::progress::reverse_chain(MemoryStorage::new(), 40);
+    let source = crate::tests::progress::reverse_chain(MemoryStorage::new(), 40);
     let responder = source.engine.clone().with_request_items(3);
     let reader = Oplog::new();
     reader.receive_ops(vec![source.genesis.clone()]).unwrap();
@@ -366,7 +366,7 @@ fn names_deepest_positions() {
 /// midway, and both reach the frontier without sending an op before its dependency.
 #[test]
 fn chain_windows_saturated() {
-    let source = super::progress::reverse_chain(MemoryStorage::new(), 40);
+    let source = crate::tests::progress::reverse_chain(MemoryStorage::new(), 40);
     let responder = source
         .engine
         .clone()
@@ -469,7 +469,7 @@ fn chain_windows_saturated() {
 fn single_visit_chain() {
     let mut previous = None;
     for actors in [40, 80] {
-        let mut source = super::progress::reverse_chain(MemoryStorage::new(), actors);
+        let mut source = crate::tests::progress::reverse_chain(MemoryStorage::new(), actors);
         source.engine = source.engine.with_page_visits(1, 16);
         let reader = Oplog::new();
         reader.receive_ops(vec![source.genesis.clone()]).unwrap();
@@ -495,7 +495,7 @@ fn single_visit_chain() {
 
 #[test]
 fn confirmed_frontier_only() {
-    let source = super::progress::reverse_chain(MemoryStorage::new(), 40);
+    let source = crate::tests::progress::reverse_chain(MemoryStorage::new(), 40);
     let responder = source
         .engine
         .clone()
@@ -1029,8 +1029,8 @@ fn wants_share_items() {
 
 #[cfg(feature = "iroh")]
 mod sessions {
-    use super::*;
     use crate::storage::StagingLimits;
+    use crate::tests::requests::*;
 
     /// A node keyed by `seed` over `storage`, serving on its own endpoint with
     /// requests of at most `items` wants and hints.
@@ -1055,7 +1055,7 @@ mod sessions {
             .with_request_items(items);
         let net = Arc::new(net::IrohNet::new(endpoint, node.clone()).unwrap());
         net.start_accept_loop().unwrap();
-        let addr = super::super::iroh::ready_addr(net.endpoint()).await;
+        let addr = crate::tests::iroh::ready_addr(net.endpoint()).await;
         (node.with_net(Arc::clone(&net)), net, addr)
     }
 
@@ -1117,7 +1117,7 @@ mod sessions {
     async fn network_work_scales() {
         let mut previous = None;
         for actors in [40, 80] {
-            let source = super::super::progress::reverse_chain(MemoryStorage::new(), actors);
+            let source = crate::tests::progress::reverse_chain(MemoryStorage::new(), actors);
             let reader = MemoryStorage::new();
             Oplog::with_storage(reader.clone())
                 .receive_ops(vec![source.genesis.clone()])
@@ -1143,7 +1143,7 @@ mod sessions {
                 .with_page_visits(1);
                 let net = Arc::new(net::IrohNet::new(endpoint, node.clone()).unwrap());
                 net.start_accept_loop().unwrap();
-                let address = super::super::iroh::ready_addr(net.endpoint()).await;
+                let address = crate::tests::iroh::ready_addr(net.endpoint()).await;
                 peers.push((node, net, address));
             }
             sync_calls(&peers[1].1, peers[0].2.clone(), source.topic_id, 64).await;
@@ -1249,7 +1249,7 @@ mod sessions {
                 .with_stream_limits(limits),
         );
         alice_net.start_accept_loop().unwrap();
-        let alice_addr = super::super::iroh::ready_addr(alice_net.endpoint()).await;
+        let alice_addr = crate::tests::iroh::ready_addr(alice_net.endpoint()).await;
 
         let bob_storage = StaleReadStorage::new(MemoryStorage::new());
         let (bob, bob_net, _) = capped(bob_storage.clone(), 245, 3).await;
@@ -1344,7 +1344,7 @@ mod sessions {
     async fn chain_beyond_sessions() {
         const ACTORS: usize = MAX_PAGE_MISSING + 44;
         let storage = MemoryStorage::new();
-        let source = super::super::progress::reverse_chain(storage.clone(), ACTORS);
+        let source = crate::tests::progress::reverse_chain(storage.clone(), ACTORS);
         let owner = Ed25519Signer::from_bytes(&[230; 32]);
         let invited = Ed25519Signer::from_bytes(&[234; 32]).peer_id();
         source

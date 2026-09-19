@@ -2,8 +2,8 @@
 //! chains across a bounded actor window, explicit hole chains longer than one
 //! page, records the source lacks, and request sets past the item limit.
 
-use super::pages::{Source, independent_chains, page_through, request_for};
-use super::support::*;
+use crate::tests::pages::{Source, independent_chains, page_through, request_for};
+use crate::tests::support::*;
 
 use crate::oplog::Oplog;
 use crate::sync::{ActorRangeHint, PageBudget, SyncCredit, SyncEngine, SyncRequest, SyncSummary};
@@ -602,7 +602,7 @@ fn fjall_heads_reached() {
 /// the branch between two pages, rather than served from the new branch.
 #[test]
 fn reset_between_pages() {
-    let branches = super::branch::branches(232);
+    let branches = crate::tests::branch::branches(232);
     let storage = MemoryStorage::new();
     let log = Oplog::with_storage(storage.clone());
     log.receive_ops_from_peer(
@@ -633,7 +633,7 @@ fn reset_between_pages() {
         .unwrap();
     assert_eq!(first.ops[0].id, branches.old.0.id);
     assert!(first.more);
-    super::branch::reset_to_new(&storage, &branches);
+    crate::tests::branch::reset_to_new(&storage, &branches);
     assert!(matches!(
         engine.response_page(member, &request, PageBudget::from_credit(request.credit)),
         Err(Error::StaleIncarnation)

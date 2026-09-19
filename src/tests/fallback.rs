@@ -2,7 +2,7 @@
 //! without a sweep or a new publish, for several fanouts and batch sizes, and
 //! is served again once it returns.
 
-use super::support::*;
+use crate::tests::support::*;
 
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ async fn member(lookup: &Lookup, key: &iroh::SecretKey, alice: PeerId) -> Irokle
         .with_net(bind(lookup, key).await)
         .build()
         .unwrap();
-    lookup.add_endpoint_info(super::iroh::ready_addr(node.endpoint().unwrap()).await);
+    lookup.add_endpoint_info(crate::tests::iroh::ready_addr(node.endpoint().unwrap()).await);
     node
 }
 

@@ -1,6 +1,6 @@
-use super::support::*;
 use crate::storage as crate_storage;
 use crate::sync as crate_sync;
+use crate::tests::support::*;
 
 #[test]
 fn transfers_missing_ops() {
