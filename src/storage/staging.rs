@@ -46,9 +46,9 @@ impl StagingLimits {
     };
 }
 
-/// Staged history of a topic not yet held locally, hidden until activation.
-///
-#[doc = include_str!("contracts/provisional_topic.md")]
+/// Staged history one source served for a topic not held here, hidden until it proves
+/// membership and is activated. The value is the namespace's capability: its store reads only
+/// while the backing store registers `session`, and writes only until activation begins.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvisionalTopic {
     pub source: PeerId,

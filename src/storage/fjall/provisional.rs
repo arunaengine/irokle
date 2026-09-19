@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-#![doc = include_str!("provisional.md")]
+//! Provisional bootstrap namespaces in Fjall, each in one slot of a fixed keyspace pool. The
+//! registry moves a namespace through staging (`bn`, `bs`), activating (the `ba` claim, hidden
+//! copies), published (one install transaction) and clearing (checked deletes, slot release).
 
 use std::collections::BTreeSet;
 
@@ -172,8 +174,7 @@ impl FjallStorage {
     }
 
     /// Empty every slot whose session ended, one bounded transaction at a time, then release it.
-    ///
-    #[doc = include_str!("../contracts/reclaim_slots.md")]
+    /// Each delete and the release check that the slot still clears that session.
     fn reclaim_slots(&self) -> Result<()> {
         let mut clearing = Vec::new();
         for item in fjall::Readable::prefix(&self.db.read_tx(), &self.records, SLOT) {
@@ -497,9 +498,9 @@ impl FjallStorage {
         Ok(())
     }
 
-    /// Claim a topic for activation; only the claiming session may claim it again.
-    ///
-    #[doc = include_str!("../contracts/claim_activation.md")]
+    /// Claim a topic's one activation for the session of `provisional` and freeze its namespace
+    /// at `expected`, in one transaction. The same session may claim again; another session's
+    /// claim or an active topic refuses. Returns the namespace keyspace.
     fn claim_activation(
         &self,
         provisional: &ProvisionalTopic,

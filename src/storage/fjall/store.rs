@@ -222,9 +222,8 @@ impl FjallStorage {
         Self::open_with_persist_mode(path, fjall::PersistMode::SyncAll)
     }
 
-    /// Open Fjall storage with an explicit transaction persist mode.
-    ///
-    #[doc = include_str!("../contracts/persist_mode.md")]
+    /// Open Fjall storage with an explicit transaction persist mode: `SyncAll` syncs every
+    /// transaction, and `Buffer` skips that fsync for callers with their own durability boundary.
     pub fn open_with_persist_mode(
         path: impl AsRef<Path>,
         persist_mode: fjall::PersistMode,

@@ -46,10 +46,9 @@
       "members": [
         "pending.rs",
         "provisional.rs",
-        "store.rs",
-        "provisional.md"
+        "store.rs"
       ],
-      "reason": "The three backend implementation files and the lifecycle documentation form the grouped Fjall domain.",
+      "reason": "The three backend implementation files form the grouped Fjall domain.",
       "source": "STYLE.md section 1 and assignment section 6"
     },
     {
@@ -60,20 +59,6 @@
         "staging.rs"
       ],
       "reason": "The three direct files form the Memory backend domain.",
-      "source": "STYLE.md section 1 and assignment section 6"
-    },
-    {
-      "path": "src/node",
-      "members": [
-        "bootstrap.rs",
-        "builder.rs",
-        "network.rs",
-        "peers.rs",
-        "topic.rs",
-        "peer_selection.md",
-        "response_page.md"
-      ],
-      "reason": "Four node implementation children form the established facade family; two documentation assets preserve its public contracts.",
       "source": "STYLE.md section 1 and assignment section 6"
     }
   ],

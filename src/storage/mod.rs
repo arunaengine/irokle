@@ -11,9 +11,8 @@ use crate::{
 pub const MAX_PENDING_OPS_TOTAL: usize = 4096;
 pub const MAX_PENDING_OPS_PER_SOURCE: usize = 1024;
 pub const MAX_PENDING_WAITERS_PER_DEP: usize = 1024;
-/// Total byte limit on buffered ops, which core enforces for every backend.
-///
-#[doc = include_str!("contracts/pending_bytes.md")]
+/// Total byte limit on buffered ops, which core enforces for every backend. A count limit
+/// alone cannot bound memory, since one op may be megabytes.
 pub const MAX_PENDING_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 pub const MAX_PENDING_BYTES_PER_SOURCE: usize = 16 * 1024 * 1024;
 pub const MAX_PENDING_MISSING_DEPS: usize = 128;
@@ -23,9 +22,8 @@ pub const MAX_PENDING_OPS_PER_TOPIC: usize = 2048;
 pub const MAX_PENDING_BYTES_PER_TOPIC: usize = 32 * 1024 * 1024;
 /// Rejected op ids a topic remembers, oldest dropped first.
 pub const MAX_REJECTED_PER_TOPIC: usize = 4096;
-/// Eviction records a store may hold unacknowledged.
-///
-#[doc = include_str!("contracts/eviction_limit.md")]
+/// Eviction records a store may hold unacknowledged. It bounds only a consumer that stopped
+/// draining: a reset that would exceed it is refused rather than losing a payload.
 pub const MAX_PENDING_EVICTIONS: usize = 1024;
 
 /// Reads of one coherent snapshot of a store. Every method sees the same commit,
@@ -174,9 +172,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn get_position(&self, id: &OpId) -> Result<Option<OpPosition>> {
         Ok(self.get_meta(id)?.as_ref().map(OpPosition::from))
     }
-    /// Whether `id` is stored completely enough to stand as a dependency.
-    ///
-    #[doc = include_str!("contracts/dep_resolvable.md")]
+    /// Whether `id` is stored completely enough to stand as a dependency: both its op and its
+    /// metadata, read by backends from one snapshot. Every caller must use this one predicate.
     fn dep_resolvable(&self, id: &OpId) -> Result<bool> {
         Ok(self.get_op(id)?.is_some() && self.get_meta(id)?.is_some())
     }
@@ -238,13 +235,12 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// actively pulled instead of stranding its dependents forever.
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
-    /// Atomically drop every pending op that transitively waits on `dep_id`.
-    ///
-    #[doc = include_str!("contracts/purge_waiters.md")]
+    /// Atomically drop every pending op that transitively waits on `dep_id`, a genesis that will
+    /// never be admitted here, and return how many. Required: single removals are not atomic.
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize>;
-    /// Remove an invalid pending subtree in one step.
-    ///
-    #[doc = include_str!("contracts/reject_subtree.md")]
+    /// Remove an invalid pending subtree in one step: `op_id` and every op waiting on it, or
+    /// nothing once `op_id` is no longer buffered. The count includes `op_id`; required, since
+    /// single removals are not atomic.
     fn reject_pending_subtree(&self, op_id: &OpId) -> Result<usize>;
     fn peer_ack(&self, peer_id: &PeerId, topic_id: &TopicId) -> Result<Option<PeerAck>>;
     fn peer_acks(&self, topic_id: &TopicId) -> Result<Vec<PeerAck>>;
@@ -257,9 +253,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
         expected_genesis: Option<OpId>,
     ) -> Result<()>;
     fn all_sync_obligations(&self) -> Result<Vec<SyncObligation>>;
-    /// Atomically persist `ack` and clear any obligations satisfied by it.
-    ///
-    #[doc = include_str!("contracts/apply_peer_ack.md")]
+    /// Atomically persist `ack` and clear the obligations it satisfies, returning how many, in one
+    /// durable write conditioned on the topic's current incarnation and membership; otherwise
+    /// [`crate::Error::StaleIncarnation`] or [`crate::Error::NotTopicMember`].
     fn apply_peer_ack(&self, ack: PeerAck) -> Result<usize>;
     /// Apply acks in order as [`Storage::apply_peer_ack`] would, one result per ack, so one
     /// uncertifiable ack neither commits nor discards the rest. Backend failures use the outer
@@ -285,8 +281,7 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn next_attempt_epoch(&self) -> Result<u64>;
     fn put_sync_status(&self, status: SyncPeerStatus) -> Result<()>;
     /// Atomically fold `update` into the status of `peer_id` on `topic_id` and return the result.
-    ///
-    #[doc = include_str!("contracts/update_sync_status.md")]
+    /// Required: a read then a blind write would lose one of two concurrent outcomes.
     fn update_sync_status(
         &self,
         peer_id: &PeerId,
@@ -308,14 +303,14 @@ pub trait Storage: Clone + Send + Sync + 'static {
         expected_genesis: Option<OpId>,
     ) -> Result<usize>;
 
-    /// Clear a topic completely, since a partial reset prevents convergence.
-    ///
-    #[doc = include_str!("contracts/reset_topic.md")]
+    /// Atomically clear every local record of `topic_id`: ops, indexes, clock, buffered ops and
+    /// every peer's acks, obligations and statuses, since a partial reset prevents convergence.
+    /// Returns the number of admitted ops removed.
     fn reset_topic(&self, topic_id: &TopicId) -> Result<usize>;
 
-    /// Replace the local chain with `batch` in one durable operation, or change nothing.
-    ///
-    #[doc = include_str!("contracts/reset_admit.md")]
+    /// If the topic state is still `expected_topic_state`, replace the local chain with `batch`
+    /// and journal `eviction` under [`TopicEviction::key`] in one durable operation, or change
+    /// nothing; refused with [`crate::Error::EvictionJournalFull`] past [`MAX_PENDING_EVICTIONS`].
     fn reset_topic_and_admit(
         &self,
         topic_id: &TopicId,
@@ -334,9 +329,8 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// only remaining copy of the payloads its reset removed.
     fn pending_evictions(&self) -> Result<Vec<TopicEviction>>;
 
-    /// Release the journalled eviction named by `key`.
-    ///
-    #[doc = include_str!("contracts/clear_eviction.md")]
+    /// Release the journalled eviction named by `key`, once the consumer durably owns its
+    /// payloads. Releasing an absent key is not an error.
     fn clear_eviction(&self, key: &EvictionKey) -> Result<()>;
 
     /// Whether `peer_id` holds `op_id` on the branch that currently stores it. Required:
@@ -354,9 +348,9 @@ pub trait Storage: Clone + Send + Sync + 'static {
     fn staging_limits(&self) -> StagingLimits;
     /// Every provisional bootstrap namespace, read at one moment.
     fn provisional_topics(&self) -> Result<Vec<ProvisionalTopic>>;
-    /// Open or reuse the staging namespace of `source` for `topic_id`.
-    ///
-    #[doc = include_str!("contracts/open_provisional.md")]
+    /// Open the staging namespace of `source` for `topic_id` empty for `genesis`, or return the
+    /// existing one unchanged. Refuses an active topic with [`crate::Error::AdmissionConflict`]
+    /// and a namespace past the count limits with [`crate::Error::StagingCapacity`].
     fn open_provisional(
         &self,
         source: PeerId,
@@ -364,17 +358,17 @@ pub trait Storage: Clone + Send + Sync + 'static {
         genesis: OpId,
         now_ms: u64,
     ) -> Result<ProvisionalTopic>;
-    /// The store holding the history of `provisional`, or `None` once its session ended.
-    ///
-    #[doc = include_str!("contracts/provisional_store.md")]
+    /// The store holding only the history of `provisional`, or `None` once its session ended. Its
+    /// reads and writes check that the session is still registered and staging, else
+    /// [`crate::Error::StaleIncarnation`]; writes past a byte limit are `StagingCapacity`.
     fn provisional_store(&self, provisional: &ProvisionalTopic) -> Result<Option<Self>>;
     /// Serialized op bytes this store holds, admitted and buffered.
     fn stored_bytes(&self) -> Result<u64>;
     /// Record a write to the namespace while its session is current.
     fn touch_provisional(&self, provisional: &ProvisionalTopic, now_ms: u64) -> Result<()>;
-    /// Make the history of `provisional` the active topic.
-    ///
-    #[doc = include_str!("contracts/activate_provisional.md")]
+    /// Make the history of `provisional` the active topic: claim its one activation, freezing the
+    /// namespace at `expected`, then install state, heads, clock and `effects` and end every
+    /// namespace in one transaction. An interrupted activation resumes when called again.
     fn activate_provisional(
         &self,
         provisional: &ProvisionalTopic,
