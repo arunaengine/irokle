@@ -879,150 +879,6 @@ fn removal_defeats_evidence() {
     );
 }
 
-/// A schema 1 database stored acknowledgements without naming the branch they
-/// certified. Upgrading keeps those records and their clocks but treats them as
-/// uncertified, so none of them silently proves the current incarnation.
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_migrates_legacy() {
-    let dir = tempfile::tempdir().unwrap();
-    let ack_signer = Ed25519Signer::from_bytes(&[127; 32]);
-    let peer = ack_signer.peer_id();
-
-    let (topic_id, op_id, actor_id, actor_seq, metas) = {
-        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-        let irokle = Irokle::with_storage(storage, NodeConfig::default()).unwrap();
-        let topic = irokle
-            .create_topic::<Note>(TopicConfig {
-                initial_peers: [peer].into(),
-                ..TopicConfig::default()
-            })
-            .unwrap();
-        let record = topic
-            .publish(Note {
-                text: "aged".into(),
-            })
-            .unwrap();
-        let mut clock = ActorClock::new();
-        clock.observe(record.meta.actor_id, record.meta.actor_seq);
-        let mut ack = sync::SyncAck {
-            topic_id: topic.id(),
-            peer_id: peer,
-            genesis: genesis_of(irokle.storage(), &topic.id()),
-            accepted: BTreeSet::new(),
-            heads: [record.meta.op_id].into(),
-            clock,
-            signature: None,
-        };
-        ack.sign(&ack_signer).unwrap();
-        irokle.apply_sync_ack(&ack).unwrap();
-        let storage = irokle.storage();
-        let metas = storage
-            .list_op_ids(&topic.id())
-            .unwrap()
-            .iter()
-            .map(|id| storage.get_meta(id).unwrap().unwrap())
-            .collect::<Vec<_>>();
-        (
-            topic.id(),
-            record.meta.op_id,
-            record.meta.actor_id,
-            record.meta.actor_seq,
-            metas,
-        )
-    };
-
-    // Rewrite the stored record in the schema 1 layout, which had no genesis
-    // field, and mark the database as schema 1 again.
-    {
-        let db = fjall::OptimisticTxDatabase::builder(dir.path())
-            .open()
-            .unwrap();
-        let records = db
-            .keyspace("records", fjall::KeyspaceCreateOptions::default)
-            .unwrap();
-        let mut clock = ActorClock::new();
-        clock.observe(actor_id, actor_seq);
-        let legacy =
-            postcard::to_allocvec(&(peer, topic_id, BTreeSet::from([op_id]), clock)).unwrap();
-        let mut tx = db.write_tx().unwrap();
-        // A schema 1 file has only the legacy key, never the current one.
-        tx.remove(
-            &records,
-            [b"ak".as_slice(), topic_id.as_ref(), peer.as_ref()].concat(),
-        );
-        tx.insert(
-            &records,
-            [b"ak".as_slice(), peer.as_ref(), topic_id.as_ref()].concat(),
-            legacy,
-        );
-        // Metadata held every clock entry and there were no clock nodes.
-        for meta in &metas {
-            tx.insert(
-                &records,
-                [b"m".as_slice(), meta.id.as_ref()].concat(),
-                postcard::to_allocvec(meta).unwrap(),
-            );
-        }
-        let nodes = [b"cn".as_slice(), topic_id.as_ref()].concat();
-        let node_keys = fjall::Readable::prefix(&tx, &records, nodes)
-            .map(|item| item.key().unwrap().to_vec())
-            .collect::<Vec<_>>();
-        for key in node_keys {
-            tx.remove(&records, key);
-        }
-        tx.insert(
-            &records,
-            b"sv".to_vec(),
-            postcard::to_allocvec(&1u32).unwrap(),
-        );
-        tx.commit().unwrap().unwrap();
-    }
-
-    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    let migrated = storage.peer_ack(&peer, &topic_id).unwrap().unwrap();
-    assert_eq!(
-        migrated.genesis, None,
-        "legacy evidence must stay uncertified"
-    );
-    assert_eq!(
-        migrated.clock.get(&actor_id),
-        actor_seq,
-        "clock is preserved"
-    );
-    assert!(migrated.heads.contains(&op_id), "frontier is preserved");
-    assert!(
-        !storage.peer_reached_op(&peer, &op_id).unwrap(),
-        "uncertified evidence must not prove the current branch"
-    );
-
-    // Work owed to that peer stays outstanding until it acknowledges again.
-    storage
-        .put_sync_obligation(
-            crate_storage::SyncObligation::repair(peer, topic_id, [op_id].into()),
-            genesis_of(&storage, &topic_id),
-        )
-        .unwrap();
-    assert_eq!(storage.sync_obligations(&peer, &topic_id).unwrap().len(), 1);
-
-    // A fresh acknowledgement naming the current branch clears it.
-    let mut clock = ActorClock::new();
-    clock.observe(actor_id, actor_seq);
-    assert_eq!(
-        storage
-            .apply_peer_ack(crate_storage::PeerAck {
-                peer_id: peer,
-                topic_id,
-                genesis: genesis_of(&storage, &topic_id),
-                heads: [op_id].into(),
-                clock,
-            })
-            .unwrap(),
-        1
-    );
-    assert!(storage.peer_reached_op(&peer, &op_id).unwrap());
-}
-
 /// A backend failure after one acknowledgement's writes are staged must abort
 /// the whole batch. Otherwise its ack row commits while clearing its work
 /// failed, and the caller is told the ack was not applied.
@@ -1277,5 +1133,148 @@ mod with_fjall {
     fn stale_batch() {
         let dir = tempfile::tempdir().unwrap();
         assert_stale_batch(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    /// A schema 1 database stored acknowledgements without naming the branch they
+    /// certified. Upgrading keeps those records and their clocks but treats them as
+    /// uncertified, so none of them silently proves the current incarnation.
+    #[test]
+    fn migrates_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let ack_signer = Ed25519Signer::from_bytes(&[127; 32]);
+        let peer = ack_signer.peer_id();
+
+        let (topic_id, op_id, actor_id, actor_seq, metas) = {
+            let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+            let irokle = Irokle::with_storage(storage, NodeConfig::default()).unwrap();
+            let topic = irokle
+                .create_topic::<Note>(TopicConfig {
+                    initial_peers: [peer].into(),
+                    ..TopicConfig::default()
+                })
+                .unwrap();
+            let record = topic
+                .publish(Note {
+                    text: "aged".into(),
+                })
+                .unwrap();
+            let mut clock = ActorClock::new();
+            clock.observe(record.meta.actor_id, record.meta.actor_seq);
+            let mut ack = sync::SyncAck {
+                topic_id: topic.id(),
+                peer_id: peer,
+                genesis: genesis_of(irokle.storage(), &topic.id()),
+                accepted: BTreeSet::new(),
+                heads: [record.meta.op_id].into(),
+                clock,
+                signature: None,
+            };
+            ack.sign(&ack_signer).unwrap();
+            irokle.apply_sync_ack(&ack).unwrap();
+            let storage = irokle.storage();
+            let metas = storage
+                .list_op_ids(&topic.id())
+                .unwrap()
+                .iter()
+                .map(|id| storage.get_meta(id).unwrap().unwrap())
+                .collect::<Vec<_>>();
+            (
+                topic.id(),
+                record.meta.op_id,
+                record.meta.actor_id,
+                record.meta.actor_seq,
+                metas,
+            )
+        };
+
+        // Rewrite the stored record in the schema 1 layout, which had no genesis
+        // field, and mark the database as schema 1 again.
+        {
+            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+                .open()
+                .unwrap();
+            let records = db
+                .keyspace("records", fjall::KeyspaceCreateOptions::default)
+                .unwrap();
+            let mut clock = ActorClock::new();
+            clock.observe(actor_id, actor_seq);
+            let legacy =
+                postcard::to_allocvec(&(peer, topic_id, BTreeSet::from([op_id]), clock)).unwrap();
+            let mut tx = db.write_tx().unwrap();
+            // A schema 1 file has only the legacy key, never the current one.
+            tx.remove(
+                &records,
+                [b"ak".as_slice(), topic_id.as_ref(), peer.as_ref()].concat(),
+            );
+            tx.insert(
+                &records,
+                [b"ak".as_slice(), peer.as_ref(), topic_id.as_ref()].concat(),
+                legacy,
+            );
+            // Metadata held every clock entry and there were no clock nodes.
+            for meta in &metas {
+                tx.insert(
+                    &records,
+                    [b"m".as_slice(), meta.id.as_ref()].concat(),
+                    postcard::to_allocvec(meta).unwrap(),
+                );
+            }
+            let nodes = [b"cn".as_slice(), topic_id.as_ref()].concat();
+            let node_keys = fjall::Readable::prefix(&tx, &records, nodes)
+                .map(|item| item.key().unwrap().to_vec())
+                .collect::<Vec<_>>();
+            for key in node_keys {
+                tx.remove(&records, key);
+            }
+            tx.insert(
+                &records,
+                b"sv".to_vec(),
+                postcard::to_allocvec(&1u32).unwrap(),
+            );
+            tx.commit().unwrap().unwrap();
+        }
+
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        let migrated = storage.peer_ack(&peer, &topic_id).unwrap().unwrap();
+        assert_eq!(
+            migrated.genesis, None,
+            "legacy evidence must stay uncertified"
+        );
+        assert_eq!(
+            migrated.clock.get(&actor_id),
+            actor_seq,
+            "clock is preserved"
+        );
+        assert!(migrated.heads.contains(&op_id), "frontier is preserved");
+        assert!(
+            !storage.peer_reached_op(&peer, &op_id).unwrap(),
+            "uncertified evidence must not prove the current branch"
+        );
+
+        // Work owed to that peer stays outstanding until it acknowledges again.
+        storage
+            .put_sync_obligation(
+                crate_storage::SyncObligation::repair(peer, topic_id, [op_id].into()),
+                genesis_of(&storage, &topic_id),
+            )
+            .unwrap();
+        assert_eq!(storage.sync_obligations(&peer, &topic_id).unwrap().len(), 1);
+
+        // A fresh acknowledgement naming the current branch clears it.
+        let mut clock = ActorClock::new();
+        clock.observe(actor_id, actor_seq);
+        assert_eq!(
+            storage
+                .apply_peer_ack(crate_storage::PeerAck {
+                    peer_id: peer,
+                    topic_id,
+                    genesis: genesis_of(&storage, &topic_id),
+                    heads: [op_id].into(),
+                    clock,
+                })
+                .unwrap(),
+            1
+        );
+        assert!(storage.peer_reached_op(&peer, &op_id).unwrap());
     }
 }
