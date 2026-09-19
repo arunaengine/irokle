@@ -339,52 +339,6 @@ impl<S: Storage> Irokle<S> {
         self.oplog.topic_unresolved(&topic_id)
     }
 
-    /// The sync engine, for transport planners that read one snapshot.
-    #[cfg(feature = "iroh")]
-    pub(crate) fn sync_engine(&self) -> &SyncEngine<S> {
-        &self.sync
-    }
-
-    /// The same node building and accepting requests of at most `items` wants and hints.
-    #[cfg(all(test, feature = "iroh"))]
-    pub(crate) fn with_request_items(mut self, items: usize) -> Self {
-        self.sync = self.sync.with_request_items(items);
-        self
-    }
-
-    /// The same node ending a page slice after `visits` storage reads.
-    #[cfg(all(test, feature = "iroh"))]
-    pub(crate) fn with_page_visits(mut self, visits: usize) -> Self {
-        self.sync = self.sync.with_page_visits(visits, 16);
-        self
-    }
-
-    /// What is known of `view`'s topic integrity within `read`, which `view` came from.
-    #[cfg(feature = "iroh")]
-    pub(crate) fn integrity_in(
-        &self,
-        read: &dyn crate::storage::SnapshotRead,
-        view: &crate::storage::TopicView,
-    ) -> Result<crate::oplog::Integrity> {
-        self.oplog.integrity_in(read, view)
-    }
-
-    /// Ids `view`'s topic cannot resolve, with any hole scan recorded under the
-    /// view's own branch and epoch.
-    #[cfg(feature = "iroh")]
-    pub(crate) fn view_unresolved(
-        &self,
-        view: &crate::storage::TopicView,
-    ) -> Result<BTreeSet<OpId>> {
-        self.oplog.view_unresolved(view)
-    }
-
-    /// The same node reading at most `reads` ids and edges per integrity scan step.
-    #[cfg(all(test, feature = "iroh"))]
-    pub(crate) fn set_step_reads(&self, reads: usize) {
-        self.oplog.set_step_reads(reads);
-    }
-
     /// Audit stored records again on the next integrity question instead of
     /// trusting the earlier verdict. Admission keeps topics whole, so this only
     /// matters for damage that happened outside irokle.
@@ -615,22 +569,6 @@ impl<S: Storage> Irokle<S> {
         })
     }
 
-    #[cfg(feature = "iroh")]
-    pub(crate) fn receive_bound(
-        &self,
-        peer: PeerId,
-        data: SyncData,
-        genesis: Option<OpId>,
-    ) -> Result<ReceiveOutcome> {
-        let Some(genesis) = genesis else {
-            return self.receive_sync_outcome(peer, data);
-        };
-        let mut node = self.clone();
-        node.oplog = node.oplog.bound_genesis(data.topic_id, genesis);
-        node.sync = node.sync.bound_genesis(data.topic_id, genesis);
-        node.receive_sync_outcome(peer, data)
-    }
-
     pub fn receive_sync_data_as_local(
         &self,
         data: SyncData,
@@ -698,41 +636,6 @@ impl<S: Storage> Irokle<S> {
         peer_whitelist
             .get_or_insert_with(BTreeSet::new)
             .extend(peer_ids);
-        Ok(())
-    }
-
-    #[cfg(feature = "iroh")]
-    pub(crate) fn record_fingerprint(
-        &self,
-        peer_id: PeerId,
-        topic_id: TopicId,
-        fingerprint: [u8; 32],
-    ) -> Result<bool> {
-        self.sync.record_fingerprint(peer_id, topic_id, fingerprint)
-    }
-
-    #[cfg(feature = "iroh")]
-    pub(crate) fn ensure_peer_allowed(
-        &self,
-        source_peer_id: PeerId,
-        data: &SyncData,
-    ) -> Result<()> {
-        if self.storage().topic_state(&data.topic_id)?.is_some() {
-            return Ok(());
-        }
-        let peer_allowed = {
-            let peer_whitelist = self
-                .peer_whitelist
-                .read()
-                .map_err(|_| Error::Storage("peer whitelist read lock poisoned".into()))?;
-            match &*peer_whitelist {
-                Some(peer_whitelist) => peer_whitelist.contains(&source_peer_id),
-                None => true,
-            }
-        };
-        if !peer_allowed {
-            return Err(Error::PeerNotWhitelisted(source_peer_id));
-        }
         Ok(())
     }
 
@@ -836,37 +739,6 @@ impl<S: Storage> Irokle<S> {
         })
     }
 
-    #[cfg(feature = "iroh")]
-    fn wake_async_replication(
-        &self,
-        topic_id: TopicId,
-        _op_id: OpId,
-        write_concern: &WriteConcern,
-        wake_failed_message: &'static str,
-    ) {
-        let Some(net) = &self.net else {
-            return;
-        };
-        let result = (|| -> Result<()> {
-            let state = self
-                .storage()
-                .topic_state(&topic_id)?
-                .ok_or(Error::TopicNotFound)?;
-            if matches!(write_concern, WriteConcern::AsyncReplication) {
-                for peer_id in self.sync_peers(topic_id, &state) {
-                    self.record_replication_scheduled(peer_id, topic_id)?;
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            tracing::warn!(%topic_id, %error, "committed replication bookkeeping failed");
-        }
-        if let Err(error) = net.schedule_topic_recheck(topic_id) {
-            tracing::warn!(%topic_id, %error, "{}", wake_failed_message);
-        }
-    }
-
     fn record_replication_scheduled(&self, peer_id: PeerId, topic_id: TopicId) -> Result<()> {
         let pending = self.storage().sync_obligation_count(&peer_id, &topic_id)?;
         let state = if pending > 0 {
@@ -928,25 +800,6 @@ impl<S: Storage> Irokle<S> {
             *counts.entry(status.state).or_default() += 1;
         }
         Ok(counts)
-    }
-
-    /// Record one attempt's reachability, however many topics it served. Reaching the peer
-    /// clears its failures; otherwise an unreachable result, as classed by the transport,
-    /// adds one. Returns whether selection changed.
-    #[cfg(feature = "iroh")]
-    pub(crate) fn note_peer_outcome(
-        &self,
-        peer_id: PeerId,
-        reached: bool,
-        unreachable: bool,
-    ) -> bool {
-        if reached {
-            self.peer_health.record_success(&peer_id)
-        } else if unreachable {
-            self.peer_health.record_failure(peer_id)
-        } else {
-            false
-        }
     }
 
     /// Record how attempt `attempt` ended. Only its first completion, `first`, counts; a repeat
