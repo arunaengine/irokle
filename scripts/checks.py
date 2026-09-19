@@ -97,6 +97,9 @@ def validate(cases):
             tests = case["tests"]
             if not tests or len(set(tests)) != len(tests):
                 raise ValueError(f"nonempty unique exact test names required: {label}")
+        allow_empty = case.get("allow_empty", False)
+        if not isinstance(allow_empty, bool) or (allow_empty and "tests" in case):
+            raise ValueError(f"allow_empty must be a boolean without exact tests: {label}")
         for log in case.get("required_logs", []):
             if Path(log).is_absolute() or ".." in Path(log).parts:
                 raise ValueError(f"required log must be repository-relative: {log}")
@@ -112,7 +115,7 @@ def inspect_log(path, case):
         wanted = sorted(case["tests"])
         if sorted(matches) != wanted or counts != [(str(len(wanted)), "0", "0")]:
             return f"exact test cardinality mismatch: expected {wanted}, got {matches}, summaries {counts}"
-    elif counts and not any(int(passed) for passed, _, _ in counts):
+    elif counts and not case.get("allow_empty") and not any(int(passed) for passed, _, _ in counts):
         return "test command matched no executed tests"
     return ""
 

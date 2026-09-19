@@ -17,7 +17,7 @@ guard.py REPOSITORY NEW_LOG COMMAND [ARGUMENT ...]
 matrix.sh REPOSITORY NEW_RESULT_DIRECTORY NEW_MANIFEST
 ```
 
-Each JSON case contains `label`, `argv`, and a positive `timeout` in seconds. Optional `tests` names the exact Rust tests expected to execute; `required_logs` names nonempty repository-relative outputs. Arguments are executed directly, without an implicit shell. Source changes, incomplete runs, changed logs, nonzero exits and incorrect test cardinality fail the run. Existing result directories and manifests cannot be overwritten.
+Each JSON case contains `label`, `argv`, and a positive `timeout` in seconds. Optional `tests` names the exact Rust tests expected to execute; `required_logs` names nonempty repository-relative outputs; `allow_empty` lets a test command without exact `tests` execute no test, as the doc test run may. Arguments are executed directly, without an implicit shell. Source changes, incomplete runs, changed logs, nonzero exits and incorrect test cardinality fail the run. Existing result directories and manifests cannot be overwritten.
 
 Heavy commands must run inside an enforced resource wrapper. `guard.py` puts the entire command tree in one Linux user scope with an 8 GiB memory cap, no swap, two build jobs, two test threads and reduced CPU/I/O priority. It refuses or stops work below 4 GiB available RAM or 8 GiB free filesystem space. Its JSON lines record resource samples and exit status. Check these limits against the actual host before running a campaign. Builds must use the selected checkout's `target/`.
 

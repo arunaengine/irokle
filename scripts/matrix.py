@@ -39,9 +39,11 @@ def cases():
         ])
     commands.extend((f"{name}-1.95", ["+1.95.0", *args]) for name, args in commands[:9])
     commands.append(("contracts", ["test", "--locked", "--all-features", "--test", "contracts"]))
+    # The crate keeps its examples as tests, so its doc test run may find none.
     result = [{"label": name,
                "argv": (["env", "RUSTDOCFLAGS=-D warnings"] if cargo_subcommand(args) == "doc" else [])
-                       + ["cargo", *args], "timeout": 7200}
+                       + ["cargo", *args], "timeout": 7200,
+               **({"allow_empty": True} if "--doc" in args else {})}
               for name, args in commands]
     result.insert(0, {"label": "style", "timeout": 120,
                       "argv": [sys.executable, "-B", "scripts/style.py"]})

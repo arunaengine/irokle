@@ -81,6 +81,17 @@ class Checks(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no executed tests", rows[0]["reason"])
 
+    def test_allowed_empty(self):
+        code = "print('test result: ok. 0 passed; 0 failed; 0 ignored;')"
+        result, _ = self.run_cases([self.case("empty", code, allow_empty=True)])
+        self.assertEqual(result.returncode, 0)
+
+    def test_empty_exact(self):
+        code = "print('test result: ok. 0 passed; 0 failed; 0 ignored;')"
+        result, rows = self.run_cases([self.case("empty", code, allow_empty=True, tests=["tests::wanted"])])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(rows, [])
+
     def test_mixed_suites(self):
         code = "print('test result: ok. 0 passed; 0 failed; 0 ignored;\\ntest result: ok. 1 passed; 0 failed; 2 ignored;')"
         result, _ = self.run_cases([self.case("mixed", code)])
