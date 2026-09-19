@@ -35,12 +35,8 @@ pub struct FjallStorage {
     pub(super) namespace: Option<Fence>,
     /// Clock nodes loaded or stored recently, shared with every view.
     clocks: std::sync::Arc<crate::clock::store::ClockCache>,
-    /// Key a test rewrites before every single-attempt commit, forcing a conflict.
-    #[cfg(test)]
-    conflict_key: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
-    /// A test's pause or failure at the named steps, shared with every view.
-    #[cfg(test)]
-    hook: std::sync::Arc<std::sync::Mutex<Option<HookFn>>>,
+    /// Pauses, failures and commit races a test injects; empty outside tests.
+    hooks: TestHooks,
 }
 
 /// Steps of namespace ownership where a test pauses or fails the operation.
@@ -66,6 +62,74 @@ pub(crate) enum Hook {
 
 #[cfg(test)]
 type HookFn = std::sync::Arc<dyn Fn(Hook) -> Result<()> + Send + Sync>;
+
+/// A test's pause or failure at the named steps, shared with every view, and
+/// the key it rewrites before each single-attempt commit to force a conflict.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct TestHooks {
+    hook: std::sync::Arc<std::sync::Mutex<Option<HookFn>>>,
+    conflict_key: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
+
+#[cfg(test)]
+impl TestHooks {
+    fn fire(&self, point: Hook) -> Result<()> {
+        let hook = self.hook.lock().unwrap().clone();
+        hook.map_or(Ok(()), |hook| hook(point))
+    }
+
+    /// A namespace view shares the hook but races no commits.
+    fn view(&self) -> Self {
+        Self {
+            hook: std::sync::Arc::clone(&self.hook),
+            conflict_key: Default::default(),
+        }
+    }
+
+    /// Rewrite the conflict key in its own commit, if a test set one.
+    fn race(
+        &self,
+        db: &fjall::OptimisticTxDatabase,
+        records: &fjall::OptimisticTxKeyspace,
+    ) -> Result<()> {
+        let Some(key) = self.conflict_key.lock().unwrap().clone() else {
+            return Ok(());
+        };
+        let mut tx = db.write_tx()?;
+        if let Some(value) = fjall::Readable::get(&tx, records, key.as_slice())? {
+            tx.insert(records, key, value);
+        }
+        tx.commit()?
+            .map_err(|_| Error::Storage("racing commit conflicted".into()))
+    }
+}
+
+/// Outside tests nothing is injected, and every call does nothing.
+#[cfg(not(test))]
+#[derive(Clone, Default)]
+struct TestHooks(());
+
+#[cfg(not(test))]
+impl TestHooks {
+    #[inline(always)]
+    fn fire(&self, _point: Hook) -> Result<()> {
+        Ok(())
+    }
+
+    fn view(&self) -> Self {
+        Self(())
+    }
+
+    #[inline(always)]
+    fn race(
+        &self,
+        _db: &fjall::OptimisticTxDatabase,
+        _records: &fjall::OptimisticTxKeyspace,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
 
 const FJALL_SCHEMA_VERSION: u32 = 2;
 /// Eviction journal records. No other keyspace begins with `e`, so this is the
@@ -218,10 +282,7 @@ impl FjallStorage {
             limits: StagingLimits::DISK,
             namespace: None,
             clocks: Default::default(),
-            #[cfg(test)]
-            conflict_key: Default::default(),
-            #[cfg(test)]
-            hook: Default::default(),
+            hooks: TestHooks::default(),
         };
         storage.ensure_schema_version()?;
         Ok(storage)
@@ -248,29 +309,18 @@ impl FjallStorage {
             limits: self.limits,
             namespace: Some(fence),
             clocks: std::sync::Arc::clone(&self.clocks),
-            #[cfg(test)]
-            conflict_key: Default::default(),
-            #[cfg(test)]
-            hook: std::sync::Arc::clone(&self.hook),
+            hooks: self.hooks.view(),
         }
     }
 
     /// Pause or fail the named steps of this store and its views.
     #[cfg(test)]
     pub(crate) fn set_hook(&self, hook: impl Fn(Hook) -> Result<()> + Send + Sync + 'static) {
-        *self.hook.lock().unwrap() = Some(std::sync::Arc::new(hook));
+        *self.hooks.hook.lock().unwrap() = Some(std::sync::Arc::new(hook));
     }
 
-    #[cfg(test)]
     pub(super) fn hook(&self, point: Hook) -> Result<()> {
-        let hook = self.hook.lock().unwrap().clone();
-        hook.map_or(Ok(()), |hook| hook(point))
-    }
-
-    #[cfg(not(test))]
-    #[inline(always)]
-    pub(super) fn hook(&self, _point: Hook) -> Result<()> {
-        Ok(())
+        self.hooks.fire(point)
     }
 
     /// A read snapshot. A namespace view first checks in it that its session
@@ -532,8 +582,7 @@ impl FjallStorage {
             limits: StagingLimits::DISK,
             namespace: None,
             clocks: Default::default(),
-            conflict_key: Default::default(),
-            hook: Default::default(),
+            hooks: TestHooks::default(),
         };
         storage.upgrade_schema(steps)
     }
@@ -627,8 +676,7 @@ impl FjallStorage {
             }
             None => f(&mut tx)?,
         };
-        #[cfg(test)]
-        self.race_commit()?;
+        self.hooks.race(&self.db, &self.records)?;
         match tx.commit()? {
             Ok(()) => Ok(result),
             Err(_) => Err(Error::AdmissionConflict),
@@ -639,20 +687,7 @@ impl FjallStorage {
     /// heads lose its commit to a concurrent rewrite of them.
     #[cfg(test)]
     pub(crate) fn race_heads(&self, topic_id: &TopicId) {
-        *self.conflict_key.lock().unwrap() = Some(Self::key_id(b"h", topic_id));
-    }
-
-    #[cfg(test)]
-    fn race_commit(&self) -> Result<()> {
-        let Some(key) = self.conflict_key.lock().unwrap().clone() else {
-            return Ok(());
-        };
-        let mut tx = self.db.write_tx()?;
-        if let Some(value) = fjall::Readable::get(&tx, &self.records, key.as_slice())? {
-            tx.insert(&self.records, key, value);
-        }
-        tx.commit()?
-            .map_err(|_| Error::Storage("racing commit conflicted".into()))
+        *self.hooks.conflict_key.lock().unwrap() = Some(Self::key_id(b"h", topic_id));
     }
 
     pub(super) fn key_id(prefix: &[u8], id: &impl AsRef<[u8]>) -> Vec<u8> {
