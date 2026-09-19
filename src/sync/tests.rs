@@ -141,67 +141,6 @@ fn memory_capture_reused() {
     capture_progress(store, MemoryStorage::counters);
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn reopened_capture_reused() {
-    let directory = tempfile::tempdir().unwrap();
-    seed(crate::FjallStorage::open(directory.path()).unwrap());
-    capture_progress(
-        crate::FjallStorage::open(directory.path()).unwrap(),
-        crate::FjallStorage::counters,
-    );
-}
-
-/// A response over a snapshot its caller holds admits the same snapshot, clock
-/// and page work as one that opens its own snapshot.
-#[cfg(feature = "iroh")]
-fn held_admission<S: Storage>(store: S) {
-    seed(store.clone());
-    let signer = Ed25519Signer::from_bytes(&[188; 32]);
-    let peer = Ed25519Signer::from_bytes(&[189; 32]).peer_id();
-    let topic = topic(false);
-    let request = SyncRequest {
-        topic_id: topic,
-        genesis: store
-            .topic_state(&topic)
-            .unwrap()
-            .map(|state| state.genesis),
-        credit: SyncCredit::default(),
-        actor_range_hints: vec![ActorRangeHint {
-            actor_id: actor_id_for(topic, signer.peer_id()),
-            from_exclusive: 1,
-            to_inclusive: 5,
-        }],
-        wants: BTreeSet::new(),
-        known: BTreeSet::new(),
-        window: Default::default(),
-    };
-    let budget = PageBudget::from_credit(request.credit);
-    let log = Oplog::with_storage(store.clone());
-    let opened = SyncEngine::new(log.clone(), signer.peer_id());
-    let held = SyncEngine::new(log, signer.peer_id());
-    let page = opened.response_page(peer, &request, budget).unwrap();
-    let inside = store
-        .read_snapshot(|read| held.response_in(read, peer, &request, budget))
-        .unwrap();
-    assert_eq!(page.ops.len(), 4);
-    assert_eq!(inside, page);
-    assert_eq!(held.page_work(), opened.page_work());
-}
-
-#[cfg(feature = "iroh")]
-#[test]
-fn memory_held_admission() {
-    held_admission(MemoryStorage::new());
-}
-
-#[cfg(all(feature = "iroh", feature = "fjall"))]
-#[test]
-fn fjall_held_admission() {
-    let directory = tempfile::tempdir().unwrap();
-    held_admission(crate::FjallStorage::open(directory.path()).unwrap());
-}
-
 fn reset_reauthorizes<S: Storage>(store: S) {
     let signer = Ed25519Signer::from_bytes(&[190; 32]);
     let peer = Ed25519Signer::from_bytes(&[191; 32]).peer_id();
@@ -264,13 +203,6 @@ fn reset_reauthorizes<S: Storage>(store: S) {
 #[test]
 fn memory_reset_reauthorizes() {
     reset_reauthorizes(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_reset_reauthorizes() {
-    let directory = tempfile::tempdir().unwrap();
-    reset_reauthorizes(crate::FjallStorage::open(directory.path()).unwrap());
 }
 
 fn repair_completion<S: Storage>(storage: S) {
@@ -401,8 +333,81 @@ fn memory_repair_completion() {
 }
 
 #[cfg(feature = "fjall")]
-#[test]
-fn fjall_repair_completion() {
-    let directory = tempfile::tempdir().unwrap();
-    repair_completion(crate::storage::FjallStorage::open(directory.path()).unwrap());
+mod with_fjall {
+    use crate::sync::tests::*;
+
+    #[test]
+    fn reopened_capture_reused() {
+        let directory = tempfile::tempdir().unwrap();
+        seed(crate::FjallStorage::open(directory.path()).unwrap());
+        capture_progress(
+            crate::FjallStorage::open(directory.path()).unwrap(),
+            crate::FjallStorage::counters,
+        );
+    }
+
+    #[test]
+    fn fjall_reset_reauthorizes() {
+        let directory = tempfile::tempdir().unwrap();
+        reset_reauthorizes(crate::FjallStorage::open(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn fjall_repair_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        repair_completion(crate::storage::FjallStorage::open(directory.path()).unwrap());
+    }
+}
+
+#[cfg(feature = "iroh")]
+mod with_iroh {
+    use crate::sync::tests::*;
+
+    /// A response over a snapshot its caller holds admits the same snapshot, clock
+    /// and page work as one that opens its own snapshot.
+    fn held_admission<S: Storage>(store: S) {
+        seed(store.clone());
+        let signer = Ed25519Signer::from_bytes(&[188; 32]);
+        let peer = Ed25519Signer::from_bytes(&[189; 32]).peer_id();
+        let topic = topic(false);
+        let request = SyncRequest {
+            topic_id: topic,
+            genesis: store
+                .topic_state(&topic)
+                .unwrap()
+                .map(|state| state.genesis),
+            credit: SyncCredit::default(),
+            actor_range_hints: vec![ActorRangeHint {
+                actor_id: actor_id_for(topic, signer.peer_id()),
+                from_exclusive: 1,
+                to_inclusive: 5,
+            }],
+            wants: BTreeSet::new(),
+            known: BTreeSet::new(),
+            window: Default::default(),
+        };
+        let budget = PageBudget::from_credit(request.credit);
+        let log = Oplog::with_storage(store.clone());
+        let opened = SyncEngine::new(log.clone(), signer.peer_id());
+        let held = SyncEngine::new(log, signer.peer_id());
+        let page = opened.response_page(peer, &request, budget).unwrap();
+        let inside = store
+            .read_snapshot(|read| held.response_in(read, peer, &request, budget))
+            .unwrap();
+        assert_eq!(page.ops.len(), 4);
+        assert_eq!(inside, page);
+        assert_eq!(held.page_work(), opened.page_work());
+    }
+
+    #[test]
+    fn memory_held_admission() {
+        held_admission(MemoryStorage::new());
+    }
+
+    #[cfg(feature = "fjall")]
+    #[test]
+    fn fjall_held_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        held_admission(crate::FjallStorage::open(directory.path()).unwrap());
+    }
 }

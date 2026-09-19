@@ -216,26 +216,6 @@ async fn abort_allows_replacement() {
     net.shutdown().await;
 }
 
-#[cfg(feature = "fjall")]
-#[tokio::test]
-async fn builder_selects_fjall() {
-    let dir = tempfile::tempdir().unwrap();
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-        .bind()
-        .await
-        .unwrap();
-    let irokle = Irokle::builder()
-        .with_net(endpoint)
-        .with_fjall_path(dir.path())
-        .unwrap()
-        .without_auto_accept()
-        .build()
-        .unwrap();
-
-    assert!(irokle.endpoint().is_some());
-    assert!(irokle.list_topics().unwrap().is_empty());
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sync_now_records() {
     let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
@@ -402,49 +382,6 @@ async fn async_obligation_schedule() {
     assert!(
         obligation_covers(alice.storage(), &report.obligations, &control.id),
         "control op should be scheduled for async replication"
-    );
-}
-
-#[cfg(feature = "fjall")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fjall_genesis_obligation() {
-    let dir = tempfile::tempdir().unwrap();
-    let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-        .bind()
-        .await
-        .unwrap();
-    let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-        .bind()
-        .await
-        .unwrap();
-    let bob_peer = PeerId::from_bytes(*bob_endpoint.id().as_bytes());
-
-    let (topic_id, genesis_id) = {
-        let alice = Irokle::builder()
-            .with_net(alice_endpoint)
-            .with_write_concern(WriteConcern::AsyncReplication)
-            .with_fjall_path(dir.path())
-            .unwrap()
-            .without_auto_accept()
-            .build()
-            .unwrap();
-        let topic = alice
-            .create_topic::<Note>(TopicConfig {
-                initial_peers: [bob_peer].into(),
-                replication_policy: ReplicationPolicy::all().with_max_sync_peers(1),
-            })
-            .unwrap();
-        let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
-        alice.shutdown_iroh().await;
-        bob_endpoint.close().await;
-        (topic.id(), genesis.id)
-    };
-
-    let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
-    let obligations = storage.sync_obligations(&bob_peer, &topic_id).unwrap();
-    assert!(
-        obligation_covers(&storage, &obligations, &genesis_id),
-        "genesis obligation should be durably committed with the op"
     );
 }
 
@@ -1582,12 +1519,6 @@ async fn memory_publishes_coalesce() {
     assert_publishes_coalesce(MemoryStorage::new()).await;
 }
 
-#[cfg(feature = "fjall")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fjall_publishes_coalesce() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_publishes_coalesce(crate::storage::FjallStorage::open(dir.path()).unwrap()).await;
-}
 /// An inviter net without background loops, and a receiver built with its net
 /// that trusts `whitelist`.
 async fn bootstrap_pair(
@@ -1866,7 +1797,78 @@ async fn memory_pull_hole() {
 }
 
 #[cfg(feature = "fjall")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fjall_pull_hole() {
-    pull_fills_hole(true).await;
+mod with_fjall {
+    use crate::tests::iroh::*;
+
+    #[tokio::test]
+    async fn builder_selects_fjall() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let irokle = Irokle::builder()
+            .with_net(endpoint)
+            .with_fjall_path(dir.path())
+            .unwrap()
+            .without_auto_accept()
+            .build()
+            .unwrap();
+
+        assert!(irokle.endpoint().is_some());
+        assert!(irokle.list_topics().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn genesis_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let bob_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .bind()
+            .await
+            .unwrap();
+        let bob_peer = PeerId::from_bytes(*bob_endpoint.id().as_bytes());
+
+        let (topic_id, genesis_id) = {
+            let alice = Irokle::builder()
+                .with_net(alice_endpoint)
+                .with_write_concern(WriteConcern::AsyncReplication)
+                .with_fjall_path(dir.path())
+                .unwrap()
+                .without_auto_accept()
+                .build()
+                .unwrap();
+            let topic = alice
+                .create_topic::<Note>(TopicConfig {
+                    initial_peers: [bob_peer].into(),
+                    replication_policy: ReplicationPolicy::all().with_max_sync_peers(1),
+                })
+                .unwrap();
+            let genesis = oplog::topological(alice.storage(), &topic.id()).unwrap()[0].clone();
+            alice.shutdown_iroh().await;
+            bob_endpoint.close().await;
+            (topic.id(), genesis.id)
+        };
+
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        let obligations = storage.sync_obligations(&bob_peer, &topic_id).unwrap();
+        assert!(
+            obligation_covers(&storage, &obligations, &genesis_id),
+            "genesis obligation should be durably committed with the op"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publishes_coalesce() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_publishes_coalesce(crate::storage::FjallStorage::open(dir.path()).unwrap()).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pull_hole() {
+        pull_fills_hole(true).await;
+    }
 }
