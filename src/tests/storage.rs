@@ -1936,202 +1936,6 @@ fn memory_pending_bytes() {
     assert_pending_bytes(MemoryStorage::new());
 }
 
-/// Rewrite a current database into the schema 1 layout: peer-first acks without a
-/// branch, peer-first legacy obligations and whole pending records without byte counters.
-#[cfg(feature = "fjall")]
-fn downgrade_schema_one(
-    db: &fjall::OptimisticTxDatabase,
-    topic_id: TopicId,
-    peer: PeerId,
-    legacy: &[(BTreeSet<OpId>, ActorClock)],
-) {
-    let records = db
-        .keyspace("records", fjall::KeyspaceCreateOptions::default)
-        .unwrap();
-    let mut tx = db.write_tx().unwrap();
-    crate_storage::write_legacy_metas(&mut tx, &records).unwrap();
-    let mut pending = Vec::new();
-    for item in fjall::Readable::prefix(&tx, &records, b"pm") {
-        let (key, value) = item.into_inner().unwrap();
-        let record: (PeerId, TopicId, BTreeSet<OpId>, u64) = postcard::from_bytes(&value).unwrap();
-        let payload = fjall::Readable::get(&tx, &records, [b"pp".as_slice(), &key[2..]].concat())
-            .unwrap()
-            .unwrap();
-        pending.push((record, postcard::from_bytes::<Op>(&payload).unwrap()));
-    }
-    for prefix in [b"pp".as_slice(), b"pm", b"pt", b"pr", b"pu", b"pc", b"ps"] {
-        let keys = fjall::Readable::prefix(&tx, &records, prefix)
-            .map(|item| item.key().unwrap().to_vec())
-            .collect::<Vec<_>>();
-        for key in keys {
-            tx.remove(&records, key);
-        }
-    }
-    let mut source_counts = std::collections::BTreeMap::<PeerId, u64>::new();
-    for ((source, _, missing, _), op) in &pending {
-        let body = &op.signed.body;
-        let meta = crate_storage::OpMeta {
-            id: op.id,
-            topic_id: body.topic_id,
-            author: body.author,
-            actor_id: body.actor_id,
-            actor_seq: body.actor_seq,
-            actor_prev: body.actor_prev,
-            deps: body.deps.clone(),
-            generation: body.generation,
-            observed_clock: ActorClock::new(),
-            ready: false,
-            missing_deps: missing.clone(),
-        };
-        let value = postcard::to_allocvec(&(source, op, meta)).unwrap();
-        tx.insert(&records, [b"po".as_slice(), op.id.as_ref()].concat(), value);
-        *source_counts.entry(*source).or_default() += 1;
-    }
-    tx.insert(
-        &records,
-        b"pn".to_vec(),
-        postcard::to_allocvec(&(pending.len() as u64)).unwrap(),
-    );
-    for (source, count) in source_counts {
-        tx.insert(
-            &records,
-            [b"ps".as_slice(), source.as_ref()].concat(),
-            postcard::to_allocvec(&count).unwrap(),
-        );
-    }
-    let mut removed = Vec::new();
-    for prefix in [b"ak".as_slice(), b"ob", b"pb", b"pq"] {
-        for item in fjall::Readable::prefix(&tx, &records, prefix) {
-            let (key, value) = item.into_inner().unwrap();
-            if prefix == b"ob" && key.len() == 33 {
-                continue;
-            }
-            removed.push((key.to_vec(), value.to_vec()));
-        }
-    }
-    for (key, value) in removed {
-        tx.remove(&records, key.clone());
-        if key.starts_with(b"ak") {
-            let ack: crate_storage::PeerAck = postcard::from_bytes(&value).unwrap();
-            let old_key = [
-                b"ak".as_slice(),
-                ack.peer_id.as_ref(),
-                ack.topic_id.as_ref(),
-            ]
-            .concat();
-            let old = (ack.peer_id, ack.topic_id, &ack.heads, &ack.clock);
-            tx.insert(&records, old_key, postcard::to_allocvec(&old).unwrap());
-        }
-    }
-    for (index, (op_ids, clock)) in legacy.iter().enumerate() {
-        let value = postcard::to_allocvec(&(peer, topic_id, op_ids, clock)).unwrap();
-        let key = [
-            b"ob".as_slice(),
-            peer.as_ref(),
-            topic_id.as_ref(),
-            &[index as u8; 32],
-        ]
-        .concat();
-        tx.insert(&records, key, value);
-    }
-    tx.insert(
-        &records,
-        b"sv".to_vec(),
-        postcard::to_allocvec(&1u32).unwrap(),
-    );
-    tx.commit().unwrap().unwrap();
-}
-
-/// A malformed legacy record fails the upgrade as a whole: the file stays at
-/// schema 1 with nothing half moved, and a future version is refused outright.
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_refuses_schema() {
-    use fjall::Readable;
-    let dir = tempfile::tempdir().unwrap();
-    let peer = PeerId::hash(b"refuse-peer");
-    let topic_id = TopicId::hash(b"refuse-topic");
-    drop(crate_storage::FjallStorage::open(dir.path()).unwrap());
-    let unchanged = {
-        let db = fjall::OptimisticTxDatabase::builder(dir.path())
-            .open()
-            .unwrap();
-        downgrade_schema_one(
-            &db,
-            topic_id,
-            peer,
-            &[(BTreeSet::new(), clock_at(ActorId::hash(b"a"), 1))],
-        );
-        let records = db
-            .keyspace("records", fjall::KeyspaceCreateOptions::default)
-            .unwrap();
-        let mut tx = db.write_tx().unwrap();
-        tx.insert(
-            &records,
-            [b"ob".as_slice(), peer.as_ref(), topic_id.as_ref(), &[9; 32]].concat(),
-            vec![0xff; 3],
-        );
-        tx.commit().unwrap().unwrap();
-        db.read_tx()
-            .iter(&records)
-            .map(|entry| {
-                let (key, value) = entry.into_inner().unwrap();
-                (key.to_vec(), value.to_vec())
-            })
-            .collect::<Vec<_>>()
-    };
-    assert!(crate_storage::FjallStorage::open(dir.path()).is_err());
-    {
-        let db = fjall::OptimisticTxDatabase::builder(dir.path())
-            .open()
-            .unwrap();
-        let records = db
-            .keyspace("records", fjall::KeyspaceCreateOptions::default)
-            .unwrap();
-        let version = records.get(b"sv").unwrap().unwrap();
-        assert_eq!(postcard::from_bytes::<u32>(&version).unwrap(), 1);
-        assert_eq!(
-            db.read_tx()
-                .iter(&records)
-                .map(|entry| {
-                    let (key, value) = entry.into_inner().unwrap();
-                    (key.to_vec(), value.to_vec())
-                })
-                .collect::<Vec<_>>(),
-            unchanged
-        );
-        let mut tx = db.write_tx().unwrap();
-        tx.insert(
-            &records,
-            b"sv".to_vec(),
-            postcard::to_allocvec(&99u32).unwrap(),
-        );
-        tx.commit().unwrap().unwrap();
-    }
-    assert!(matches!(
-        crate_storage::FjallStorage::open(dir.path()),
-        Err(Error::Storage(message)) if message.contains("unsupported")
-    ));
-    let db = fjall::OptimisticTxDatabase::builder(dir.path())
-        .open()
-        .unwrap();
-    let records = db
-        .keyspace("records", fjall::KeyspaceCreateOptions::default)
-        .unwrap();
-    let mut expected = unchanged;
-    let (_, version) = expected.iter_mut().find(|(key, _)| key == b"sv").unwrap();
-    *version = postcard::to_allocvec(&99u32).unwrap();
-    assert_eq!(
-        db.read_tx()
-            .iter(&records)
-            .map(|entry| {
-                let (key, value) = entry.into_inner().unwrap();
-                (key.to_vec(), value.to_vec())
-            })
-            .collect::<Vec<_>>(),
-        expected
-    );
-}
 fn assert_repair_limit<S: Storage>(storage: S) {
     let (source, topic, ops) = crate::tests::ownership::history(181, 0, 0);
     oplog::Oplog::with_storage(storage.clone())
@@ -2155,13 +1959,6 @@ fn assert_repair_limit<S: Storage>(storage: S) {
 #[test]
 fn memory_repair_limit() {
     assert_repair_limit(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_repair_limit() {
-    let directory = tempfile::tempdir().unwrap();
-    assert_repair_limit(crate::storage::FjallStorage::open(directory.path()).unwrap());
 }
 
 #[cfg(feature = "fjall")]
@@ -2631,5 +2428,208 @@ mod with_fjall {
             storage.pending_usage(&source.peer_id()),
             (1, charge, 1, charge)
         );
+    }
+
+    /// Rewrite a current database into the schema 1 layout: peer-first acks without a
+    /// branch, peer-first legacy obligations and whole pending records without byte counters.
+    fn downgrade_schema_one(
+        db: &fjall::OptimisticTxDatabase,
+        topic_id: TopicId,
+        peer: PeerId,
+        legacy: &[(BTreeSet<OpId>, ActorClock)],
+    ) {
+        let records = db
+            .keyspace("records", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut tx = db.write_tx().unwrap();
+        crate_storage::write_legacy_metas(&mut tx, &records).unwrap();
+        let mut pending = Vec::new();
+        for item in fjall::Readable::prefix(&tx, &records, b"pm") {
+            let (key, value) = item.into_inner().unwrap();
+            let record: (PeerId, TopicId, BTreeSet<OpId>, u64) =
+                postcard::from_bytes(&value).unwrap();
+            let payload =
+                fjall::Readable::get(&tx, &records, [b"pp".as_slice(), &key[2..]].concat())
+                    .unwrap()
+                    .unwrap();
+            pending.push((record, postcard::from_bytes::<Op>(&payload).unwrap()));
+        }
+        for prefix in [b"pp".as_slice(), b"pm", b"pt", b"pr", b"pu", b"pc", b"ps"] {
+            let keys = fjall::Readable::prefix(&tx, &records, prefix)
+                .map(|item| item.key().unwrap().to_vec())
+                .collect::<Vec<_>>();
+            for key in keys {
+                tx.remove(&records, key);
+            }
+        }
+        let mut source_counts = std::collections::BTreeMap::<PeerId, u64>::new();
+        for ((source, _, missing, _), op) in &pending {
+            let body = &op.signed.body;
+            let meta = crate_storage::OpMeta {
+                id: op.id,
+                topic_id: body.topic_id,
+                author: body.author,
+                actor_id: body.actor_id,
+                actor_seq: body.actor_seq,
+                actor_prev: body.actor_prev,
+                deps: body.deps.clone(),
+                generation: body.generation,
+                observed_clock: ActorClock::new(),
+                ready: false,
+                missing_deps: missing.clone(),
+            };
+            let value = postcard::to_allocvec(&(source, op, meta)).unwrap();
+            tx.insert(&records, [b"po".as_slice(), op.id.as_ref()].concat(), value);
+            *source_counts.entry(*source).or_default() += 1;
+        }
+        tx.insert(
+            &records,
+            b"pn".to_vec(),
+            postcard::to_allocvec(&(pending.len() as u64)).unwrap(),
+        );
+        for (source, count) in source_counts {
+            tx.insert(
+                &records,
+                [b"ps".as_slice(), source.as_ref()].concat(),
+                postcard::to_allocvec(&count).unwrap(),
+            );
+        }
+        let mut removed = Vec::new();
+        for prefix in [b"ak".as_slice(), b"ob", b"pb", b"pq"] {
+            for item in fjall::Readable::prefix(&tx, &records, prefix) {
+                let (key, value) = item.into_inner().unwrap();
+                if prefix == b"ob" && key.len() == 33 {
+                    continue;
+                }
+                removed.push((key.to_vec(), value.to_vec()));
+            }
+        }
+        for (key, value) in removed {
+            tx.remove(&records, key.clone());
+            if key.starts_with(b"ak") {
+                let ack: crate_storage::PeerAck = postcard::from_bytes(&value).unwrap();
+                let old_key = [
+                    b"ak".as_slice(),
+                    ack.peer_id.as_ref(),
+                    ack.topic_id.as_ref(),
+                ]
+                .concat();
+                let old = (ack.peer_id, ack.topic_id, &ack.heads, &ack.clock);
+                tx.insert(&records, old_key, postcard::to_allocvec(&old).unwrap());
+            }
+        }
+        for (index, (op_ids, clock)) in legacy.iter().enumerate() {
+            let value = postcard::to_allocvec(&(peer, topic_id, op_ids, clock)).unwrap();
+            let key = [
+                b"ob".as_slice(),
+                peer.as_ref(),
+                topic_id.as_ref(),
+                &[index as u8; 32],
+            ]
+            .concat();
+            tx.insert(&records, key, value);
+        }
+        tx.insert(
+            &records,
+            b"sv".to_vec(),
+            postcard::to_allocvec(&1u32).unwrap(),
+        );
+        tx.commit().unwrap().unwrap();
+    }
+
+    /// A malformed legacy record fails the upgrade as a whole: the file stays at
+    /// schema 1 with nothing half moved, and a future version is refused outright.
+    #[test]
+    fn refuses_schema() {
+        use fjall::Readable;
+        let dir = tempfile::tempdir().unwrap();
+        let peer = PeerId::hash(b"refuse-peer");
+        let topic_id = TopicId::hash(b"refuse-topic");
+        drop(crate_storage::FjallStorage::open(dir.path()).unwrap());
+        let unchanged = {
+            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+                .open()
+                .unwrap();
+            downgrade_schema_one(
+                &db,
+                topic_id,
+                peer,
+                &[(BTreeSet::new(), clock_at(ActorId::hash(b"a"), 1))],
+            );
+            let records = db
+                .keyspace("records", fjall::KeyspaceCreateOptions::default)
+                .unwrap();
+            let mut tx = db.write_tx().unwrap();
+            tx.insert(
+                &records,
+                [b"ob".as_slice(), peer.as_ref(), topic_id.as_ref(), &[9; 32]].concat(),
+                vec![0xff; 3],
+            );
+            tx.commit().unwrap().unwrap();
+            db.read_tx()
+                .iter(&records)
+                .map(|entry| {
+                    let (key, value) = entry.into_inner().unwrap();
+                    (key.to_vec(), value.to_vec())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(crate_storage::FjallStorage::open(dir.path()).is_err());
+        {
+            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+                .open()
+                .unwrap();
+            let records = db
+                .keyspace("records", fjall::KeyspaceCreateOptions::default)
+                .unwrap();
+            let version = records.get(b"sv").unwrap().unwrap();
+            assert_eq!(postcard::from_bytes::<u32>(&version).unwrap(), 1);
+            assert_eq!(
+                db.read_tx()
+                    .iter(&records)
+                    .map(|entry| {
+                        let (key, value) = entry.into_inner().unwrap();
+                        (key.to_vec(), value.to_vec())
+                    })
+                    .collect::<Vec<_>>(),
+                unchanged
+            );
+            let mut tx = db.write_tx().unwrap();
+            tx.insert(
+                &records,
+                b"sv".to_vec(),
+                postcard::to_allocvec(&99u32).unwrap(),
+            );
+            tx.commit().unwrap().unwrap();
+        }
+        assert!(matches!(
+            crate_storage::FjallStorage::open(dir.path()),
+            Err(Error::Storage(message)) if message.contains("unsupported")
+        ));
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .open()
+            .unwrap();
+        let records = db
+            .keyspace("records", fjall::KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut expected = unchanged;
+        let (_, version) = expected.iter_mut().find(|(key, _)| key == b"sv").unwrap();
+        *version = postcard::to_allocvec(&99u32).unwrap();
+        assert_eq!(
+            db.read_tx()
+                .iter(&records)
+                .map(|entry| {
+                    let (key, value) = entry.into_inner().unwrap();
+                    (key.to_vec(), value.to_vec())
+                })
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn repair_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_repair_limit(crate::storage::FjallStorage::open(directory.path()).unwrap());
     }
 }
