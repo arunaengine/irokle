@@ -1641,13 +1641,6 @@ fn memory_status_ordering() {
     assert_status_ordering(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_status_ordering() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_status_ordering(crate_storage::FjallStorage::open(dir.path()).unwrap());
-}
-
 /// Outcome of attempt `(epoch, sequence)` finished at wall clock `at`.
 fn attempt_outcome(attempt: (u64, u64), at: u64, healthy: bool) -> crate_storage::SyncStatusUpdate {
     let state = if healthy {
@@ -1835,79 +1828,9 @@ fn memory_replay_once() {
     assert_replay_once(MemoryStorage::new(), |storage| storage);
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_replay_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_replay_once(storage, |storage| {
-        drop(storage);
-        crate_storage::FjallStorage::open(dir.path()).unwrap()
-    });
-}
-
 #[test]
 fn memory_attempt_order() {
     assert_attempt_order(MemoryStorage::new(), |storage| storage);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_attempt_order() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_attempt_order(storage, |storage| {
-        drop(storage);
-        crate_storage::FjallStorage::open(dir.path()).unwrap()
-    });
-}
-
-/// A status written before attempt identities still reads, and takes one.
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_reads_legacy() {
-    let dir = tempfile::tempdir().unwrap();
-    let peer = PeerId::hash(b"legacy-status-peer");
-    let topic_id = TopicId::hash(b"legacy-status-topic");
-    drop(crate_storage::FjallStorage::open(dir.path()).unwrap());
-    {
-        let db = fjall::OptimisticTxDatabase::builder(dir.path())
-            .open()
-            .unwrap();
-        let records = db
-            .keyspace("records", fjall::KeyspaceCreateOptions::default)
-            .unwrap();
-        let legacy = (
-            peer,
-            topic_id,
-            crate_storage::SyncPeerState::Behind,
-            3_usize,
-            1_u64,
-            2_u64,
-            Some(5_u64),
-            Some(4_u64),
-            Some("dial failed".to_string()),
-        );
-        let mut tx = db.write_tx().unwrap();
-        tx.insert(
-            &records,
-            [b"ss".as_slice(), topic_id.as_ref(), peer.as_ref()].concat(),
-            postcard::to_allocvec(&legacy).unwrap(),
-        );
-        tx.commit().unwrap().unwrap();
-    }
-    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    let status = storage.sync_statuses(&topic_id).unwrap().remove(0);
-    assert_eq!(status.state, crate_storage::SyncPeerState::Behind);
-    assert_eq!((status.failed_attempts, status.successful_attempts), (1, 2));
-    assert_eq!(status.latest_attempt, None);
-
-    let updated = storage
-        .update_sync_status(&peer, &topic_id, &attempt_outcome((1, 1), 6, true))
-        .unwrap();
-    assert_eq!(updated.successful_attempts, 3);
-    assert_eq!(updated.latest_attempt, Some((1, 1)));
-    assert_eq!(storage.sync_statuses(&topic_id).unwrap(), vec![updated]);
 }
 
 /// Buffered pending payloads are bounded by bytes, not only by record count: a
@@ -2011,13 +1934,6 @@ fn assert_pending_bytes<S: Storage>(storage: S) {
 #[test]
 fn memory_pending_bytes() {
     assert_pending_bytes(MemoryStorage::new());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_pending_bytes() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_pending_bytes(crate_storage::FjallStorage::open(dir.path()).unwrap());
 }
 
 /// Rewrite a current database into the schema 1 layout: peer-first acks without a
@@ -2124,134 +2040,6 @@ fn downgrade_schema_one(
         postcard::to_allocvec(&1u32).unwrap(),
     );
     tx.commit().unwrap().unwrap();
-}
-
-/// A schema 1 file is upgraded by every facade that opens it at once, exactly
-/// once: obligations take their explicit kinds, acks move keys and certify nothing,
-/// and the byte counters it never had are rebuilt instead of reading as an empty pool.
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_upgrade_one() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = node(140);
-    let peer = PeerId::hash(b"upgrade-peer");
-    let topic = source
-        .create_topic::<Note>(TopicConfig {
-            initial_peers: [peer].into(),
-            ..TopicConfig::default()
-        })
-        .unwrap();
-    let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
-    // The buffered op waits on an event this store never receives.
-    topic
-        .publish(Note {
-            text: "absent".into(),
-        })
-        .unwrap();
-    let pending = topic
-        .publish(Note {
-            text: "pending".into(),
-        })
-        .unwrap();
-    let pending_op = source
-        .storage()
-        .get_op(&pending.meta.op_id)
-        .unwrap()
-        .unwrap();
-    let pending_meta = crate_storage::OpMeta {
-        ready: false,
-        missing_deps: pending_op.signed.body.deps.clone(),
-        ..source
-            .storage()
-            .get_meta(&pending.meta.op_id)
-            .unwrap()
-            .unwrap()
-    };
-    let charge = crate_storage::pending_op_bytes(&pending_op).unwrap() as u64;
-    let genesis = ops[0].id;
-    let actor = actor_id_for(topic.id(), source.peer_id());
-    let unknown = OpId::hash(b"upgrade-unknown");
-    {
-        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-        let log = oplog::Oplog::with_storage(storage.clone());
-        log.receive_ops(ops.clone()).unwrap();
-        storage
-            .put_pending_op(source.peer_id(), pending_op, pending_meta)
-            .unwrap();
-        storage
-            .apply_peer_ack(crate_storage::PeerAck {
-                peer_id: peer,
-                topic_id: topic.id(),
-                genesis: Some(genesis),
-                heads: [genesis].into(),
-                clock: clock_at(actor, 1),
-            })
-            .unwrap();
-    }
-    {
-        let db = fjall::OptimisticTxDatabase::builder(dir.path())
-            .open()
-            .unwrap();
-        downgrade_schema_one(
-            &db,
-            topic.id(),
-            peer,
-            &[
-                ([genesis].into(), clock_at(actor, 1)),
-                (BTreeSet::new(), clock_at(actor, 2)),
-                ([unknown].into(), ActorClock::new()),
-                (BTreeSet::new(), ActorClock::new()),
-            ],
-        );
-    }
-
-    let db = fjall::OptimisticTxDatabase::builder(dir.path())
-        .open()
-        .unwrap();
-    let barrier = Arc::new(Barrier::new(2));
-    let openers = (0..2)
-        .map(|_| {
-            let db = db.clone();
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                crate_storage::FjallStorage::from_database(db).unwrap()
-            })
-        })
-        .collect::<Vec<_>>();
-    let facades = openers
-        .into_iter()
-        .map(|opener| opener.join().unwrap())
-        .collect::<Vec<_>>();
-    let storage = &facades[0];
-
-    assert_eq!(
-        storage.sync_obligations(&peer, &topic.id()).unwrap(),
-        vec![
-            crate_storage::SyncObligation::clock(peer, topic.id(), clock_at(actor, 2)),
-            crate_storage::SyncObligation::repair(peer, topic.id(), [unknown].into()),
-        ]
-    );
-    let ack = facades[1].peer_ack(&peer, &topic.id()).unwrap().unwrap();
-    assert_eq!(ack.genesis, None);
-    assert_eq!(
-        storage.pending_usage(&source.peer_id()),
-        (1, charge, 1, charge),
-        "missing counters are rebuilt from the buffered records"
-    );
-    drop(facades);
-    drop(db);
-
-    // Reopening an upgraded file changes nothing.
-    let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
-    assert_eq!(
-        storage.sync_obligations(&peer, &topic.id()).unwrap().len(),
-        2
-    );
-    assert_eq!(
-        storage.pending_usage(&source.peer_id()),
-        (1, charge, 1, charge)
-    );
 }
 
 /// A malformed legacy record fails the upgrade as a whole: the file stays at
@@ -2637,5 +2425,211 @@ mod with_fjall {
     fn rejects_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         assert_rejects_mismatch(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn status_ordering() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_status_ordering(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn replay_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        assert_replay_once(storage, |storage| {
+            drop(storage);
+            crate_storage::FjallStorage::open(dir.path()).unwrap()
+        });
+    }
+
+    #[test]
+    fn attempt_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        assert_attempt_order(storage, |storage| {
+            drop(storage);
+            crate_storage::FjallStorage::open(dir.path()).unwrap()
+        });
+    }
+
+    /// A status written before attempt identities still reads, and takes one.
+    #[test]
+    fn reads_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer = PeerId::hash(b"legacy-status-peer");
+        let topic_id = TopicId::hash(b"legacy-status-topic");
+        drop(crate_storage::FjallStorage::open(dir.path()).unwrap());
+        {
+            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+                .open()
+                .unwrap();
+            let records = db
+                .keyspace("records", fjall::KeyspaceCreateOptions::default)
+                .unwrap();
+            let legacy = (
+                peer,
+                topic_id,
+                crate_storage::SyncPeerState::Behind,
+                3_usize,
+                1_u64,
+                2_u64,
+                Some(5_u64),
+                Some(4_u64),
+                Some("dial failed".to_string()),
+            );
+            let mut tx = db.write_tx().unwrap();
+            tx.insert(
+                &records,
+                [b"ss".as_slice(), topic_id.as_ref(), peer.as_ref()].concat(),
+                postcard::to_allocvec(&legacy).unwrap(),
+            );
+            tx.commit().unwrap().unwrap();
+        }
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        let status = storage.sync_statuses(&topic_id).unwrap().remove(0);
+        assert_eq!(status.state, crate_storage::SyncPeerState::Behind);
+        assert_eq!((status.failed_attempts, status.successful_attempts), (1, 2));
+        assert_eq!(status.latest_attempt, None);
+
+        let updated = storage
+            .update_sync_status(&peer, &topic_id, &attempt_outcome((1, 1), 6, true))
+            .unwrap();
+        assert_eq!(updated.successful_attempts, 3);
+        assert_eq!(updated.latest_attempt, Some((1, 1)));
+        assert_eq!(storage.sync_statuses(&topic_id).unwrap(), vec![updated]);
+    }
+
+    #[test]
+    fn pending_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_pending_bytes(crate_storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    /// A schema 1 file is upgraded by every facade that opens it at once, exactly
+    /// once: obligations take their explicit kinds, acks move keys and certify nothing,
+    /// and the byte counters it never had are rebuilt instead of reading as an empty pool.
+    #[test]
+    fn upgrade_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = node(140);
+        let peer = PeerId::hash(b"upgrade-peer");
+        let topic = source
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [peer].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
+        // The buffered op waits on an event this store never receives.
+        topic
+            .publish(Note {
+                text: "absent".into(),
+            })
+            .unwrap();
+        let pending = topic
+            .publish(Note {
+                text: "pending".into(),
+            })
+            .unwrap();
+        let pending_op = source
+            .storage()
+            .get_op(&pending.meta.op_id)
+            .unwrap()
+            .unwrap();
+        let pending_meta = crate_storage::OpMeta {
+            ready: false,
+            missing_deps: pending_op.signed.body.deps.clone(),
+            ..source
+                .storage()
+                .get_meta(&pending.meta.op_id)
+                .unwrap()
+                .unwrap()
+        };
+        let charge = crate_storage::pending_op_bytes(&pending_op).unwrap() as u64;
+        let genesis = ops[0].id;
+        let actor = actor_id_for(topic.id(), source.peer_id());
+        let unknown = OpId::hash(b"upgrade-unknown");
+        {
+            let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+            let log = oplog::Oplog::with_storage(storage.clone());
+            log.receive_ops(ops.clone()).unwrap();
+            storage
+                .put_pending_op(source.peer_id(), pending_op, pending_meta)
+                .unwrap();
+            storage
+                .apply_peer_ack(crate_storage::PeerAck {
+                    peer_id: peer,
+                    topic_id: topic.id(),
+                    genesis: Some(genesis),
+                    heads: [genesis].into(),
+                    clock: clock_at(actor, 1),
+                })
+                .unwrap();
+        }
+        {
+            let db = fjall::OptimisticTxDatabase::builder(dir.path())
+                .open()
+                .unwrap();
+            downgrade_schema_one(
+                &db,
+                topic.id(),
+                peer,
+                &[
+                    ([genesis].into(), clock_at(actor, 1)),
+                    (BTreeSet::new(), clock_at(actor, 2)),
+                    ([unknown].into(), ActorClock::new()),
+                    (BTreeSet::new(), ActorClock::new()),
+                ],
+            );
+        }
+
+        let db = fjall::OptimisticTxDatabase::builder(dir.path())
+            .open()
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let openers = (0..2)
+            .map(|_| {
+                let db = db.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    crate_storage::FjallStorage::from_database(db).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let facades = openers
+            .into_iter()
+            .map(|opener| opener.join().unwrap())
+            .collect::<Vec<_>>();
+        let storage = &facades[0];
+
+        assert_eq!(
+            storage.sync_obligations(&peer, &topic.id()).unwrap(),
+            vec![
+                crate_storage::SyncObligation::clock(peer, topic.id(), clock_at(actor, 2)),
+                crate_storage::SyncObligation::repair(peer, topic.id(), [unknown].into()),
+            ]
+        );
+        let ack = facades[1].peer_ack(&peer, &topic.id()).unwrap().unwrap();
+        assert_eq!(ack.genesis, None);
+        assert_eq!(
+            storage.pending_usage(&source.peer_id()),
+            (1, charge, 1, charge),
+            "missing counters are rebuilt from the buffered records"
+        );
+        drop(facades);
+        drop(db);
+
+        // Reopening an upgraded file changes nothing.
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        assert_eq!(
+            storage.sync_obligations(&peer, &topic.id()).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            storage.pending_usage(&source.peer_id()),
+            (1, charge, 1, charge)
+        );
     }
 }
