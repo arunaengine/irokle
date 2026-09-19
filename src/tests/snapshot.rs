@@ -87,64 +87,6 @@ fn memory_request_views() {
     assert_request_views(MemoryStorage::new());
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_request_views() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_request_views(crate::FjallStorage::open(dir.path()).unwrap());
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn request_snapshot_holds() {
-    let branch = branches(96);
-    let dir = tempfile::tempdir().unwrap();
-    let storage = crate::FjallStorage::open(dir.path()).unwrap();
-    Oplog::with_storage(storage.clone())
-        .receive_ops(vec![branch.old.0.clone(), branch.old.1.clone()])
-        .unwrap();
-    let (opened, ready) = std::sync::mpsc::channel();
-    let (changed, resume) = std::sync::mpsc::channel();
-    let reading = thread::spawn({
-        let storage = storage.clone();
-        let (topic, peer, actor) = (
-            branch.topic_id,
-            branch.member.peer_id(),
-            branch.old.1.signed.body.actor_id,
-        );
-        move || {
-            storage
-                .read_snapshot(|read| {
-                    let before = read.request_view(&topic, &peer, &[actor].into())?;
-                    opened.send(()).unwrap();
-                    resume
-                        .recv_timeout(std::time::Duration::from_secs(60))
-                        .unwrap();
-                    assert_eq!(read.request_view(&topic, &peer, &[actor].into())?, before);
-                    Ok(())
-                })
-                .unwrap()
-        }
-    });
-    ready
-        .recv_timeout(std::time::Duration::from_secs(60))
-        .unwrap();
-    reset_to_new(&storage, &branch);
-    changed.send(()).unwrap();
-    reading.join().unwrap();
-    storage
-        .read_snapshot(|read| {
-            assert_eq!(
-                read.request_view(&branch.topic_id, &branch.member.peer_id(), &BTreeSet::new())?
-                    .unwrap()
-                    .genesis,
-                branch.new.0.id
-            );
-            Ok(())
-        })
-        .unwrap();
-}
-
 /// A summary of a reader that holds only the genesis of `topic_id`.
 fn genesis_summary<S: Storage>(storage: &S, topic_id: TopicId, owner: PeerId) -> SyncSummary {
     let genesis = genesis_of(storage, &topic_id).unwrap();
@@ -222,16 +164,6 @@ fn memory_removal_excluded() {
     assert_removal_excluded(MemoryStorage::new(), Isolation::Blocks);
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_removal_excluded() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_removal_excluded(
-        crate::storage::FjallStorage::open(dir.path()).unwrap(),
-        Isolation::Commits,
-    );
-}
-
 /// A request accepted on the old genesis pauses before its positions are read
 /// while a reset installs the new branch at the same actor positions. The page
 /// holds only old-branch ops or the request is refused as stale.
@@ -291,16 +223,6 @@ fn assert_reset_excluded<S: Storage>(inner: S, isolation: Isolation) {
 #[test]
 fn memory_reset_excluded() {
     assert_reset_excluded(MemoryStorage::new(), Isolation::Blocks);
-}
-
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_reset_excluded() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_reset_excluded(
-        crate::storage::FjallStorage::open(dir.path()).unwrap(),
-        Isolation::Commits,
-    );
 }
 
 /// Records a page reads inside its snapshot are counted by the backend, so a
@@ -375,16 +297,6 @@ fn memory_snapshot_counted() {
     assert_snapshot_counted(MemoryStorage::new(), MemoryStorage::counters);
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_snapshot_counted() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_snapshot_counted(
-        crate::storage::FjallStorage::open(dir.path()).unwrap(),
-        crate::storage::FjallStorage::counters,
-    );
-}
-
 /// A reader pages toward the goal it captured while the source keeps appending
 /// on the same branch between pages. The captured goal still completes.
 #[test]
@@ -456,132 +368,6 @@ fn appends_keep_goal() {
             .unwrap()
             .dominates(&captured.actor_clock)
     );
-}
-
-/// Topic reads of a sync attempt before its push is planned: the digest's
-/// view, the open's state read, then the plan's own view.
-#[cfg(feature = "iroh")]
-const PLAN_TOPIC_READS: usize = 2;
-
-/// A real batch push from `alice` pauses after its planner authorized `bob`,
-/// while `bob` is removed and a later event is published. `bob` receives
-/// nothing selected from the state after its removal.
-#[cfg(feature = "iroh")]
-async fn assert_push_excluded<S: Storage>(inner: S, isolation: Isolation) {
-    let bind = || async {
-        iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-            .bind()
-            .await
-            .unwrap()
-    };
-    let (alice_endpoint, bob_endpoint) = (bind().await, bind().await);
-    let storage = StaleReadStorage::new(inner);
-    let alice = Irokle::with_storage(
-        storage.clone(),
-        NodeConfig {
-            signer: Ed25519Signer::from_iroh_secret_key(alice_endpoint.secret_key()),
-            default_write_concern: WriteConcern::Local,
-            ..NodeConfig::default()
-        },
-    )
-    .unwrap();
-    let bob = Irokle::with_storage(
-        MemoryStorage::new(),
-        NodeConfig {
-            signer: Ed25519Signer::from_iroh_secret_key(bob_endpoint.secret_key()),
-            default_write_concern: WriteConcern::Local,
-            ..NodeConfig::default()
-        },
-    )
-    .unwrap();
-    let topic = alice
-        .create_topic::<Note>(TopicConfig {
-            initial_peers: [bob.peer_id(), node(94).peer_id()].into(),
-            ..TopicConfig::default()
-        })
-        .unwrap();
-    let topic_id = topic.id();
-    let genesis = oplog::topological(&storage, &topic_id).unwrap()[0].clone();
-    bob.receive_sync_outcome(
-        alice.peer_id(),
-        sync::SyncData {
-            topic_id,
-            ops: vec![genesis],
-        },
-    )
-    .unwrap();
-    for text in ["one", "two"] {
-        topic.publish(Note { text: text.into() }).unwrap();
-    }
-    let before = storage.list_op_ids(&topic_id).unwrap();
-    let bob_net = Arc::new(net::IrohNet::new(bob_endpoint, bob.clone()).unwrap());
-    bob_net.start_accept_loop().unwrap();
-    let bob_addr = crate::tests::iroh::ready_addr(bob_net.endpoint()).await;
-    let alice_net = Arc::new(net::IrohNet::new(alice_endpoint, alice.clone()).unwrap());
-
-    let gate = Arc::new(Gate::default());
-    let release = gate.releaser();
-    storage.arm_read_after(
-        GatePoint::Topic(topic_id),
-        PLAN_TOPIC_READS,
-        Arc::clone(&gate),
-    );
-    let syncing = tokio::spawn({
-        let alice_net = Arc::clone(&alice_net);
-        async move { alice_net.sync_now(bob_addr, topic_id).await }
-    });
-    let arrival = Arc::clone(&gate);
-    tokio::task::spawn_blocking(move || arrival.wait_arrival())
-        .await
-        .unwrap();
-    let reader = bob.peer_id();
-    let writing = std::thread::spawn(move || {
-        topic.remove_peer(reader).unwrap();
-        topic
-            .publish(Note {
-                text: "after".into(),
-            })
-            .unwrap();
-    });
-    let mut writing = Some(writing);
-    if matches!(isolation, Isolation::Commits) {
-        writing.take().unwrap().join().unwrap();
-    }
-    drop(release);
-    let _ = syncing.await.unwrap();
-    if let Some(writing) = writing {
-        writing.join().unwrap();
-    }
-    assert!(storage.list_op_ids(&topic_id).unwrap().len() > before.len());
-    let received = bob.storage().list_op_ids(&topic_id).unwrap();
-    assert_eq!(
-        received, before,
-        "the push planned before the removal carried the allowed events"
-    );
-    assert!(
-        received.is_subset(&before),
-        "a removed member received later ops: {:?}",
-        received.difference(&before).collect::<Vec<_>>()
-    );
-    alice_net.shutdown().await;
-    bob_net.shutdown().await;
-}
-
-#[cfg(feature = "iroh")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn memory_push_excluded() {
-    assert_push_excluded(MemoryStorage::new(), Isolation::Blocks).await;
-}
-
-#[cfg(all(feature = "iroh", feature = "fjall"))]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fjall_push_excluded() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_push_excluded(
-        crate::storage::FjallStorage::open(dir.path()).unwrap(),
-        Isolation::Commits,
-    )
-    .await;
 }
 
 fn bounded_dependencies<S: Storage>(storage: S, counts: impl Fn(&S) -> crate::CounterSnapshot) {
@@ -680,16 +466,6 @@ fn memory_dependency_slices() {
     bounded_dependencies(MemoryStorage::new(), MemoryStorage::counters);
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_dependency_slices() {
-    let directory = tempfile::tempdir().unwrap();
-    bounded_dependencies(
-        crate::FjallStorage::open(directory.path()).unwrap(),
-        crate::FjallStorage::counters,
-    );
-}
-
 #[test]
 fn unsupported_dependencies_block() {
     use crate::storage::{SnapshotRead, TopicView};
@@ -759,16 +535,6 @@ fn memory_read_admission() {
     admission_first(MemoryStorage::new(), MemoryStorage::counters);
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn fjall_read_admission() {
-    let directory = tempfile::tempdir().unwrap();
-    admission_first(
-        crate::FjallStorage::open(directory.path()).unwrap(),
-        crate::FjallStorage::counters,
-    );
-}
-
 #[test]
 fn unsupported_capture_blocks() {
     use crate::storage::{SnapshotRead, TopicView};
@@ -809,4 +575,242 @@ fn unsupported_capture_blocks() {
         Unsupported.sync_clock(&topic, None, &mut |_| Ok(())),
         Err(Error::SyncCapacity(_))
     ));
+}
+
+#[cfg(feature = "fjall")]
+mod with_fjall {
+    use crate::tests::snapshot::*;
+
+    #[test]
+    fn request_views() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_request_views(crate::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn request_snapshot_holds() {
+        let branch = branches(96);
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::FjallStorage::open(dir.path()).unwrap();
+        Oplog::with_storage(storage.clone())
+            .receive_ops(vec![branch.old.0.clone(), branch.old.1.clone()])
+            .unwrap();
+        let (opened, ready) = std::sync::mpsc::channel();
+        let (changed, resume) = std::sync::mpsc::channel();
+        let reading = thread::spawn({
+            let storage = storage.clone();
+            let (topic, peer, actor) = (
+                branch.topic_id,
+                branch.member.peer_id(),
+                branch.old.1.signed.body.actor_id,
+            );
+            move || {
+                storage
+                    .read_snapshot(|read| {
+                        let before = read.request_view(&topic, &peer, &[actor].into())?;
+                        opened.send(()).unwrap();
+                        resume
+                            .recv_timeout(std::time::Duration::from_secs(60))
+                            .unwrap();
+                        assert_eq!(read.request_view(&topic, &peer, &[actor].into())?, before);
+                        Ok(())
+                    })
+                    .unwrap()
+            }
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap();
+        reset_to_new(&storage, &branch);
+        changed.send(()).unwrap();
+        reading.join().unwrap();
+        storage
+            .read_snapshot(|read| {
+                assert_eq!(
+                    read.request_view(
+                        &branch.topic_id,
+                        &branch.member.peer_id(),
+                        &BTreeSet::new()
+                    )?
+                    .unwrap()
+                    .genesis,
+                    branch.new.0.id
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn removal_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_removal_excluded(
+            crate::storage::FjallStorage::open(dir.path()).unwrap(),
+            Isolation::Commits,
+        );
+    }
+
+    #[test]
+    fn reset_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_reset_excluded(
+            crate::storage::FjallStorage::open(dir.path()).unwrap(),
+            Isolation::Commits,
+        );
+    }
+
+    #[test]
+    fn snapshot_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_snapshot_counted(
+            crate::storage::FjallStorage::open(dir.path()).unwrap(),
+            crate::storage::FjallStorage::counters,
+        );
+    }
+
+    #[test]
+    fn dependency_slices() {
+        let directory = tempfile::tempdir().unwrap();
+        bounded_dependencies(
+            crate::FjallStorage::open(directory.path()).unwrap(),
+            crate::FjallStorage::counters,
+        );
+    }
+
+    #[test]
+    fn read_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        admission_first(
+            crate::FjallStorage::open(directory.path()).unwrap(),
+            crate::FjallStorage::counters,
+        );
+    }
+}
+
+#[cfg(feature = "iroh")]
+mod with_iroh {
+    use crate::tests::snapshot::*;
+
+    /// Topic reads of a sync attempt before its push is planned: the digest's
+    /// view, the open's state read, then the plan's own view.
+    const PLAN_TOPIC_READS: usize = 2;
+
+    /// A real batch push from `alice` pauses after its planner authorized `bob`,
+    /// while `bob` is removed and a later event is published. `bob` receives
+    /// nothing selected from the state after its removal.
+    async fn assert_push_excluded<S: Storage>(inner: S, isolation: Isolation) {
+        let bind = || async {
+            iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+                .bind()
+                .await
+                .unwrap()
+        };
+        let (alice_endpoint, bob_endpoint) = (bind().await, bind().await);
+        let storage = StaleReadStorage::new(inner);
+        let alice = Irokle::with_storage(
+            storage.clone(),
+            NodeConfig {
+                signer: Ed25519Signer::from_iroh_secret_key(alice_endpoint.secret_key()),
+                default_write_concern: WriteConcern::Local,
+                ..NodeConfig::default()
+            },
+        )
+        .unwrap();
+        let bob = Irokle::with_storage(
+            MemoryStorage::new(),
+            NodeConfig {
+                signer: Ed25519Signer::from_iroh_secret_key(bob_endpoint.secret_key()),
+                default_write_concern: WriteConcern::Local,
+                ..NodeConfig::default()
+            },
+        )
+        .unwrap();
+        let topic = alice
+            .create_topic::<Note>(TopicConfig {
+                initial_peers: [bob.peer_id(), node(94).peer_id()].into(),
+                ..TopicConfig::default()
+            })
+            .unwrap();
+        let topic_id = topic.id();
+        let genesis = oplog::topological(&storage, &topic_id).unwrap()[0].clone();
+        bob.receive_sync_outcome(
+            alice.peer_id(),
+            sync::SyncData {
+                topic_id,
+                ops: vec![genesis],
+            },
+        )
+        .unwrap();
+        for text in ["one", "two"] {
+            topic.publish(Note { text: text.into() }).unwrap();
+        }
+        let before = storage.list_op_ids(&topic_id).unwrap();
+        let bob_net = Arc::new(net::IrohNet::new(bob_endpoint, bob.clone()).unwrap());
+        bob_net.start_accept_loop().unwrap();
+        let bob_addr = crate::tests::iroh::ready_addr(bob_net.endpoint()).await;
+        let alice_net = Arc::new(net::IrohNet::new(alice_endpoint, alice.clone()).unwrap());
+
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read_after(
+            GatePoint::Topic(topic_id),
+            PLAN_TOPIC_READS,
+            Arc::clone(&gate),
+        );
+        let syncing = tokio::spawn({
+            let alice_net = Arc::clone(&alice_net);
+            async move { alice_net.sync_now(bob_addr, topic_id).await }
+        });
+        let arrival = Arc::clone(&gate);
+        tokio::task::spawn_blocking(move || arrival.wait_arrival())
+            .await
+            .unwrap();
+        let reader = bob.peer_id();
+        let writing = std::thread::spawn(move || {
+            topic.remove_peer(reader).unwrap();
+            topic
+                .publish(Note {
+                    text: "after".into(),
+                })
+                .unwrap();
+        });
+        let mut writing = Some(writing);
+        if matches!(isolation, Isolation::Commits) {
+            writing.take().unwrap().join().unwrap();
+        }
+        drop(release);
+        let _ = syncing.await.unwrap();
+        if let Some(writing) = writing {
+            writing.join().unwrap();
+        }
+        assert!(storage.list_op_ids(&topic_id).unwrap().len() > before.len());
+        let received = bob.storage().list_op_ids(&topic_id).unwrap();
+        assert_eq!(
+            received, before,
+            "the push planned before the removal carried the allowed events"
+        );
+        assert!(
+            received.is_subset(&before),
+            "a removed member received later ops: {:?}",
+            received.difference(&before).collect::<Vec<_>>()
+        );
+        alice_net.shutdown().await;
+        bob_net.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_push_excluded() {
+        assert_push_excluded(MemoryStorage::new(), Isolation::Blocks).await;
+    }
+
+    #[cfg(feature = "fjall")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fjall_push_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_push_excluded(
+            crate::storage::FjallStorage::open(dir.path()).unwrap(),
+            Isolation::Commits,
+        )
+        .await;
+    }
 }
