@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 
 use crate::history::{DagQuery, HistoryCursor, HistoryOrder, limited, ordered};
 use crate::oplog::{Oplog, topological, topological_ids};
-use crate::reducer::EventRecord;
+use crate::reducer::{EventRecord, HistoryEntry, HistoryPage};
 use crate::storage::{MemoryStorage, Storage};
 use crate::{ActorClock, ActorId, Error, Event, Op, OpId, PeerId, Result, TopicControl, TopicId};
 
@@ -84,6 +84,23 @@ impl<E: Event, S: Storage> Topic<E, S> {
         order: HistoryOrder,
     ) -> Result<Vec<EventRecord<E>>> {
         self.node.history_after_cursor(self.topic_id, cursor, order)
+    }
+
+    /// Every event, each decoded on its own: an undecodable payload is reported
+    /// with its op instead of failing the whole read like [`Self::history`].
+    pub fn history_entries(&self, order: HistoryOrder) -> Result<Vec<HistoryEntry<E>>> {
+        self.node.topic_entries(self.topic_id, order)
+    }
+
+    /// Events after `cursor`, oldest first, at most `limit` ops, with the cursor
+    /// that covers exactly them, all read from one snapshot. Only ops past the
+    /// cursor are read. A cursor from a replaced genesis fails like [`Self::history_after`].
+    pub fn history_page(
+        &self,
+        cursor: &HistoryCursor,
+        limit: Option<usize>,
+    ) -> Result<HistoryPage<E>> {
+        self.node.history_page(self.topic_id, cursor, limit)
     }
 
     /// The current branch and actor clock, read together, for a later [`Self::history_after`].

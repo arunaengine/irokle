@@ -25,7 +25,7 @@ mod topology;
 pub(crate) use genesis::is_structural_genesis;
 pub(crate) use integrity::{Holes, Integrity};
 pub(crate) use topology::topological_ids;
-pub(crate) use topology::{subset_in, topological_subset_entries};
+pub(crate) use topology::{subset_entries_in, subset_in, topological_subset_entries};
 pub use topology::{topological, topological_subset};
 
 /// Attempts one admission job makes; storage writes on this path try once each.

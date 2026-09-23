@@ -47,7 +47,7 @@ pub(crate) fn subset_in(read: &dyn SnapshotRead, ids: &BTreeSet<crate::OpId>) ->
         .collect())
 }
 
-fn subset_entries_in(
+pub(crate) fn subset_entries_in(
     read: &dyn SnapshotRead,
     ids: &BTreeSet<crate::OpId>,
 ) -> Result<Vec<(Op, OpMeta)>> {

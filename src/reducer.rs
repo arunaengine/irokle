@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Reducer traits and typed event records for application projections.
 
+use crate::history::HistoryCursor;
 use crate::{ActorClock, ActorId, OpId};
 
 pub trait Reducer<E> {
@@ -45,4 +46,30 @@ impl<E> EventRecord<E> {
             },
         }
     }
+}
+
+/// One event of a typed history read that reports each record on its own. A
+/// payload that does not decode as `E` names its op instead of failing the read.
+#[derive(Debug)]
+pub enum HistoryEntry<E> {
+    Event(EventRecord<E>),
+    Undecodable { meta: OpMeta, error: crate::Error },
+}
+
+impl<E> HistoryEntry<E> {
+    /// The decoded record, or the error its payload failed with.
+    pub fn into_record(self) -> crate::Result<EventRecord<E>> {
+        match self {
+            Self::Event(record) => Ok(record),
+            Self::Undecodable { error, .. } => Err(error),
+        }
+    }
+}
+
+/// Events after a cursor, oldest first, read from one snapshot, with the cursor
+/// that covers exactly these events. The next read passes `cursor`.
+#[derive(Debug)]
+pub struct HistoryPage<E> {
+    pub entries: Vec<HistoryEntry<E>>,
+    pub cursor: HistoryCursor,
 }
