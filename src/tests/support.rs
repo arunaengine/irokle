@@ -908,13 +908,33 @@ pub(crate) fn forked_side<S: Storage>(
     peers: impl IntoIterator<Item = PeerId>,
     text: &str,
 ) -> (oplog::Oplog<S>, Ed25519Signer, Op, Op) {
+    forked_policy(
+        storage,
+        topic_id,
+        seed,
+        peers,
+        ReplicationPolicy::default(),
+        text,
+    )
+}
+
+/// [`forked_side`] with `policy`, so two sides naming the same initial peers
+/// still fork the topic, as a genesis replacement requires.
+pub(crate) fn forked_policy<S: Storage>(
+    storage: S,
+    topic_id: TopicId,
+    seed: u8,
+    peers: impl IntoIterator<Item = PeerId>,
+    policy: ReplicationPolicy,
+    text: &str,
+) -> (oplog::Oplog<S>, Ed25519Signer, Op, Op) {
     let signer = Ed25519Signer::from_bytes(&[seed; 32]);
     let log = oplog::Oplog::with_storage(storage);
     let actor = actor_id_for(topic_id, signer.peer_id());
     let genesis = TopicGenesis {
         event_type_id: Note::TYPE_ID.into(),
         initial_peers: peers.into_iter().collect(),
-        replication_policy: ReplicationPolicy::default(),
+        replication_policy: policy,
     };
     let genesis_op = log
         .create_topic_genesis(topic_id, actor, genesis, &signer)

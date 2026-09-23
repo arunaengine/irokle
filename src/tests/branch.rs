@@ -23,21 +23,18 @@ pub(super) fn branches(seed: u8) -> Branches {
     let author = Ed25519Signer::from_bytes(&[seed; 32]);
     let member = Ed25519Signer::from_bytes(&[seed.wrapping_add(1); 32]);
     let third = Ed25519Signer::from_bytes(&[seed.wrapping_add(2); 32]);
-    let fourth = Ed25519Signer::from_bytes(&[seed.wrapping_add(3); 32]);
-    let (_, _, left_genesis, left_event) = forked_side(
-        MemoryStorage::new(),
-        topic_id,
-        seed,
-        [member.peer_id(), third.peer_id()],
-        "left",
-    );
-    let (_, _, right_genesis, right_event) = forked_side(
-        MemoryStorage::new(),
-        topic_id,
-        seed,
-        [member.peer_id(), third.peer_id(), fourth.peer_id()],
-        "right",
-    );
+    let side = |max_sync_peers, text| {
+        forked_policy(
+            MemoryStorage::new(),
+            topic_id,
+            seed,
+            [member.peer_id(), third.peer_id()],
+            ReplicationPolicy::all().with_max_sync_peers(max_sync_peers),
+            text,
+        )
+    };
+    let (_, _, left_genesis, left_event) = side(1, "left");
+    let (_, _, right_genesis, right_event) = side(2, "right");
     let left = (left_genesis, left_event);
     let right = (right_genesis, right_event);
     let (old, new) = if left.0.id > right.0.id {

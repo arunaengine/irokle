@@ -72,7 +72,7 @@ Membership decisions are causal. Events remain valid only when their authors wer
 These are the guarantees and limits applications should design around.
 
 - Every member is an administrator. Any member can add or remove peers and change the replication policy. `Irokle::seal_topic` blocks genesis resets on a node.
-- A smaller genesis replaces the current one only if its author is an initial peer of the genesis it replaces. Initial peers never change, so every replica makes the same choice whatever order records arrive in. The discarded payloads are reported as `TopicEviction`s.
+- A smaller genesis replaces the current one only if it names exactly the same initial peers, its author among them. This covers two nodes creating one topic at once. Every genesis in a chain shares that set, so every replica makes the same choice whatever order records arrive in, and a reset cannot change who the initial members are. The discarded payloads are reported as `TopicEviction`s.
 - Revocation is causal. A removed peer's operation stays valid when its dependencies come before the removal. Removal does not delete data the peer already holds, and former members can still see topic summaries.
 - Two members that remove each other concurrently keep different views of each other. Other members see both removals and agree. Irokle does not reconcile the two removed peers automatically.
 - One secret key must drive one store. If a writer identity signs two different operations at one actor position, replicas keep whichever arrived first and refuse the other. Acknowledgements then certify only the ancestry of the heads the receiving node holds, so a fork never marks an absent operation as delivered.

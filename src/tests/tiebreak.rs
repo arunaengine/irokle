@@ -414,6 +414,52 @@ fn removal_order_converges() {
     assert_eq!(genesis(&second), smaller.id);
 }
 
+/// Three geneses of one topic: the first names A, B and C, a smaller one by C
+/// leaves B out, and a still smaller one by B names all three. Every arrival
+/// order keeps the same genesis, since only a genesis naming the same initial
+/// peers may replace another.
+#[test]
+fn successive_geneses_agree() {
+    let topic_id = TopicId::hash(b"successive-geneses-agree");
+    let [a, b, c] = [93_u8, 94, 95].map(|seed| Ed25519Signer::from_bytes(&[seed; 32]));
+    let genesis_of = |signer: &Ed25519Signer, peers: &[&Ed25519Signer], nonce: usize| {
+        let created = TopicGenesis {
+            event_type_id: Note::TYPE_ID.into(),
+            initial_peers: peers.iter().map(|peer| peer.peer_id()).collect(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(nonce),
+        };
+        Oplog::new()
+            .create_topic_genesis(
+                topic_id,
+                actor_id_for(topic_id, signer.peer_id()),
+                created,
+                signer,
+            )
+            .unwrap()
+    };
+    let first = genesis_of(&a, &[&b, &c], 1);
+    let narrower = (2..4096)
+        .map(|nonce| genesis_of(&c, &[&a], nonce))
+        .find(|genesis| genesis.id < first.id)
+        .expect("a smaller genesis nonce exists");
+    let smallest = (2..4096)
+        .map(|nonce| genesis_of(&b, &[&a, &c], nonce))
+        .find(|genesis| genesis.id < narrower.id)
+        .expect("a smaller genesis nonce exists");
+    for order in [
+        [&narrower, &smallest, &narrower],
+        [&smallest, &narrower, &smallest],
+    ] {
+        let log = Oplog::new();
+        log.receive_op(first.clone()).unwrap();
+        for genesis in order {
+            let _ = log.receive_op(genesis.clone());
+        }
+        let state = log.storage().topic_state(&topic_id).unwrap().unwrap();
+        assert_eq!(state.genesis, smallest.id);
+    }
+}
+
 #[test]
 fn fork_symmetric() {
     // Deterministic ed25519 signing makes genesis ids stable, so scanning seed
