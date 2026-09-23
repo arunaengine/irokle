@@ -1776,6 +1776,9 @@ impl Storage for FjallStorage {
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         self.transaction(|tx| Self::tx_remove_pending(tx, &self.records, op_id))
     }
+    fn expire_pending(&self, now_ms: u64, max_idle_ms: u64) -> Result<usize> {
+        self.expire_pending_ops(now_ms, max_idle_ms)
+    }
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
         self.transaction(|tx| Self::tx_purge_waiters(tx, &self.records, dep_id))
     }

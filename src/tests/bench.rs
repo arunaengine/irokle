@@ -125,6 +125,7 @@ impl<S: Storage + PayloadReads> Storage for Counting<S> {
         ready_pending_after(after: Option<&OpId>, limit: usize) -> Vec<(PeerId, Op)>;
         pending_missing_deps(topic: &TopicId) -> BTreeSet<OpId>;
         is_pending(id: &OpId) -> bool;
+        expire_pending(now_ms: u64, max_idle_ms: u64) -> usize;
         remove_pending_op(id: &OpId) -> ();
         purge_pending_waiters(dep: &OpId) -> usize;
         reject_pending_subtree(id: &OpId) -> usize;

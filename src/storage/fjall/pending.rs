@@ -33,6 +33,8 @@ const WAITER_COUNT: &[u8] = b"wn";
 const TOTAL_USAGE: &[u8] = b"pu";
 const SOURCE_USAGE: &[u8] = b"ps";
 const TOPIC_USAGE: &[u8] = b"pc";
+/// When an expiry sweep first saw a buffered op, `pe<op>` to milliseconds.
+const SINCE: &[u8] = b"pe";
 /// Rejected ids per topic: `rj<topic><op>` to a sequence, `rq<topic><seq>` to
 /// the id in rejection order, and `rc<topic>` to the oldest and next sequence.
 const REJECTED: &[u8] = b"rj";
@@ -237,6 +239,52 @@ impl FjallStorage {
             }
         }
         Ok(())
+    }
+
+    /// See [`crate::storage::Storage::expire_pending`]. One transaction times the
+    /// buffered ops, then each expired op and its waiters go in their own.
+    pub(super) fn expire_pending_ops(&self, now_ms: u64, max_idle_ms: u64) -> Result<usize> {
+        let expired = self.transaction(|tx| {
+            let mut since = std::collections::BTreeMap::new();
+            for item in fjall::Readable::prefix(tx, &self.records, SINCE) {
+                let (item_key, value) = item.into_inner()?;
+                let id = id_at(item_key.as_ref(), SINCE.len())?;
+                since.insert(id, postcard::from_bytes::<u64>(value.as_ref())?);
+            }
+            let mut buffered = BTreeSet::new();
+            for item in fjall::Readable::prefix(tx, &self.records, RECORD) {
+                buffered.insert(id_at(item.key()?.as_ref(), RECORD.len())?);
+            }
+            for id in since.keys().filter(|id| !buffered.contains(*id)) {
+                tx.remove(&self.records, key(&[SINCE, id.as_ref()]))?;
+            }
+            let mut expired = Vec::new();
+            for id in buffered {
+                match since.get(&id) {
+                    None => Self::tx_put(tx, &self.records, key(&[SINCE, id.as_ref()]), &now_ms)?,
+                    Some(first) if first.saturating_add(max_idle_ms) < now_ms => expired.push(id),
+                    Some(_) => {}
+                }
+            }
+            Ok(expired)
+        })?;
+        let mut removed = 0;
+        for id in expired {
+            removed += self.transaction(|tx| {
+                let mut subtree = Self::tx_waiter_closure(tx, &self.records, &id)?;
+                subtree.insert(id);
+                let mut removed = 0;
+                for op_id in subtree {
+                    if Self::tx_pending_record(tx, &self.records, &op_id)?.is_some() {
+                        Self::tx_remove_pending(tx, &self.records, &op_id)?;
+                        tx.remove(&self.records, key(&[SINCE, op_id.as_ref()]))?;
+                        removed += 1;
+                    }
+                }
+                Ok(removed)
+            })?;
+        }
+        Ok(removed)
     }
 
     /// Drop a buffered op and refund its stored charge. Underflow is an error:

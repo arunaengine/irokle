@@ -340,6 +340,22 @@ impl<S: Storage> Irokle<S> {
         self.oplog.recheck_topics()
     }
 
+    /// Drop buffered ops that waited for their dependencies longer than
+    /// [`crate::storage::MAX_PENDING_IDLE_MS`], with the ops that wait on them, and
+    /// return how many went. Admitted history is untouched; the Iroh sweep calls this.
+    pub fn expire_pending(&self) -> Result<usize> {
+        let expired = self
+            .storage()
+            .expire_pending(now_millis()?, crate::storage::MAX_PENDING_IDLE_MS)?;
+        if expired > 0 {
+            tracing::info!(
+                expired,
+                "expired buffered ops whose dependencies never arrived"
+            );
+        }
+        Ok(expired)
+    }
+
     /// Discard unreachable ops of `topic_id` and rebuild it from the remaining heads.
     /// Replaced-genesis descendants stay unresolved; returned payloads belong to the embedder.
     pub fn quarantine_orphans(&self, topic_id: TopicId) -> Result<Option<TopicEviction>> {

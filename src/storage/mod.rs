@@ -25,6 +25,9 @@ pub const MAX_REJECTED_PER_TOPIC: usize = 4096;
 /// Eviction records a store may hold unacknowledged. It bounds only a consumer that stopped
 /// draining: a reset that would exceed it is refused rather than losing a payload.
 pub const MAX_PENDING_EVICTIONS: usize = 1024;
+/// How long a buffered op may wait for its dependencies before it expires, so one
+/// source cannot hold pending capacity and repair requests forever.
+pub const MAX_PENDING_IDLE_MS: u64 = 60 * 60 * 1000;
 
 /// Reads of one coherent snapshot of a store. Every method sees the same commit,
 /// so a planner can authorize a peer, select positions and load records without
@@ -240,6 +243,13 @@ pub trait Storage: Clone + Send + Sync + 'static {
         Ok(false)
     }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
+    /// Drop buffered ops that waited more than `max_idle_ms` by `now_ms`, with the ops
+    /// that wait on them, and return how many went. Each op is timed from the first
+    /// call that sees it. They were never admitted or acknowledged, so a later sync
+    /// can send them again. The default keeps everything.
+    fn expire_pending(&self, _now_ms: u64, _max_idle_ms: u64) -> Result<usize> {
+        Ok(0)
+    }
     /// Atomically drop every pending op that transitively waits on `dep_id`, a genesis that will
     /// never be admitted here, and return how many. Required: single removals are not atomic.
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize>;

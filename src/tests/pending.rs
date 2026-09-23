@@ -864,6 +864,50 @@ fn memory_retained_drain() {
     assert_retained_drain(MemoryStorage::new());
 }
 
+/// A buffered op behind a dependency that never arrives, and its own waiter,
+/// expire once they waited longer than the limit since the first sweep saw
+/// them. Admitted records stay, and nothing is left unresolved.
+fn assert_pending_expires<S: Storage>(storage: S) {
+    let m = members(236);
+    let log = Oplog::with_storage(storage.clone());
+    let source = Some(m.alice.peer_id());
+    log.receive_ops_from_peer(source, vec![m.genesis.clone()])
+        .unwrap();
+    let missing = event_op(&m.bob, m.topic_id, 1, None, &[&m.genesis], "missing");
+    let waiting = event_op(
+        &m.bob,
+        m.topic_id,
+        2,
+        Some(&missing),
+        &[&missing],
+        "waiting",
+    );
+    let behind = event_op(&m.carol, m.topic_id, 1, None, &[&waiting], "behind");
+    log.receive_ops_from_peer(source, vec![waiting.clone(), behind.clone()])
+        .unwrap();
+    assert!(storage.is_pending(&waiting.id).unwrap());
+    assert!(storage.is_pending(&behind.id).unwrap());
+
+    assert_eq!(storage.expire_pending(1_000, 100).unwrap(), 0);
+    assert_eq!(storage.expire_pending(1_100, 100).unwrap(), 0);
+    assert_eq!(storage.expire_pending(1_101, 100).unwrap(), 2);
+    assert!(!storage.is_pending(&waiting.id).unwrap());
+    assert!(!storage.is_pending(&behind.id).unwrap());
+    assert!(log.topic_unresolved(&m.topic_id).unwrap().is_empty());
+    assert!(storage.get_op(&m.genesis.id).unwrap().is_some());
+
+    // An op buffered later is timed from the sweep that first sees it.
+    log.receive_ops_from_peer(source, vec![waiting.clone()])
+        .unwrap();
+    assert_eq!(storage.expire_pending(5_000, 100).unwrap(), 0);
+    assert!(storage.is_pending(&waiting.id).unwrap());
+}
+
+#[test]
+fn memory_pending_expires() {
+    assert_pending_expires(MemoryStorage::new());
+}
+
 #[cfg(feature = "fjall")]
 mod fjall {
     use crate::tests::pending::*;
@@ -910,6 +954,12 @@ mod fjall {
     fn drains_complete() {
         let dir = tempfile::tempdir().unwrap();
         assert_drains_complete(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn pending_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_pending_expires(crate::storage::FjallStorage::open(dir.path()).unwrap());
     }
 
     #[test]
