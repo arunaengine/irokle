@@ -171,9 +171,18 @@ impl<S: Storage> Irokle<S> {
         let store = storage
             .provisional_store(&provisional)?
             .ok_or(Error::StaleIncarnation)?;
+        // An op the namespace already stores or buffers, or that repeats in the
+        // fragment, adds no bytes, so a replay fits again. The store still rechecks
+        // the quota when it commits.
         let mut bytes = 0_u64;
+        let mut counted = BTreeSet::new();
         for op in &data.ops {
-            bytes = bytes.saturating_add(crate::storage::pending_op_bytes(op)? as u64);
+            if counted.insert(op.id)
+                && !store.dep_resolvable(&op.id)?
+                && !store.is_pending(&op.id)?
+            {
+                bytes = bytes.saturating_add(crate::storage::pending_op_bytes(op)? as u64);
+            }
         }
         make_room(storage, &provisional, bytes)?;
         let admitted = self.oplog.sharing_membership(store).receive_preverified(
@@ -289,7 +298,14 @@ impl<S: Storage> Irokle<S> {
         }
         let effects = self.activation_effects(source, &view.state, &view.clock);
         match storage.activate_provisional(provisional, &view.state, effects) {
-            Ok(()) => Ok(Bootstrap::Active(BTreeSet::new())),
+            Ok(()) => {
+                // Buffered ops move with the activation; those it made ready are
+                // admitted now. Ones left ready stay stored for a later pass.
+                if let Err(error) = self.oplog.reconcile_pending_ops() {
+                    tracing::debug!(topic_id = %provisional.topic_id, %error, "moved buffered ops wait for a later pass");
+                }
+                Ok(Bootstrap::Active(BTreeSet::new()))
+            }
             Err(Error::AdmissionConflict)
                 if storage.topic_state(&provisional.topic_id)?.is_some() =>
             {

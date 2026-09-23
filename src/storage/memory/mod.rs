@@ -81,6 +81,8 @@ struct MemoryInner {
     pending_by_topic: BTreeMap<TopicId, BTreeSet<OpId>>,
     pending_waiters: BTreeMap<OpId, BTreeSet<OpId>>,
     pending_ready: BTreeSet<OpId>,
+    /// When an expiry sweep first saw each buffered op.
+    pending_since: BTreeMap<OpId, u64>,
     pending_usage: PendingUsage,
     source_usage: BTreeMap<PeerId, PendingUsage>,
     topic_usage: BTreeMap<TopicId, PendingUsage>,
@@ -525,9 +527,43 @@ impl Storage for MemoryStorage {
         let inner = self.lock()?;
         Ok(pending_missing_locked(&inner, topic_id))
     }
+    fn is_pending(&self, op_id: &OpId) -> Result<bool> {
+        Ok(self.lock()?.pending_records.contains_key(op_id))
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         let mut inner = self.lock()?;
         remove_pending_locked(&mut inner, op_id)
+    }
+    fn hold_workspace(&self, bytes: u64) -> Result<crate::storage::WorkspaceHold> {
+        let budget = Arc::clone(&self.lock()?.budget);
+        let charge = budget.reserve(MemoryDomain::Workspace, bytes)?;
+        Ok(crate::storage::WorkspaceHold::new(charge))
+    }
+    fn expire_pending(&self, now_ms: u64, max_idle_ms: u64) -> Result<usize> {
+        let mut inner = self.lock()?;
+        let inner = &mut *inner;
+        let records = &inner.pending_records;
+        inner.pending_since.retain(|id, _| records.contains_key(id));
+        let mut expired = BTreeSet::new();
+        for id in inner.pending_records.keys() {
+            let since = *inner.pending_since.entry(*id).or_insert(now_ms);
+            if since.saturating_add(max_idle_ms) < now_ms {
+                expired.insert(*id);
+            }
+        }
+        let mut removed = BTreeSet::new();
+        for id in expired {
+            let mut subtree = waiter_closure_locked(inner, &id);
+            subtree.insert(id);
+            for op_id in subtree {
+                if inner.pending_records.contains_key(&op_id) {
+                    remove_pending_locked(inner, &op_id)?;
+                    inner.pending_since.remove(&op_id);
+                    removed.insert(op_id);
+                }
+            }
+        }
+        Ok(removed.len())
     }
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
         let mut inner = self.lock()?;

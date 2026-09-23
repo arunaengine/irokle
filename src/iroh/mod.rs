@@ -1281,6 +1281,9 @@ impl<S: Storage> IrohNet<S> {
                 if let Err(error) = shared.node.recheck_topics() {
                     tracing::warn!(%error, "sweep could not refresh topic caches");
                 }
+                if let Err(error) = shared.node.expire_pending() {
+                    tracing::warn!(%error, "sweep could not expire buffered ops");
+                }
                 let mut scheduled = shared.schedule_persisted_obligations()?;
                 for (peer_id, topic_id) in shared.sweep_targets()? {
                     shared

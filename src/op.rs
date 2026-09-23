@@ -85,7 +85,8 @@ impl Op {
         Ok(OpId::hash(canonical_bytes(signed)?))
     }
 
-    #[cfg(feature = "iroh")]
+    /// Refuse an op too large for one sync frame, in every build: an op admitted
+    /// without the `iroh` feature must still fit when the history is later synced.
     pub(crate) fn validate_frame(&self) -> Result<()> {
         crate::net::validate_op(self)
     }

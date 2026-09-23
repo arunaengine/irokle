@@ -358,6 +358,107 @@ fn nonmember_no_reset() {
     );
 }
 
+/// A removal of an initial peer and that peer's smaller genesis reach two
+/// replicas in opposite orders. Initial peers of the replaced genesis decide,
+/// not current membership, so both replicas keep the same genesis.
+#[test]
+fn removal_order_converges() {
+    let topic_id = TopicId::hash(b"removal-order-converges");
+    let owner = Ed25519Signer::from_bytes(&[91; 32]);
+    let peer = Ed25519Signer::from_bytes(&[92; 32]);
+    let genesis_of = |signer: &Ed25519Signer, peers: [PeerId; 1], max_sync_peers: usize| {
+        let created = TopicGenesis {
+            event_type_id: Note::TYPE_ID.into(),
+            initial_peers: peers.into(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(max_sync_peers),
+        };
+        Oplog::new()
+            .create_topic_genesis(
+                topic_id,
+                actor_id_for(topic_id, signer.peer_id()),
+                created,
+                signer,
+            )
+            .unwrap()
+    };
+    let original = genesis_of(&owner, [peer.peer_id()], 1);
+    let smaller = (2..4096)
+        .map(|nonce| genesis_of(&peer, [owner.peer_id()], nonce))
+        .find(|genesis| genesis.id < original.id)
+        .expect("a smaller genesis nonce exists");
+    let first = Oplog::new();
+    let second = Oplog::new();
+    first.receive_op(original.clone()).unwrap();
+    second.receive_op(original).unwrap();
+    let removal = first
+        .create_control_op(
+            topic_id,
+            actor_id_for(topic_id, owner.peer_id()),
+            TopicControl::RemovePeer {
+                peer: peer.peer_id(),
+            },
+            &owner,
+        )
+        .unwrap();
+    first.receive_op(smaller.clone()).unwrap();
+    second.receive_op(smaller.clone()).unwrap();
+    let _ = second.receive_op(removal);
+    let genesis = |log: &Oplog| {
+        log.storage()
+            .topic_state(&topic_id)
+            .unwrap()
+            .unwrap()
+            .genesis
+    };
+    assert_eq!(genesis(&first), smaller.id);
+    assert_eq!(genesis(&second), smaller.id);
+}
+
+/// Geneses naming A, B and C, a smaller one by C without B, and a still smaller
+/// one by B naming all three. Every arrival order keeps the smallest, since only
+/// a genesis naming the same initial peers may replace another.
+#[test]
+fn successive_geneses_agree() {
+    let topic_id = TopicId::hash(b"successive-geneses-agree");
+    let [a, b, c] = [93_u8, 94, 95].map(|seed| Ed25519Signer::from_bytes(&[seed; 32]));
+    let genesis_of = |signer: &Ed25519Signer, peers: &[&Ed25519Signer], nonce: usize| {
+        let created = TopicGenesis {
+            event_type_id: Note::TYPE_ID.into(),
+            initial_peers: peers.iter().map(|peer| peer.peer_id()).collect(),
+            replication_policy: ReplicationPolicy::all().with_max_sync_peers(nonce),
+        };
+        Oplog::new()
+            .create_topic_genesis(
+                topic_id,
+                actor_id_for(topic_id, signer.peer_id()),
+                created,
+                signer,
+            )
+            .unwrap()
+    };
+    let first = genesis_of(&a, &[&b, &c], 1);
+    let narrower = (2..4096)
+        .map(|nonce| genesis_of(&c, &[&a], nonce))
+        .find(|genesis| genesis.id < first.id)
+        .expect("a smaller genesis nonce exists");
+    let smallest = (2..4096)
+        .map(|nonce| genesis_of(&b, &[&a, &c], nonce))
+        .find(|genesis| genesis.id < narrower.id)
+        .expect("a smaller genesis nonce exists");
+    for order in [
+        [&narrower, &smallest, &narrower],
+        [&smallest, &narrower, &smallest],
+    ] {
+        let log = Oplog::new();
+        log.receive_op(first.clone()).unwrap();
+        for genesis in order {
+            let _ = log.receive_op(genesis.clone());
+        }
+        let state = log.storage().topic_state(&topic_id).unwrap().unwrap();
+        assert_eq!(state.genesis, smallest.id);
+    }
+}
+
 #[test]
 fn fork_symmetric() {
     // Deterministic ed25519 signing makes genesis ids stable, so scanning seed

@@ -3,9 +3,9 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::marker::PhantomData;
 
-use crate::history::{DagQuery, HistoryOrder, limited, ordered};
+use crate::history::{DagQuery, HistoryCursor, HistoryOrder, limited, ordered};
 use crate::oplog::{Oplog, topological, topological_ids};
-use crate::reducer::EventRecord;
+use crate::reducer::{EventRecord, HistoryEntry, HistoryPage};
 use crate::storage::{MemoryStorage, Storage};
 use crate::{ActorClock, ActorId, Error, Event, Op, OpId, PeerId, Result, TopicControl, TopicId};
 
@@ -76,12 +76,36 @@ impl<E: Event, S: Storage> Topic<E, S> {
         self.node.topic_history(self.topic_id, order)
     }
 
+    /// Events not covered by `cursor`. A cursor from a replaced genesis fails with
+    /// [`Error::StaleIncarnation`]; the caller then rebuilds from [`Self::history`].
     pub fn history_after(
         &self,
-        clock: &ActorClock,
+        cursor: &HistoryCursor,
         order: HistoryOrder,
     ) -> Result<Vec<EventRecord<E>>> {
-        self.node.history_after_clock(self.topic_id, clock, order)
+        self.node.history_after_cursor(self.topic_id, cursor, order)
+    }
+
+    /// Every event, each decoded on its own: an undecodable payload is reported
+    /// with its op instead of failing the whole read like [`Self::history`].
+    pub fn history_entries(&self, order: HistoryOrder) -> Result<Vec<HistoryEntry<E>>> {
+        self.node.topic_entries(self.topic_id, order)
+    }
+
+    /// Events after `cursor`, oldest first, at most `limit` ops, with the cursor
+    /// that covers exactly them, all read from one snapshot. Only ops past the
+    /// cursor are read. A cursor from a replaced genesis fails like [`Self::history_after`].
+    pub fn history_page(
+        &self,
+        cursor: &HistoryCursor,
+        limit: Option<usize>,
+    ) -> Result<HistoryPage<E>> {
+        self.node.history_page(self.topic_id, cursor, limit)
+    }
+
+    /// The current branch and actor clock, read together, for a later [`Self::history_after`].
+    pub fn history_cursor(&self) -> Result<HistoryCursor> {
+        self.node.topic_history_cursor(self.topic_id)
     }
 
     pub fn dag(&self, query: DagQuery<OpId>) -> Result<Vec<Op>> {

@@ -25,6 +25,23 @@ pub const MAX_REJECTED_PER_TOPIC: usize = 4096;
 /// Eviction records a store may hold unacknowledged. It bounds only a consumer that stopped
 /// draining: a reset that would exceed it is refused rather than losing a payload.
 pub const MAX_PENDING_EVICTIONS: usize = 1024;
+/// How long a buffered op may wait for its dependencies before it expires, so one
+/// source cannot hold pending capacity and repair requests forever.
+pub const PENDING_IDLE_MS: u64 = 60 * 60 * 1000;
+
+/// Temporary work a store charged to its memory budget; the charge ends on drop.
+#[derive(Default)]
+pub struct WorkspaceHold {
+    _charge: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl WorkspaceHold {
+    pub(crate) fn new(charge: impl std::any::Any + Send + Sync) -> Self {
+        Self {
+            _charge: Some(Box::new(charge)),
+        }
+    }
+}
 
 /// Reads of one coherent snapshot of a store. Every method sees the same commit,
 /// so a planner can authorize a peer, select positions and load records without
@@ -234,7 +251,23 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// Sync planning turns these into wants, so a hole a peer never pushes is
     /// actively pulled instead of stranding its dependents forever.
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
+    /// Whether an op with this id is buffered here. The default answers no, so a
+    /// store without the lookup only charges a buffered op again, never too little.
+    fn is_pending(&self, _op_id: &OpId) -> Result<bool> {
+        Ok(false)
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
+    /// Charge `bytes` of temporary admission work to this store's memory budget until
+    /// the hold drops, refusing past the budget. A store without one holds nothing.
+    fn hold_workspace(&self, _bytes: u64) -> Result<WorkspaceHold> {
+        Ok(WorkspaceHold::default())
+    }
+    /// Drop buffered ops, and their waiters, that waited more than `max_idle_ms` since
+    /// the first call that saw them, and return how many went. They were never
+    /// acknowledged, so a later sync can resend them. The default keeps everything.
+    fn expire_pending(&self, _now_ms: u64, _max_idle_ms: u64) -> Result<usize> {
+        Ok(0)
+    }
     /// Atomically drop every pending op that transitively waits on `dep_id`, a genesis that will
     /// never be admitted here, and return how many. Required: single removals are not atomic.
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize>;

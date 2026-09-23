@@ -610,3 +610,17 @@ fn concurrent_commit_retries() {
     assert_eq!(accepted.unwrap(), [ops[4].id].into());
     assert_eq!(storage.heads(&topic.id()).unwrap(), [ops[4].id].into());
 }
+
+/// An op too large for one sync frame is refused in every build, so a store
+/// without the `iroh` feature never holds history it could not sync later.
+#[test]
+fn refuses_unsyncable_op() {
+    let node = node(203);
+    let topic = node.create_topic::<Note>(TopicConfig::default()).unwrap();
+    let text = "x".repeat(17 * 1024 * 1024);
+    assert!(matches!(
+        topic.publish(Note { text }),
+        Err(Error::OpTooLarge)
+    ));
+    assert_eq!(node.storage().list_op_ids(&topic.id()).unwrap().len(), 1);
+}

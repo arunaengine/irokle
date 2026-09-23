@@ -43,15 +43,16 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         // `Ord` is lexicographic over those bytes, so both nodes pick the same
         // winner with no coordination.
         if genesis.id < state.genesis {
-            // A smaller foreign genesis may reset only for a current local member:
-            // genesis ids are grindable, so disjoint-membership forks do not auto-converge.
-            if !state.members.contains(&genesis.signed.body.author) {
+            // Genesis ids are grindable, so a smaller genesis resets only when it
+            // names the same initial peers, its author among them. Every genesis of
+            // a chain shares that set, so replicas agree whatever the arrival order.
+            if !self.same_peers(&state.genesis, &genesis)? {
                 tracing::warn!(
                     %topic_id,
                     local_genesis = %state.genesis,
                     foreign_genesis = %genesis.id,
                     author = %genesis.signed.body.author,
-                    "rejected non-member genesis collision"
+                    "rejected genesis collision naming other initial peers"
                 );
                 let filtered = without_descendants(ops, genesis.id);
                 return Ok((filtered, None, Some(genesis.id)));
@@ -83,6 +84,20 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             let filtered = without_descendants(ops, genesis.id);
             Ok((filtered, None, Some(genesis.id)))
         }
+    }
+
+    /// Whether `candidate` names the initial peers of the genesis `genesis_id`,
+    /// with its own author among them. An unreadable genesis matches nothing.
+    fn same_peers(&self, genesis_id: &OpId, candidate: &Op) -> Result<bool> {
+        let peers = |op: &Op| match &op.signed.body.payload {
+            TopicPayload::Genesis(genesis) => Some(genesis.initial_peers.clone()),
+            TopicPayload::Event(_) | TopicPayload::Control(_) => None,
+        };
+        let Some(current) = self.storage.get_op(genesis_id)?.as_ref().and_then(peers) else {
+            return Ok(false);
+        };
+        Ok(peers(candidate)
+            .is_some_and(|named| named == current && named.contains(&candidate.signed.body.author)))
     }
 
     /// Collect local non-genesis payloads by actor and sequence for re-emission.

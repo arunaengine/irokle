@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::net::iroh::session::*;
-use crate::tests::support::{forked_side, node};
+use crate::tests::support::{forked_policy, forked_side, node};
 use crate::{MemoryStorage, Op, TopicId};
 
 fn send_ops(
@@ -41,11 +41,12 @@ async fn replies_follow_branch() {
         [net.node.peer_id()],
         "left",
     );
-    let (_, _, right, right_event) = forked_side(
+    let (_, _, right, right_event) = forked_policy(
         MemoryStorage::new(),
         topic_id,
         210,
-        [net.node.peer_id(), node(212).peer_id()],
+        [net.node.peer_id()],
+        crate::ReplicationPolicy::all().with_max_sync_peers(1),
         "right",
     );
     let (old, new) = if left.id > right.id {

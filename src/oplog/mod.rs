@@ -25,12 +25,15 @@ mod topology;
 pub(crate) use genesis::is_structural_genesis;
 pub(crate) use integrity::{Holes, Integrity};
 pub(crate) use topology::topological_ids;
-pub(crate) use topology::{subset_in, topological_subset_entries};
+pub(crate) use topology::{subset_entries_in, subset_in, topological_subset_entries};
 pub use topology::{topological, topological_subset};
 
 /// Attempts one admission job makes; storage writes on this path try once each.
 pub(crate) const MAX_ADMISSION_RETRIES: usize = 64;
 const MAX_CACHED_PROJECTIONS: usize = 4096;
+/// Estimated bytes the projection states one batch or the cache keeps may hold
+/// together, so kept states stay bounded however large the member sets are.
+const MAX_PROJECTION_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
 struct MembershipCache {
@@ -232,12 +235,22 @@ impl<S: Storage> Oplog<S> {
         self.integrity.step(read, view)
     }
 
-    /// A view of the topic and whether it is whole, both from one snapshot.
+    /// A view of the topic and whether its admitted history is whole, both from one snapshot.
+    /// A buffered op is not admitted, so its missing dependency does not count.
     pub(crate) fn whole_view(&self, topic_id: &TopicId) -> Result<Option<(TopicView, bool)>> {
         Ok(self.inspect(topic_id)?.map(|(view, integrity)| {
-            let whole = integrity.certifies(&view);
+            let whole = integrity.is_whole();
             (view, whole)
         }))
+    }
+
+    /// Whether every admitted op of the topic is usable. A buffered op that waits
+    /// for a dependency that never arrives must not hide the admitted history.
+    pub(crate) fn history_whole(&self, topic_id: &TopicId) -> Result<bool> {
+        Ok(match self.inspect(topic_id)? {
+            Some((_, integrity)) => integrity.is_whole(),
+            None => self.stateless_holes(topic_id)?.is_empty(),
+        })
     }
 
     /// The topic's integrity once its scan is complete, with the view of the

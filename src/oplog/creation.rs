@@ -216,6 +216,14 @@ impl<S: crate::oplog::Storage> Oplog<S> {
     {
         if !matches!(payload, TopicPayload::Genesis(_)) {
             self.ensure_member(&topic_id, signer.peer_id())?;
+            if self.storage.actor_tip(&topic_id, &actor_id)?.is_none()
+                && self
+                    .storage
+                    .read_snapshot(|read| read.actor_count(&topic_id))?
+                    >= crate::sync::MAX_TOPIC_ACTORS
+            {
+                return Err(Error::TopicFull);
+            }
         }
         let expected_heads = self.storage.heads(&topic_id)?;
         let expected_state = self.storage.topic_state(&topic_id)?;
@@ -228,7 +236,6 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             signed.take(),
         )?;
         let committed = (|| {
-            #[cfg(feature = "iroh")]
             op.validate_frame()?;
             self.validate_op(&op)?;
             let meta = self.meta_for(&op)?;
@@ -318,10 +325,8 @@ impl<S: crate::oplog::Storage> Oplog<S> {
     {
         let topic_id = genesis_op.signed.body.topic_id;
         let actor_id = genesis_op.signed.body.actor_id;
-        #[cfg(feature = "iroh")]
         genesis_op.validate_frame()?;
         self.validate_op(&genesis_op)?;
-        #[cfg(feature = "iroh")]
         event_op.validate_frame()?;
 
         let genesis_heads = heads_after(&expected_heads, &genesis_op);
@@ -427,8 +432,9 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         if body.actor_id != actor_id_for(body.topic_id, body.author) {
             return Err(Error::ActorAuthorMismatch);
         }
-        if matches!(body.payload, TopicPayload::Genesis(_))
-            && self.storage.topic_state(&body.topic_id)?.is_some()
+        if let TopicPayload::Genesis(genesis) = &body.payload
+            && (genesis.event_type_id.len() > crate::sync::MAX_TYPE_BYTES
+                || self.storage.topic_state(&body.topic_id)?.is_some())
         {
             return Err(Error::InvalidGenesis);
         }

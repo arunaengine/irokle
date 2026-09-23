@@ -204,7 +204,7 @@ fn clock_clears_obligation() {
         peer_id: peer,
         genesis: genesis_of(alice.storage(), &topic.id()),
         accepted: BTreeSet::new(),
-        heads: BTreeSet::new(),
+        heads: [record.meta.op_id].into(),
         clock,
         signature: None,
     };
@@ -275,7 +275,8 @@ fn rejects_future_clock() {
 
 #[test]
 fn accepts_unknown_heads() {
-    // A head we have not learned is the peer's own history, not a bad ack.
+    // A head we have not learned is the peer's own history, not a bad ack, but it
+    // may be the other side of an actor fork, so it certifies nothing yet.
     let alice = node(96);
     let ack_signer = Ed25519Signer::from_bytes(&[97; 32]);
     let peer = ack_signer.peer_id();
@@ -303,7 +304,7 @@ fn accepts_unknown_heads() {
             .storage()
             .peer_ack(&peer, &topic.id())
             .unwrap()
-            .is_some()
+            .is_none()
     );
 }
 
@@ -407,13 +408,14 @@ fn accepts_mesh_ack() {
 
     alice.apply_sync_ack(&ack).unwrap();
 
-    assert!(
-        alice
-            .storage()
-            .peer_ack(&bob.peer_id(), &topic_id)
-            .unwrap()
-            .is_some()
-    );
+    // Only the ancestry of heads Alice holds is certified, never Charlie's op.
+    let stored = alice
+        .storage()
+        .peer_ack(&bob.peer_id(), &topic_id)
+        .unwrap()
+        .unwrap();
+    assert!(local_clock.dominates(&stored.clock));
+    assert!(!stored.heads.is_empty());
 }
 
 #[test]
@@ -1272,5 +1274,121 @@ mod fjall {
                 assert!(!reopened.sync_obligations(&peer, topic).unwrap().is_empty());
             }
         }
+    }
+}
+
+/// One writer identity forks: the left store holds X at actor sequence 2, the
+/// right store Y. The right store's signed ack claims that sequence, but names
+/// the head Y the left store never admits, so it cannot prove X reached it.
+#[test]
+fn fork_ack_uncertified() {
+    let writer = Ed25519Signer::from_bytes(&[241; 32]);
+    let peer = Ed25519Signer::from_bytes(&[242; 32]);
+    let topic_id = TopicId::hash(b"fork-ack-certifies-nothing");
+    let actor = actor_id_for(topic_id, writer.peer_id());
+    let note = |text: &str| EventEnvelope::encode_event(&Note { text: text.into() }).unwrap();
+    let origin = oplog::Oplog::new();
+    let created = TopicGenesis::new(Note::TYPE_ID, [peer.peer_id()]);
+    let genesis = origin
+        .create_topic_genesis(topic_id, actor, created, &writer)
+        .unwrap();
+    let x = origin
+        .create_event_op(topic_id, actor, note("x"), &writer)
+        .unwrap();
+    let left = oplog::Oplog::new();
+    let right = oplog::Oplog::new();
+    left.receive_ops(vec![genesis.clone(), x.clone()]).unwrap();
+    right.receive_op(genesis).unwrap();
+    let y = right
+        .create_event_op(topic_id, actor, note("y"), &writer)
+        .unwrap();
+    assert!(matches!(left.receive_op(y), Err(Error::ActorFork)));
+
+    let left_sync = sync::SyncEngine::new(left.clone(), writer.peer_id());
+    let right_sync = sync::SyncEngine::new(right, peer.peer_id());
+    left_sync
+        .put_obligation(peer.peer_id(), topic_id, [x.id].into())
+        .unwrap();
+    let data = sync::SyncData {
+        topic_id,
+        ops: Vec::new(),
+    };
+    let (mut ack, _) = right_sync
+        .receive_data(writer.peer_id(), peer.peer_id(), data)
+        .unwrap();
+    ack.sign(&peer).unwrap();
+    assert_eq!(ack.clock.get(&actor), 2);
+    left_sync.apply_ack(&ack).unwrap();
+    assert!(
+        !left
+            .storage()
+            .peer_reached_op(&peer.peer_id(), &x.id)
+            .unwrap()
+    );
+    assert!(
+        left.storage()
+            .has_sync_obligations(&peer.peer_id(), &topic_id)
+            .unwrap()
+    );
+}
+
+/// A member signs acks naming only the shared genesis, or no head, while
+/// claiming the sender's later event. The claim goes beyond the held heads'
+/// ancestry, so it proves nothing and the sender keeps its work.
+#[test]
+fn heads_bound_clock() {
+    let alice = node(243);
+    let signer = Ed25519Signer::from_bytes(&[244; 32]);
+    let peer = signer.peer_id();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let genesis = genesis_of(alice.storage(), &topic.id()).unwrap();
+    let event = topic
+        .publish(Note {
+            text: "owed".into(),
+        })
+        .unwrap()
+        .meta;
+    alice
+        .storage()
+        .put_sync_obligation(
+            crate::storage::SyncObligation::clock(
+                peer,
+                topic.id(),
+                alice.storage().actor_clock(&topic.id()).unwrap(),
+            ),
+            Some(genesis),
+        )
+        .unwrap();
+    let mut clock = ActorClock::new();
+    clock.observe(event.actor_id, event.actor_seq);
+    for heads in [BTreeSet::from([genesis]), BTreeSet::new()] {
+        let mut ack = sync::SyncAck {
+            topic_id: topic.id(),
+            peer_id: peer,
+            genesis: Some(genesis),
+            accepted: BTreeSet::new(),
+            heads,
+            clock: clock.clone(),
+            signature: None,
+        };
+        ack.sign(&signer).unwrap();
+        alice.apply_sync_ack(&ack).unwrap();
+        assert!(
+            !alice
+                .storage()
+                .peer_reached_op(&peer, &event.op_id)
+                .unwrap()
+        );
+        assert!(
+            alice
+                .storage()
+                .has_sync_obligations(&peer, &topic.id())
+                .unwrap()
+        );
     }
 }

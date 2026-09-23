@@ -4,14 +4,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use crate::storage::{AdmissionEffects, AdmittedBatch, OpMeta, TopicState};
-use crate::{Error, Op, OpBody, OpId, Result, TopicId, TopicPayload, actor_id_for};
+use crate::{Error, Op, OpBody, OpId, Result, TopicControl, TopicId, TopicPayload, actor_id_for};
 
 use crate::oplog::membership::{apply_control, materialize_topic_state, merge_states};
 use crate::oplog::pending::{PendingVerdict, pending_meta_for};
 use crate::oplog::topology::topological_ops;
 use crate::oplog::{
-    Admitted, BatchOverlay, MAX_ADMISSION_RETRIES, MAX_CACHED_PROJECTIONS, MembershipCache,
-    OpAdmission, Oplog, ReceiveEffects, ResetPlan, TopicEviction, conflict_pause,
+    Admitted, BatchOverlay, MAX_ADMISSION_RETRIES, MAX_CACHED_PROJECTIONS, MAX_PROJECTION_BYTES,
+    MembershipCache, OpAdmission, Oplog, ReceiveEffects, ResetPlan, TopicEviction, conflict_pause,
     is_structural_genesis,
 };
 
@@ -182,7 +182,6 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         let mut checked = BTreeSet::new();
         for op in &ops {
             if !verified.contains(&op.id) {
-                #[cfg(feature = "iroh")]
                 op.validate_frame()?;
                 op.validate()?;
             }
@@ -324,10 +323,15 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             for id in projection_tips {
                 if let Some(state) = projections.get(&id)
                     && !cache.states.contains_key(&id)
+                    && state_bytes(state) <= MAX_PROJECTION_BYTES
                 {
-                    if cache.states.len() == MAX_CACHED_PROJECTIONS
-                        && let Some(oldest) = cache.order.pop_front()
+                    while cache.states.len() >= MAX_CACHED_PROJECTIONS
+                        || projection_bytes(cache.states.values()) + state_bytes(state)
+                            > MAX_PROJECTION_BYTES
                     {
+                        let Some(oldest) = cache.order.pop_front() else {
+                            break;
+                        };
                         cache.states.remove(&oldest);
                     }
                     cache.states.insert(id, Arc::clone(state));
@@ -411,7 +415,6 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         let mut projection_tips = BTreeSet::new();
 
         for op in ops {
-            #[cfg(feature = "iroh")]
             op.validate_frame()?;
             if !verified.contains(&op.id) {
                 op.validate()?;
@@ -580,8 +583,11 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             return Err(Error::ActorFork);
         }
         match &body.payload {
-            TopicPayload::Genesis(_) => {
-                if !is_structural_genesis(op) || state.is_some_and(|state| state.genesis != op.id) {
+            TopicPayload::Genesis(genesis) => {
+                if !is_structural_genesis(op)
+                    || genesis.event_type_id.len() > crate::sync::MAX_TYPE_BYTES
+                    || state.is_some_and(|state| state.genesis != op.id)
+                {
                     return Err(Error::InvalidGenesis);
                 }
             }
@@ -709,10 +715,11 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             }
         }
         match &body.payload {
-            TopicPayload::Genesis(_) => {
+            TopicPayload::Genesis(genesis) => {
                 if body.actor_seq != 1
                     || body.actor_prev.is_some()
                     || !body.deps.is_empty()
+                    || genesis.event_type_id.len() > crate::sync::MAX_TYPE_BYTES
                     || state.is_some()
                 {
                     return Err(Error::InvalidGenesis);
@@ -797,40 +804,84 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         overlay_meta: &BTreeMap<OpId, OpMeta>,
         projections: &mut BTreeMap<OpId, Arc<TopicState>>,
     ) -> Result<Arc<TopicState>> {
-        let mut pending = deps.iter().map(|id| (*id, false)).collect::<Vec<_>>();
-        let mut visiting = BTreeSet::new();
-        while let Some((id, visited)) = pending.pop() {
+        if let [dep] = deps.iter().collect::<Vec<_>>()[..]
+            && let Some(state) = projections.get(dep)
+        {
+            return Ok(Arc::clone(state));
+        }
+        // Each peer and the policy take their control with the greatest key, in
+        // any order, so the state at `deps` is one fold over the controls of their
+        // ancestry, down to states already known. It needs no state per ancestor.
+        let mut workspace = Workspace::new(&self.storage);
+        let mut known = BTreeSet::new();
+        let mut folded = Vec::new();
+        // What the folded controls add to a state, charged before it is built.
+        let mut grows = 0_u64;
+        let mut seen = BTreeSet::new();
+        workspace.charge(WALK_BYTES * deps.len() as u64)?;
+        let mut walk = deps.iter().copied().collect::<Vec<_>>();
+        while let Some(id) = walk.pop() {
+            if seen.contains(&id) {
+                continue;
+            }
+            workspace.charge(SEEN_BYTES)?;
+            seen.insert(id);
             if projections.contains_key(&id) {
+                known.insert(id);
                 continue;
             }
             let meta = self.meta_projected(&id, overlay_meta)?;
             if meta.topic_id != *topic_id {
                 return Err(Error::TopicMismatch);
             }
-            if !visited {
-                if !visiting.insert(id) {
-                    return Err(Error::Storage("cycle in op graph".into()));
-                }
-                pending.push((id, true));
-                pending.extend(meta.deps.iter().map(|dep| (*dep, false)));
-                continue;
-            }
+            workspace.charge(WALK_BYTES * meta.deps.len() as u64)?;
+            walk.extend(meta.deps.iter().copied());
             let op = self.op_projected(&id, overlay_ops)?;
-            let state = match &op.signed.body.payload {
-                TopicPayload::Genesis(_) => {
-                    Arc::new(materialize_topic_state(vec![op], BTreeSet::new())?)
-                }
-                TopicPayload::Event(_) => merge_states(&meta.deps, projections)?,
-                TopicPayload::Control(control) => {
-                    let mut state = (*merge_states(&meta.deps, projections)?).clone();
-                    apply_control(&mut state, &op, control);
-                    Arc::new(state)
-                }
-            };
-            visiting.remove(&id);
-            projections.insert(id, state);
+            if !matches!(op.signed.body.payload, TopicPayload::Event(_)) {
+                // The op, the vector growth around it, and its share of the state.
+                workspace.charge(3 * crate::storage::pending_op_bytes(&op)? as u64)?;
+                grows = grows.saturating_add(fold_bytes(&op));
+                folded.push(op);
+            }
         }
-        merge_states(deps, projections)
+        let state = if known.is_empty() {
+            // Materializing copies the genesis peers besides the state it returns.
+            workspace.charge(STATE_BASE_BYTES + 2 * grows)?;
+            Arc::new(materialize_topic_state(folded, BTreeSet::new())?)
+        } else {
+            let merged = known
+                .iter()
+                .filter_map(|id| projections.get(id))
+                .map(|state| state_bytes(state) as u64)
+                .sum::<u64>();
+            workspace.charge(merged.saturating_add(grows))?;
+            let mut state = merge_states(&known, projections)?;
+            for op in &folded {
+                match &op.signed.body.payload {
+                    TopicPayload::Genesis(_) if op.id != state.genesis => {
+                        return Err(Error::InvalidGenesis);
+                    }
+                    TopicPayload::Control(control) => {
+                        apply_control(Arc::make_mut(&mut state), op, control);
+                    }
+                    TopicPayload::Genesis(_) | TopicPayload::Event(_) => {}
+                }
+            }
+            state
+        };
+        // Only the state of one dependency is kept, replacing the known states it
+        // covers, and only within the byte budget, so a batch of late ops cannot
+        // hold one large state per historical control.
+        if let [dep] = deps.iter().collect::<Vec<_>>()[..] {
+            for id in &known {
+                projections.remove(id);
+            }
+            if projection_bytes(projections.values()) + state_bytes(&state) <= MAX_PROJECTION_BYTES
+            {
+                projections.insert(*dep, Arc::clone(&state));
+            }
+        }
+        Ok(state)
     }
 
     fn meta_projected<'a>(
@@ -987,6 +1038,98 @@ pub(super) fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
     }
 }
 
+/// Bytes a queued id and a seen id cost a projection walk, with vector growth and
+/// B-tree nodes at their lowest occupancy.
+const WALK_BYTES: u64 = 64;
+const SEEN_BYTES: u64 = 80;
+/// Bytes a projection charges its store at once.
+const HOLD_BYTES: u64 = 64 * 1024;
+/// Projection workspace any store allows, so a store without a memory budget
+/// still refuses a projection past it.
+const MAX_WORKSPACE_BYTES: u64 = 256 * 1024 * 1024;
+/// Upper bounds of one entry of a peer set and of the membership controls, with
+/// B-tree nodes at their lowest occupancy, and of a state's fixed part.
+const PEER_BYTES: u64 = 72;
+const CONTROL_BYTES: u64 = 264;
+const STATE_BASE_BYTES: u64 = 512;
+
+/// Memory a projected state holds: members, controls, both policy peer sets and
+/// the event type id, each at its upper bound.
+pub(super) fn state_bytes(state: &TopicState) -> usize {
+    let peers = state.members.len()
+        + state.replication_policy.selected_peers.len()
+        + state
+            .replication_policy_control
+            .as_ref()
+            .map_or(0, |(_, policy)| policy.selected_peers.len());
+    (STATE_BASE_BYTES
+        + state.event_type_id.len() as u64
+        + PEER_BYTES * peers as u64
+        + CONTROL_BYTES * state.membership_controls.len() as u64) as usize
+}
+
+/// Memory folding `op` can add to a state, at the same upper bounds.
+fn fold_bytes(op: &Op) -> u64 {
+    match &op.signed.body.payload {
+        TopicPayload::Genesis(genesis) => {
+            genesis.event_type_id.len() as u64
+                + PEER_BYTES
+                    * (genesis.initial_peers.len()
+                        + 2 * genesis.replication_policy.selected_peers.len())
+                        as u64
+        }
+        TopicPayload::Control(TopicControl::SetReplicationPolicy { policy }) => {
+            2 * PEER_BYTES * policy.selected_peers.len() as u64
+        }
+        TopicPayload::Control(TopicControl::AddPeer { .. } | TopicControl::RemovePeer { .. }) => {
+            CONTROL_BYTES + PEER_BYTES
+        }
+        TopicPayload::Event(_) => 0,
+    }
+}
+
+/// Memory `states` hold together; a shared state is counted each time.
+pub(super) fn projection_bytes<'a>(states: impl Iterator<Item = &'a Arc<TopicState>>) -> usize {
+    states.map(|state| state_bytes(state)).sum()
+}
+
+/// Temporary projection memory charged to the store in steps, released on drop.
+struct Workspace<'a, S> {
+    storage: &'a S,
+    holds: Vec<crate::storage::WorkspaceHold>,
+    held: u64,
+    used: u64,
+}
+
+impl<'a, S: crate::oplog::Storage> Workspace<'a, S> {
+    fn new(storage: &'a S) -> Self {
+        Self {
+            storage,
+            holds: Vec::new(),
+            held: 0,
+            used: 0,
+        }
+    }
+
+    /// Account `bytes` more, refusing once the store's budget or the projection
+    /// limit is exhausted.
+    fn charge(&mut self, bytes: u64) -> Result<()> {
+        self.used = self.used.saturating_add(bytes);
+        if self.used > MAX_WORKSPACE_BYTES {
+            return Err(Error::MemoryPressure {
+                domain: crate::storage::MemoryDomain::Workspace,
+                required: self.used,
+                limit: MAX_WORKSPACE_BYTES,
+            });
+        }
+        while self.used > self.held {
+            self.holds.push(self.storage.hold_workspace(HOLD_BYTES)?);
+            self.held += HOLD_BYTES;
+        }
+        Ok(())
+    }
+}
+
 /// Failures a concurrent commit can cause by moving topic state mid-attempt.
 /// Retry only when state moved: for a locally built op these failures imply it,
 /// while a received batch must check that its topic heads changed.
@@ -1003,4 +1146,157 @@ pub(super) fn is_admission_race(err: &Error) -> bool {
             | Error::InvalidOpId
             | Error::GenerationMismatch { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::oplog::Oplog;
+    use crate::oplog::admission::{projection_bytes, state_bytes};
+    use crate::storage::{MemoryLimits, MemoryStorage, Storage};
+    use crate::{
+        Ed25519Signer, Error, EventEnvelope, Op, OpBody, PeerId, ReplicationPolicy, Signer,
+        TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
+    };
+
+    /// A topic of `writers` plus 4,096 other initial peers and one policy
+    /// control per writer, with each writer's first event depending on its own
+    /// historical control, so every event needs a different cold projection.
+    fn late_writes(writers: u8) -> (Oplog, TopicId, Vec<Op>) {
+        let owner = Ed25519Signer::from_bytes(&[62; 32]);
+        let signers = (0..writers)
+            .map(|index| Ed25519Signer::from_bytes(&[index.wrapping_add(100); 32]))
+            .collect::<Vec<_>>();
+        let topic = TopicId::hash(b"late-writes");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let peers = (0..4096_u32)
+            .map(|index| PeerId::hash(index.to_le_bytes()))
+            .chain(signers.iter().map(Signer::peer_id));
+        let source = Oplog::new();
+        let genesis = source
+            .create_topic_genesis(topic, actor, TopicGenesis::new("test.note", peers), &owner)
+            .unwrap();
+        let mut ops = vec![genesis];
+        let mut events = Vec::new();
+        for (index, signer) in signers.iter().enumerate() {
+            let policy = ReplicationPolicy::all().with_max_sync_peers(index + 1);
+            let control = source
+                .create_control_op(
+                    topic,
+                    actor,
+                    TopicControl::SetReplicationPolicy { policy },
+                    &owner,
+                )
+                .unwrap();
+            let body = OpBody {
+                topic_id: topic,
+                author: signer.peer_id(),
+                actor_id: actor_id_for(topic, signer.peer_id()),
+                actor_seq: 1,
+                actor_prev: None,
+                deps: [control.id].into(),
+                generation: control.signed.body.generation + 1,
+                payload: TopicPayload::Event(EventEnvelope {
+                    type_id: "test.note".into(),
+                    payload: vec![0].into(),
+                }),
+            };
+            events.push(Op::sign(body, signer).unwrap());
+            ops.push(control);
+        }
+        ops.extend(events);
+        (source, topic, ops)
+    }
+
+    /// Late first writes that each need a projection holding 4,096 initial
+    /// peers keep the long-lived cache within its byte budget, members counted.
+    #[test]
+    fn cache_counts_members() {
+        let (_, _, ops) = late_writes(100);
+        let log = Oplog::new();
+        for op in ops {
+            log.receive_op(op).unwrap();
+        }
+        let cache = log.membership_cache().unwrap();
+        assert!(!cache.states.is_empty());
+        assert!(
+            cache
+                .states
+                .values()
+                .all(|state| state_bytes(state) > 4096 * 48)
+        );
+        assert!(projection_bytes(cache.states.values()) <= crate::oplog::MAX_PROJECTION_BYTES);
+    }
+
+    /// A cold projection charges its walk to the store's workspace budget, so a
+    /// budget too small for it refuses the op instead of allocating past it.
+    #[test]
+    fn projection_charges_workspace() {
+        // The first writer's event depends on a control that is no longer a head.
+        let (_, _, ops) = late_writes(2);
+        let limits = MemoryLimits {
+            workspace_bytes: 128 * 1024,
+            ..MemoryLimits::default()
+        };
+        let storage = MemoryStorage::new().with_memory_limits(limits).unwrap();
+        let log = Oplog::with_storage(storage);
+        let (history, event) = (&ops[..3], &ops[3]);
+        log.receive_ops(history.to_vec()).unwrap();
+        assert!(matches!(
+            log.receive_op(event.clone()),
+            Err(Error::MemoryPressure { .. })
+        ));
+        assert!(log.storage().get_op(&event.id).unwrap().is_none());
+        Oplog::new().receive_ops(ops).unwrap();
+    }
+
+    /// A cold projection over a long control chain keeps only the state it
+    /// was asked for, not one growing state per historical control.
+    #[test]
+    fn projection_drops_ancestors() {
+        let owner = Ed25519Signer::from_bytes(&[61; 32]);
+        let topic = TopicId::hash(b"projection-drops-ancestors");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let log = Oplog::new();
+        log.create_topic_genesis(topic, actor, TopicGenesis::new("test.note", []), &owner)
+            .unwrap();
+        let controls = (0..200_u32)
+            .map(|index| {
+                let peer = PeerId::hash(index.to_le_bytes());
+                log.create_control_op(topic, actor, TopicControl::AddPeer { peer }, &owner)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let target = BTreeSet::from([controls[149].id]);
+        let mut projections = BTreeMap::new();
+        let state = log
+            .project_membership(
+                &topic,
+                &target,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &mut projections,
+            )
+            .unwrap();
+        assert_eq!(state.members.len(), 151);
+        assert!(state.members.contains(&PeerId::hash(149_u32.to_le_bytes())));
+        assert!(!state.members.contains(&PeerId::hash(150_u32.to_le_bytes())));
+        assert_eq!(projections.keys().collect::<Vec<_>>(), [&controls[149].id]);
+
+        // A dependency on every control, as a wide join, folds into one state too.
+        let wide = controls.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+        let mut projections = BTreeMap::new();
+        let state = log
+            .project_membership(
+                &topic,
+                &wide,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &mut projections,
+            )
+            .unwrap();
+        assert_eq!(state.members.len(), 201);
+        assert!(projections.is_empty());
+    }
 }

@@ -221,6 +221,71 @@ fn retains_unproven_author() {
     );
 }
 
+/// A removed member's buffered op behind a dependency that never arrives keeps
+/// its dependency unresolved, but neither hides the admitted history nor empties the ack.
+#[test]
+fn orphan_keeps_history() {
+    let m = members(234);
+    let topic = m.alice.open_topic::<Note>(m.topic_id).unwrap();
+    topic
+        .publish(Note {
+            text: "kept".into(),
+        })
+        .unwrap();
+    topic.remove_peer(m.bob.peer_id()).unwrap();
+    let missing = OpId::hash(b"never stored");
+    let orphan = Op::sign(
+        OpBody {
+            topic_id: m.topic_id,
+            author: m.bob.peer_id(),
+            actor_id: actor_id_for(m.topic_id, m.bob.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [missing].into(),
+            generation: 1,
+            payload: TopicPayload::Event(
+                EventEnvelope::encode_event(&Note {
+                    text: "orphan".into(),
+                })
+                .unwrap(),
+            ),
+        },
+        &m.bob,
+    )
+    .unwrap();
+    let data = sync::SyncData {
+        topic_id: m.topic_id,
+        ops: vec![orphan.clone()],
+    };
+    let (ack, _) = m
+        .alice
+        .receive_sync_data_from(m.bob.peer_id(), data)
+        .unwrap();
+
+    assert!(buffered(m.alice.storage(), &m.topic_id, &orphan));
+    assert_eq!(
+        m.alice.topic_unresolved(m.topic_id).unwrap(),
+        [missing].into()
+    );
+    assert_eq!(ack.heads, topic.heads().unwrap());
+    assert_eq!(ack.clock, topic.actor_clock().unwrap());
+    let history = topic
+        .history(crate::history::HistoryOrder::OldestFirst)
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].event.text, "kept");
+    let after = topic
+        .history_after(
+            &crate::history::HistoryCursor {
+                genesis: m.genesis.id,
+                clock: ActorClock::new(),
+            },
+            crate::history::HistoryOrder::OldestFirst,
+        )
+        .unwrap();
+    assert_eq!(after.len(), 1);
+}
+
 /// Buffered ops of `count` distinct authors waiting on one missing op of
 /// `topic_id`, each charged to `source`.
 fn fill_waiters<S: Storage>(storage: &S, m: &Members, source: PeerId, count: u8, seed: u8) {
@@ -799,6 +864,50 @@ fn memory_retained_drain() {
     assert_retained_drain(MemoryStorage::new());
 }
 
+/// A buffered op behind a dependency that never arrives, and its own waiter,
+/// expire once they waited longer than the limit since the first sweep saw
+/// them. Admitted records stay, and nothing is left unresolved.
+fn assert_pending_expires<S: Storage>(storage: S) {
+    let m = members(236);
+    let log = Oplog::with_storage(storage.clone());
+    let source = Some(m.alice.peer_id());
+    log.receive_ops_from_peer(source, vec![m.genesis.clone()])
+        .unwrap();
+    let missing = event_op(&m.bob, m.topic_id, 1, None, &[&m.genesis], "missing");
+    let waiting = event_op(
+        &m.bob,
+        m.topic_id,
+        2,
+        Some(&missing),
+        &[&missing],
+        "waiting",
+    );
+    let behind = event_op(&m.carol, m.topic_id, 1, None, &[&waiting], "behind");
+    log.receive_ops_from_peer(source, vec![waiting.clone(), behind.clone()])
+        .unwrap();
+    assert!(storage.is_pending(&waiting.id).unwrap());
+    assert!(storage.is_pending(&behind.id).unwrap());
+
+    assert_eq!(storage.expire_pending(1_000, 100).unwrap(), 0);
+    assert_eq!(storage.expire_pending(1_100, 100).unwrap(), 0);
+    assert_eq!(storage.expire_pending(1_101, 100).unwrap(), 2);
+    assert!(!storage.is_pending(&waiting.id).unwrap());
+    assert!(!storage.is_pending(&behind.id).unwrap());
+    assert!(log.topic_unresolved(&m.topic_id).unwrap().is_empty());
+    assert!(storage.get_op(&m.genesis.id).unwrap().is_some());
+
+    // An op buffered later is timed from the sweep that first sees it.
+    log.receive_ops_from_peer(source, vec![waiting.clone()])
+        .unwrap();
+    assert_eq!(storage.expire_pending(5_000, 100).unwrap(), 0);
+    assert!(storage.is_pending(&waiting.id).unwrap());
+}
+
+#[test]
+fn memory_pending_expires() {
+    assert_pending_expires(MemoryStorage::new());
+}
+
 #[cfg(feature = "fjall")]
 mod fjall {
     use crate::tests::pending::*;
@@ -845,6 +954,12 @@ mod fjall {
     fn drains_complete() {
         let dir = tempfile::tempdir().unwrap();
         assert_drains_complete(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn pending_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_pending_expires(crate::storage::FjallStorage::open(dir.path()).unwrap());
     }
 
     #[test]

@@ -139,6 +139,13 @@ const SEALED_TOPIC_PREFIX: &[u8] = b"se";
 const SCHEMA_VERSION_KEY: &[u8] = b"sv";
 /// Where an unfinished schema 2 upgrade continues, see [`ClockMigration`].
 const CLOCK_MIGRATION: &[u8] = b"sm";
+/// Keys and values read as stored, for the schema 1 upgrade.
+type RawRecords = Vec<(Vec<u8>, Vec<u8>)>;
+/// The phase an unfinished schema 1 upgrade continues in, one `u8`.
+const LEGACY_PHASE: &[u8] = b"sq";
+/// Converted acks and obligations wait under `zm<key>` until every legacy record
+/// is read, since schema 1 and 2 records share key prefixes.
+const CONVERTED_PREFIX: &[u8] = b"zm";
 /// Metadata records one step of the schema 2 upgrade rewrites at most.
 const MIGRATION_RECORDS: usize = 1024;
 /// Observed clock entries one step of the schema 2 upgrade reads at most,
@@ -378,7 +385,11 @@ impl FjallStorage {
         match self.get::<u32>(SCHEMA_VERSION_KEY)? {
             Some(FJALL_SCHEMA_VERSION) => self.finish_clock_migration(steps),
             Some(1) => {
-                self.migrate_schema_two()?;
+                let mut steps = steps;
+                self.migrate_schema_two(&mut steps)?;
+                if self.get::<u32>(SCHEMA_VERSION_KEY)? != Some(FJALL_SCHEMA_VERSION) {
+                    return Ok(());
+                }
                 self.finish_clock_migration(steps)
             }
             Some(version) => Err(Error::Storage(format!(
@@ -388,115 +399,196 @@ impl FjallStorage {
         }
     }
 
-    /// Upgrade schema 1 in one transaction that rechecks the version; after a
-    /// crash the store is at schema 1 or 2, never between. Acks certify nothing
-    /// until renewed, and pending ops and obligations take their current shape.
-    fn migrate_schema_two(&self) -> Result<()> {
-        self.transaction(|tx| {
-            // A concurrent facade may have finished the upgrade already.
-            if Self::tx_get::<u32>(tx, &self.records, SCHEMA_VERSION_KEY)? != Some(1) {
-                return Ok(());
-            }
-            let mut acks = Vec::new();
-            for item in fjall::Readable::prefix(tx, &self.records, PEER_ACK_PREFIX) {
-                let (key, value) = item.into_inner()?;
-                let legacy: LegacyPeerAck = postcard::from_bytes(value.as_ref())?;
-                acks.push((
-                    key.to_vec(),
-                    PeerAck {
-                        peer_id: legacy.peer_id,
-                        topic_id: legacy.topic_id,
-                        genesis: None,
-                        heads: legacy.heads,
-                        clock: legacy.clock,
-                    },
-                ));
-            }
-            for (key, _) in &acks {
-                tx.remove(&self.records, key)?;
-            }
-            for (_, ack) in acks {
-                Self::tx_put(
-                    tx,
-                    &self.records,
-                    Self::ack_key(&ack.topic_id, &ack.peer_id),
-                    &ack,
-                )?;
-            }
-
-            let mut obligations = BTreeMap::<Vec<u8>, SyncObligation>::new();
-            let mut legacy_keys = Vec::new();
-            for item in fjall::Readable::prefix(tx, &self.records, OBLIGATION_PREFIX) {
-                let (key, value) = item.into_inner()?;
-                if Self::is_op_key(key.as_ref()) {
-                    continue;
-                }
-                legacy_keys.push(key.to_vec());
-                let legacy: LegacyObligation = postcard::from_bytes(value.as_ref())?;
-                let obligation = if !legacy.target_clock.is_empty() {
-                    SyncObligation::clock(legacy.peer_id, legacy.topic_id, legacy.target_clock)
-                } else if !legacy.op_ids.is_empty() {
-                    SyncObligation::repair(legacy.peer_id, legacy.topic_id, legacy.op_ids)
-                } else {
-                    continue;
-                };
-                // Legacy wants are kept whole even past the repair limit.
-                let key = Self::obligation_key(&obligation);
-                let merged = match (obligations.remove(&key), &obligation.target) {
-                    (Some(mut stored), ObligationTarget::Repair(ids)) => {
-                        if let ObligationTarget::Repair(stored_ids) = &mut stored.target {
-                            stored_ids.extend(ids.iter().copied());
-                        }
-                        stored
-                    }
-                    (stored, _) => merged_obligation(stored, &obligation)?,
-                };
-                obligations.insert(key, merged);
-            }
-            for key in legacy_keys {
-                tx.remove(&self.records, key)?;
-            }
-            for (key, obligation) in obligations {
-                Self::tx_put(tx, &self.records, key, &obligation)?;
-            }
-
-            let mut legacy = Vec::new();
-            for item in fjall::Readable::prefix(tx, &self.records, PENDING_OP_PREFIX) {
-                let (key, value) = item.into_inner()?;
-                if key.len() == PENDING_OP_PREFIX.len() + OpId::LEN {
-                    legacy.push(postcard::from_bytes::<(PeerId, Op, OpMeta)>(
-                        value.as_ref(),
-                    )?);
-                }
-            }
-            for prefix in [PENDING_OP_PREFIX, b"pn", b"ps", b"pw", b"wn"] {
-                Self::tx_remove_prefix(tx, &self.records, prefix)?;
-            }
-            for (source_peer, op, meta) in legacy {
-                let mut missing = BTreeSet::new();
-                for dep in meta.missing_deps {
-                    if !fjall::Readable::contains_key(tx, &self.records, Self::key_id(b"o", &dep))?
-                        || !fjall::Readable::contains_key(
-                            tx,
-                            &self.records,
-                            Self::key_id(b"m", &dep),
-                        )?
-                    {
-                        missing.insert(dep);
+    /// Upgrade schema 1 in at most `steps` bounded transactions that each recheck
+    /// version and phase, so a crash resumes where it stopped. Acks certify
+    /// nothing until renewed; pending ops and obligations take their current shape.
+    fn migrate_schema_two(&self, steps: &mut usize) -> Result<()> {
+        let mut limit = MIGRATION_RECORDS;
+        while *steps > 0 {
+            match self.transaction(|tx| self.tx_legacy_step(tx, limit)) {
+                Err(Error::StorageBuffer { .. }) if limit > 1 => limit = limit.div_ceil(2),
+                result => {
+                    *steps -= 1;
+                    if !result? {
+                        return Ok(());
                     }
                 }
-                Self::tx_import_pending(tx, &self.records, source_peer, &op, missing)?;
             }
+        }
+        Ok(())
+    }
 
-            Self::tx_put(
-                tx,
-                &self.records,
-                CLOCK_MIGRATION,
-                &ClockMigration::default(),
-            )?;
-            Self::tx_put(tx, &self.records, SCHEMA_VERSION_KEY, &FJALL_SCHEMA_VERSION)?;
-            Ok(())
-        })
+    /// One step of the schema 1 upgrade. False once the store is at schema 2.
+    fn tx_legacy_step(&self, tx: &mut Transaction, limit: usize) -> Result<bool> {
+        // A concurrent facade may have finished the upgrade already.
+        if Self::tx_get::<u32>(tx, &self.records, SCHEMA_VERSION_KEY)? != Some(1) {
+            return Ok(false);
+        }
+        // Finished phases continue in the same transaction, so a small store
+        // upgrades at once, and a refused record there leaves it unchanged.
+        let first = Self::tx_get::<u8>(tx, &self.records, LEGACY_PHASE)?.unwrap_or_default();
+        for phase in first..=4 {
+            let finished = match phase {
+                0 => self.tx_legacy_acks(tx, limit)?,
+                1 => self.tx_legacy_obligations(tx, limit)?,
+                2 => self.tx_legacy_indexes(tx, limit)?,
+                3 => self.tx_legacy_pending(tx, limit)?,
+                4 => self.tx_place_converted(tx, limit)?,
+                _ => {
+                    return Err(Error::Storage(format!(
+                        "unknown schema 1 upgrade phase {phase}"
+                    )));
+                }
+            };
+            if !finished {
+                if phase != first {
+                    Self::tx_put(tx, &self.records, LEGACY_PHASE, &phase)?;
+                }
+                return Ok(true);
+            }
+        }
+        if first > 4 {
+            return Err(Error::Storage(format!(
+                "unknown schema 1 upgrade phase {first}"
+            )));
+        }
+        tx.remove(&self.records, LEGACY_PHASE)?;
+        Self::tx_put(
+            tx,
+            &self.records,
+            CLOCK_MIGRATION,
+            &ClockMigration::default(),
+        )?;
+        Self::tx_put(tx, &self.records, SCHEMA_VERSION_KEY, &FJALL_SCHEMA_VERSION)?;
+        Ok(false)
+    }
+
+    /// Up to `limit` records under `prefix` accepted by `keep`, and whether that was all.
+    fn tx_legacy_items(
+        tx: &Transaction,
+        records: &fjall::OptimisticTxKeyspace,
+        prefix: &[u8],
+        limit: usize,
+        keep: impl Fn(&[u8]) -> bool,
+    ) -> Result<(RawRecords, bool)> {
+        let mut items = Vec::new();
+        for item in fjall::Readable::prefix(tx, records, prefix) {
+            let (key, value) = item.into_inner()?;
+            if !keep(key.as_ref()) {
+                continue;
+            }
+            if items.len() == limit {
+                return Ok((items, false));
+            }
+            items.push((key.to_vec(), value.to_vec()));
+        }
+        Ok((items, true))
+    }
+
+    fn converted_key(key: &[u8]) -> Vec<u8> {
+        [CONVERTED_PREFIX, key].concat()
+    }
+
+    fn tx_legacy_acks(&self, tx: &mut Transaction, limit: usize) -> Result<bool> {
+        let (items, finished) =
+            Self::tx_legacy_items(tx, &self.records, PEER_ACK_PREFIX, limit, |_| true)?;
+        for (key, value) in items {
+            let legacy: LegacyPeerAck = postcard::from_bytes(&value)?;
+            tx.remove(&self.records, key)?;
+            let ack = PeerAck {
+                peer_id: legacy.peer_id,
+                topic_id: legacy.topic_id,
+                genesis: None,
+                heads: legacy.heads,
+                clock: legacy.clock,
+            };
+            let key = Self::converted_key(&Self::ack_key(&ack.topic_id, &ack.peer_id));
+            Self::tx_put(tx, &self.records, key, &ack)?;
+        }
+        Ok(finished)
+    }
+
+    fn tx_legacy_obligations(&self, tx: &mut Transaction, limit: usize) -> Result<bool> {
+        let (items, finished) =
+            Self::tx_legacy_items(tx, &self.records, OBLIGATION_PREFIX, limit, |key| {
+                !Self::is_op_key(key)
+            })?;
+        for (key, value) in items {
+            tx.remove(&self.records, key)?;
+            let legacy: LegacyObligation = postcard::from_bytes(&value)?;
+            let obligation = if !legacy.target_clock.is_empty() {
+                SyncObligation::clock(legacy.peer_id, legacy.topic_id, legacy.target_clock)
+            } else if !legacy.op_ids.is_empty() {
+                SyncObligation::repair(legacy.peer_id, legacy.topic_id, legacy.op_ids)
+            } else {
+                continue;
+            };
+            // Legacy wants are kept whole even past the repair limit.
+            let key = Self::converted_key(&Self::obligation_key(&obligation));
+            let stored = Self::tx_get::<SyncObligation>(tx, &self.records, key.as_slice())?;
+            let merged = match (stored, &obligation.target) {
+                (Some(mut stored), ObligationTarget::Repair(ids)) => {
+                    if let ObligationTarget::Repair(stored_ids) = &mut stored.target {
+                        stored_ids.extend(ids.iter().copied());
+                    }
+                    stored
+                }
+                (stored, _) => merged_obligation(stored, &obligation)?,
+            };
+            Self::tx_put(tx, &self.records, key, &merged)?;
+        }
+        Ok(finished)
+    }
+
+    /// Remove the schema 1 pending indexes before any pending op is imported,
+    /// since their prefixes hold schema 2 records afterwards.
+    fn tx_legacy_indexes(&self, tx: &mut Transaction, limit: usize) -> Result<bool> {
+        let mut left = limit;
+        for prefix in [b"pn".as_slice(), b"ps", b"pw", b"wn"] {
+            let (items, finished) =
+                Self::tx_legacy_items(tx, &self.records, prefix, left, |_| true)?;
+            left -= items.len();
+            for (key, _) in items {
+                tx.remove(&self.records, key)?;
+            }
+            if !finished {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn tx_legacy_pending(&self, tx: &mut Transaction, limit: usize) -> Result<bool> {
+        let (items, finished) =
+            Self::tx_legacy_items(tx, &self.records, PENDING_OP_PREFIX, limit, |_| true)?;
+        for (key, value) in items {
+            tx.remove(&self.records, key.as_slice())?;
+            if key.len() != PENDING_OP_PREFIX.len() + OpId::LEN {
+                continue;
+            }
+            let (source_peer, op, meta) = postcard::from_bytes::<(PeerId, Op, OpMeta)>(&value)?;
+            let mut missing = BTreeSet::new();
+            for dep in meta.missing_deps {
+                if !fjall::Readable::contains_key(tx, &self.records, Self::key_id(b"o", &dep))?
+                    || !fjall::Readable::contains_key(tx, &self.records, Self::key_id(b"m", &dep))?
+                {
+                    missing.insert(dep);
+                }
+            }
+            Self::tx_import_pending(tx, &self.records, source_peer, &op, missing)?;
+        }
+        Ok(finished)
+    }
+
+    /// Move converted acks and obligations to their schema 2 keys.
+    fn tx_place_converted(&self, tx: &mut Transaction, limit: usize) -> Result<bool> {
+        let (items, finished) =
+            Self::tx_legacy_items(tx, &self.records, CONVERTED_PREFIX, limit, |_| true)?;
+        for (key, value) in items {
+            tx.remove(&self.records, key.as_slice())?;
+            tx.insert(&self.records, &key[CONVERTED_PREFIX.len()..], value)?;
+        }
+        Ok(finished)
     }
 
     /// Run up to `steps` of the metadata rewrite steps a schema 2 upgrade has left.
@@ -1751,7 +1843,14 @@ impl Storage for FjallStorage {
                     charge,
                 )?;
             }
-            Self::tx_put_pending(tx, &self.records, source_peer, &op, &meta, charge)
+            Self::tx_put_pending(
+                tx,
+                &self.records,
+                source_peer,
+                &op,
+                &meta.missing_deps,
+                charge,
+            )
         })
     }
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>> {
@@ -1763,8 +1862,14 @@ impl Storage for FjallStorage {
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         Self::read_pending_missing(&self.snapshot()?, &self.records, topic_id)
     }
+    fn is_pending(&self, op_id: &OpId) -> Result<bool> {
+        Ok(Self::tx_pending_record(&self.snapshot()?, &self.records, op_id)?.is_some())
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         self.transaction(|tx| Self::tx_remove_pending(tx, &self.records, op_id))
+    }
+    fn expire_pending(&self, now_ms: u64, max_idle_ms: u64) -> Result<usize> {
+        self.expire_pending_ops(now_ms, max_idle_ms)
     }
     fn purge_pending_waiters(&self, dep_id: &OpId) -> Result<usize> {
         self.transaction(|tx| Self::tx_purge_waiters(tx, &self.records, dep_id))

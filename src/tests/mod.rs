@@ -20,6 +20,7 @@ mod exchange;
 mod fallback;
 #[cfg(feature = "iroh")]
 mod genesis;
+mod history;
 mod holes;
 mod integrated;
 #[cfg(feature = "iroh")]

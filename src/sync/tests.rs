@@ -3,7 +3,7 @@
 //! traversal, and completion covers repair bodies and the requested forward goal together.
 
 use crate::sync::*;
-use crate::tests::support::{Note, StaleReadStorage, forked_side};
+use crate::tests::support::{Note, StaleReadStorage, forked_policy, forked_side};
 use crate::{
     Ed25519Signer, Event, EventEnvelope, MemoryStorage, Signer, TopicControl, TopicGenesis,
     actor_id_for,
@@ -147,11 +147,12 @@ fn reset_reauthorizes<S: Storage>(store: S) {
     for informed in [false, true] {
         let topic = TopicId::hash([b"capture-reset".as_slice(), &[u8::from(informed)]].concat());
         let (_, _, a, ae) = forked_side(MemoryStorage::new(), topic, 190, [peer], "a");
-        let (_, _, b, be) = forked_side(
+        let (_, _, b, be) = forked_policy(
             MemoryStorage::new(),
             topic,
             190,
-            [peer, Ed25519Signer::from_bytes(&[192; 32]).peer_id()],
+            [peer],
+            crate::ReplicationPolicy::all().with_max_sync_peers(1),
             "b",
         );
         let (old, new) = if a.id > b.id {

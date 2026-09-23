@@ -42,6 +42,15 @@ const ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/2";
 /// window and names the positions a page needed. Older peers are refused before any message.
 pub const SYNC_PROTOCOL: &str = "irokle/sync/2";
 
+/// Actors a topic may hold before a member's first write is refused. A summary of
+/// up to [`SUMMARY_ACTORS`] fits one frame, which leaves room for concurrent first
+/// writes: admission cannot refuse them without depending on arrival order.
+pub const MAX_TOPIC_ACTORS: usize = 90_000;
+/// Actors whose clock entries, tips and heads one summary frame always holds.
+pub const SUMMARY_ACTORS: usize = 100_000;
+/// Longest event type id a genesis may name, so it cannot crowd a summary out of its frame.
+pub const MAX_TYPE_BYTES: usize = 1024;
+
 /// Maximum sequences a single `ActorRangeHint` may span. Hints built by `request_ranges` stay
 /// within it, and every response clamps peer hints to it, so a malicious peer cannot make us
 /// walk unbounded sequence ranges.

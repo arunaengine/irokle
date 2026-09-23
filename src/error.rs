@@ -47,6 +47,11 @@ pub enum Error {
     #[error("topic not found")]
     TopicNotFound,
 
+    /// The topic holds [`crate::sync::MAX_TOPIC_ACTORS`] actors, so a new writer
+    /// would make its sync summary too large for one frame.
+    #[error("topic holds the most actors a sync summary can carry")]
+    TopicFull,
+
     #[error("peer is not a member of topic")]
     NotTopicMember,
 
@@ -65,7 +70,6 @@ pub enum Error {
     #[error("async replication requires a configured transport")]
     ReplicationUnavailable,
 
-    #[cfg(feature = "iroh")]
     #[error("operation exceeds sync frame size limit")]
     OpTooLarge,
 

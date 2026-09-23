@@ -67,6 +67,23 @@ A member can discover received topics through `list_topics()` and open one with 
 
 Membership decisions are causal. Events remain valid only when their authors were members at the operation's position in the DAG, and receiving data does not bypass those checks.
 
+## Trust And Consistency Model
+
+These are the guarantees and limits applications should design around.
+
+- Every member is an administrator. Any member can add or remove peers and change the replication policy. `Irokle::seal_topic` blocks genesis resets on a node.
+- A smaller genesis replaces the current one only if it names exactly the same initial peers, its author among them. This covers two nodes creating one topic at once. Every genesis in a chain shares that set, so every replica makes the same choice whatever order records arrive in, and a reset cannot change who the initial members are. The discarded payloads are reported as `TopicEviction`s.
+- Revocation is causal. A removed peer's operation stays valid when its dependencies come before the removal. Removal does not delete data the peer already holds, and former members can still see topic summaries.
+- Two members that remove each other concurrently keep different views of each other. Other members see both removals and agree. Irokle does not reconcile the two removed peers automatically.
+- One secret key must drive one store. If a writer identity signs two different operations at one actor position, replicas keep whichever arrived first and refuse the other. Acknowledgements then certify only the ancestry of the heads the receiving node holds, so a fork never marks an absent operation as delivered.
+- History order is deterministic for one set of operations. It is not append-stable: a late concurrent operation can sort before events a consumer already processed. Reducers must commute or rebuild their projection.
+
+Read history incrementally with `Topic::history_page`. It reads one snapshot, only visits operations after the cursor, and returns the `HistoryCursor` that covers exactly the returned page. A cursor from a replaced genesis fails with `Error::StaleIncarnation`, and the consumer rebuilds from `Topic::history`. `Topic::history_entries` decodes each event on its own, so one undecodable payload is reported with its operation id instead of failing the whole read.
+
+Buffered operations that wait for missing dependencies expire after `storage::PENDING_IDLE_MS`. They were never admitted or acknowledged, so a later sync can send them again. The Iroh sweep runs this expiry, and other transports call `Irokle::expire_pending`.
+
+A sync summary always fits one frame for up to `sync::SUMMARY_ACTORS` writers, and event type ids are limited to `sync::MAX_TYPE_BYTES`. A node refuses a new writer's first operation once a topic holds `sync::MAX_TOPIC_ACTORS` writers. Received operations are not refused this way, since that would depend on arrival order. The gap between the two limits leaves room for writers that start concurrently on other nodes. Only more than that many concurrent new writers near the limit can make a summary too large to send. Every build refuses an operation too large for one sync frame.
+
 ## Joining A Topic
 
 Data for an unknown topic is staged separately from visible topic state. It becomes visible only when the staged history contains the topic genesis and proves that both the receiver and sender are members.
@@ -149,7 +166,13 @@ Each peer status reports its state, pending obligations, attempt counters, times
 
 `MemoryStorage` is available without feature flags. Enable `fjall` for durable storage. Custom backends implement the `Storage` contract and must preserve the atomic read and write boundaries documented by each method.
 
-Durable Iroh nodes must reopen the same Fjall path and reuse the same Iroh secret key. The key defines the node's peer identity, so applications should store it through their normal secret-management system and back it up with the database.
+Durable Iroh nodes must reopen the same Fjall path and reuse the same Iroh secret key. The key defines the node's peer identity, so applications should store it through their normal secret-management system and back it up with the database. Never run two stores with one key: restoring an old backup next to a live store forks the writer's actor chain.
+
+`FjallStorage::open` persists every commit with `SyncAll`. With `PersistMode::Buffer`, an acknowledgement can precede durability until the application calls `persist`. An uncertain commit returns `Error::ReopenRequired`, and the application must reopen the store before writing again. A schema 1 store is upgraded in bounded steps when it is opened, and an interrupted upgrade continues on the next open.
+
+`Irokle::recheck_topics` and the integrity scan check that every stored record and dependency is present. They do not decode and rehash every signed payload, so they are not a cryptographic scrub of a backup.
+
+The transport-neutral receive methods and `Storage::put_admitted_batch` are trusted boundaries. The Iroh adapter authenticates the sending peer, applies the introduction whitelist and enforces frame and session limits. A custom transport must bind the peer id it passes to an authenticated connection and apply the same limits. A custom storage backend must keep the atomic snapshot and commit checks each `Storage` method documents.
 
 ## Development
 

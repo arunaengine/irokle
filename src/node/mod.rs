@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! High-level node, topic, publishing, and sync facade APIs.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,9 +19,9 @@ use peers::{PeerHealthStore, select_sync_targets};
 pub use topic::{RawTopic, Topic};
 
 use crate::ActorClock;
-use crate::history::{DagQuery, HistoryOrder, ordered};
-use crate::oplog::{Oplog, topological_subset_entries};
-use crate::reducer::EventRecord;
+use crate::history::{DagQuery, HistoryCursor, HistoryOrder, ordered};
+use crate::oplog::{Oplog, subset_entries_in, topological_subset_entries};
+use crate::reducer::{EventRecord, HistoryEntry, HistoryPage};
 use crate::storage::{AdmissionEffects, OpMeta, StagedTopic, SyncObligation, TopicState};
 use crate::storage::{
     MemoryStorage, Storage, SyncPeerState, SyncPeerStatus, SyncStateUpdate, SyncStatusUpdate,
@@ -338,6 +338,22 @@ impl<S: Storage> Irokle<S> {
     /// matters for damage that happened outside irokle.
     pub fn recheck_topics(&self) -> Result<()> {
         self.oplog.recheck_topics()
+    }
+
+    /// Drop buffered ops that waited for their dependencies longer than
+    /// [`crate::storage::PENDING_IDLE_MS`], with the ops that wait on them, and
+    /// return how many went. Admitted history is untouched; the Iroh sweep calls this.
+    pub fn expire_pending(&self) -> Result<usize> {
+        let expired = self
+            .storage()
+            .expire_pending(now_millis()?, crate::storage::PENDING_IDLE_MS)?;
+        if expired > 0 {
+            tracing::info!(
+                expired,
+                "expired buffered ops whose dependencies never arrived"
+            );
+        }
+        Ok(expired)
     }
 
     /// Discard unreachable ops of `topic_id` and rebuild it from the remaining heads.
@@ -929,73 +945,124 @@ impl<S: Storage> Irokle<S> {
         topic_id: TopicId,
         order: HistoryOrder,
     ) -> Result<Vec<EventRecord<E>>> {
+        self.topic_entries(topic_id, order)?
+            .into_iter()
+            .map(HistoryEntry::into_record)
+            .collect()
+    }
+
+    pub(crate) fn topic_entries<E: Event>(
+        &self,
+        topic_id: TopicId,
+        order: HistoryOrder,
+    ) -> Result<Vec<HistoryEntry<E>>> {
         let storage = self.oplog.storage();
         let ids = storage.list_op_ids(&topic_id)?;
         let entries = topological_subset_entries(storage, &ids)?;
-        if entries.len() != ids.len() || !self.oplog.topic_unresolved(&topic_id)?.is_empty() {
-            return Err(Error::Storage("incomplete topic history".into()));
+        if entries.len() != ids.len() || !self.oplog.history_whole(&topic_id)? {
+            return Err(incomplete_history());
         }
-        let mut records = Vec::new();
-        for (op, meta) in entries {
-            if let crate::TopicPayload::Event(envelope) = &op.signed.body.payload {
-                records.push(EventRecord::new(
-                    envelope.decode_event::<E>()?,
-                    op.id,
-                    meta.actor_id,
-                    meta.actor_seq,
-                    meta.observed_clock,
-                ));
-            }
-        }
+        Ok(ordered(decode_entries(entries), order))
+    }
+
+    pub(crate) fn history_after_cursor<E: Event>(
+        &self,
+        topic_id: TopicId,
+        cursor: &HistoryCursor,
+        order: HistoryOrder,
+    ) -> Result<Vec<EventRecord<E>>> {
+        let records = self
+            .history_page::<E>(topic_id, cursor, None)?
+            .entries
+            .into_iter()
+            .map(HistoryEntry::into_record)
+            .collect::<Result<Vec<_>>>()?;
         Ok(ordered(records, order))
     }
 
-    pub(crate) fn history_after_clock<E: Event>(
+    /// Events after `cursor`, at most `limit` ops, from one snapshot. Only the
+    /// actor ranges past the cursor are read, so the work follows the unread ops,
+    /// not the whole history. The returned cursor covers exactly the page.
+    pub(crate) fn history_page<E: Event>(
         &self,
         topic_id: TopicId,
-        clock: &ActorClock,
-        order: HistoryOrder,
-    ) -> Result<Vec<EventRecord<E>>> {
-        let storage = self.oplog.storage();
-        let mut seen = BTreeSet::new();
-        let mut queue = storage
-            .heads(&topic_id)?
-            .into_iter()
-            .collect::<VecDeque<_>>();
-
-        while let Some(op_id) = queue.pop_front() {
-            if !seen.insert(op_id) {
-                continue;
-            }
-            let meta = storage
-                .get_position(&op_id)?
-                .ok_or_else(|| Error::Storage(format!("missing op meta for {op_id}")))?;
-            if meta.topic_id != topic_id {
-                return Err(Error::TopicMismatch);
-            }
-            queue.extend(meta.deps);
+        cursor: &HistoryCursor,
+        limit: Option<usize>,
+    ) -> Result<HistoryPage<E>> {
+        if !self.oplog.history_whole(&topic_id)? {
+            return Err(incomplete_history());
         }
-
-        let entries = topological_subset_entries(storage, &seen)?;
-        if entries.len() != seen.len() || !self.oplog.topic_unresolved(&topic_id)?.is_empty() {
-            return Err(Error::Storage("incomplete topic history".into()));
-        }
-        let mut records = Vec::new();
-        for (op, meta) in entries {
-            if clock.get(&meta.actor_id) >= meta.actor_seq {
-                continue;
+        let limit = limit.unwrap_or(usize::MAX).max(1);
+        let entries = self.oplog.storage().read_snapshot(|read| {
+            let view = read
+                .topic_view(&topic_id, None)?
+                .ok_or(Error::TopicNotFound)?;
+            if view.state.genesis != cursor.genesis {
+                return Err(Error::StaleIncarnation);
             }
-            if let crate::TopicPayload::Event(envelope) = &op.signed.body.payload {
-                records.push(EventRecord::new(
-                    envelope.decode_event::<E>()?,
-                    op.id,
-                    meta.actor_id,
-                    meta.actor_seq,
-                    meta.observed_clock,
-                ));
+            // Each actor's next unread op waits, smallest generation first. An op
+            // joins once the cursor or the page covers its dependencies, which come
+            // first; a refused op ends its actor's part of this page.
+            let mut next = std::collections::BinaryHeap::new();
+            let unread = |actor: &ActorId, after: u64| -> Result<Option<_>> {
+                let Some((seq, id)) = read.actor_range(&topic_id, actor, after, 1)?.pop() else {
+                    return Ok(None);
+                };
+                let position = read.get_position(&id)?.ok_or_else(incomplete_history)?;
+                Ok(Some(std::cmp::Reverse((
+                    position.generation,
+                    id,
+                    *actor,
+                    seq,
+                    position.deps,
+                ))))
+            };
+            for (actor, seq) in view.clock.iter() {
+                let after = cursor.clock.get(actor);
+                if *seq > after {
+                    next.extend(unread(actor, after)?);
+                }
             }
+            let mut page = BTreeSet::new();
+            while page.len() < limit
+                && let Some(std::cmp::Reverse((_, id, actor, seq, deps))) = next.pop()
+            {
+                let mut joins = true;
+                for dep in &deps {
+                    if page.contains(dep) {
+                        continue;
+                    }
+                    let header = read.get_header(dep)?.ok_or_else(incomplete_history)?;
+                    if cursor.clock.get(&header.actor_id) < header.actor_seq {
+                        joins = false;
+                        break;
+                    }
+                }
+                if joins {
+                    page.insert(id);
+                    next.extend(unread(&actor, seq)?);
+                }
+            }
+            // Only the chosen ops are loaded.
+            let entries = subset_entries_in(read, &page)?;
+            if entries.len() != page.len() {
+                return Err(incomplete_history());
+            }
+            Ok(entries)
+        })?;
+        // A topological prefix holds each actor's ops contiguously, so the clock
+        // of its last ops covers exactly the page.
+        let mut clock = cursor.clock.clone();
+        for (_, meta) in &entries {
+            clock.observe(meta.actor_id, meta.actor_seq);
         }
-        Ok(ordered(records, order))
+        Ok(HistoryPage {
+            entries: decode_entries(entries),
+            cursor: HistoryCursor {
+                genesis: cursor.genesis,
+                clock,
+            },
+        })
     }
 
     pub(crate) fn topic_dag(&self, topic_id: TopicId, query: DagQuery<OpId>) -> Result<Vec<Op>> {
@@ -1004,6 +1071,18 @@ impl<S: Storage> Irokle<S> {
 
     pub(crate) fn topic_heads(&self, topic_id: TopicId) -> Result<BTreeSet<OpId>> {
         self.oplog.storage().heads(&topic_id)
+    }
+
+    pub(crate) fn topic_history_cursor(&self, topic_id: TopicId) -> Result<HistoryCursor> {
+        let view = self
+            .oplog
+            .storage()
+            .topic_view(&topic_id, None)?
+            .ok_or(Error::TopicNotFound)?;
+        Ok(HistoryCursor {
+            genesis: view.state.genesis,
+            clock: view.clock,
+        })
     }
 
     pub(crate) fn topic_actor_clock(&self, topic_id: TopicId) -> Result<ActorClock> {
@@ -1084,4 +1163,29 @@ fn now_millis() -> Result<u64> {
     millis
         .try_into()
         .map_err(|_| Error::Storage("system time does not fit in u64 milliseconds".into()))
+}
+
+fn incomplete_history() -> Error {
+    Error::Storage("incomplete topic history".into())
+}
+
+/// The events of `entries` in their order, each decoded on its own.
+fn decode_entries<E: Event>(entries: Vec<(Op, crate::storage::OpMeta)>) -> Vec<HistoryEntry<E>> {
+    let mut decoded = Vec::new();
+    for (op, meta) in entries {
+        let crate::TopicPayload::Event(envelope) = &op.signed.body.payload else {
+            continue;
+        };
+        let meta = crate::reducer::OpMeta {
+            op_id: op.id,
+            actor_id: meta.actor_id,
+            actor_seq: meta.actor_seq,
+            observed_clock: meta.observed_clock,
+        };
+        decoded.push(match envelope.decode_event::<E>() {
+            Ok(event) => HistoryEntry::Event(EventRecord { event, meta }),
+            Err(error) => HistoryEntry::Undecodable { meta, error },
+        });
+    }
+    decoded
 }

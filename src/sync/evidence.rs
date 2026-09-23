@@ -11,8 +11,8 @@ use crate::sync::{SyncAck, SyncEngine, SyncReport};
 
 impl<S: Storage> SyncEngine<S> {
     /// Heads and clock an ack may certify, read from one view with their genesis. A topic
-    /// holding an unresolvable id certifies nothing until repair completes, so the source
-    /// keeps its obligation and this node stays visibly behind.
+    /// whose admitted history holds an unresolvable id certifies nothing until repair
+    /// completes, so the source keeps its obligation and this node stays visibly behind.
     pub(super) fn ack_frontier(
         &self,
         topic_id: &TopicId,
@@ -29,14 +29,16 @@ impl<S: Storage> SyncEngine<S> {
         Ok((view.state, heads, view.clock))
     }
 
+    /// Store what a valid ack certifies: the ancestry of the heads it names that
+    /// this node holds, whatever clock the ack claims beyond them.
     pub fn apply_ack(&self, ack: &SyncAck) -> Result<()> {
         ack.verify_signature()?;
-        self.validate_ack(ack)?;
+        let Some(evidence) = self.validate_ack(ack)? else {
+            return Ok(());
+        };
         // Storage repeats the identity and membership checks in the writing
         // transaction, so a reset or removal in between refuses the commit.
-        self.oplog
-            .storage()
-            .apply_peer_ack(Self::peer_ack_for(ack))?;
+        self.oplog.storage().apply_peer_ack(evidence)?;
         Ok(())
     }
 
@@ -49,11 +51,12 @@ impl<S: Storage> SyncEngine<S> {
         let mut peer_acks = Vec::new();
         for (index, ack) in acks.iter().enumerate() {
             match ack.verify_signature().and_then(|()| self.validate_ack(ack)) {
-                Ok(()) => {
+                Ok(Some(evidence)) => {
                     validated.push(index);
-                    peer_acks.push(Self::peer_ack_for(ack));
+                    peer_acks.push(evidence);
                     results.push(Ok(()));
                 }
+                Ok(None) => results.push(Ok(())),
                 Err(err) => results.push(Err(err)),
             }
         }
@@ -123,13 +126,16 @@ impl<S: Storage> SyncEngine<S> {
         Ok(true)
     }
 
-    fn validate_ack(&self, ack: &SyncAck) -> Result<()> {
+    fn validate_ack(&self, ack: &SyncAck) -> Result<Option<PeerAck>> {
         self.oplog
             .storage()
             .read_snapshot(|read| self.validate_ack_in(read, ack))
     }
 
-    fn validate_ack_in(&self, read: &dyn SnapshotRead, ack: &SyncAck) -> Result<()> {
+    /// Refuse an invalid ack, and return what a valid one certifies: the clock of the
+    /// held heads' ancestry, never the claimed clock beyond it. A head not held may
+    /// be an actor fork, whose equal sequence must not prove the op held here.
+    fn validate_ack_in(&self, read: &dyn SnapshotRead, ack: &SyncAck) -> Result<Option<PeerAck>> {
         let view = read
             .topic_view(&ack.topic_id, None)?
             .ok_or(Error::TopicNotFound)?;
@@ -159,11 +165,15 @@ impl<S: Storage> SyncEngine<S> {
             )));
         }
 
+        let mut held = BTreeSet::new();
         for op_id in ack.accepted.iter().chain(ack.heads.iter()) {
             // History we have not learned yet makes no locally checkable claim.
             let Some(meta) = read.get_position(op_id)? else {
                 continue;
             };
+            if ack.heads.contains(op_id) {
+                held.insert(*op_id);
+            }
             if meta.topic_id != ack.topic_id {
                 return Err(Error::TopicMismatch);
             }
@@ -173,7 +183,22 @@ impl<S: Storage> SyncEngine<S> {
                 )));
             }
         }
-        Ok(())
+        if held.is_empty() {
+            return Ok(None);
+        }
+        let mut clock = ActorClock::new();
+        for head in &held {
+            let (header, observed) = read
+                .get_observation(head)?
+                .ok_or(Error::MissingDependency(*head))?;
+            clock.merge(&observed);
+            clock.observe(header.actor_id, header.actor_seq);
+        }
+        Ok(Some(PeerAck {
+            heads: held,
+            clock,
+            ..Self::peer_ack_for(ack)
+        }))
     }
 
     /// The stored record for a validated acknowledgement. One constructor means
