@@ -304,6 +304,61 @@ fn memory_replay_fits() {
     assert_replay_fits(MemoryStorage::new());
 }
 
+/// A namespace buffers an op behind a missing dependency when another member's
+/// invitation activates the topic. The op stays buffered through the activation
+/// and is admitted once the dependency arrives.
+fn assert_activation_keeps<S: Storage>(storage: S) {
+    let author = Ed25519Signer::from_bytes(&[176; 32]);
+    let inviter = Ed25519Signer::from_bytes(&[177; 32]);
+    let reader = reader_node(storage, 178);
+    let topic_id = TopicId::hash(b"activation-keeps-pending");
+    let actor = actor_id_for(topic_id, author.peer_id());
+    let log = oplog::Oplog::new();
+    let created = TopicGenesis::new(Note::TYPE_ID, [inviter.peer_id()]);
+    let genesis = log
+        .create_topic_genesis(topic_id, actor, created, &author)
+        .unwrap();
+    let note = |text: &str| EventEnvelope::encode_event(&Note { text: text.into() }).unwrap();
+    let first = log
+        .create_event_op(topic_id, actor, note("first"), &author)
+        .unwrap();
+    let second = log
+        .create_event_op(topic_id, actor, note("second"), &author)
+        .unwrap();
+    let invites = oplog::Oplog::new();
+    invites.receive_op(genesis.clone()).unwrap();
+    let invite = invites
+        .create_control_op(
+            topic_id,
+            actor_id_for(topic_id, inviter.peer_id()),
+            TopicControl::AddPeer {
+                peer: reader.peer_id(),
+            },
+            &inviter,
+        )
+        .unwrap();
+    let send =
+        |ops: Vec<Op>| reader.receive_sync_outcome(author.peer_id(), SyncData { topic_id, ops });
+
+    staged(send(vec![genesis, second.clone()]).unwrap());
+    assert!(matches!(
+        send(vec![invite]).unwrap(),
+        ReceiveOutcome::Acked { .. }
+    ));
+    assert!(reader.storage().provisional_topics().unwrap().is_empty());
+    assert_eq!(
+        reader.storage().pending_waiters(&first.id).unwrap().len(),
+        1
+    );
+    send(vec![first]).unwrap();
+    assert!(reader.storage().get_op(&second.id).unwrap().is_some());
+}
+
+#[test]
+fn memory_activation_keeps() {
+    assert_activation_keeps(MemoryStorage::new());
+}
+
 /// Stores whose staging limits a test sets.
 trait Limited: Storage {
     fn with_limits(self, limits: crate::storage::StagingLimits) -> Self;
@@ -516,6 +571,12 @@ mod fjall {
     fn reclaim_behind() {
         let dir = tempfile::tempdir().unwrap();
         assert_reclaim_behind(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn activation_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_activation_keeps(crate::storage::FjallStorage::open(dir.path()).unwrap());
     }
 
     #[test]

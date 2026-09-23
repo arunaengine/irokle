@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex, Weak};
 
 use crate::oplog::is_structural_genesis;
 use crate::storage::{
-    AdmissionEffects, MAX_STAGED_IDLE_MS as STAGED_IDLE_MS, ProvisionalTopic, StagedTopic,
+    AdmissionEffects, MAX_STAGED_IDLE_MS as STAGED_IDLE_MS, OpMeta, ProvisionalTopic, StagedTopic,
     SyncObligation, TopicState,
 };
 use crate::sync::SyncData;
-use crate::{ActorClock, Error, OpId, PeerId, Result, Storage, TopicId, TopicPayload};
+use crate::{ActorClock, Error, Op, OpId, PeerId, Result, Storage, TopicId, TopicPayload};
 
 use crate::node::{Bootstrap, Irokle, now_millis};
 
@@ -292,8 +292,14 @@ impl<S: Storage> Irokle<S> {
             return Ok(Bootstrap::Staged(staged_of(provisional, &store)?));
         }
         let effects = self.activation_effects(source, &view.state, &view.clock);
+        // Activation copies admitted records only and ends every namespace of the
+        // topic, so buffered ops are read first and buffered again once it is active.
+        let buffered = self.staged_pending(provisional.topic_id)?;
         match storage.activate_provisional(provisional, &view.state, effects) {
-            Ok(()) => Ok(Bootstrap::Active(BTreeSet::new())),
+            Ok(()) => {
+                self.buffer_again(provisional.topic_id, buffered);
+                Ok(Bootstrap::Active(BTreeSet::new()))
+            }
             Err(Error::AdmissionConflict)
                 if storage.topic_state(&provisional.topic_id)?.is_some() =>
             {
@@ -310,6 +316,56 @@ impl<S: Storage> Irokle<S> {
                 Ok(Bootstrap::Active(BTreeSet::new()))
             }
             Err(error) => Err(error),
+        }
+    }
+
+    /// Buffered ops of every namespace staging `topic_id`, with their sources,
+    /// dependencies first.
+    fn staged_pending(&self, topic_id: TopicId) -> Result<Vec<(PeerId, Op)>> {
+        let storage = self.storage();
+        let mut buffered = Vec::new();
+        let mut seen = BTreeSet::new();
+        for provisional in storage.provisional_topics()? {
+            if provisional.topic_id != topic_id {
+                continue;
+            }
+            let Some(store) = storage.provisional_store(&provisional)? else {
+                continue;
+            };
+            let mut waited = store
+                .pending_missing_deps(&topic_id)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            while let Some(dep) = waited.pop() {
+                for (source, op) in store.pending_waiters(&dep)? {
+                    if seen.insert(op.id) {
+                        waited.push(op.id);
+                        buffered.push((source, op));
+                    }
+                }
+            }
+        }
+        buffered.sort_by_key(|(_, op)| op.signed.body.generation);
+        Ok(buffered)
+    }
+
+    /// Receive staged buffered ops into the activated topic. They were never
+    /// acknowledged, so a failure only leaves them for a later sync to resend.
+    fn buffer_again(&self, topic_id: TopicId, buffered: Vec<(PeerId, Op)>) {
+        let mut by_source = BTreeMap::<PeerId, Vec<Op>>::new();
+        for (source, op) in buffered {
+            by_source.entry(source).or_default().push(op);
+        }
+        let forward = |source: Option<PeerId>, entries: &[(Op, OpMeta)], state: &TopicState| {
+            self.forward_effects(source, entries, state)
+        };
+        for (source, ops) in by_source {
+            if let Err(error) =
+                self.oplog
+                    .receive_preverified(Some(source), ops, &BTreeSet::new(), Some(&forward))
+            {
+                tracing::warn!(%topic_id, %source, %error, "dropping staged buffered ops");
+            }
         }
     }
 
