@@ -1000,22 +1000,34 @@ impl<S: Storage> Irokle<S> {
             if view.state.genesis != cursor.genesis {
                 return Err(Error::StaleIncarnation);
             }
-            let mut candidates = Vec::new();
-            for (actor, seq) in view.clock.iter() {
-                let after = cursor.clock.get(actor);
-                if *seq <= after {
-                    continue;
-                }
-                for (_, id) in read.actor_range(&topic_id, actor, after, limit)? {
-                    let position = read.get_position(&id)?.ok_or_else(incomplete_history)?;
-                    candidates.push((position.generation, id, position.deps));
-                }
-            }
+            // Each actor's next unread op waits in a queue ordered by generation.
             // An op joins once every dependency is covered by the cursor or joined
             // before it; dependencies have smaller generations, so they come first.
-            candidates.sort_by_key(|(generation, id, _)| (*generation, *id));
+            // A refused op blocks the rest of its actor for this page.
+            let mut next = std::collections::BinaryHeap::new();
+            let unread = |actor: &ActorId, after: u64| -> Result<Option<_>> {
+                let Some((seq, id)) = read.actor_range(&topic_id, actor, after, 1)?.pop() else {
+                    return Ok(None);
+                };
+                let position = read.get_position(&id)?.ok_or_else(incomplete_history)?;
+                Ok(Some(std::cmp::Reverse((
+                    position.generation,
+                    id,
+                    *actor,
+                    seq,
+                    position.deps,
+                ))))
+            };
+            for (actor, seq) in view.clock.iter() {
+                let after = cursor.clock.get(actor);
+                if *seq > after {
+                    next.extend(unread(actor, after)?);
+                }
+            }
             let mut page = BTreeSet::new();
-            for (_, id, deps) in candidates {
+            while page.len() < limit
+                && let Some(std::cmp::Reverse((_, id, actor, seq, deps))) = next.pop()
+            {
                 let mut joins = true;
                 for dep in &deps {
                     if page.contains(dep) {
@@ -1029,13 +1041,14 @@ impl<S: Storage> Irokle<S> {
                 }
                 if joins {
                     page.insert(id);
+                    next.extend(unread(&actor, seq)?);
                 }
             }
-            let mut entries = subset_entries_in(read, &page)?;
+            // Only the chosen ops are loaded.
+            let entries = subset_entries_in(read, &page)?;
             if entries.len() != page.len() {
                 return Err(incomplete_history());
             }
-            entries.truncate(limit);
             Ok(entries)
         })?;
         // A topological prefix holds each actor's ops contiguously, so the clock

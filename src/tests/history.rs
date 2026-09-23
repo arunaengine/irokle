@@ -126,3 +126,54 @@ fn pages_follow_causality() {
             .is_empty()
     );
 }
+
+/// With 64 writers unread, a one-record page loads one payload, not one per
+/// writer, and the pages still cover every event once.
+#[test]
+fn page_loads_limit() {
+    let writers = (0..64_u8)
+        .map(|index| Ed25519Signer::from_bytes(&[index.wrapping_add(120); 32]))
+        .collect::<Vec<_>>();
+    let storage = MemoryStorage::new();
+    let node = Irokle::builder()
+        .with_signer(Ed25519Signer::from_bytes(&[204; 32]))
+        .with_storage(storage.clone())
+        .build()
+        .unwrap();
+    let topic = node
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: writers.iter().map(Signer::peer_id).collect(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let mut cursor = topic.history_cursor().unwrap();
+    let log = Oplog::with_storage(storage.clone());
+    for writer in &writers {
+        let note = Note {
+            text: writer.peer_id().to_string(),
+        };
+        log.create_event_op(
+            topic.id(),
+            actor_id_for(topic.id(), writer.peer_id()),
+            EventEnvelope::encode_event(&note).unwrap(),
+            writer,
+        )
+        .unwrap();
+    }
+
+    let mut read = BTreeSet::new();
+    loop {
+        let before = storage.counters().op_reads;
+        let page = topic.history_page(&cursor, Some(1)).unwrap();
+        assert!(storage.counters().op_reads - before <= 1);
+        if page.entries.is_empty() {
+            break;
+        }
+        for entry in page.entries {
+            assert!(read.insert(entry.into_record().unwrap().meta.op_id));
+        }
+        cursor = page.cursor;
+    }
+    assert_eq!(read.len(), writers.len());
+    assert_eq!(cursor, topic.history_cursor().unwrap());
+}
