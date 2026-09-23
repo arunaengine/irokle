@@ -534,6 +534,11 @@ impl Storage for MemoryStorage {
         let mut inner = self.lock()?;
         remove_pending_locked(&mut inner, op_id)
     }
+    fn hold_workspace(&self, bytes: u64) -> Result<crate::storage::WorkspaceHold> {
+        let budget = Arc::clone(&self.lock()?.budget);
+        let charge = budget.reserve(MemoryDomain::Workspace, bytes)?;
+        Ok(crate::storage::WorkspaceHold::new(charge))
+    }
     fn expire_pending(&self, now_ms: u64, max_idle_ms: u64) -> Result<usize> {
         let mut inner = self.lock()?;
         let inner = &mut *inner;

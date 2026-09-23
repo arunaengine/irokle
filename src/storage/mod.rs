@@ -29,6 +29,20 @@ pub const MAX_PENDING_EVICTIONS: usize = 1024;
 /// source cannot hold pending capacity and repair requests forever.
 pub const PENDING_IDLE_MS: u64 = 60 * 60 * 1000;
 
+/// Temporary work a store charged to its memory budget; the charge ends on drop.
+#[derive(Default)]
+pub struct WorkspaceHold {
+    _charge: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl WorkspaceHold {
+    pub(crate) fn new(charge: impl std::any::Any + Send + Sync) -> Self {
+        Self {
+            _charge: Some(Box::new(charge)),
+        }
+    }
+}
+
 /// Reads of one coherent snapshot of a store. Every method sees the same commit,
 /// so a planner can authorize a peer, select positions and load records without
 /// mixing a state before and after a concurrent write.
@@ -243,6 +257,11 @@ pub trait Storage: Clone + Send + Sync + 'static {
         Ok(false)
     }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
+    /// Charge `bytes` of temporary admission work to this store's memory budget until
+    /// the hold drops, refusing past the budget. A store without one holds nothing.
+    fn hold_workspace(&self, _bytes: u64) -> Result<WorkspaceHold> {
+        Ok(WorkspaceHold::default())
+    }
     /// Drop buffered ops, and their waiters, that waited more than `max_idle_ms` since
     /// the first call that saw them, and return how many went. They were never
     /// acknowledged, so a later sync can resend them. The default keeps everything.

@@ -31,9 +31,9 @@ pub use topology::{topological, topological_subset};
 /// Attempts one admission job makes; storage writes on this path try once each.
 pub(crate) const MAX_ADMISSION_RETRIES: usize = 64;
 const MAX_CACHED_PROJECTIONS: usize = 4096;
-/// Membership entries the projection states one batch or the cache keeps may hold
-/// together, so kept states stay bounded however many controls a topic has.
-const MAX_PROJECTION_ENTRIES: usize = 1 << 16;
+/// Estimated bytes the projection states one batch or the cache keeps may hold
+/// together, so kept states stay bounded however large the member sets are.
+const MAX_PROJECTION_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
 struct MembershipCache {

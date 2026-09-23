@@ -414,10 +414,9 @@ fn removal_order_converges() {
     assert_eq!(genesis(&second), smaller.id);
 }
 
-/// Three geneses of one topic: the first names A, B and C, a smaller one by C
-/// leaves B out, and a still smaller one by B names all three. Every arrival
-/// order keeps the same genesis, since only a genesis naming the same initial
-/// peers may replace another.
+/// Geneses naming A, B and C, a smaller one by C without B, and a still smaller
+/// one by B naming all three. Every arrival order keeps the smallest, since only
+/// a genesis naming the same initial peers may replace another.
 #[test]
 fn successive_geneses_agree() {
     let topic_id = TopicId::hash(b"successive-geneses-agree");

@@ -10,7 +10,7 @@ use crate::oplog::membership::{apply_control, materialize_topic_state, merge_sta
 use crate::oplog::pending::{PendingVerdict, pending_meta_for};
 use crate::oplog::topology::topological_ops;
 use crate::oplog::{
-    Admitted, BatchOverlay, MAX_ADMISSION_RETRIES, MAX_CACHED_PROJECTIONS, MAX_PROJECTION_ENTRIES,
+    Admitted, BatchOverlay, MAX_ADMISSION_RETRIES, MAX_CACHED_PROJECTIONS, MAX_PROJECTION_BYTES,
     MembershipCache, OpAdmission, Oplog, ReceiveEffects, ResetPlan, TopicEviction, conflict_pause,
     is_structural_genesis,
 };
@@ -323,11 +323,11 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             for id in projection_tips {
                 if let Some(state) = projections.get(&id)
                     && !cache.states.contains_key(&id)
-                    && state_entries(state) <= MAX_PROJECTION_ENTRIES
+                    && state_bytes(state) <= MAX_PROJECTION_BYTES
                 {
                     while cache.states.len() >= MAX_CACHED_PROJECTIONS
-                        || projection_entries(cache.states.values()) + state_entries(state)
-                            > MAX_PROJECTION_ENTRIES
+                        || projection_bytes(cache.states.values()) + state_bytes(state)
+                            > MAX_PROJECTION_BYTES
                     {
                         let Some(oldest) = cache.order.pop_front() else {
                             break;
@@ -808,6 +808,7 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         // Each peer and the policy take their control with the greatest key, in
         // any order, so the state at `deps` is one fold over the controls of their
         // ancestry, down to states already known. It needs no state per ancestor.
+        let mut workspace = Workspace::new(&self.storage);
         let mut known = BTreeSet::new();
         let mut folded = Vec::new();
         let mut seen = BTreeSet::new();
@@ -816,6 +817,7 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             if !seen.insert(id) {
                 continue;
             }
+            workspace.charge(WALK_BYTES)?;
             if projections.contains_key(&id) {
                 known.insert(id);
                 continue;
@@ -827,6 +829,7 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             walk.extend(meta.deps.iter().copied());
             let op = self.op_projected(&id, overlay_ops)?;
             if !matches!(op.signed.body.payload, TopicPayload::Event(_)) {
+                workspace.charge(2 * crate::storage::pending_op_bytes(&op)? as u64)?;
                 folded.push(op);
             }
         }
@@ -834,6 +837,7 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             Arc::new(materialize_topic_state(folded, BTreeSet::new())?)
         } else {
             let mut state = merge_states(&known, projections)?;
+            workspace.charge(state_bytes(&state) as u64)?;
             for op in &folded {
                 match &op.signed.body.payload {
                     TopicPayload::Genesis(_) if op.id != state.genesis => {
@@ -848,14 +852,13 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             state
         };
         // Only the state of one dependency is kept, replacing the known states it
-        // covers, and only within the entry budget, so a batch of late ops cannot
+        // covers, and only within the byte budget, so a batch of late ops cannot
         // hold one large state per historical control.
         if let [dep] = deps.iter().collect::<Vec<_>>()[..] {
             for id in &known {
                 projections.remove(id);
             }
-            if projection_entries(projections.values()) + state_entries(&state)
-                <= MAX_PROJECTION_ENTRIES
+            if projection_bytes(projections.values()) + state_bytes(&state) <= MAX_PROJECTION_BYTES
             {
                 projections.insert(*dep, Arc::clone(&state));
             }
@@ -1017,14 +1020,48 @@ pub(super) fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
     }
 }
 
-/// Membership entries a projected state holds, as the unit of the projection budget.
-pub(super) fn state_entries(state: &TopicState) -> usize {
-    state.membership_controls.len() + 1
+/// Bytes one walked id costs a projection: its entry in the walk and the seen set.
+const WALK_BYTES: u64 = 96;
+/// Bytes a projection charges its store at once.
+const HOLD_BYTES: u64 = 64 * 1024;
+
+/// Memory a projected state holds, estimated from its members and controls.
+pub(super) fn state_bytes(state: &TopicState) -> usize {
+    256 + 48 * state.members.len() + 160 * state.membership_controls.len()
 }
 
-/// Membership entries `states` hold together; a shared state is counted each time.
-pub(super) fn projection_entries<'a>(states: impl Iterator<Item = &'a Arc<TopicState>>) -> usize {
-    states.map(|state| state_entries(state)).sum()
+/// Memory `states` hold together; a shared state is counted each time.
+pub(super) fn projection_bytes<'a>(states: impl Iterator<Item = &'a Arc<TopicState>>) -> usize {
+    states.map(|state| state_bytes(state)).sum()
+}
+
+/// Temporary projection memory charged to the store in steps, released on drop.
+struct Workspace<'a, S> {
+    storage: &'a S,
+    holds: Vec<crate::storage::WorkspaceHold>,
+    held: u64,
+    used: u64,
+}
+
+impl<'a, S: crate::oplog::Storage> Workspace<'a, S> {
+    fn new(storage: &'a S) -> Self {
+        Self {
+            storage,
+            holds: Vec::new(),
+            held: 0,
+            used: 0,
+        }
+    }
+
+    /// Account `bytes` more, refusing once the store's budget is exhausted.
+    fn charge(&mut self, bytes: u64) -> Result<()> {
+        self.used = self.used.saturating_add(bytes);
+        while self.used > self.held {
+            self.holds.push(self.storage.hold_workspace(HOLD_BYTES)?);
+            self.held += HOLD_BYTES;
+        }
+        Ok(())
+    }
 }
 
 /// Failures a concurrent commit can cause by moving topic state mid-attempt.
@@ -1050,7 +1087,103 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use crate::oplog::Oplog;
-    use crate::{Ed25519Signer, PeerId, Signer, TopicControl, TopicGenesis, TopicId, actor_id_for};
+    use crate::oplog::admission::{projection_bytes, state_bytes};
+    use crate::storage::{MemoryLimits, MemoryStorage, Storage};
+    use crate::{
+        Ed25519Signer, Error, EventEnvelope, Op, OpBody, PeerId, ReplicationPolicy, Signer,
+        TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
+    };
+
+    /// A topic of `writers` plus 4,096 other initial peers and one policy
+    /// control per writer, with each writer's first event depending on its own
+    /// historical control, so every event needs a different cold projection.
+    fn late_writes(writers: u8) -> (Oplog, TopicId, Vec<Op>) {
+        let owner = Ed25519Signer::from_bytes(&[62; 32]);
+        let signers = (0..writers)
+            .map(|index| Ed25519Signer::from_bytes(&[index.wrapping_add(100); 32]))
+            .collect::<Vec<_>>();
+        let topic = TopicId::hash(b"late-writes");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let peers = (0..4096_u32)
+            .map(|index| PeerId::hash(index.to_le_bytes()))
+            .chain(signers.iter().map(Signer::peer_id));
+        let source = Oplog::new();
+        let genesis = source
+            .create_topic_genesis(topic, actor, TopicGenesis::new("test.note", peers), &owner)
+            .unwrap();
+        let mut ops = vec![genesis];
+        let mut events = Vec::new();
+        for (index, signer) in signers.iter().enumerate() {
+            let policy = ReplicationPolicy::all().with_max_sync_peers(index + 1);
+            let control = source
+                .create_control_op(
+                    topic,
+                    actor,
+                    TopicControl::SetReplicationPolicy { policy },
+                    &owner,
+                )
+                .unwrap();
+            let body = OpBody {
+                topic_id: topic,
+                author: signer.peer_id(),
+                actor_id: actor_id_for(topic, signer.peer_id()),
+                actor_seq: 1,
+                actor_prev: None,
+                deps: [control.id].into(),
+                generation: control.signed.body.generation + 1,
+                payload: TopicPayload::Event(EventEnvelope {
+                    type_id: "test.note".into(),
+                    payload: vec![0].into(),
+                }),
+            };
+            events.push(Op::sign(body, signer).unwrap());
+            ops.push(control);
+        }
+        ops.extend(events);
+        (source, topic, ops)
+    }
+
+    /// Late first writes that each need a projection holding 4,096 initial
+    /// peers keep the long-lived cache within its byte budget, members counted.
+    #[test]
+    fn cache_counts_members() {
+        let (_, _, ops) = late_writes(100);
+        let log = Oplog::new();
+        for op in ops {
+            log.receive_op(op).unwrap();
+        }
+        let cache = log.membership_cache().unwrap();
+        assert!(!cache.states.is_empty());
+        assert!(
+            cache
+                .states
+                .values()
+                .all(|state| state_bytes(state) > 4096 * 48)
+        );
+        assert!(projection_bytes(cache.states.values()) <= crate::oplog::MAX_PROJECTION_BYTES);
+    }
+
+    /// A cold projection charges its walk to the store's workspace budget, so a
+    /// budget too small for it refuses the op instead of allocating past it.
+    #[test]
+    fn projection_charges_workspace() {
+        // The first writer's event depends on a control that is no longer a head.
+        let (_, _, ops) = late_writes(2);
+        let limits = MemoryLimits {
+            workspace_bytes: 32 * 1024,
+            ..MemoryLimits::default()
+        };
+        let storage = MemoryStorage::new().with_memory_limits(limits).unwrap();
+        let log = Oplog::with_storage(storage);
+        let (history, event) = (&ops[..3], &ops[3]);
+        log.receive_ops(history.to_vec()).unwrap();
+        assert!(matches!(
+            log.receive_op(event.clone()),
+            Err(Error::MemoryPressure { .. })
+        ));
+        assert!(log.storage().get_op(&event.id).unwrap().is_none());
+        Oplog::new().receive_ops(ops).unwrap();
+    }
 
     /// A cold projection over a long control chain keeps only the state it
     /// was asked for, not one growing state per historical control.

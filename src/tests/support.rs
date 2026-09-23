@@ -691,6 +691,9 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
     fn expire_pending(&self, now_ms: u64, max_idle_ms: u64) -> Result<usize, Error> {
         self.inner.expire_pending(now_ms, max_idle_ms)
     }
+    fn hold_workspace(&self, bytes: u64) -> Result<crate::storage::WorkspaceHold, Error> {
+        self.inner.hold_workspace(bytes)
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<(), Error> {
         self.inner.remove_pending_op(op_id)
     }
