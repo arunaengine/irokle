@@ -651,6 +651,9 @@ impl FjallStorage {
                     Self::tx_put_obligation(tx, &self.records, obligation)?;
                 }
             }
+            // Buffered ops move in this transaction, so none is lost when the
+            // namespace ends and a refused charge leaves them all staged.
+            Self::tx_move_pending(tx, store, &self.records, &topic_id)?;
             for other in Self::tx_namespaces(tx, &self.records)? {
                 if other.provisional.topic_id == topic_id {
                     Self::tx_end_namespace(tx, &self.records, &other)?;

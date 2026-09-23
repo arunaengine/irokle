@@ -336,14 +336,21 @@ fn memory_repeats_fit() {
     assert_repeats_fit(MemoryStorage::new());
 }
 
-/// A namespace buffers an op behind a missing dependency when another member's
-/// invitation activates the topic. The op stays buffered through the activation
-/// and is admitted once the dependency arrives.
-fn assert_activation_keeps<S: Storage>(storage: S) {
-    let author = Ed25519Signer::from_bytes(&[176; 32]);
-    let inviter = Ed25519Signer::from_bytes(&[177; 32]);
-    let reader = reader_node(storage, 178);
-    let topic_id = TopicId::hash(b"activation-keeps-pending");
+/// A topic whose genesis names only `inviter`, two events of its author and the
+/// inviter's invitation of `reader`, made outside the reader's store.
+struct PendingInvite {
+    author: Ed25519Signer,
+    topic_id: TopicId,
+    genesis: Op,
+    first: Op,
+    second: Op,
+    invite: Op,
+}
+
+fn pending_invite(reader: PeerId, seed: u8) -> PendingInvite {
+    let author = Ed25519Signer::from_bytes(&[seed; 32]);
+    let inviter = Ed25519Signer::from_bytes(&[seed.wrapping_add(1); 32]);
+    let topic_id = TopicId::hash([b"activation-keeps-pending".as_slice(), &[seed]].concat());
     let actor = actor_id_for(topic_id, author.peer_id());
     let log = oplog::Oplog::new();
     let created = TopicGenesis::new(Note::TYPE_ID, [inviter.peer_id()]);
@@ -363,32 +370,126 @@ fn assert_activation_keeps<S: Storage>(storage: S) {
         .create_control_op(
             topic_id,
             actor_id_for(topic_id, inviter.peer_id()),
-            TopicControl::AddPeer {
-                peer: reader.peer_id(),
-            },
+            TopicControl::AddPeer { peer: reader },
             &inviter,
         )
         .unwrap();
-    let send =
-        |ops: Vec<Op>| reader.receive_sync_outcome(author.peer_id(), SyncData { topic_id, ops });
+    PendingInvite {
+        author,
+        topic_id,
+        genesis,
+        first,
+        second,
+        invite,
+    }
+}
 
-    staged(send(vec![genesis, second.clone()]).unwrap());
+impl PendingInvite {
+    fn send<S: Storage>(&self, reader: &Irokle<S>, ops: Vec<Op>) -> Result<ReceiveOutcome, Error> {
+        let data = SyncData {
+            topic_id: self.topic_id,
+            ops,
+        };
+        reader.receive_sync_outcome(self.author.peer_id(), data)
+    }
+
+    /// The buffered second event is admitted once its dependency arrives.
+    fn assert_completes<S: Storage>(&self, reader: &Irokle<S>) {
+        assert_eq!(
+            reader
+                .storage()
+                .pending_waiters(&self.first.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        self.send(reader, vec![self.first.clone()]).unwrap();
+        assert!(reader.storage().get_op(&self.second.id).unwrap().is_some());
+    }
+}
+
+/// A namespace buffers an op behind a missing dependency when another member's
+/// invitation activates the topic. The op stays buffered through the activation
+/// and is admitted once the dependency arrives.
+fn assert_activation_keeps<S: Storage>(storage: S) {
+    let reader = reader_node(storage, 178);
+    let case = pending_invite(reader.peer_id(), 176);
+    staged(
+        case.send(&reader, vec![case.genesis.clone(), case.second.clone()])
+            .unwrap(),
+    );
     assert!(matches!(
-        send(vec![invite]).unwrap(),
+        case.send(&reader, vec![case.invite.clone()]).unwrap(),
         ReceiveOutcome::Acked { .. }
     ));
     assert!(reader.storage().provisional_topics().unwrap().is_empty());
-    assert_eq!(
-        reader.storage().pending_waiters(&first.id).unwrap().len(),
-        1
-    );
-    send(vec![first]).unwrap();
-    assert!(reader.storage().get_op(&second.id).unwrap().is_some());
+    case.assert_completes(&reader);
 }
 
 #[test]
 fn memory_activation_keeps() {
     assert_activation_keeps(MemoryStorage::new());
+}
+
+/// The author's pending pool in the active store is full when the invitation
+/// arrives. The activation is refused and keeps every staged op; once the pool
+/// has room it completes with the buffered op.
+fn assert_full_pool_waits<S: Storage>(storage: S) {
+    let reader = reader_node(storage.clone(), 182);
+    let case = pending_invite(reader.peer_id(), 183);
+    let other = TopicId::hash(b"full-pool-waits");
+    let actor = actor_id_for(other, case.author.peer_id());
+    let log = oplog::Oplog::with_storage(storage.clone());
+    let created = TopicGenesis::new(Note::TYPE_ID, [reader.peer_id()]);
+    log.create_topic_genesis(other, actor, created, &case.author)
+        .unwrap();
+    let fillers = (0..crate::storage::MAX_PENDING_OPS_PER_SOURCE)
+        .map(|index| {
+            let missing = OpId::hash(index.to_le_bytes());
+            let body = OpBody {
+                topic_id: other,
+                author: case.author.peer_id(),
+                actor_id: actor,
+                actor_seq: index as u64 + 2,
+                actor_prev: Some(missing),
+                deps: [missing].into(),
+                generation: 1,
+                payload: TopicPayload::Event(
+                    EventEnvelope::encode_event(&Note {
+                        text: "filler".into(),
+                    })
+                    .unwrap(),
+                ),
+            };
+            Op::sign(body, &case.author).unwrap()
+        })
+        .collect::<Vec<_>>();
+    log.receive_ops_from_peer(Some(case.author.peer_id()), fillers.clone())
+        .unwrap();
+
+    staged(
+        case.send(&reader, vec![case.genesis.clone(), case.second.clone()])
+            .unwrap(),
+    );
+    assert!(case.send(&reader, vec![case.invite.clone()]).is_err());
+    assert!(storage.topic_state(&case.topic_id).unwrap().is_none());
+    let held = storage.provisional_topics().unwrap();
+    assert_eq!(held.len(), 1);
+    let staged_store = storage.provisional_store(&held[0]).unwrap().unwrap();
+    assert!(staged_store.is_pending(&case.second.id).unwrap());
+
+    storage.remove_pending_op(&fillers[0].id).unwrap();
+    assert!(
+        reader
+            .finish_bootstrap(case.author.peer_id(), case.topic_id)
+            .unwrap()
+    );
+    case.assert_completes(&reader);
+}
+
+#[test]
+fn memory_full_pool_waits() {
+    assert_full_pool_waits(MemoryStorage::new());
 }
 
 /// Stores whose staging limits a test sets.
@@ -609,6 +710,40 @@ mod fjall {
     fn activation_keeps() {
         let dir = tempfile::tempdir().unwrap();
         assert_activation_keeps(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn full_pool_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_full_pool_waits(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    /// An activation stops after its copies, as a crash there would. The reopen
+    /// finishes it, and the buffered op moves with it.
+    #[test]
+    fn reopen_keeps_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let reader_peer = Ed25519Signer::from_bytes(&[186; 32]).peer_id();
+        let case = pending_invite(reader_peer, 184);
+        {
+            let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+            let reader = reader_node(storage.clone(), 186);
+            let ops = vec![case.genesis.clone(), case.second.clone()];
+            staged(case.send(&reader, ops).unwrap());
+            let provisional = storage.provisional_topics().unwrap().pop().unwrap();
+            let store = storage.provisional_store(&provisional).unwrap().unwrap();
+            oplog::Oplog::with_storage(store)
+                .receive_ops_from_peer(Some(case.author.peer_id()), vec![case.invite.clone()])
+                .unwrap();
+            let provisional = storage.provisional_topics().unwrap().pop().unwrap();
+            storage.interrupt_activation(&provisional);
+            assert!(storage.topic_state(&case.topic_id).unwrap().is_none());
+        }
+        let storage = crate::storage::FjallStorage::open(dir.path()).unwrap();
+        let reader = reader_node(storage.clone(), 186);
+        assert!(storage.topic_state(&case.topic_id).unwrap().is_some());
+        assert!(storage.provisional_topics().unwrap().is_empty());
+        case.assert_completes(&reader);
     }
 
     #[test]

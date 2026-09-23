@@ -1751,7 +1751,14 @@ impl Storage for FjallStorage {
                     charge,
                 )?;
             }
-            Self::tx_put_pending(tx, &self.records, source_peer, &op, &meta, charge)
+            Self::tx_put_pending(
+                tx,
+                &self.records,
+                source_peer,
+                &op,
+                &meta.missing_deps,
+                charge,
+            )
         })
     }
     fn pending_waiters(&self, dep_id: &OpId) -> Result<Vec<(PeerId, Op)>> {

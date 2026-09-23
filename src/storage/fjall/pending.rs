@@ -109,7 +109,7 @@ impl FjallStorage {
         records: &Records,
         source_peer: PeerId,
         op: &Op,
-        meta: &OpMeta,
+        missing_deps: &BTreeSet<OpId>,
         charge: u64,
     ) -> Result<()> {
         let topic_id = op.signed.body.topic_id;
@@ -118,12 +118,12 @@ impl FjallStorage {
         if Self::tx_resolvable(tx, records, &op.id)? {
             return Ok(());
         }
-        for dep in &meta.missing_deps {
+        for dep in missing_deps {
             if Self::tx_resolvable(tx, records, dep)? {
                 return Err(Error::AdmissionConflict);
             }
         }
-        for id in std::iter::once(&op.id).chain(&meta.missing_deps) {
+        for id in std::iter::once(&op.id).chain(missing_deps) {
             if fjall::Readable::contains_key(
                 tx,
                 records,
@@ -140,7 +140,7 @@ impl FjallStorage {
                     "pending op id collision with different op".into(),
                 ));
             }
-            if record.missing == meta.missing_deps {
+            if record.missing == *missing_deps {
                 return Ok(());
             }
         }
@@ -148,7 +148,7 @@ impl FjallStorage {
             .as_ref()
             .map(|record| record.missing.clone())
             .unwrap_or_default();
-        for dep in meta.missing_deps.difference(&previous) {
+        for dep in missing_deps.difference(&previous) {
             if Self::tx_waiter_count(tx, records, dep, 1)? >= MAX_WAITERS as u64 {
                 return Err(Error::Storage("pending waiter quota exceeded".into()));
             }
@@ -159,12 +159,12 @@ impl FjallStorage {
                 &(),
             )?;
         }
-        for dep in previous.difference(&meta.missing_deps) {
+        for dep in previous.difference(missing_deps) {
             tx.remove(records, key(&[WAITER, dep.as_ref(), op.id.as_ref()]))?;
             Self::tx_waiter_count(tx, records, dep, -1)?;
         }
         let ready_key = key(&[READY, op.id.as_ref()]);
-        if meta.missing_deps.is_empty() {
+        if missing_deps.is_empty() {
             Self::tx_put(tx, records, ready_key, &())?;
         } else {
             tx.remove(records, ready_key)?;
@@ -172,7 +172,7 @@ impl FjallStorage {
         // A known op keeps its stored source and charge; only its waits move.
         let record = match existing {
             Some(record) => PendingRecord {
-                missing: meta.missing_deps.clone(),
+                missing: missing_deps.clone(),
                 ..record
             },
             None => {
@@ -195,12 +195,48 @@ impl FjallStorage {
                 PendingRecord {
                     source: source_peer,
                     topic_id,
-                    missing: meta.missing_deps.clone(),
+                    missing: missing_deps.clone(),
                     charge,
                 }
             }
         };
         Self::tx_put(tx, records, key(&[RECORD, op.id.as_ref()]), &record)
+    }
+
+    /// Move the buffered ops of `topic_id` from the namespace keyspace `store` into
+    /// the active `records` in `tx`, each charged to its source again. Waits are
+    /// read again from the active records, so an op whose dependencies arrived with
+    /// the namespace becomes ready. A refused charge fails the whole transaction.
+    pub(super) fn tx_move_pending(
+        tx: &mut Tx,
+        store: &Records,
+        records: &Records,
+        topic_id: &TopicId,
+    ) -> Result<()> {
+        let mut ids = Vec::new();
+        for item in fjall::Readable::prefix(tx, store, key(&[BY_TOPIC, topic_id.as_ref()])) {
+            ids.push(id_at(item.key()?.as_ref(), BY_TOPIC.len() + TopicId::LEN)?);
+        }
+        for op_id in ids {
+            let Some(record) = Self::tx_pending_record(tx, store, &op_id)? else {
+                continue;
+            };
+            let Some(op) = Self::tx_get::<Op>(tx, store, key(&[PAYLOAD, op_id.as_ref()]))? else {
+                continue;
+            };
+            let mut missing = BTreeSet::new();
+            for dep in &record.missing {
+                if !Self::tx_resolvable(tx, records, dep)? {
+                    missing.insert(*dep);
+                }
+            }
+            match Self::tx_put_pending(tx, records, record.source, &op, &missing, record.charge) {
+                // An op behind a rejected id can never be admitted here.
+                Ok(()) | Err(Error::RejectedOp(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// Drop a buffered op and refund its stored charge. Underflow is an error:
