@@ -797,37 +797,59 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         overlay_meta: &BTreeMap<OpId, OpMeta>,
         projections: &mut BTreeMap<OpId, Arc<TopicState>>,
     ) -> Result<Arc<TopicState>> {
-        let mut pending = deps.iter().map(|id| (*id, false)).collect::<Vec<_>>();
+        // First find the ops without a state, dependencies first, and count the
+        // ops that read each state. A state nothing reads any more is dropped, so a
+        // cold walk holds a few states at a time instead of one per ancestor.
+        let mut order = Vec::new();
+        let mut readers = BTreeMap::<OpId, usize>::new();
+        let mut pending = deps.iter().map(|id| (*id, None)).collect::<Vec<_>>();
         let mut visiting = BTreeSet::new();
-        while let Some((id, visited)) = pending.pop() {
-            if projections.contains_key(&id) {
+        let mut walked = BTreeSet::new();
+        while let Some((id, expanded)) = pending.pop() {
+            if let Some(op_deps) = expanded {
+                visiting.remove(&id);
+                walked.insert(id);
+                order.push((id, op_deps));
+                continue;
+            }
+            if projections.contains_key(&id) || walked.contains(&id) {
                 continue;
             }
             let meta = self.meta_projected(&id, overlay_meta)?;
             if meta.topic_id != *topic_id {
                 return Err(Error::TopicMismatch);
             }
-            if !visited {
-                if !visiting.insert(id) {
-                    return Err(Error::Storage("cycle in op graph".into()));
-                }
-                pending.push((id, true));
-                pending.extend(meta.deps.iter().map(|dep| (*dep, false)));
-                continue;
+            if !visiting.insert(id) {
+                return Err(Error::Storage("cycle in op graph".into()));
             }
+            for dep in &meta.deps {
+                *readers.entry(*dep).or_default() += 1;
+            }
+            pending.push((id, Some(meta.deps.clone())));
+            pending.extend(meta.deps.iter().map(|dep| (*dep, None)));
+        }
+        for (id, op_deps) in order {
             let op = self.op_projected(&id, overlay_ops)?;
-            let state = match &op.signed.body.payload {
+            let mut state = match &op.signed.body.payload {
                 TopicPayload::Genesis(_) => {
-                    Arc::new(materialize_topic_state(vec![op], BTreeSet::new())?)
+                    Arc::new(materialize_topic_state(vec![op.clone()], BTreeSet::new())?)
                 }
-                TopicPayload::Event(_) => merge_states(&meta.deps, projections)?,
-                TopicPayload::Control(control) => {
-                    let mut state = (*merge_states(&meta.deps, projections)?).clone();
-                    apply_control(&mut state, &op, control);
-                    Arc::new(state)
+                TopicPayload::Event(_) | TopicPayload::Control(_) => {
+                    merge_states(&op_deps, projections)?
                 }
             };
-            visiting.remove(&id);
+            for dep in &op_deps {
+                if let Some(count) = readers.get_mut(dep) {
+                    *count -= 1;
+                    if *count == 0 && walked.contains(dep) && !deps.contains(dep) {
+                        projections.remove(dep);
+                    }
+                }
+            }
+            // A state no other op still reads is changed in place, not copied.
+            if let TopicPayload::Control(control) = &op.signed.body.payload {
+                apply_control(Arc::make_mut(&mut state), &op, control);
+            }
             projections.insert(id, state);
         }
         merge_states(deps, projections)
@@ -1003,4 +1025,46 @@ pub(super) fn is_admission_race(err: &Error) -> bool {
             | Error::InvalidOpId
             | Error::GenerationMismatch { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::oplog::Oplog;
+    use crate::{Ed25519Signer, PeerId, Signer, TopicControl, TopicGenesis, TopicId, actor_id_for};
+
+    /// A cold projection over a long control chain keeps only the state it
+    /// was asked for, not one growing state per historical control.
+    #[test]
+    fn projection_drops_ancestors() {
+        let owner = Ed25519Signer::from_bytes(&[61; 32]);
+        let topic = TopicId::hash(b"projection-drops-ancestors");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let log = Oplog::new();
+        log.create_topic_genesis(topic, actor, TopicGenesis::new("test.note", []), &owner)
+            .unwrap();
+        let controls = (0..200_u32)
+            .map(|index| {
+                let peer = PeerId::hash(index.to_le_bytes());
+                log.create_control_op(topic, actor, TopicControl::AddPeer { peer }, &owner)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let target = BTreeSet::from([controls[149].id]);
+        let mut projections = BTreeMap::new();
+        let state = log
+            .project_membership(
+                &topic,
+                &target,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &mut projections,
+            )
+            .unwrap();
+        assert_eq!(state.members.len(), 151);
+        assert!(state.members.contains(&PeerId::hash(149_u32.to_le_bytes())));
+        assert!(!state.members.contains(&PeerId::hash(150_u32.to_le_bytes())));
+        assert_eq!(projections.keys().collect::<Vec<_>>(), [&controls[149].id]);
+    }
 }
