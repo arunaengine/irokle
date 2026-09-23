@@ -228,7 +228,6 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             signed.take(),
         )?;
         let committed = (|| {
-            #[cfg(feature = "iroh")]
             op.validate_frame()?;
             self.validate_op(&op)?;
             let meta = self.meta_for(&op)?;
@@ -318,10 +317,8 @@ impl<S: crate::oplog::Storage> Oplog<S> {
     {
         let topic_id = genesis_op.signed.body.topic_id;
         let actor_id = genesis_op.signed.body.actor_id;
-        #[cfg(feature = "iroh")]
         genesis_op.validate_frame()?;
         self.validate_op(&genesis_op)?;
-        #[cfg(feature = "iroh")]
         event_op.validate_frame()?;
 
         let genesis_heads = heads_after(&expected_heads, &genesis_op);

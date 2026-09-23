@@ -5,11 +5,10 @@
 
 use std::io;
 
+use crate::Op;
 #[cfg(any(feature = "iroh", test))]
-use crate::sync::SyncData;
-use crate::sync::SyncMessage;
-#[cfg(any(feature = "iroh", test))]
-use crate::{Op, TopicId};
+use crate::TopicId;
+use crate::sync::{SyncData, SyncMessage};
 
 #[path = "frame.rs"]
 mod frame;
@@ -132,7 +131,6 @@ pub(crate) fn framed_message_len(message: &SyncMessage) -> io::Result<usize> {
     Ok(4 + len)
 }
 
-#[cfg(feature = "iroh")]
 pub(crate) fn validate_op(op: &Op) -> crate::Result<()> {
     let overhead = postcard::experimental::serialized_size(&SyncMessage::Data(SyncData {
         topic_id: op.signed.body.topic_id,

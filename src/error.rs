@@ -65,7 +65,6 @@ pub enum Error {
     #[error("async replication requires a configured transport")]
     ReplicationUnavailable,
 
-    #[cfg(feature = "iroh")]
     #[error("operation exceeds sync frame size limit")]
     OpTooLarge,
 

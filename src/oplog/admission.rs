@@ -182,7 +182,6 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         let mut checked = BTreeSet::new();
         for op in &ops {
             if !verified.contains(&op.id) {
-                #[cfg(feature = "iroh")]
                 op.validate_frame()?;
                 op.validate()?;
             }
@@ -416,7 +415,6 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         let mut projection_tips = BTreeSet::new();
 
         for op in ops {
-            #[cfg(feature = "iroh")]
             op.validate_frame()?;
             if !verified.contains(&op.id) {
                 op.validate()?;
