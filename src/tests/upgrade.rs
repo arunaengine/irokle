@@ -71,12 +71,18 @@ fn raw_records(path: &Path) -> BTreeMap<Vec<u8>, Vec<u8>> {
 }
 
 fn raw_write(path: &Path, key: &[u8], value: Vec<u8>) {
+    raw_writes(path, [(key.to_vec(), value)]);
+}
+
+fn raw_writes(path: &Path, items: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>) {
     let db = fjall::OptimisticTxDatabase::builder(path).open().unwrap();
     let records = db
         .keyspace("records", fjall::KeyspaceCreateOptions::default)
         .unwrap();
     let mut tx = db.write_tx().unwrap();
-    tx.insert(&records, key.to_vec(), value);
+    for (key, value) in items {
+        tx.insert(&records, key, value);
+    }
     tx.commit().unwrap().unwrap();
 }
 
@@ -240,8 +246,8 @@ fn concurrent_open_agrees() {
     assert_eq!(stored_version(&dir.path().join("db")), 2);
 }
 
-/// A buffered record the upgrade cannot decode aborts it with nothing
-/// written; once the record is repaired the next open finishes the upgrade.
+/// A buffered record the upgrade cannot decode stops it at schema 1 with that
+/// record untouched; once the record is repaired the next open finishes it.
 #[test]
 fn upgrade_rolls_back() {
     let dir = fixture_copy(FIXTURE);
@@ -251,9 +257,8 @@ fn upgrade_rolls_back() {
         .find(|(key, _)| key.starts_with(b"po"))
         .unwrap();
     raw_write(&path, &key, vec![0xff; 3]);
-    let before = raw_records(&path);
     assert!(FjallStorage::open(&path).is_err());
-    assert_eq!(raw_records(&path), before);
+    assert_eq!(raw_records(&path).get(&key), Some(&vec![0xff; 3]));
     assert_eq!(stored_version(&path), 1);
 
     raw_write(&path, &key, value);
@@ -440,6 +445,33 @@ fn legacy_metas(path: &Path) -> BTreeMap<OpId, crate_storage::OpMeta> {
 
 /// A crash after the upgrade transaction or between two metadata rewrite steps
 /// leaves a store the next open finishes, with every record readable.
+/// More schema 1 acks than one upgrade step rewrites all reach schema 2, in steps.
+#[test]
+fn upgrade_spans_steps() {
+    let dir = fixture_copy(FIXTURE);
+    let path = dir.path().join("db");
+    let topic = TopicId::hash(b"upgrade-spans-steps");
+    let peers = (0..2500_u32)
+        .map(|index| PeerId::hash(index.to_le_bytes()))
+        .collect::<Vec<_>>();
+    raw_writes(
+        &path,
+        peers.iter().map(|peer| {
+            let legacy = (*peer, topic, BTreeSet::<OpId>::new(), ActorClock::new());
+            (
+                [b"ak".as_slice(), topic.as_ref(), peer.as_ref()].concat(),
+                postcard::to_allocvec(&legacy).unwrap(),
+            )
+        }),
+    );
+    let storage = FjallStorage::open(&path).unwrap();
+    let acks = storage.peer_acks(&topic).unwrap();
+    assert_eq!(acks.len(), peers.len());
+    assert!(acks.iter().all(|ack| ack.genesis.is_none()));
+    drop(storage);
+    assert_eq!(stored_version(&path), 2);
+}
+
 #[test]
 fn upgrade_resumes() {
     let original = fixture_copy(FIXTURE);
@@ -449,8 +481,8 @@ fn upgrade_resumes() {
         let dir = fixture_copy(FIXTURE);
         let path = dir.path().join("db");
         FjallStorage::open_interrupted(&path, steps).unwrap();
-        assert_eq!(stored_version(&path), 2);
-        let stopped = raw_records(&path).contains_key(b"sm".as_slice());
+        let raw = raw_records(&path);
+        let stopped = stored_version(&path) == 1 || raw.contains_key(b"sm".as_slice());
         let storage = FjallStorage::open(&path).unwrap();
         assert!(!storage.migrating().unwrap(), "{steps} steps");
         for (id, meta) in &metas {
