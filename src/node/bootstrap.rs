@@ -171,11 +171,16 @@ impl<S: Storage> Irokle<S> {
         let store = storage
             .provisional_store(&provisional)?
             .ok_or(Error::StaleIncarnation)?;
-        // An op the namespace already stores adds no bytes, so a replayed fragment
-        // fits again. The store still rechecks the quota when it commits.
+        // An op the namespace already stores or buffers, or that repeats in the
+        // fragment, adds no bytes, so a replay fits again. The store still rechecks
+        // the quota when it commits.
         let mut bytes = 0_u64;
+        let mut counted = BTreeSet::new();
         for op in &data.ops {
-            if !store.dep_resolvable(&op.id)? {
+            if counted.insert(op.id)
+                && !store.dep_resolvable(&op.id)?
+                && !store.is_pending(&op.id)?
+            {
                 bytes = bytes.saturating_add(crate::storage::pending_op_bytes(op)? as u64);
             }
         }

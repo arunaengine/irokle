@@ -234,6 +234,11 @@ pub trait Storage: Clone + Send + Sync + 'static {
     /// Sync planning turns these into wants, so a hole a peer never pushes is
     /// actively pulled instead of stranding its dependents forever.
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>>;
+    /// Whether an op with this id is buffered here. The default answers no, so a
+    /// store without the lookup only charges a buffered op again, never too little.
+    fn is_pending(&self, _op_id: &OpId) -> Result<bool> {
+        Ok(false)
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()>;
     /// Atomically drop every pending op that transitively waits on `dep_id`, a genesis that will
     /// never be admitted here, and return how many. Required: single removals are not atomic.

@@ -304,6 +304,38 @@ fn memory_replay_fits() {
     assert_replay_fits(MemoryStorage::new());
 }
 
+/// A replayed fragment whose op is buffered behind a missing dependency, and a
+/// fragment that repeats an op, fit a quota that holds each op once.
+fn assert_repeats_fit<S: Limited>(inner: S) {
+    let source = node(179);
+    let reader_peer = Ed25519Signer::from_bytes(&[180; 32]).peer_id();
+    let (topic_id, ops) = late_invite(&source, reader_peer, 2);
+    let (genesis, second) = (ops[0].clone(), ops[2].clone());
+    let size = |op: &Op| crate::storage::pending_op_bytes(op).unwrap() as u64;
+    let bytes = size(&genesis) + size(&second);
+    let storage = inner.with_limits(crate::storage::StagingLimits {
+        total_bytes: bytes,
+        source_bytes: bytes,
+        namespace_bytes: bytes,
+        ..crate::storage::StagingLimits::MEMORY
+    });
+    let reader = reader_node(storage, 180);
+    let send = |ops: Vec<Op>| {
+        reader
+            .receive_sync_outcome(source.peer_id(), SyncData { topic_id, ops })
+            .map(staged)
+    };
+    let first = send(vec![genesis.clone(), second.clone()]).unwrap();
+    assert_eq!(first.bytes, bytes);
+    assert_eq!(send(vec![genesis.clone(), second]).unwrap(), first);
+    assert_eq!(send(vec![genesis.clone(), genesis]).unwrap(), first);
+}
+
+#[test]
+fn memory_repeats_fit() {
+    assert_repeats_fit(MemoryStorage::new());
+}
+
 /// A namespace buffers an op behind a missing dependency when another member's
 /// invitation activates the topic. The op stays buffered through the activation
 /// and is admitted once the dependency arrives.
@@ -577,6 +609,12 @@ mod fjall {
     fn activation_keeps() {
         let dir = tempfile::tempdir().unwrap();
         assert_activation_keeps(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn repeats_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_repeats_fit(crate::storage::FjallStorage::open(dir.path()).unwrap());
     }
 
     #[test]

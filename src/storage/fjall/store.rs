@@ -1763,6 +1763,9 @@ impl Storage for FjallStorage {
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>> {
         Self::read_pending_missing(&self.snapshot()?, &self.records, topic_id)
     }
+    fn is_pending(&self, op_id: &OpId) -> Result<bool> {
+        Ok(Self::tx_pending_record(&self.snapshot()?, &self.records, op_id)?.is_some())
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         self.transaction(|tx| Self::tx_remove_pending(tx, &self.records, op_id))
     }

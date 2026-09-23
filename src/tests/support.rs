@@ -685,6 +685,9 @@ impl<S: Storage> Storage for StaleReadStorage<S> {
     fn pending_missing_deps(&self, topic_id: &TopicId) -> Result<BTreeSet<OpId>, Error> {
         self.inner.pending_missing_deps(topic_id)
     }
+    fn is_pending(&self, op_id: &OpId) -> Result<bool, Error> {
+        self.inner.is_pending(op_id)
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<(), Error> {
         self.inner.remove_pending_op(op_id)
     }

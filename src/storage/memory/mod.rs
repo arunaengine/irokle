@@ -525,6 +525,9 @@ impl Storage for MemoryStorage {
         let inner = self.lock()?;
         Ok(pending_missing_locked(&inner, topic_id))
     }
+    fn is_pending(&self, op_id: &OpId) -> Result<bool> {
+        Ok(self.lock()?.pending_records.contains_key(op_id))
+    }
     fn remove_pending_op(&self, op_id: &OpId) -> Result<()> {
         let mut inner = self.lock()?;
         remove_pending_locked(&mut inner, op_id)
