@@ -29,7 +29,8 @@ impl<S: Storage> SyncEngine<S> {
         Ok((view.state, heads, view.clock))
     }
 
-    /// Store what a valid ack certifies, see [`Self::validate_ack_in`].
+    /// Store what a valid ack certifies: all of it when this node holds every head
+    /// the ack names, else only the ancestry of the heads it holds.
     pub fn apply_ack(&self, ack: &SyncAck) -> Result<()> {
         ack.verify_signature()?;
         let Some(evidence) = self.validate_ack(ack)? else {

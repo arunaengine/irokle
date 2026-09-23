@@ -424,25 +424,33 @@ impl FjallStorage {
         if Self::tx_get::<u32>(tx, &self.records, SCHEMA_VERSION_KEY)? != Some(1) {
             return Ok(false);
         }
-        let phase = Self::tx_get::<u8>(tx, &self.records, LEGACY_PHASE)?.unwrap_or_default();
-        let finished = match phase {
-            0 => self.tx_legacy_acks(tx, limit)?,
-            1 => self.tx_legacy_obligations(tx, limit)?,
-            2 => self.tx_legacy_indexes(tx, limit)?,
-            3 => self.tx_legacy_pending(tx, limit)?,
-            4 => self.tx_place_converted(tx, limit)?,
-            _ => {
-                return Err(Error::Storage(format!(
-                    "unknown schema 1 upgrade phase {phase}"
-                )));
+        // Finished phases continue in the same transaction, so a small store
+        // upgrades at once, and a refused record there leaves it unchanged.
+        let first = Self::tx_get::<u8>(tx, &self.records, LEGACY_PHASE)?.unwrap_or_default();
+        for phase in first..=4 {
+            let finished = match phase {
+                0 => self.tx_legacy_acks(tx, limit)?,
+                1 => self.tx_legacy_obligations(tx, limit)?,
+                2 => self.tx_legacy_indexes(tx, limit)?,
+                3 => self.tx_legacy_pending(tx, limit)?,
+                4 => self.tx_place_converted(tx, limit)?,
+                _ => {
+                    return Err(Error::Storage(format!(
+                        "unknown schema 1 upgrade phase {phase}"
+                    )));
+                }
+            };
+            if !finished {
+                if phase != first {
+                    Self::tx_put(tx, &self.records, LEGACY_PHASE, &phase)?;
+                }
+                return Ok(true);
             }
-        };
-        if !finished {
-            return Ok(true);
         }
-        if phase < 4 {
-            Self::tx_put(tx, &self.records, LEGACY_PHASE, &(phase + 1))?;
-            return Ok(true);
+        if first > 4 {
+            return Err(Error::Storage(format!(
+                "unknown schema 1 upgrade phase {first}"
+            )));
         }
         tx.remove(&self.records, LEGACY_PHASE)?;
         Self::tx_put(
