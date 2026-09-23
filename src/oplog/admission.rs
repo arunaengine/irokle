@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use crate::storage::{AdmissionEffects, AdmittedBatch, OpMeta, TopicState};
-use crate::{Error, Op, OpBody, OpId, Result, TopicId, TopicPayload, actor_id_for};
+use crate::{Error, Op, OpBody, OpId, Result, TopicControl, TopicId, TopicPayload, actor_id_for};
 
 use crate::oplog::membership::{apply_control, materialize_topic_state, merge_states};
 use crate::oplog::pending::{PendingVerdict, pending_meta_for};
@@ -815,13 +815,17 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         let mut workspace = Workspace::new(&self.storage);
         let mut known = BTreeSet::new();
         let mut folded = Vec::new();
+        // What the folded controls add to a state, charged before it is built.
+        let mut grows = 0_u64;
         let mut seen = BTreeSet::new();
+        workspace.charge(WALK_BYTES * deps.len() as u64)?;
         let mut walk = deps.iter().copied().collect::<Vec<_>>();
         while let Some(id) = walk.pop() {
-            if !seen.insert(id) {
+            if seen.contains(&id) {
                 continue;
             }
-            workspace.charge(WALK_BYTES)?;
+            workspace.charge(SEEN_BYTES)?;
+            seen.insert(id);
             if projections.contains_key(&id) {
                 known.insert(id);
                 continue;
@@ -830,18 +834,28 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             if meta.topic_id != *topic_id {
                 return Err(Error::TopicMismatch);
             }
+            workspace.charge(WALK_BYTES * meta.deps.len() as u64)?;
             walk.extend(meta.deps.iter().copied());
             let op = self.op_projected(&id, overlay_ops)?;
             if !matches!(op.signed.body.payload, TopicPayload::Event(_)) {
-                workspace.charge(2 * crate::storage::pending_op_bytes(&op)? as u64)?;
+                // The op, the vector growth around it, and its share of the state.
+                workspace.charge(3 * crate::storage::pending_op_bytes(&op)? as u64)?;
+                grows = grows.saturating_add(fold_bytes(&op));
                 folded.push(op);
             }
         }
         let state = if known.is_empty() {
+            // Materializing copies the genesis peers besides the state it returns.
+            workspace.charge(STATE_BASE_BYTES + 2 * grows)?;
             Arc::new(materialize_topic_state(folded, BTreeSet::new())?)
         } else {
+            let merged = known
+                .iter()
+                .filter_map(|id| projections.get(id))
+                .map(|state| state_bytes(state) as u64)
+                .sum::<u64>();
+            workspace.charge(merged.saturating_add(grows))?;
             let mut state = merge_states(&known, projections)?;
-            workspace.charge(state_bytes(&state) as u64)?;
             for op in &folded {
                 match &op.signed.body.payload {
                     TopicPayload::Genesis(_) if op.id != state.genesis => {
@@ -1024,14 +1038,54 @@ pub(super) fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
     }
 }
 
-/// Bytes one walked id costs a projection: its entry in the walk and the seen set.
-const WALK_BYTES: u64 = 96;
+/// Bytes a queued id and a seen id cost a projection walk, with vector growth and
+/// B-tree nodes at their lowest occupancy.
+const WALK_BYTES: u64 = 64;
+const SEEN_BYTES: u64 = 80;
 /// Bytes a projection charges its store at once.
 const HOLD_BYTES: u64 = 64 * 1024;
+/// Projection workspace any store allows, so a store without a memory budget
+/// still refuses a projection past it.
+const MAX_WORKSPACE_BYTES: u64 = 256 * 1024 * 1024;
+/// Upper bounds of one entry of a peer set and of the membership controls, with
+/// B-tree nodes at their lowest occupancy, and of a state's fixed part.
+const PEER_BYTES: u64 = 72;
+const CONTROL_BYTES: u64 = 264;
+const STATE_BASE_BYTES: u64 = 512;
 
-/// Memory a projected state holds, estimated from its members and controls.
+/// Memory a projected state holds: members, controls, both policy peer sets and
+/// the event type id, each at its upper bound.
 pub(super) fn state_bytes(state: &TopicState) -> usize {
-    256 + 48 * state.members.len() + 160 * state.membership_controls.len()
+    let peers = state.members.len()
+        + state.replication_policy.selected_peers.len()
+        + state
+            .replication_policy_control
+            .as_ref()
+            .map_or(0, |(_, policy)| policy.selected_peers.len());
+    (STATE_BASE_BYTES
+        + state.event_type_id.len() as u64
+        + PEER_BYTES * peers as u64
+        + CONTROL_BYTES * state.membership_controls.len() as u64) as usize
+}
+
+/// Memory folding `op` can add to a state, at the same upper bounds.
+fn fold_bytes(op: &Op) -> u64 {
+    match &op.signed.body.payload {
+        TopicPayload::Genesis(genesis) => {
+            genesis.event_type_id.len() as u64
+                + PEER_BYTES
+                    * (genesis.initial_peers.len()
+                        + 2 * genesis.replication_policy.selected_peers.len())
+                        as u64
+        }
+        TopicPayload::Control(TopicControl::SetReplicationPolicy { policy }) => {
+            2 * PEER_BYTES * policy.selected_peers.len() as u64
+        }
+        TopicPayload::Control(TopicControl::AddPeer { .. } | TopicControl::RemovePeer { .. }) => {
+            CONTROL_BYTES + PEER_BYTES
+        }
+        TopicPayload::Event(_) => 0,
+    }
 }
 
 /// Memory `states` hold together; a shared state is counted each time.
@@ -1057,9 +1111,17 @@ impl<'a, S: crate::oplog::Storage> Workspace<'a, S> {
         }
     }
 
-    /// Account `bytes` more, refusing once the store's budget is exhausted.
+    /// Account `bytes` more, refusing once the store's budget or the projection
+    /// limit is exhausted.
     fn charge(&mut self, bytes: u64) -> Result<()> {
         self.used = self.used.saturating_add(bytes);
+        if self.used > MAX_WORKSPACE_BYTES {
+            return Err(Error::MemoryPressure {
+                domain: crate::storage::MemoryDomain::Workspace,
+                required: self.used,
+                limit: MAX_WORKSPACE_BYTES,
+            });
+        }
         while self.used > self.held {
             self.holds.push(self.storage.hold_workspace(HOLD_BYTES)?);
             self.held += HOLD_BYTES;
