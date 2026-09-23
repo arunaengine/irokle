@@ -2143,3 +2143,38 @@ mod fjall {
         assert_outcome_states(crate::storage::FjallStorage::open(dir.path()).unwrap());
     }
 }
+
+/// A summary of a topic at the actor limit, with the widest sequence numbers,
+/// a head per actor and no staged receipt, still fits one sync frame.
+#[test]
+fn full_summary_fits() {
+    let actors = (0..crate::sync::MAX_TOPIC_ACTORS as u64)
+        .map(|index| ActorId::hash(index.to_le_bytes()))
+        .collect::<Vec<_>>();
+    let mut actor_clock = ActorClock::new();
+    for actor in &actors {
+        actor_clock.set(*actor, u64::MAX);
+    }
+    let summary = sync::SyncSummary {
+        topic_id: TopicId::hash(b"full-summary-fits"),
+        event_type_id: Some(Note::TYPE_ID.into()),
+        genesis: Some(OpId::hash(b"genesis")),
+        fingerprint: [0; 32],
+        heads: actors
+            .iter()
+            .map(|actor| OpId::hash(actor.as_ref()))
+            .collect(),
+        actor_clock,
+        actor_tips: actors
+            .iter()
+            .map(|actor| (*actor, (u64::MAX, OpId::hash(actor.as_ref()))))
+            .collect(),
+        staged: None,
+    };
+    let bytes = crate::net::encode_sync_message(&sync::SyncMessage::Summary(summary)).unwrap();
+    assert!(
+        crate::net::encode_frame(&bytes).is_ok(),
+        "{} bytes",
+        bytes.len()
+    );
+}

@@ -216,6 +216,14 @@ impl<S: crate::oplog::Storage> Oplog<S> {
     {
         if !matches!(payload, TopicPayload::Genesis(_)) {
             self.ensure_member(&topic_id, signer.peer_id())?;
+            if self.storage.actor_tip(&topic_id, &actor_id)?.is_none()
+                && self
+                    .storage
+                    .read_snapshot(|read| read.actor_count(&topic_id))?
+                    >= crate::sync::MAX_TOPIC_ACTORS
+            {
+                return Err(Error::TopicFull);
+            }
         }
         let expected_heads = self.storage.heads(&topic_id)?;
         let expected_state = self.storage.topic_state(&topic_id)?;

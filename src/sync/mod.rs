@@ -42,6 +42,12 @@ const ACK_SIGNING_DOMAIN: &[u8] = b"irokle/sync-ack/2";
 /// window and names the positions a page needed. Older peers are refused before any message.
 pub const SYNC_PROTOCOL: &str = "irokle/sync/2";
 
+/// Actors a topic may hold before a member's first write is refused. A summary
+/// names every actor's clock entry and tip and at most one head each, so at this
+/// count it still fits one sync frame. Admission does not refuse: that would make
+/// the accepted set depend on arrival order.
+pub const MAX_TOPIC_ACTORS: usize = 100_000;
+
 /// Maximum sequences a single `ActorRangeHint` may span. Hints built by `request_ranges` stay
 /// within it, and every response clamps peer hints to it, so a malicious peer cannot make us
 /// walk unbounded sequence ranges.
