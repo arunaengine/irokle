@@ -4,12 +4,25 @@
 use std::collections::HashSet;
 use std::hash::Hash;
 
+use serde::{Deserialize, Serialize};
+
+use crate::{ActorClock, OpId};
+
 /// Ordering used when traversing linearized history.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HistoryOrder {
     #[default]
     OldestFirst,
     NewestFirst,
+}
+
+/// Where an incremental history read resumes: the actor clock read so far and the
+/// genesis of the branch it was read on. A replaced genesis reuses actor sequences,
+/// so a cursor from another branch is refused instead of skipping new events.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistoryCursor {
+    pub genesis: OpId,
+    pub clock: ActorClock,
 }
 
 /// Query options for DAG traversal.

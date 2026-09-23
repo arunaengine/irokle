@@ -339,6 +339,48 @@ fn obligation_keeps_branch() {
     );
 }
 
+/// A history cursor read on a replaced branch is refused, rather than covering
+/// the new branch's events that reuse its actor positions.
+#[test]
+fn cursor_keeps_branch() {
+    use crate::history::{HistoryCursor, HistoryOrder};
+
+    let branches = branches(240);
+    let node = Irokle::builder()
+        .with_signer(branches.member.clone())
+        .build()
+        .unwrap();
+    Oplog::with_storage(node.storage().clone())
+        .receive_ops(vec![branches.old.0.clone(), branches.old.1.clone()])
+        .unwrap();
+    let topic = node.open_topic::<Note>(branches.topic_id).unwrap();
+    let cursor = topic.history_cursor().unwrap();
+    assert_eq!(cursor.genesis, branches.old.0.id);
+    assert!(
+        topic
+            .history_after(&cursor, HistoryOrder::OldestFirst)
+            .unwrap()
+            .is_empty()
+    );
+
+    reset_to_new(node.storage(), &branches);
+    assert!(matches!(
+        topic.history_after(&cursor, HistoryOrder::OldestFirst),
+        Err(Error::StaleIncarnation)
+    ));
+    let fresh = HistoryCursor {
+        genesis: branches.new.0.id,
+        clock: ActorClock::new(),
+    };
+    let events = topic
+        .history_after(&fresh, HistoryOrder::OldestFirst)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.meta.op_id)
+        .collect::<Vec<_>>();
+    assert_eq!(events, [branches.new.1.id]);
+}
+
 /// Sync state is dropped only for a peer that is still absent from the branch
 /// the caller judged, never for a member of a replacement branch.
 fn assert_clear_keeps<S: Storage>(storage: S) {

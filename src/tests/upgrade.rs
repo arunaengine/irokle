@@ -315,7 +315,7 @@ fn reopen_keeps_progress() {
         .unwrap();
     let topic_id = topic.id();
     topic.publish(Note { text: "one".into() }).unwrap();
-    let cursor = topic.actor_clock().unwrap();
+    let cursor = topic.history_cursor().unwrap();
     for text in ["two", "three"] {
         topic.publish(Note { text: text.into() }).unwrap();
     }

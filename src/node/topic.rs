@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::marker::PhantomData;
 
-use crate::history::{DagQuery, HistoryOrder, limited, ordered};
+use crate::history::{DagQuery, HistoryCursor, HistoryOrder, limited, ordered};
 use crate::oplog::{Oplog, topological, topological_ids};
 use crate::reducer::EventRecord;
 use crate::storage::{MemoryStorage, Storage};
@@ -76,12 +76,19 @@ impl<E: Event, S: Storage> Topic<E, S> {
         self.node.topic_history(self.topic_id, order)
     }
 
+    /// Events not covered by `cursor`. A cursor from a replaced genesis fails with
+    /// [`Error::StaleIncarnation`]; the caller then rebuilds from [`Self::history`].
     pub fn history_after(
         &self,
-        clock: &ActorClock,
+        cursor: &HistoryCursor,
         order: HistoryOrder,
     ) -> Result<Vec<EventRecord<E>>> {
-        self.node.history_after_clock(self.topic_id, clock, order)
+        self.node.history_after_cursor(self.topic_id, cursor, order)
+    }
+
+    /// The current branch and actor clock, read together, for a later [`Self::history_after`].
+    pub fn history_cursor(&self) -> Result<HistoryCursor> {
+        self.node.topic_history_cursor(self.topic_id)
     }
 
     pub fn dag(&self, query: DagQuery<OpId>) -> Result<Vec<Op>> {

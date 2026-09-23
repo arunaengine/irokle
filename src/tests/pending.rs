@@ -276,7 +276,10 @@ fn orphan_keeps_history() {
     assert_eq!(history[0].event.text, "kept");
     let after = topic
         .history_after(
-            &ActorClock::new(),
+            &crate::history::HistoryCursor {
+                genesis: m.genesis.id,
+                clock: ActorClock::new(),
+            },
             crate::history::HistoryOrder::OldestFirst,
         )
         .unwrap();

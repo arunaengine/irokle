@@ -19,7 +19,7 @@ use peers::{PeerHealthStore, select_sync_targets};
 pub use topic::{RawTopic, Topic};
 
 use crate::ActorClock;
-use crate::history::{DagQuery, HistoryOrder, ordered};
+use crate::history::{DagQuery, HistoryCursor, HistoryOrder, ordered};
 use crate::oplog::{Oplog, topological_subset_entries};
 use crate::reducer::EventRecord;
 use crate::storage::{AdmissionEffects, OpMeta, StagedTopic, SyncObligation, TopicState};
@@ -950,13 +950,25 @@ impl<S: Storage> Irokle<S> {
         Ok(ordered(records, order))
     }
 
-    pub(crate) fn history_after_clock<E: Event>(
+    pub(crate) fn history_after_cursor<E: Event>(
         &self,
         topic_id: TopicId,
-        clock: &ActorClock,
+        cursor: &HistoryCursor,
         order: HistoryOrder,
     ) -> Result<Vec<EventRecord<E>>> {
         let storage = self.oplog.storage();
+        // Checked before and after the walk, so a replacement in between is not missed.
+        let same_branch = || -> Result<()> {
+            let state = storage
+                .topic_state(&topic_id)?
+                .ok_or(Error::TopicNotFound)?;
+            if state.genesis != cursor.genesis {
+                return Err(Error::StaleIncarnation);
+            }
+            Ok(())
+        };
+        same_branch()?;
+        let clock = &cursor.clock;
         let mut seen = BTreeSet::new();
         let mut queue = storage
             .heads(&topic_id)?
@@ -980,6 +992,7 @@ impl<S: Storage> Irokle<S> {
         if entries.len() != seen.len() || !self.oplog.history_whole(&topic_id)? {
             return Err(Error::Storage("incomplete topic history".into()));
         }
+        same_branch()?;
         let mut records = Vec::new();
         for (op, meta) in entries {
             if clock.get(&meta.actor_id) >= meta.actor_seq {
@@ -1004,6 +1017,18 @@ impl<S: Storage> Irokle<S> {
 
     pub(crate) fn topic_heads(&self, topic_id: TopicId) -> Result<BTreeSet<OpId>> {
         self.oplog.storage().heads(&topic_id)
+    }
+
+    pub(crate) fn topic_history_cursor(&self, topic_id: TopicId) -> Result<HistoryCursor> {
+        let view = self
+            .oplog
+            .storage()
+            .topic_view(&topic_id, None)?
+            .ok_or(Error::TopicNotFound)?;
+        Ok(HistoryCursor {
+            genesis: view.state.genesis,
+            clock: view.clock,
+        })
     }
 
     pub(crate) fn topic_actor_clock(&self, topic_id: TopicId) -> Result<ActorClock> {
