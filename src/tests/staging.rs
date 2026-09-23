@@ -340,6 +340,7 @@ fn memory_repeats_fit() {
 /// inviter's invitation of `reader`, made outside the reader's store.
 struct PendingInvite {
     author: Ed25519Signer,
+    inviter: Ed25519Signer,
     topic_id: TopicId,
     genesis: Op,
     first: Op,
@@ -376,6 +377,7 @@ fn pending_invite(reader: PeerId, seed: u8) -> PendingInvite {
         .unwrap();
     PendingInvite {
         author,
+        inviter,
         topic_id,
         genesis,
         first,
@@ -429,6 +431,35 @@ fn assert_activation_keeps<S: Storage>(storage: S) {
 #[test]
 fn memory_activation_keeps() {
     assert_activation_keeps(MemoryStorage::new());
+}
+
+/// The author stages the genesis and a buffered op, then the inviter, another
+/// source, stages the same genesis with its invitation and activates the topic.
+/// The author's buffered op moves too, so its dependency completes it.
+fn assert_sources_keep<S: Storage>(storage: S) {
+    let reader = reader_node(storage, 188);
+    let case = pending_invite(reader.peer_id(), 186);
+    staged(
+        case.send(&reader, vec![case.genesis.clone(), case.second.clone()])
+            .unwrap(),
+    );
+    let data = SyncData {
+        topic_id: case.topic_id,
+        ops: vec![case.genesis.clone(), case.invite.clone()],
+    };
+    assert!(matches!(
+        reader
+            .receive_sync_outcome(case.inviter.peer_id(), data)
+            .unwrap(),
+        ReceiveOutcome::Acked { .. }
+    ));
+    assert!(reader.storage().provisional_topics().unwrap().is_empty());
+    case.assert_completes(&reader);
+}
+
+#[test]
+fn memory_sources_keep() {
+    assert_sources_keep(MemoryStorage::new());
 }
 
 /// The author's pending pool in the active store is full when the invitation
@@ -710,6 +741,12 @@ mod fjall {
     fn activation_keeps() {
         let dir = tempfile::tempdir().unwrap();
         assert_activation_keeps(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn sources_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_sources_keep(crate::storage::FjallStorage::open(dir.path()).unwrap());
     }
 
     #[test]

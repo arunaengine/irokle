@@ -249,15 +249,15 @@ impl MemoryStorage {
             .namespaces
             .iter()
             .filter(|((_, topic), _)| *topic == topic_id)
-            .map(|(key, (_, records))| (*key, Arc::clone(records)))
+            .map(|(key, (current, records))| (*key, current.genesis, Arc::clone(records)))
             .collect::<Vec<_>>();
         let mut locked = records
             .iter()
-            .map(|(_, records)| records.lock())
+            .map(|(_, _, records)| records.lock())
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let position = records
             .iter()
-            .position(|(key, _)| *key == (provisional.source, topic_id))
+            .position(|(key, _, _)| *key == (provisional.source, topic_id))
             .ok_or(Error::StaleIncarnation)?;
         let staged = &locked[position];
         if topic_state_locked(staged, &topic_id).as_ref() != Some(expected) {
@@ -302,16 +302,24 @@ impl MemoryStorage {
             let merged = merged_obligation(existing, &obligation)?;
             changes.insert(key, merged);
         }
-        // Buffered ops move with the admitted records, checked before anything
-        // changes, so a refused charge leaves them all staged.
-        let moves = pending_moves(staged, &inner, &topic_id)?;
+        // Buffered ops of every namespace on this branch move with the admitted
+        // records, checked before anything changes, so a refused charge leaves
+        // them all staged. Namespaces of another genesis stay apart and end.
+        let branch = records
+            .iter()
+            .zip(&locked)
+            .filter(|((_, genesis, _), _)| *genesis == provisional.genesis)
+            .map(|(_, records)| &**records)
+            .collect::<Vec<_>>();
+        let moves = pending_moves(&branch, staged, &inner, &topic_id)?;
         let mut reservation = MetadataPlan::new(&inner)?;
         for obligation in changes.values() {
             reservation.obligation(&inner, obligation)?;
         }
         reservation.commit(&mut inner);
         copy_topic_locked(staged, &mut inner, &topic_id);
-        move_pending(staged, &mut inner, &topic_id, moves);
+        move_pending(&branch, &mut inner, &topic_id, moves);
+        drop(branch);
         inner.topics.insert(topic_id, expected.clone());
         for merged in changes.into_values() {
             put_obligation_locked(&mut inner, merged);
@@ -323,7 +331,7 @@ impl MemoryStorage {
             };
         }
         drop(locked);
-        for (key, _) in records {
+        for (key, _, _) in records {
             staging.namespaces.remove(&key);
         }
         Ok(())
@@ -351,72 +359,83 @@ impl MemoryStorage {
     }
 }
 
-/// The buffered ops of `topic_id` in `staged`, each with the dependencies it
-/// still misses once the staged records are active. Refuses unless all of them
-/// fit the pending quotas and waiter limits of `inner` together.
+/// The buffered ops of `topic_id` in `stores`, each with its store and the
+/// dependencies it still misses once `copied` is active. Refuses unless all of
+/// them fit the pending quotas and waiter limits of `inner` together.
 fn pending_moves(
-    staged: &MemoryInner,
+    stores: &[&MemoryInner],
+    copied: &MemoryInner,
     inner: &MemoryInner,
     topic_id: &TopicId,
-) -> Result<Vec<(OpId, BTreeSet<OpId>)>> {
+) -> Result<Vec<(usize, OpId, BTreeSet<OpId>)>> {
     let resolvable =
-        |id: &OpId| dep_resolvable_locked(inner, id) || dep_resolvable_locked(staged, id);
+        |id: &OpId| dep_resolvable_locked(inner, id) || dep_resolvable_locked(copied, id);
     let mut total = inner.pending_usage;
     let mut topic = inner.topic_usage.get(topic_id).copied().unwrap_or_default();
     let mut sources = BTreeMap::new();
     let mut waiters = BTreeMap::<OpId, usize>::new();
+    let mut moved = BTreeSet::new();
     let mut moves = Vec::new();
-    for id in staged.pending_by_topic.get(topic_id).into_iter().flatten() {
-        let Some(record) = staged.pending_records.get(id) else {
-            continue;
-        };
-        let rejected = inner.rejected.get(topic_id).is_some_and(|rejected| {
-            std::iter::once(id)
-                .chain(&record.missing)
-                .any(|id| rejected.ids.contains(id))
-        });
-        // An admitted, already buffered or rejected op needs no move.
-        if resolvable(id) || inner.pending_records.contains_key(id) || rejected {
-            continue;
-        }
-        let source = sources.entry(record.source).or_insert_with(|| {
-            inner
-                .source_usage
-                .get(&record.source)
-                .copied()
-                .unwrap_or_default()
-        });
-        check_pending_quota(total, *source, topic, record.charge)?;
-        *source = source.charged(record.charge);
-        total = total.charged(record.charge);
-        topic = topic.charged(record.charge);
-        let missing = record
-            .missing
-            .iter()
-            .copied()
-            .filter(|dep| !resolvable(dep))
-            .collect::<BTreeSet<_>>();
-        for dep in &missing {
-            let added = waiters.entry(*dep).or_default();
-            let held = inner.pending_waiters.get(dep).map_or(0, BTreeSet::len);
-            if held + *added >= MAX_WAITERS {
-                return Err(Error::Storage("pending waiter quota exceeded".into()));
+    for (index, staged) in stores.iter().enumerate() {
+        for id in staged.pending_by_topic.get(topic_id).into_iter().flatten() {
+            let Some(record) = staged.pending_records.get(id) else {
+                continue;
+            };
+            let rejected = inner.rejected.get(topic_id).is_some_and(|rejected| {
+                std::iter::once(id)
+                    .chain(&record.missing)
+                    .any(|id| rejected.ids.contains(id))
+            });
+            // An admitted, already buffered or rejected op needs no move.
+            if resolvable(id)
+                || inner.pending_records.contains_key(id)
+                || rejected
+                || !moved.insert(*id)
+            {
+                continue;
             }
-            *added += 1;
+            let source = sources.entry(record.source).or_insert_with(|| {
+                inner
+                    .source_usage
+                    .get(&record.source)
+                    .copied()
+                    .unwrap_or_default()
+            });
+            check_pending_quota(total, *source, topic, record.charge)?;
+            *source = source.charged(record.charge);
+            total = total.charged(record.charge);
+            topic = topic.charged(record.charge);
+            let missing = record
+                .missing
+                .iter()
+                .copied()
+                .filter(|dep| !resolvable(dep))
+                .collect::<BTreeSet<_>>();
+            for dep in &missing {
+                let added = waiters.entry(*dep).or_default();
+                let held = inner.pending_waiters.get(dep).map_or(0, BTreeSet::len);
+                if held + *added >= MAX_WAITERS {
+                    return Err(Error::Storage("pending waiter quota exceeded".into()));
+                }
+                *added += 1;
+            }
+            moves.push((index, *id, missing));
         }
-        moves.push((*id, missing));
     }
     Ok(moves)
 }
 
-/// Buffer the checked `moves` from `staged` in `inner`, keeping each op's source and charge.
+/// Buffer the checked `moves` from `stores` in `inner`, keeping each op's source and charge.
 fn move_pending(
-    staged: &MemoryInner,
+    stores: &[&MemoryInner],
     inner: &mut MemoryInner,
     topic_id: &TopicId,
-    moves: Vec<(OpId, BTreeSet<OpId>)>,
+    moves: Vec<(usize, OpId, BTreeSet<OpId>)>,
 ) {
-    for (id, missing) in moves {
+    for (index, id, missing) in moves {
+        let Some(staged) = stores.get(index) else {
+            continue;
+        };
         let (Some(record), Some(op)) =
             (staged.pending_records.get(&id), staged.pending_ops.get(&id))
         else {
