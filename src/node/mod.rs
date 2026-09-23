@@ -1000,10 +1000,9 @@ impl<S: Storage> Irokle<S> {
             if view.state.genesis != cursor.genesis {
                 return Err(Error::StaleIncarnation);
             }
-            // Each actor's next unread op waits in a queue ordered by generation.
-            // An op joins once every dependency is covered by the cursor or joined
-            // before it; dependencies have smaller generations, so they come first.
-            // A refused op blocks the rest of its actor for this page.
+            // Each actor's next unread op waits, smallest generation first. An op
+            // joins once the cursor or the page covers its dependencies, which come
+            // first; a refused op ends its actor's part of this page.
             let mut next = std::collections::BinaryHeap::new();
             let unread = |actor: &ActorId, after: u64| -> Result<Option<_>> {
                 let Some((seq, id)) = read.actor_range(&topic_id, actor, after, 1)?.pop() else {
