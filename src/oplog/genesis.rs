@@ -43,15 +43,17 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         // `Ord` is lexicographic over those bytes, so both nodes pick the same
         // winner with no coordination.
         if genesis.id < state.genesis {
-            // A smaller foreign genesis may reset only for a current local member:
-            // genesis ids are grindable, so disjoint-membership forks do not auto-converge.
-            if !state.members.contains(&genesis.signed.body.author) {
+            // A smaller foreign genesis may reset only for an initial peer of the
+            // genesis it replaces: genesis ids are grindable, so an outsider must not
+            // win. Initial peers never change, unlike current membership, so every
+            // replica decides the same way whatever order removals arrive in.
+            if !self.initial_peer(&state.genesis, &genesis.signed.body.author)? {
                 tracing::warn!(
                     %topic_id,
                     local_genesis = %state.genesis,
                     foreign_genesis = %genesis.id,
                     author = %genesis.signed.body.author,
-                    "rejected non-member genesis collision"
+                    "rejected genesis collision by a peer the local genesis does not name"
                 );
                 let filtered = without_descendants(ops, genesis.id);
                 return Ok((filtered, None, Some(genesis.id)));
@@ -83,6 +85,18 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             let filtered = without_descendants(ops, genesis.id);
             Ok((filtered, None, Some(genesis.id)))
         }
+    }
+
+    /// Whether the genesis `genesis_id` names `peer` among its initial peers. A
+    /// genesis record that cannot be read names nobody.
+    fn initial_peer(&self, genesis_id: &OpId, peer: &crate::PeerId) -> Result<bool> {
+        Ok(match self.storage.get_op(genesis_id)? {
+            Some(op) => match &op.signed.body.payload {
+                TopicPayload::Genesis(genesis) => genesis.initial_peers.contains(peer),
+                TopicPayload::Event(_) | TopicPayload::Control(_) => false,
+            },
+            None => false,
+        })
     }
 
     /// Collect local non-genesis payloads by actor and sequence for re-emission.
