@@ -932,7 +932,7 @@ impl<S: Storage> Irokle<S> {
         let storage = self.oplog.storage();
         let ids = storage.list_op_ids(&topic_id)?;
         let entries = topological_subset_entries(storage, &ids)?;
-        if entries.len() != ids.len() || !self.oplog.topic_unresolved(&topic_id)?.is_empty() {
+        if entries.len() != ids.len() || !self.oplog.history_whole(&topic_id)? {
             return Err(Error::Storage("incomplete topic history".into()));
         }
         let mut records = Vec::new();
@@ -977,7 +977,7 @@ impl<S: Storage> Irokle<S> {
         }
 
         let entries = topological_subset_entries(storage, &seen)?;
-        if entries.len() != seen.len() || !self.oplog.topic_unresolved(&topic_id)?.is_empty() {
+        if entries.len() != seen.len() || !self.oplog.history_whole(&topic_id)? {
             return Err(Error::Storage("incomplete topic history".into()));
         }
         let mut records = Vec::new();

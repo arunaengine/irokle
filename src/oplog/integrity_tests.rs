@@ -184,8 +184,8 @@ fn memory_wide_resumes() {
     assert_wide_resumes(MemoryStorage::new());
 }
 
-/// A buffered op waiting on a missing dependency keeps the topic uncertified
-/// although its scan is whole, until the dependency arrives.
+/// A buffered op waiting on a missing dependency keeps the topic uncertified for
+/// sync and lists the dependency as unresolved, but the admitted history stays whole.
 fn assert_pending_counts<S: Corrupt>(storage: S) {
     let (log, topic_id, ops) = seeded(&storage, 6, 4);
     log.receive_ops(vec![ops[5].clone()]).unwrap();
@@ -194,7 +194,8 @@ fn assert_pending_counts<S: Corrupt>(storage: S) {
     assert!(!integrity.certifies(&view));
     let missing = BTreeSet::from([ops[4].id]);
     assert_eq!(log.topic_unresolved(&topic_id).unwrap(), missing);
-    assert!(!log.whole_view(&topic_id).unwrap().unwrap().1);
+    assert!(log.whole_view(&topic_id).unwrap().unwrap().1);
+    assert!(log.history_whole(&topic_id).unwrap());
     log.receive_ops(vec![ops[4].clone()]).unwrap();
     assert!(log.topic_unresolved(&topic_id).unwrap().is_empty());
     assert!(log.whole_view(&topic_id).unwrap().unwrap().1);

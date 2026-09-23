@@ -11,8 +11,8 @@ use crate::sync::{SyncAck, SyncEngine, SyncReport};
 
 impl<S: Storage> SyncEngine<S> {
     /// Heads and clock an ack may certify, read from one view with their genesis. A topic
-    /// holding an unresolvable id certifies nothing until repair completes, so the source
-    /// keeps its obligation and this node stays visibly behind.
+    /// whose admitted history holds an unresolvable id certifies nothing until repair
+    /// completes, so the source keeps its obligation and this node stays visibly behind.
     pub(super) fn ack_frontier(
         &self,
         topic_id: &TopicId,

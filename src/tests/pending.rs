@@ -221,6 +221,68 @@ fn retains_unproven_author() {
     );
 }
 
+/// A removed member's buffered op behind a dependency that never arrives keeps
+/// its dependency unresolved, but neither hides the admitted history nor empties the ack.
+#[test]
+fn orphan_keeps_history() {
+    let m = members(234);
+    let topic = m.alice.open_topic::<Note>(m.topic_id).unwrap();
+    topic
+        .publish(Note {
+            text: "kept".into(),
+        })
+        .unwrap();
+    topic.remove_peer(m.bob.peer_id()).unwrap();
+    let missing = OpId::hash(b"never stored");
+    let orphan = Op::sign(
+        OpBody {
+            topic_id: m.topic_id,
+            author: m.bob.peer_id(),
+            actor_id: actor_id_for(m.topic_id, m.bob.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [missing].into(),
+            generation: 1,
+            payload: TopicPayload::Event(
+                EventEnvelope::encode_event(&Note {
+                    text: "orphan".into(),
+                })
+                .unwrap(),
+            ),
+        },
+        &m.bob,
+    )
+    .unwrap();
+    let data = sync::SyncData {
+        topic_id: m.topic_id,
+        ops: vec![orphan.clone()],
+    };
+    let (ack, _) = m
+        .alice
+        .receive_sync_data_from(m.bob.peer_id(), data)
+        .unwrap();
+
+    assert!(buffered(m.alice.storage(), &m.topic_id, &orphan));
+    assert_eq!(
+        m.alice.topic_unresolved(m.topic_id).unwrap(),
+        [missing].into()
+    );
+    assert_eq!(ack.heads, topic.heads().unwrap());
+    assert_eq!(ack.clock, topic.actor_clock().unwrap());
+    let history = topic
+        .history(crate::history::HistoryOrder::OldestFirst)
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].event.text, "kept");
+    let after = topic
+        .history_after(
+            &ActorClock::new(),
+            crate::history::HistoryOrder::OldestFirst,
+        )
+        .unwrap();
+    assert_eq!(after.len(), 1);
+}
+
 /// Buffered ops of `count` distinct authors waiting on one missing op of
 /// `topic_id`, each charged to `source`.
 fn fill_waiters<S: Storage>(storage: &S, m: &Members, source: PeerId, count: u8, seed: u8) {
