@@ -171,9 +171,13 @@ impl<S: Storage> Irokle<S> {
         let store = storage
             .provisional_store(&provisional)?
             .ok_or(Error::StaleIncarnation)?;
+        // An op the namespace already stores adds no bytes, so a replayed fragment
+        // fits again. The store still rechecks the quota when it commits.
         let mut bytes = 0_u64;
         for op in &data.ops {
-            bytes = bytes.saturating_add(crate::storage::pending_op_bytes(op)? as u64);
+            if !store.dep_resolvable(&op.id)? {
+                bytes = bytes.saturating_add(crate::storage::pending_op_bytes(op)? as u64);
+            }
         }
         make_room(storage, &provisional, bytes)?;
         let admitted = self.oplog.sharing_membership(store).receive_preverified(

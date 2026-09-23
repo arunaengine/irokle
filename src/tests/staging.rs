@@ -268,6 +268,42 @@ fn assert_reclaim_behind<S: Limited>(inner: S) {
     ));
 }
 
+/// A staged fragment that exactly fills the staging quota is received again, as
+/// after a lost receipt. The replay adds no bytes, so it is not refused for space.
+fn assert_replay_fits<S: Limited>(inner: S) {
+    let source = node(174);
+    let reader_peer = Ed25519Signer::from_bytes(&[175; 32]).peer_id();
+    let (topic_id, ops) = late_invite(&source, reader_peer, 1);
+    let fragment = ops[..2].to_vec();
+    let bytes = fragment
+        .iter()
+        .map(|op| crate::storage::pending_op_bytes(op).unwrap() as u64)
+        .sum::<u64>();
+    let storage = inner.with_limits(crate::storage::StagingLimits {
+        total_bytes: bytes,
+        source_bytes: bytes,
+        namespace_bytes: bytes,
+        ..crate::storage::StagingLimits::MEMORY
+    });
+    let reader = reader_node(storage, 175);
+    let data = SyncData {
+        topic_id,
+        ops: fragment,
+    };
+    let first = staged(
+        reader
+            .receive_sync_outcome(source.peer_id(), data.clone())
+            .unwrap(),
+    );
+    let replay = staged(reader.receive_sync_outcome(source.peer_id(), data).unwrap());
+    assert_eq!(replay, first);
+}
+
+#[test]
+fn memory_replay_fits() {
+    assert_replay_fits(MemoryStorage::new());
+}
+
 /// Stores whose staging limits a test sets.
 trait Limited: Storage {
     fn with_limits(self, limits: crate::storage::StagingLimits) -> Self;
@@ -480,6 +516,12 @@ mod fjall {
     fn reclaim_behind() {
         let dir = tempfile::tempdir().unwrap();
         assert_reclaim_behind(crate::storage::FjallStorage::open(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn replay_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_replay_fits(crate::storage::FjallStorage::open(dir.path()).unwrap());
     }
 
     #[test]
