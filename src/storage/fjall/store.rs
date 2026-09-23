@@ -139,6 +139,8 @@ const SEALED_TOPIC_PREFIX: &[u8] = b"se";
 const SCHEMA_VERSION_KEY: &[u8] = b"sv";
 /// Where an unfinished schema 2 upgrade continues, see [`ClockMigration`].
 const CLOCK_MIGRATION: &[u8] = b"sm";
+/// Keys and values read as stored, for the schema 1 upgrade.
+type RawRecords = Vec<(Vec<u8>, Vec<u8>)>;
 /// The phase an unfinished schema 1 upgrade continues in, one `u8`.
 const LEGACY_PHASE: &[u8] = b"sq";
 /// Converted acks and obligations wait under `zm<key>` until every legacy record
@@ -397,11 +399,9 @@ impl FjallStorage {
         }
     }
 
-    /// Upgrade schema 1 in bounded steps, each one transaction that rechecks the
-    /// version and the phase, so a large store can finish and a crash resumes
-    /// where it stopped. The store stays at schema 1 until the last step. Acks
-    /// certify nothing until renewed, and pending ops and obligations take their
-    /// current shape. Runs at most `steps` steps.
+    /// Upgrade schema 1 in at most `steps` bounded transactions that each recheck
+    /// version and phase, so a crash resumes where it stopped. Acks certify
+    /// nothing until renewed; pending ops and obligations take their current shape.
     fn migrate_schema_two(&self, steps: &mut usize) -> Result<()> {
         let mut limit = MIGRATION_RECORDS;
         while *steps > 0 {
@@ -462,7 +462,7 @@ impl FjallStorage {
         prefix: &[u8],
         limit: usize,
         keep: impl Fn(&[u8]) -> bool,
-    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
+    ) -> Result<(RawRecords, bool)> {
         let mut items = Vec::new();
         for item in fjall::Readable::prefix(tx, records, prefix) {
             let (key, value) = item.into_inner()?;

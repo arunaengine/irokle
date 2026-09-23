@@ -1281,7 +1281,7 @@ mod fjall {
 /// right store Y. The right store's signed ack claims that sequence, but names
 /// the head Y the left store never admits, so it cannot prove X reached it.
 #[test]
-fn fork_ack_certifies_nothing() {
+fn fork_ack_uncertified() {
     let writer = Ed25519Signer::from_bytes(&[241; 32]);
     let peer = Ed25519Signer::from_bytes(&[242; 32]);
     let topic_id = TopicId::hash(b"fork-ack-certifies-nothing");

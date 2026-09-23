@@ -131,11 +131,9 @@ impl<S: Storage> SyncEngine<S> {
             .read_snapshot(|read| self.validate_ack_in(read, ack))
     }
 
-    /// Refuse an invalid ack, and return the evidence a valid one certifies. A
-    /// peer's history is the ancestry of its heads, so with every head held here
-    /// its actor positions are this node's ops and the whole ack counts. A head
-    /// not held may be the other side of an actor fork, whose equal sequence must
-    /// not prove the op held here: then only the ancestry of the held heads counts.
+    /// Refuse an invalid ack, and return what a valid one certifies: all of it when
+    /// this node holds every head, else only the ancestry of held heads. A head not
+    /// held may be an actor fork, whose equal sequence must not prove the op here.
     fn validate_ack_in(&self, read: &dyn SnapshotRead, ack: &SyncAck) -> Result<Option<PeerAck>> {
         let view = read
             .topic_view(&ack.topic_id, None)?

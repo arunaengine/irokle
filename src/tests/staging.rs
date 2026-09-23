@@ -434,7 +434,7 @@ fn memory_activation_keeps() {
 /// The author's pending pool in the active store is full when the invitation
 /// arrives. The activation is refused and keeps every staged op; once the pool
 /// has room it completes with the buffered op.
-fn assert_full_pool_waits<S: Storage>(storage: S) {
+fn assert_pool_waits<S: Storage>(storage: S) {
     let reader = reader_node(storage.clone(), 182);
     let case = pending_invite(reader.peer_id(), 183);
     let other = TopicId::hash(b"full-pool-waits");
@@ -488,8 +488,8 @@ fn assert_full_pool_waits<S: Storage>(storage: S) {
 }
 
 #[test]
-fn memory_full_pool_waits() {
-    assert_full_pool_waits(MemoryStorage::new());
+fn memory_pool_waits() {
+    assert_pool_waits(MemoryStorage::new());
 }
 
 /// Stores whose staging limits a test sets.
@@ -713,9 +713,9 @@ mod fjall {
     }
 
     #[test]
-    fn full_pool_waits() {
+    fn pool_waits() {
         let dir = tempfile::tempdir().unwrap();
-        assert_full_pool_waits(crate::storage::FjallStorage::open(dir.path()).unwrap());
+        assert_pool_waits(crate::storage::FjallStorage::open(dir.path()).unwrap());
     }
 
     /// An activation stops after its copies, as a crash there would. The reopen

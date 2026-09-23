@@ -13,8 +13,9 @@ use crate::storage::memory::{
     put_obligation_locked, topic_state_locked,
 };
 use crate::storage::{
-    AdmissionEffects, MAX_PENDING_WAITERS_PER_DEP, PendingRecord, ProvisionalTopic, StagingLimits,
-    StagingQuota, TopicState, ack_covers, check_namespaces, check_pending_quota, merged_obligation,
+    AdmissionEffects, MAX_PENDING_WAITERS_PER_DEP as MAX_WAITERS, PendingRecord, ProvisionalTopic,
+    StagingLimits, StagingQuota, TopicState, ack_covers, check_namespaces, check_pending_quota,
+    merged_obligation,
 };
 
 /// Registered provisional namespaces with their records. Lock order: this
@@ -398,7 +399,7 @@ fn pending_moves(
         for dep in &missing {
             let added = waiters.entry(*dep).or_default();
             let held = inner.pending_waiters.get(dep).map_or(0, BTreeSet::len);
-            if held + *added >= MAX_PENDING_WAITERS_PER_DEP {
+            if held + *added >= MAX_WAITERS {
                 return Err(Error::Storage("pending waiter quota exceeded".into()));
             }
             *added += 1;

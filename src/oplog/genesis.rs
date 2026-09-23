@@ -43,10 +43,9 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         // `Ord` is lexicographic over those bytes, so both nodes pick the same
         // winner with no coordination.
         if genesis.id < state.genesis {
-            // A smaller foreign genesis may reset only for an initial peer of the
-            // genesis it replaces: genesis ids are grindable, so an outsider must not
-            // win. Initial peers never change, unlike current membership, so every
-            // replica decides the same way whatever order removals arrive in.
+            // Genesis ids are grindable, so only an initial peer of the replaced
+            // genesis may reset. Initial peers never change, unlike membership, so
+            // every replica decides alike whatever order removals arrive in.
             if !self.initial_peer(&state.genesis, &genesis.signed.body.author)? {
                 tracing::warn!(
                     %topic_id,

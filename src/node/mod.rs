@@ -341,12 +341,12 @@ impl<S: Storage> Irokle<S> {
     }
 
     /// Drop buffered ops that waited for their dependencies longer than
-    /// [`crate::storage::MAX_PENDING_IDLE_MS`], with the ops that wait on them, and
+    /// [`crate::storage::PENDING_IDLE_MS`], with the ops that wait on them, and
     /// return how many went. Admitted history is untouched; the Iroh sweep calls this.
     pub fn expire_pending(&self) -> Result<usize> {
         let expired = self
             .storage()
-            .expire_pending(now_millis()?, crate::storage::MAX_PENDING_IDLE_MS)?;
+            .expire_pending(now_millis()?, crate::storage::PENDING_IDLE_MS)?;
         if expired > 0 {
             tracing::info!(
                 expired,

@@ -1017,9 +1017,6 @@ pub(super) fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
     }
 }
 
-/// Failures a concurrent commit can cause by moving topic state mid-attempt.
-/// Retry only when state moved: for a locally built op these failures imply it,
-/// while a received batch must check that its topic heads changed.
 /// Membership entries a projected state holds, as the unit of the projection budget.
 pub(super) fn state_entries(state: &TopicState) -> usize {
     state.membership_controls.len() + 1
@@ -1030,6 +1027,9 @@ pub(super) fn projection_entries<'a>(states: impl Iterator<Item = &'a Arc<TopicS
     states.map(|state| state_entries(state)).sum()
 }
 
+/// Failures a concurrent commit can cause by moving topic state mid-attempt.
+/// Retry only when state moved: for a locally built op these failures imply it,
+/// while a received batch must check that its topic heads changed.
 pub(super) fn is_admission_race(err: &Error) -> bool {
     // A generation mismatch here is a concurrent admission advancing
     // max_generation between the heads read and op validation, not immutable

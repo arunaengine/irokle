@@ -205,10 +205,9 @@ impl FjallStorage {
         Self::tx_put(tx, records, key(&[RECORD, op.id.as_ref()]), &record)
     }
 
-    /// Move the buffered ops of `topic_id` from the namespace keyspace `store` into
-    /// the active `records` in `tx`, each charged to its source again. Waits are
-    /// read again from the active records, so an op whose dependencies arrived with
-    /// the namespace becomes ready. A refused charge fails the whole transaction.
+    /// Move the buffered ops of `topic_id` from namespace `store` into `records` in
+    /// `tx`, charged to their sources, with waits read again from `records`. A
+    /// refused charge fails the whole transaction.
     pub(super) fn tx_move_pending(
         tx: &mut Tx,
         store: &Records,

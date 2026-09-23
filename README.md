@@ -80,7 +80,7 @@ These are the guarantees and limits applications should design around.
 
 Read history incrementally with `Topic::history_page`. It reads one snapshot, only visits operations after the cursor, and returns the `HistoryCursor` that covers exactly the returned page. A cursor from a replaced genesis fails with `Error::StaleIncarnation`, and the consumer rebuilds from `Topic::history`. `Topic::history_entries` decodes each event on its own, so one undecodable payload is reported with its operation id instead of failing the whole read.
 
-Buffered operations that wait for missing dependencies expire after `storage::MAX_PENDING_IDLE_MS`. They were never admitted or acknowledged, so a later sync can send them again. The Iroh sweep runs this expiry, and other transports call `Irokle::expire_pending`.
+Buffered operations that wait for missing dependencies expire after `storage::PENDING_IDLE_MS`. They were never admitted or acknowledged, so a later sync can send them again. The Iroh sweep runs this expiry, and other transports call `Irokle::expire_pending`.
 
 A topic holds at most `sync::MAX_TOPIC_ACTORS` writers, so its sync summary always fits one frame. Every build refuses an operation too large for one sync frame.
 
