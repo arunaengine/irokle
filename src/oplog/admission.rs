@@ -1174,7 +1174,7 @@ mod tests {
         // The first writer's event depends on a control that is no longer a head.
         let (_, _, ops) = late_writes(2);
         let limits = MemoryLimits {
-            workspace_bytes: 32 * 1024,
+            workspace_bytes: 128 * 1024,
             ..MemoryLimits::default()
         };
         let storage = MemoryStorage::new().with_memory_limits(limits).unwrap();
