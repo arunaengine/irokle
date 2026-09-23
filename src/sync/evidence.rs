@@ -29,8 +29,8 @@ impl<S: Storage> SyncEngine<S> {
         Ok((view.state, heads, view.clock))
     }
 
-    /// Store what a valid ack certifies: all of it when this node holds every head
-    /// the ack names, else only the ancestry of the heads it holds.
+    /// Store what a valid ack certifies: the ancestry of the heads it names that
+    /// this node holds, whatever clock the ack claims beyond them.
     pub fn apply_ack(&self, ack: &SyncAck) -> Result<()> {
         ack.verify_signature()?;
         let Some(evidence) = self.validate_ack(ack)? else {
@@ -132,9 +132,9 @@ impl<S: Storage> SyncEngine<S> {
             .read_snapshot(|read| self.validate_ack_in(read, ack))
     }
 
-    /// Refuse an invalid ack, and return what a valid one certifies: all of it when
-    /// this node holds every head, else only the ancestry of held heads. A head not
-    /// held may be an actor fork, whose equal sequence must not prove the op here.
+    /// Refuse an invalid ack, and return what a valid one certifies: the clock of the
+    /// held heads' ancestry, never the claimed clock beyond it. A head not held may
+    /// be an actor fork, whose equal sequence must not prove the op held here.
     fn validate_ack_in(&self, read: &dyn SnapshotRead, ack: &SyncAck) -> Result<Option<PeerAck>> {
         let view = read
             .topic_view(&ack.topic_id, None)?
@@ -182,9 +182,6 @@ impl<S: Storage> SyncEngine<S> {
                     "head {op_id} is not represented by ack clock"
                 )));
             }
-        }
-        if held.len() == ack.heads.len() {
-            return Ok(Some(Self::peer_ack_for(ack)));
         }
         if held.is_empty() {
             return Ok(None);

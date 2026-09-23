@@ -204,7 +204,7 @@ fn clock_clears_obligation() {
         peer_id: peer,
         genesis: genesis_of(alice.storage(), &topic.id()),
         accepted: BTreeSet::new(),
-        heads: BTreeSet::new(),
+        heads: [record.meta.op_id].into(),
         clock,
         signature: None,
     };
@@ -1330,4 +1330,65 @@ fn fork_ack_uncertified() {
             .has_sync_obligations(&peer.peer_id(), &topic_id)
             .unwrap()
     );
+}
+
+/// A member signs acks naming only the shared genesis, or no head, while
+/// claiming the sender's later event. The claim goes beyond the held heads'
+/// ancestry, so it proves nothing and the sender keeps its work.
+#[test]
+fn held_heads_bound_clock() {
+    let alice = node(243);
+    let signer = Ed25519Signer::from_bytes(&[244; 32]);
+    let peer = signer.peer_id();
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [peer].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    let genesis = genesis_of(alice.storage(), &topic.id()).unwrap();
+    let event = topic
+        .publish(Note {
+            text: "owed".into(),
+        })
+        .unwrap()
+        .meta;
+    alice
+        .storage()
+        .put_sync_obligation(
+            crate::storage::SyncObligation::clock(
+                peer,
+                topic.id(),
+                alice.storage().actor_clock(&topic.id()).unwrap(),
+            ),
+            Some(genesis),
+        )
+        .unwrap();
+    let mut clock = ActorClock::new();
+    clock.observe(event.actor_id, event.actor_seq);
+    for heads in [BTreeSet::from([genesis]), BTreeSet::new()] {
+        let mut ack = sync::SyncAck {
+            topic_id: topic.id(),
+            peer_id: peer,
+            genesis: Some(genesis),
+            accepted: BTreeSet::new(),
+            heads,
+            clock: clock.clone(),
+            signature: None,
+        };
+        ack.sign(&signer).unwrap();
+        alice.apply_sync_ack(&ack).unwrap();
+        assert!(
+            !alice
+                .storage()
+                .peer_reached_op(&peer, &event.op_id)
+                .unwrap()
+        );
+        assert!(
+            alice
+                .storage()
+                .has_sync_obligations(&peer, &topic.id())
+                .unwrap()
+        );
+    }
 }
