@@ -82,7 +82,7 @@ Read history incrementally with `Topic::history_page`. It reads one snapshot, on
 
 Buffered operations that wait for missing dependencies expire after `storage::PENDING_IDLE_MS`. They were never admitted or acknowledged, so a later sync can send them again. The Iroh sweep runs this expiry, and other transports call `Irokle::expire_pending`.
 
-A topic holds at most `sync::MAX_TOPIC_ACTORS` writers, so its sync summary always fits one frame. Every build refuses an operation too large for one sync frame.
+A sync summary always fits one frame for up to `sync::SUMMARY_ACTORS` writers, and event type ids are limited to `sync::MAX_TYPE_BYTES`. A node refuses a new writer's first operation once a topic holds `sync::MAX_TOPIC_ACTORS` writers. Received operations are not refused this way, since that would depend on arrival order. The gap between the two limits leaves room for writers that start concurrently on other nodes. Only more than that many concurrent new writers near the limit can make a summary too large to send. Every build refuses an operation too large for one sync frame.
 
 ## Joining A Topic
 

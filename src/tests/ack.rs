@@ -1336,7 +1336,7 @@ fn fork_ack_uncertified() {
 /// claiming the sender's later event. The claim goes beyond the held heads'
 /// ancestry, so it proves nothing and the sender keeps its work.
 #[test]
-fn held_heads_bound_clock() {
+fn heads_bound_clock() {
     let alice = node(243);
     let signer = Ed25519Signer::from_bytes(&[244; 32]);
     let peer = signer.peer_id();

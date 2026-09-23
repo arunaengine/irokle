@@ -432,8 +432,9 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         if body.actor_id != actor_id_for(body.topic_id, body.author) {
             return Err(Error::ActorAuthorMismatch);
         }
-        if matches!(body.payload, TopicPayload::Genesis(_))
-            && self.storage.topic_state(&body.topic_id)?.is_some()
+        if let TopicPayload::Genesis(genesis) = &body.payload
+            && (genesis.event_type_id.len() > crate::sync::MAX_TYPE_BYTES
+                || self.storage.topic_state(&body.topic_id)?.is_some())
         {
             return Err(Error::InvalidGenesis);
         }

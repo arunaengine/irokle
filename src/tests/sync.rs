@@ -2144,11 +2144,12 @@ mod fjall {
     }
 }
 
-/// A summary of a topic at the actor limit, with the widest sequence numbers,
-/// a head per actor and no staged receipt, still fits one sync frame.
+/// A summary of a topic at the summary capacity, with the longest event type id,
+/// the widest sequence numbers, a head per actor and no staged receipt, still
+/// fits one sync frame.
 #[test]
 fn full_summary_fits() {
-    let actors = (0..crate::sync::MAX_TOPIC_ACTORS as u64)
+    let actors = (0..crate::sync::SUMMARY_ACTORS as u64)
         .map(|index| ActorId::hash(index.to_le_bytes()))
         .collect::<Vec<_>>();
     let mut actor_clock = ActorClock::new();
@@ -2157,7 +2158,7 @@ fn full_summary_fits() {
     }
     let summary = sync::SyncSummary {
         topic_id: TopicId::hash(b"full-summary-fits"),
-        event_type_id: Some(Note::TYPE_ID.into()),
+        event_type_id: Some("x".repeat(crate::sync::MAX_TYPE_BYTES)),
         genesis: Some(OpId::hash(b"genesis")),
         fingerprint: [0; 32],
         heads: actors
@@ -2177,4 +2178,40 @@ fn full_summary_fits() {
         "{} bytes",
         bytes.len()
     );
+}
+
+/// A genesis naming an event type id longer than the limit is refused when it is
+/// created and when it is received, since its summaries could not fit a frame.
+#[test]
+fn refuses_long_type() {
+    let signer = Ed25519Signer::from_bytes(&[245; 32]);
+    let topic_id = TopicId::hash(b"refuses-long-type");
+    let actor = actor_id_for(topic_id, signer.peer_id());
+    let long = "x".repeat(crate::sync::MAX_TYPE_BYTES + 1);
+    let log = oplog::Oplog::new();
+    assert!(matches!(
+        log.create_topic_genesis(
+            topic_id,
+            actor,
+            TopicGenesis::new(long.clone(), []),
+            &signer
+        ),
+        Err(Error::InvalidGenesis)
+    ));
+    let body = OpBody {
+        topic_id,
+        author: signer.peer_id(),
+        actor_id: actor,
+        actor_seq: 1,
+        actor_prev: None,
+        deps: BTreeSet::new(),
+        generation: 0,
+        payload: TopicPayload::Genesis(TopicGenesis::new(long, [signer.peer_id()])),
+    };
+    let genesis = Op::sign(body, &signer).unwrap();
+    assert!(matches!(
+        oplog::Oplog::new().receive_op(genesis),
+        Err(Error::InvalidGenesis)
+    ));
+    assert!(log.storage().topic_state(&topic_id).unwrap().is_none());
 }

@@ -583,8 +583,11 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             return Err(Error::ActorFork);
         }
         match &body.payload {
-            TopicPayload::Genesis(_) => {
-                if !is_structural_genesis(op) || state.is_some_and(|state| state.genesis != op.id) {
+            TopicPayload::Genesis(genesis) => {
+                if !is_structural_genesis(op)
+                    || genesis.event_type_id.len() > crate::sync::MAX_TYPE_BYTES
+                    || state.is_some_and(|state| state.genesis != op.id)
+                {
                     return Err(Error::InvalidGenesis);
                 }
             }
@@ -712,10 +715,11 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             }
         }
         match &body.payload {
-            TopicPayload::Genesis(_) => {
+            TopicPayload::Genesis(genesis) => {
                 if body.actor_seq != 1
                     || body.actor_prev.is_some()
                     || !body.deps.is_empty()
+                    || genesis.event_type_id.len() > crate::sync::MAX_TYPE_BYTES
                     || state.is_some()
                 {
                     return Err(Error::InvalidGenesis);
