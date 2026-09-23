@@ -10,8 +10,8 @@ use crate::oplog::membership::{apply_control, materialize_topic_state, merge_sta
 use crate::oplog::pending::{PendingVerdict, pending_meta_for};
 use crate::oplog::topology::topological_ops;
 use crate::oplog::{
-    Admitted, BatchOverlay, MAX_ADMISSION_RETRIES, MAX_CACHED_PROJECTIONS, MembershipCache,
-    OpAdmission, Oplog, ReceiveEffects, ResetPlan, TopicEviction, conflict_pause,
+    Admitted, BatchOverlay, MAX_ADMISSION_RETRIES, MAX_CACHED_PROJECTIONS, MAX_PROJECTION_ENTRIES,
+    MembershipCache, OpAdmission, Oplog, ReceiveEffects, ResetPlan, TopicEviction, conflict_pause,
     is_structural_genesis,
 };
 
@@ -324,10 +324,15 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             for id in projection_tips {
                 if let Some(state) = projections.get(&id)
                     && !cache.states.contains_key(&id)
+                    && state_entries(state) <= MAX_PROJECTION_ENTRIES
                 {
-                    if cache.states.len() == MAX_CACHED_PROJECTIONS
-                        && let Some(oldest) = cache.order.pop_front()
+                    while cache.states.len() >= MAX_CACHED_PROJECTIONS
+                        || projection_entries(cache.states.values()) + state_entries(state)
+                            > MAX_PROJECTION_ENTRIES
                     {
+                        let Some(oldest) = cache.order.pop_front() else {
+                            break;
+                        };
                         cache.states.remove(&oldest);
                     }
                     cache.states.insert(id, Arc::clone(state));
@@ -797,62 +802,67 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         overlay_meta: &BTreeMap<OpId, OpMeta>,
         projections: &mut BTreeMap<OpId, Arc<TopicState>>,
     ) -> Result<Arc<TopicState>> {
-        // First find the ops without a state, dependencies first, and count the
-        // ops that read each state. A state nothing reads any more is dropped, so a
-        // cold walk holds a few states at a time instead of one per ancestor.
-        let mut order = Vec::new();
-        let mut readers = BTreeMap::<OpId, usize>::new();
-        let mut pending = deps.iter().map(|id| (*id, None)).collect::<Vec<_>>();
-        let mut visiting = BTreeSet::new();
-        let mut walked = BTreeSet::new();
-        while let Some((id, expanded)) = pending.pop() {
-            if let Some(op_deps) = expanded {
-                visiting.remove(&id);
-                walked.insert(id);
-                order.push((id, op_deps));
+        if let [dep] = deps.iter().collect::<Vec<_>>()[..]
+            && let Some(state) = projections.get(dep)
+        {
+            return Ok(Arc::clone(state));
+        }
+        // Each peer and the policy take their control with the greatest key, in
+        // any order, so the state at `deps` is one fold over the controls of their
+        // ancestry, down to states already known. It needs no state per ancestor.
+        let mut known = BTreeSet::new();
+        let mut folded = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut walk = deps.iter().copied().collect::<Vec<_>>();
+        while let Some(id) = walk.pop() {
+            if !seen.insert(id) {
                 continue;
             }
-            if projections.contains_key(&id) || walked.contains(&id) {
+            if projections.contains_key(&id) {
+                known.insert(id);
                 continue;
             }
             let meta = self.meta_projected(&id, overlay_meta)?;
             if meta.topic_id != *topic_id {
                 return Err(Error::TopicMismatch);
             }
-            if !visiting.insert(id) {
-                return Err(Error::Storage("cycle in op graph".into()));
-            }
-            for dep in &meta.deps {
-                *readers.entry(*dep).or_default() += 1;
-            }
-            pending.push((id, Some(meta.deps.clone())));
-            pending.extend(meta.deps.iter().map(|dep| (*dep, None)));
-        }
-        for (id, op_deps) in order {
+            walk.extend(meta.deps.iter().copied());
             let op = self.op_projected(&id, overlay_ops)?;
-            let mut state = match &op.signed.body.payload {
-                TopicPayload::Genesis(_) => {
-                    Arc::new(materialize_topic_state(vec![op.clone()], BTreeSet::new())?)
-                }
-                TopicPayload::Event(_) | TopicPayload::Control(_) => {
-                    merge_states(&op_deps, projections)?
-                }
-            };
-            for dep in &op_deps {
-                if let Some(count) = readers.get_mut(dep) {
-                    *count -= 1;
-                    if *count == 0 && walked.contains(dep) && !deps.contains(dep) {
-                        projections.remove(dep);
-                    }
-                }
+            if !matches!(op.signed.body.payload, TopicPayload::Event(_)) {
+                folded.push(op);
             }
-            // A state no other op still reads is changed in place, not copied.
-            if let TopicPayload::Control(control) = &op.signed.body.payload {
-                apply_control(Arc::make_mut(&mut state), &op, control);
-            }
-            projections.insert(id, state);
         }
-        merge_states(deps, projections)
+        let state = if known.is_empty() {
+            Arc::new(materialize_topic_state(folded, BTreeSet::new())?)
+        } else {
+            let mut state = merge_states(&known, projections)?;
+            for op in &folded {
+                match &op.signed.body.payload {
+                    TopicPayload::Genesis(_) if op.id != state.genesis => {
+                        return Err(Error::InvalidGenesis);
+                    }
+                    TopicPayload::Control(control) => {
+                        apply_control(Arc::make_mut(&mut state), op, control);
+                    }
+                    TopicPayload::Genesis(_) | TopicPayload::Event(_) => {}
+                }
+            }
+            state
+        };
+        // Only the state of one dependency is kept, replacing the known states it
+        // covers, and only within the entry budget, so a batch of late ops cannot
+        // hold one large state per historical control.
+        if let [dep] = deps.iter().collect::<Vec<_>>()[..] {
+            for id in &known {
+                projections.remove(id);
+            }
+            if projection_entries(projections.values()) + state_entries(&state)
+                <= MAX_PROJECTION_ENTRIES
+            {
+                projections.insert(*dep, Arc::clone(&state));
+            }
+        }
+        Ok(state)
     }
 
     fn meta_projected<'a>(
@@ -1012,6 +1022,16 @@ pub(super) fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
 /// Failures a concurrent commit can cause by moving topic state mid-attempt.
 /// Retry only when state moved: for a locally built op these failures imply it,
 /// while a received batch must check that its topic heads changed.
+/// Membership entries a projected state holds, as the unit of the projection budget.
+pub(super) fn state_entries(state: &TopicState) -> usize {
+    state.membership_controls.len() + 1
+}
+
+/// Membership entries `states` hold together; a shared state is counted each time.
+pub(super) fn projection_entries<'a>(states: impl Iterator<Item = &'a Arc<TopicState>>) -> usize {
+    states.map(|state| state_entries(state)).sum()
+}
+
 pub(super) fn is_admission_race(err: &Error) -> bool {
     // A generation mismatch here is a concurrent admission advancing
     // max_generation between the heads read and op validation, not immutable
@@ -1066,5 +1086,20 @@ mod tests {
         assert!(state.members.contains(&PeerId::hash(149_u32.to_le_bytes())));
         assert!(!state.members.contains(&PeerId::hash(150_u32.to_le_bytes())));
         assert_eq!(projections.keys().collect::<Vec<_>>(), [&controls[149].id]);
+
+        // A dependency on every control, as a wide join, folds into one state too.
+        let wide = controls.iter().map(|op| op.id).collect::<BTreeSet<_>>();
+        let mut projections = BTreeMap::new();
+        let state = log
+            .project_membership(
+                &topic,
+                &wide,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &mut projections,
+            )
+            .unwrap();
+        assert_eq!(state.members.len(), 201);
+        assert!(projections.is_empty());
     }
 }
