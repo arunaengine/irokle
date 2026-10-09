@@ -810,6 +810,10 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         state: &TopicState,
         overlay_meta: &BTreeMap<OpId, OpMeta>,
     ) -> Result<bool> {
+        // Without dependencies there is no genesis to cover; the projection refuses it.
+        if op.signed.body.deps.is_empty() {
+            return Ok(false);
+        }
         let clock = self.meta_for_projected(op, overlay_meta)?.observed_clock;
         let policy = state.replication_policy_control.iter().map(|(key, _)| key);
         Ok(state
@@ -1284,6 +1288,40 @@ mod tests {
         ));
         assert!(log.storage().get_op(&event.id).unwrap().is_none());
         Oplog::new().receive_ops(ops).unwrap();
+    }
+
+    /// An event or control without dependencies is no genesis and is refused, also in
+    /// a topic without controls, where no membership projection is needed.
+    #[test]
+    fn rejects_rootless_ops() {
+        let owner = Ed25519Signer::from_bytes(&[66; 32]);
+        let writer = Ed25519Signer::from_bytes(&[67; 32]);
+        let topic = TopicId::hash(b"rejects-rootless-ops");
+        let log = Oplog::new();
+        let genesis = TopicGenesis::new("test.note", [writer.peer_id()]);
+        log.create_topic_genesis(topic, actor_id_for(topic, owner.peer_id()), genesis, &owner)
+            .unwrap();
+        let event = TopicPayload::Event(EventEnvelope {
+            type_id: "test.note".into(),
+            payload: vec![0].into(),
+        });
+        let control = TopicPayload::Control(TopicControl::AddPeer {
+            peer: PeerId::hash(b"rootless"),
+        });
+        for payload in [event, control] {
+            let body = OpBody {
+                topic_id: topic,
+                author: writer.peer_id(),
+                actor_id: actor_id_for(topic, writer.peer_id()),
+                actor_seq: 1,
+                actor_prev: None,
+                deps: BTreeSet::new(),
+                generation: 0,
+                payload,
+            };
+            let op = Op::sign(body, &writer).unwrap();
+            assert!(matches!(log.receive_op(op), Err(Error::TopicNotFound)));
+        }
     }
 
     /// An admission of a topic waits for the turn of one paused before its commit,
