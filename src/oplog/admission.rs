@@ -867,6 +867,14 @@ impl<S: crate::oplog::Storage> Oplog<S> {
                 folded.push(op);
             }
         }
+        if seen.len() > LONG_WALK_OPS {
+            tracing::warn!(
+                %topic_id,
+                visited = seen.len(),
+                deps = deps.len(),
+                "membership projection walked a long topic history"
+            );
+        }
         let state = if known.is_empty() {
             // Materializing copies the genesis peers besides the state it returns.
             workspace.charge(STATE_BASE_BYTES + 2 * grows)?;
@@ -1065,6 +1073,9 @@ pub(super) fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
 /// B-tree nodes at their lowest occupancy.
 const WALK_BYTES: u64 = 64;
 const SEEN_BYTES: u64 = 80;
+/// Ops one projection may visit before it warns: each visit reads an op from the
+/// store, so longer walks repeated per admission keep a node busy.
+const LONG_WALK_OPS: usize = 10_000;
 /// Bytes a projection charges its store at once.
 const HOLD_BYTES: u64 = 64 * 1024;
 /// Projection workspace any store allows, so a store without a memory budget
