@@ -10,17 +10,17 @@ use crate::{
     TopicInfo,
 };
 
+use crate::storage::MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS;
 use crate::storage::fjall::provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
 use crate::storage::pressure::{Pressure, Transaction};
 use crate::storage::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
-    MAX_PENDING_MISSING_DEPS, ObligationTarget, OpMeta, OpPosition, PeerAck, ProvisionalTopic,
-    SnapshotRead, StagingLimits, Storage, StorageCounters, SyncObligation, SyncPeerStatus,
-    SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers, ack_reached_op,
-    apply_status_update, branch_matches, ensure_deps_resolvable, journalled_eviction,
-    merged_obligation, merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes,
-    settled_obligation, stored_ack_dominates, topic_fingerprint_for, validate_batch,
-    validate_heads,
+    ObligationTarget, OpMeta, OpPosition, PeerAck, ProvisionalTopic, SnapshotRead, StagingLimits,
+    Storage, StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState,
+    TopicView, ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches,
+    ensure_deps_resolvable, journalled_eviction, merged_obligation, merged_peer_ack,
+    new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
+    topic_fingerprint_for, validate_batch, validate_heads,
 };
 
 #[derive(Clone)]
@@ -1502,7 +1502,7 @@ impl FjallStorage {
             }
         }
         // A buffered op removes up to its missing dependencies' waiters with it.
-        let pending = (step / (MAX_PENDING_MISSING_DEPS + 4)).max(1);
+        let pending = (step / (MAX_MISSING_DEPS + 4)).max(1);
         while self.transaction(|tx| Self::tx_drop_pending(tx, &self.records, topic_id, pending))?
             > 0
         {}
