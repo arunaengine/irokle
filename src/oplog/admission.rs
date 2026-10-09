@@ -1325,8 +1325,8 @@ mod tests {
         }
     }
 
-    /// An admission of a topic waits for the turn of one paused before its commit,
-    /// so that commit is not voided by a concurrent one and its validation redone.
+    /// A received batch and a local write of a topic wait for the turn of an admission
+    /// paused before its commit, so that commit is not voided and its validation redone.
     #[test]
     fn admission_waits_turn() {
         use std::sync::Arc;
@@ -1336,10 +1336,11 @@ mod tests {
 
         let owner = Ed25519Signer::from_bytes(&[63; 32]);
         let writer = Ed25519Signer::from_bytes(&[64; 32]);
+        let local = Ed25519Signer::from_bytes(&[65; 32]);
         let topic = TopicId::hash(b"admission-waits-turn");
         let actor = actor_id_for(topic, owner.peer_id());
         let source = Oplog::new();
-        let peers = [owner.peer_id(), writer.peer_id()];
+        let peers = [owner.peer_id(), writer.peer_id(), local.peer_id()];
         let genesis = source
             .create_topic_genesis(topic, actor, TopicGenesis::new("test.note", peers), &owner)
             .unwrap();
@@ -1358,7 +1359,7 @@ mod tests {
             actor_prev: None,
             deps: [genesis.id].into(),
             generation: genesis.signed.body.generation + 1,
-            payload: TopicPayload::Event(envelope),
+            payload: TopicPayload::Event(envelope.clone()),
         };
         let second = Op::sign(body, &writer).unwrap();
         let storage = StaleReadStorage::new(MemoryStorage::new());
@@ -1376,15 +1377,33 @@ mod tests {
             let (log, second) = (log.clone(), second.clone());
             move || log.receive_op(second)
         });
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while log.turns.waiting() == 0 {
-            assert!(Instant::now() < deadline, "second admission never waited");
-            std::thread::yield_now();
-        }
+        let wait_for = |count: usize, what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while log.turns.waiting() < count {
+                assert!(Instant::now() < deadline, "{what} never waited");
+                std::thread::yield_now();
+            }
+        };
+        wait_for(1, "the second admission");
+        let writing = std::thread::spawn({
+            let log = log.clone();
+            move || {
+                log.create_event_op(
+                    topic,
+                    actor_id_for(topic, local.peer_id()),
+                    envelope,
+                    &local,
+                )
+            }
+        });
+        wait_for(2, "the local write");
         drop(release);
         paused.join().unwrap().unwrap();
         waiting.join().unwrap().unwrap();
-        assert_eq!(storage.heads(&topic).unwrap(), [first.id, second.id].into());
+        let written = writing.join().unwrap().unwrap();
+        for id in [first.id, second.id, written.id] {
+            assert!(storage.get_op(&id).unwrap().is_some());
+        }
     }
 
     /// A cold projection over a long control chain keeps only the state it

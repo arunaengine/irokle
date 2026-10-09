@@ -91,6 +91,8 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             ..genesis
         };
         let mut signed = None;
+        // Held across retries, so a slow received batch of the topic is not voided.
+        let _turn = self.turns.take(topic_id)?;
         for attempt in 0..MAX_ADMISSION_RETRIES {
             conflict_pause(attempt);
             match self.try_genesis_effects(
@@ -185,6 +187,8 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         F: Fn(&Op, &OpMeta, &TopicState) -> Result<AdmissionEffects>,
     {
         let mut signed = None;
+        // Held across retries, so a slow received batch of the topic is not voided.
+        let _turn = self.turns.take(topic_id)?;
         for attempt in 0..MAX_ADMISSION_RETRIES {
             conflict_pause(attempt);
             match self.try_local_effects(
