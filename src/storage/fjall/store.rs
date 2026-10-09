@@ -868,6 +868,23 @@ impl FjallStorage {
         Ok(removed)
     }
 
+    /// Removes up to `limit` keys under `prefix`.
+    fn tx_remove_some(
+        tx: &mut Transaction,
+        records: &fjall::OptimisticTxKeyspace,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<usize> {
+        let mut keys = Vec::new();
+        for item in fjall::Readable::prefix(tx, records, prefix).take(limit) {
+            keys.push(item.key()?.to_vec());
+        }
+        for key in &keys {
+            tx.remove(records, key.clone())?;
+        }
+        Ok(keys.len())
+    }
+
     pub(super) fn tx_put_obligation(
         tx: &mut Transaction,
         records: &fjall::OptimisticTxKeyspace,
@@ -1464,9 +1481,9 @@ impl FjallStorage {
         Ok(op_ids.len())
     }
 
-    /// Deletes `topic_id` like [`Storage::reset_topic`], but its ops in transactions of at most
-    /// `step` ops, so an offline cleanup of a long history never needs one large transaction.
-    /// Returns the ops removed; an interrupted or repeated purge continues where it stopped.
+    /// Deletes `topic_id` like [`Storage::reset_topic`], in transactions of at most `step` rows.
+    /// Not atomic: no reader or writer may use the store until a purge, resumed after any
+    /// failure, has returned. Returns the ops removed; a repeated purge continues.
     pub fn purge_topic(&self, topic_id: &TopicId, step: usize) -> Result<usize> {
         let step = step.max(1);
         let mut removed = 0;
@@ -1474,9 +1491,17 @@ impl FjallStorage {
             let batch = self.transaction(|tx| self.tx_remove_ops(tx, topic_id, step))?;
             removed += batch;
             if batch < step {
-                return Ok(removed + self.reset_topic(topic_id)?);
+                break;
             }
         }
+        // The actor index and clock nodes grow with the ops, so they shrink in steps as well.
+        for prefix in [b"as".as_slice(), CLOCK_NODE] {
+            let scan = [prefix, topic_id.as_ref()].concat();
+            while self.transaction(|tx| Self::tx_remove_some(tx, &self.records, &scan, step))?
+                == step
+            {}
+        }
+        Ok(removed + self.reset_topic(topic_id)?)
     }
 
     fn tx_reset_topic(&self, tx: &mut Transaction, topic_id: &TopicId) -> Result<usize> {

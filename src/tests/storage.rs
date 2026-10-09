@@ -1989,6 +1989,25 @@ mod fjall {
         assert_eq!(topic_snapshot(&storage, &kept), before);
     }
 
+    /// A long topic purges under a transaction budget that one reset of its indexes exceeds.
+    #[test]
+    fn purge_within_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pressure = crate::storage::StoragePressure::default();
+        pressure.recovery_buffer_bytes = 128 * 1024;
+        let storage =
+            crate_storage::FjallStorage::open_with_pressure(dir.path(), pressure).unwrap();
+        let topic = TopicId::hash(b"long");
+        let events: Vec<String> = (0..500).map(|index| index.to_string()).collect();
+        let texts: Vec<&str> = events.iter().map(String::as_str).collect();
+        seed_chain(&storage, topic, 1, &texts);
+
+        assert!(storage.reset_topic(&topic).is_err());
+        assert_eq!(storage.purge_topic(&topic, 16).unwrap(), 501);
+        assert!(storage.topic_state(&topic).unwrap().is_none());
+        assert!(storage.actor_clock(&topic).unwrap().is_empty());
+    }
+
     #[test]
     fn reset_clears() {
         let dir = tempfile::tempdir().unwrap();
