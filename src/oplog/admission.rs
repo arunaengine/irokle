@@ -196,6 +196,7 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         };
         for attempt in 0..MAX_ADMISSION_RETRIES {
             conflict_pause(attempt);
+            // A wait that runs out fails the job; retrying here would only wait again.
             let _turn = topic_id.map(|topic| self.turns.take(topic)).transpose()?;
             let before = heads()?;
             if let Some((topic, genesis)) = self.receive_genesis

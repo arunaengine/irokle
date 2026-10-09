@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::{Error, Result, TopicId};
 
-/// Longest wait for a turn. Past it an admission goes on without one and races
-/// for its commit as before, so a stuck admission cannot hold its topic forever.
+/// Longest wait for a turn. Past it the waiter fails with a retryable conflict
+/// instead of validating beside the holder, and gives its thread back.
 const TURN_PATIENCE: Duration = Duration::from_secs(60);
 
 /// Topics with an admission in progress. A second admission of the same topic
@@ -47,8 +47,8 @@ impl AdmissionTurns {
         }
     }
 
-    /// Waits for the topic's turn, or returns `None` once the wait outlasts the patience.
-    pub(super) fn take(&self, topic_id: TopicId) -> Result<Option<AdmissionTurn<'_>>> {
+    /// Waits for the topic's turn; a wait past the patience fails with `AdmissionConflict`.
+    pub(super) fn take(&self, topic_id: TopicId) -> Result<AdmissionTurn<'_>> {
         let deadline = Instant::now() + self.patience;
         let mut busy = self.state.lock().map_err(poisoned)?;
         while busy.topics.contains(&topic_id) {
@@ -59,19 +59,19 @@ impl AdmissionTurns {
                 tracing::warn!(
                     %topic_id,
                     waited_ms = self.patience.as_millis() as u64,
-                    "admission goes on without its topic turn after waiting"
+                    "admission gave up waiting for its topic turn"
                 );
-                return Ok(None);
+                return Err(Error::AdmissionConflict);
             };
             busy.waiting += 1;
             busy = self.freed.wait_timeout(busy, left).map_err(poisoned)?.0;
             busy.waiting -= 1;
         }
         busy.topics.insert(topic_id);
-        Ok(Some(AdmissionTurn {
+        Ok(AdmissionTurn {
             turns: self,
             topic_id,
-        }))
+        })
     }
 
     /// Admissions waiting for a turn now.
@@ -105,7 +105,7 @@ mod tests {
     use std::time::Duration;
 
     use super::AdmissionTurns;
-    use crate::TopicId;
+    use crate::{Error, TopicId};
 
     /// A second turn on a topic starts only after the first is given back, while
     /// another topic takes its turn at once.
@@ -119,8 +119,8 @@ mod tests {
         let second = {
             let (turns, released) = (Arc::clone(&turns), Arc::clone(&released));
             std::thread::spawn(move || {
-                let turn = turns.take(topic).unwrap();
-                turn.is_some() && released.load(Ordering::SeqCst)
+                let _turn = turns.take(topic).unwrap();
+                released.load(Ordering::SeqCst)
             })
         };
         released.store(true, Ordering::SeqCst);
@@ -132,16 +132,16 @@ mod tests {
         assert!(turns.state.lock().unwrap().topics.is_empty());
     }
 
-    /// A turn held past the patience no longer holds the topic back: the waiter
-    /// goes on without one, and the holder still gives its turn back.
+    /// A waiter past the patience fails with a retryable conflict and starts no
+    /// admission beside the holder, which still gives its turn back.
     #[test]
     fn patience_ends_wait() {
         let turns = AdmissionTurns::with_patience(Duration::from_millis(10));
         let topic = TopicId::hash(b"turns-patience");
         let held = turns.take(topic).unwrap();
-        assert!(held.is_some());
-        assert!(turns.take(topic).unwrap().is_none());
+        assert!(matches!(turns.take(topic), Err(Error::AdmissionConflict)));
+        assert!(turns.state.lock().unwrap().topics.contains(&topic));
         drop(held);
-        assert!(turns.take(topic).unwrap().is_some());
+        assert!(turns.take(topic).is_ok());
     }
 }
