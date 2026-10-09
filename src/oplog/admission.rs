@@ -196,6 +196,7 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         };
         for attempt in 0..MAX_ADMISSION_RETRIES {
             conflict_pause(attempt);
+            let _turn = topic_id.map(|topic| self.turns.take(topic)).transpose()?;
             let before = heads()?;
             if let Some((topic, genesis)) = self.receive_genesis
                 && ops
@@ -1283,6 +1284,68 @@ mod tests {
         ));
         assert!(log.storage().get_op(&event.id).unwrap().is_none());
         Oplog::new().receive_ops(ops).unwrap();
+    }
+
+    /// An admission of a topic waits for the turn of one paused before its commit,
+    /// so that commit is not voided by a concurrent one and its validation redone.
+    #[test]
+    fn admission_waits_turn() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use crate::tests::support::{Gate, GatePoint, StaleReadStorage};
+
+        let owner = Ed25519Signer::from_bytes(&[63; 32]);
+        let writer = Ed25519Signer::from_bytes(&[64; 32]);
+        let topic = TopicId::hash(b"admission-waits-turn");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let source = Oplog::new();
+        let peers = [owner.peer_id(), writer.peer_id()];
+        let genesis = source
+            .create_topic_genesis(topic, actor, TopicGenesis::new("test.note", peers), &owner)
+            .unwrap();
+        let envelope = EventEnvelope {
+            type_id: "test.note".into(),
+            payload: vec![0].into(),
+        };
+        let first = source
+            .create_event_op(topic, actor, envelope.clone(), &owner)
+            .unwrap();
+        let body = OpBody {
+            topic_id: topic,
+            author: writer.peer_id(),
+            actor_id: actor_id_for(topic, writer.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [genesis.id].into(),
+            generation: genesis.signed.body.generation + 1,
+            payload: TopicPayload::Event(envelope),
+        };
+        let second = Op::sign(body, &writer).unwrap();
+        let storage = StaleReadStorage::new(MemoryStorage::new());
+        let log = Oplog::with_storage(storage.clone());
+        log.receive_op(genesis).unwrap();
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Admit(topic), Arc::clone(&gate));
+        let paused = std::thread::spawn({
+            let (log, first) = (log.clone(), first.clone());
+            move || log.receive_op(first)
+        });
+        gate.wait_arrival();
+        let waiting = std::thread::spawn({
+            let (log, second) = (log.clone(), second.clone());
+            move || log.receive_op(second)
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while log.turns.waiting() == 0 {
+            assert!(Instant::now() < deadline, "second admission never waited");
+            std::thread::yield_now();
+        }
+        drop(release);
+        paused.join().unwrap().unwrap();
+        waiting.join().unwrap().unwrap();
+        assert_eq!(storage.heads(&topic).unwrap(), [first.id, second.id].into());
     }
 
     /// A cold projection over a long control chain keeps only the state it

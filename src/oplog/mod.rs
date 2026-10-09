@@ -21,6 +21,7 @@ mod integrity;
 mod membership;
 mod pending;
 mod topology;
+mod turns;
 
 pub(crate) use genesis::is_structural_genesis;
 pub(crate) use integrity::{Holes, Integrity};
@@ -155,6 +156,7 @@ pub struct Oplog<S = MemoryStorage> {
     // hole, so only a reset or damage from outside irokle needs a new scan.
     integrity: Arc<integrity::Inspections>,
     membership_cache: Arc<Mutex<MembershipCache>>,
+    turns: Arc<turns::AdmissionTurns>,
     receive_genesis: Option<(TopicId, OpId)>,
 }
 
@@ -176,6 +178,7 @@ impl<S: Storage> Oplog<S> {
             storage,
             integrity: Arc::default(),
             membership_cache: Arc::new(Mutex::new(MembershipCache::default())),
+            turns: Arc::default(),
             receive_genesis: None,
         }
     }
@@ -196,6 +199,8 @@ impl<S: Storage> Oplog<S> {
             storage,
             integrity: Arc::default(),
             membership_cache: Arc::clone(&self.membership_cache),
+            // Its store has its own heads, so its admissions take their own turns.
+            turns: Arc::default(),
             receive_genesis: self.receive_genesis,
         }
     }
