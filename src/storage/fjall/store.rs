@@ -870,7 +870,7 @@ impl FjallStorage {
     }
 
     /// Removes up to `limit` keys under `prefix`.
-    fn tx_remove_some(
+    pub(super) fn tx_remove_some(
         tx: &mut Transaction,
         records: &fjall::OptimisticTxKeyspace,
         prefix: &[u8],
@@ -1463,19 +1463,26 @@ impl FjallStorage {
             }
             // Edges pointing at this op go too, or a dependency the reset does
             // not reach keeps naming a child the topic no longer holds.
+            // Removed edges are skipped, so an op with more edges than fit resumes next time.
             if let Some(meta) =
                 Self::tx_get::<MetaPrefix>(tx, &self.records, Self::key_id(b"m", op_id))?
             {
-                if rows > 0 && rows + meta.deps.len() > limit {
+                let mut full = false;
+                for dep in &meta.deps {
+                    let edge = [b"ch".as_slice(), dep.as_ref(), op_id.as_ref()].concat();
+                    if fjall::Readable::get(tx, &self.records, &edge)?.is_none() {
+                        continue;
+                    }
+                    if rows >= limit {
+                        full = true;
+                        break;
+                    }
+                    tx.remove(&self.records, edge)?;
+                    rows += 1;
+                }
+                if full {
                     break;
                 }
-                for dep in &meta.deps {
-                    tx.remove(
-                        &self.records,
-                        [b"ch".as_slice(), dep.as_ref(), op_id.as_ref()].concat(),
-                    )?;
-                }
-                rows += meta.deps.len();
             }
             tx.remove(&self.records, Self::key_id(b"o", op_id))?;
             tx.remove(&self.records, Self::key_id(b"m", op_id))?;
@@ -1505,6 +1512,9 @@ impl FjallStorage {
         let pending = (step / (MAX_MISSING_DEPS + 4)).max(1);
         while self.transaction(|tx| Self::tx_drop_pending(tx, &self.records, topic_id, pending))?
             > 0
+        {}
+        while self.transaction(|tx| Self::tx_drop_rejected(tx, &self.records, topic_id, step))?
+            == step
         {}
         // Rows that grow with the ops, actors or peers go in steps too, so the reset stays small.
         for prefix in [

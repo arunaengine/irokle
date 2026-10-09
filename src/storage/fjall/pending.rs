@@ -437,9 +437,28 @@ impl FjallStorage {
             ids.push(id_at(item.key()?.as_ref(), BY_TOPIC.len() + TopicId::LEN)?);
         }
         for op_id in &ids {
+            if Self::tx_pending_record(tx, records, op_id)?.is_none() {
+                // An index row without its record would otherwise be selected again and again.
+                tx.remove(records, key(&[BY_TOPIC, topic_id.as_ref(), op_id.as_ref()]))?;
+            }
             Self::tx_remove_pending(tx, records, op_id)?;
         }
         Ok(ids.len())
+    }
+
+    /// Removes up to `limit` rows of `topic_id`'s rejection indexes.
+    pub(super) fn tx_drop_rejected(
+        tx: &mut Tx,
+        records: &Records,
+        topic_id: &TopicId,
+        limit: usize,
+    ) -> Result<usize> {
+        let mut removed = 0;
+        for prefix in [REJECTED, REJECTED_ORDER] {
+            let scan = key(&[prefix, topic_id.as_ref()]);
+            removed += Self::tx_remove_some(tx, records, &scan, limit - removed)?;
+        }
+        Ok(removed)
     }
 
     /// Dependencies buffered ops of `topic_id` still wait for, read from the

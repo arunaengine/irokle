@@ -2008,7 +2008,7 @@ mod fjall {
         assert!(storage.actor_clock(&topic).unwrap().is_empty());
     }
 
-    /// One op with many children and many actors also purges within the budget.
+    /// Ops with many children, many dependencies and many actors also purge within the budget.
     #[test]
     fn purge_wide_topic() {
         let dir = tempfile::tempdir().unwrap();
@@ -2046,12 +2046,23 @@ mod fjall {
             let actor = actor_id_for(topic, joiner.peer_id());
             ops.push(branch.create_event_op(topic, actor, note, joiner).unwrap());
         }
-        oplog::Oplog::with_storage(storage.clone())
-            .receive_ops(ops)
-            .unwrap();
+        let log = oplog::Oplog::with_storage(storage.clone());
+        log.receive_ops(ops).unwrap();
+        // One more op joins all 500 branches, so it has 500 dependencies.
+        let join = EventEnvelope::encode_event(&Note {
+            text: "join".into(),
+        })
+        .unwrap();
+        log.create_event_op(
+            topic,
+            actor_id_for(topic, founder.peer_id()),
+            join,
+            &founder,
+        )
+        .unwrap();
 
         assert!(storage.reset_topic(&topic).is_err());
-        assert_eq!(storage.purge_topic(&topic, 16).unwrap(), 501);
+        assert_eq!(storage.purge_topic(&topic, 16).unwrap(), 502);
         assert!(storage.topic_state(&topic).unwrap().is_none());
         assert!(storage.actor_clock(&topic).unwrap().is_empty());
     }
