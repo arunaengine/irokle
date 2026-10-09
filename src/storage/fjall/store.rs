@@ -14,12 +14,13 @@ use crate::storage::fjall::provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
 use crate::storage::pressure::{Pressure, Transaction};
 use crate::storage::{
     AckCommit, AdmissionEffects, AdmittedBatch, CounterSnapshot, MAX_PENDING_EVICTIONS,
-    ObligationTarget, OpMeta, OpPosition, PeerAck, ProvisionalTopic, SnapshotRead, StagingLimits,
-    Storage, StorageCounters, SyncObligation, SyncPeerStatus, SyncStatusUpdate, TopicState,
-    TopicView, ack_commit, ack_covers, ack_reached_op, apply_status_update, branch_matches,
-    ensure_deps_resolvable, journalled_eviction, merged_obligation, merged_peer_ack,
-    new_peer_status, peer_departed, pending_op_bytes, settled_obligation, stored_ack_dominates,
-    topic_fingerprint_for, validate_batch, validate_heads,
+    MAX_PENDING_MISSING_DEPS, ObligationTarget, OpMeta, OpPosition, PeerAck, ProvisionalTopic,
+    SnapshotRead, StagingLimits, Storage, StorageCounters, SyncObligation, SyncPeerStatus,
+    SyncStatusUpdate, TopicState, TopicView, ack_commit, ack_covers, ack_reached_op,
+    apply_status_update, branch_matches, ensure_deps_resolvable, journalled_eviction,
+    merged_obligation, merged_peer_ack, new_peer_status, peer_departed, pending_op_bytes,
+    settled_obligation, stored_ack_dominates, topic_fingerprint_for, validate_batch,
+    validate_heads,
 };
 
 #[derive(Clone)]
@@ -1434,13 +1435,15 @@ impl FjallStorage {
         Ok(state.map(|state| (meta, state.genesis)))
     }
 
-    /// Removes up to `limit` ops of `topic_id` with their meta and child edges.
+    /// Removes rows of `topic_id`'s ops, op by op, until about `limit` rows are gone: child
+    /// edges, dependency edges, op, meta and index row. An op whose child edges do not all fit
+    /// keeps the rest for the next call. Returns the ops and the rows removed.
     fn tx_remove_ops(
         &self,
         tx: &mut Transaction,
         topic_id: &TopicId,
         limit: usize,
-    ) -> Result<usize> {
+    ) -> Result<(usize, usize)> {
         // Topic op ids come from the `to` index; op records, meta, and the
         // children edges are keyed by op id, not by topic.
         let to_prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
@@ -1449,53 +1452,69 @@ impl FjallStorage {
             let (key, _) = item.into_inner()?;
             op_ids.push(Self::id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
         }
+        let (mut ops, mut rows) = (0, 0);
         for op_id in &op_ids {
+            let room = limit.saturating_sub(rows);
+            let ch_prefix = [b"ch".as_slice(), op_id.as_ref()].concat();
+            let children = Self::tx_remove_some(tx, &self.records, &ch_prefix, room)?;
+            rows += children;
+            if room == 0 || children == room {
+                break;
+            }
             // Edges pointing at this op go too, or a dependency the reset does
             // not reach keeps naming a child the topic no longer holds.
             if let Some(meta) =
                 Self::tx_get::<MetaPrefix>(tx, &self.records, Self::key_id(b"m", op_id))?
             {
+                if rows > 0 && rows + meta.deps.len() > limit {
+                    break;
+                }
                 for dep in &meta.deps {
                     tx.remove(
                         &self.records,
                         [b"ch".as_slice(), dep.as_ref(), op_id.as_ref()].concat(),
                     )?;
                 }
+                rows += meta.deps.len();
             }
             tx.remove(&self.records, Self::key_id(b"o", op_id))?;
             tx.remove(&self.records, Self::key_id(b"m", op_id))?;
-            let ch_prefix = [b"ch".as_slice(), op_id.as_ref()].concat();
-            let mut ch_keys = Vec::new();
-            for item in fjall::Readable::prefix(tx, &self.records, ch_prefix) {
-                let (key, _) = item.into_inner()?;
-                ch_keys.push(key.to_vec());
-            }
-            for key in ch_keys {
-                tx.remove(&self.records, key)?;
-            }
             tx.remove(
                 &self.records,
                 [b"to".as_slice(), topic_id.as_ref(), op_id.as_ref()].concat(),
             )?;
+            (ops, rows) = (ops + 1, rows + 3);
         }
-        Ok(op_ids.len())
+        Ok((ops, rows))
     }
 
-    /// Deletes `topic_id` like [`Storage::reset_topic`], in transactions of at most `step` rows.
+    /// Deletes `topic_id` like [`Storage::reset_topic`], in transactions of about `step` rows.
     /// Not atomic: no reader or writer may use the store until a purge, resumed after any
     /// failure, has returned. Returns the ops removed; a repeated purge continues.
     pub fn purge_topic(&self, topic_id: &TopicId, step: usize) -> Result<usize> {
         let step = step.max(1);
         let mut removed = 0;
         loop {
-            let batch = self.transaction(|tx| self.tx_remove_ops(tx, topic_id, step))?;
-            removed += batch;
-            if batch < step {
+            let (ops, rows) = self.transaction(|tx| self.tx_remove_ops(tx, topic_id, step))?;
+            removed += ops;
+            if rows == 0 {
                 break;
             }
         }
-        // The actor index and clock nodes grow with the ops, so they shrink in steps as well.
-        for prefix in [b"as".as_slice(), CLOCK_NODE] {
+        // A buffered op removes up to its missing dependencies' waiters with it.
+        let pending = (step / (MAX_PENDING_MISSING_DEPS + 4)).max(1);
+        while self.transaction(|tx| Self::tx_drop_pending(tx, &self.records, topic_id, pending))?
+            > 0
+        {}
+        // Rows that grow with the ops, actors or peers go in steps too, so the reset stays small.
+        for prefix in [
+            b"as".as_slice(),
+            b"at".as_slice(),
+            b"ss".as_slice(),
+            CLOCK_NODE,
+            PEER_ACK_PREFIX,
+            OBLIGATION_PREFIX,
+        ] {
             let scan = [prefix, topic_id.as_ref()].concat();
             while self.transaction(|tx| Self::tx_remove_some(tx, &self.records, &scan, step))?
                 == step
@@ -1511,7 +1530,7 @@ impl FjallStorage {
             .checked_add(1)
             .ok_or_else(|| Error::Storage("topic data epoch overflow".into()))?;
         Self::tx_put(tx, &self.records, epoch_key, &next_epoch)?;
-        let removed = self.tx_remove_ops(tx, topic_id, usize::MAX)?;
+        let (removed, _) = self.tx_remove_ops(tx, topic_id, usize::MAX)?;
         for prefix in [
             b"h".as_slice(),
             b"ac".as_slice(),

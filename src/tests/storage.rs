@@ -2008,6 +2008,54 @@ mod fjall {
         assert!(storage.actor_clock(&topic).unwrap().is_empty());
     }
 
+    /// One op with many children and many actors also purges within the budget.
+    #[test]
+    fn purge_wide_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pressure = crate::storage::StoragePressure::default();
+        pressure.recovery_buffer_bytes = 128 * 1024;
+        let storage =
+            crate_storage::FjallStorage::open_with_pressure(dir.path(), pressure).unwrap();
+        let topic = TopicId::hash(b"wide");
+        let founder = Ed25519Signer::from_bytes(&[1; 32]);
+        let joiners: Vec<Ed25519Signer> = (0..500_u16)
+            .map(|index| {
+                let mut seed = [2; 32];
+                seed[..2].copy_from_slice(&index.to_be_bytes());
+                Ed25519Signer::from_bytes(&seed)
+            })
+            .collect();
+        let genesis = oplog::Oplog::with_storage(MemoryStorage::new())
+            .create_topic_genesis(
+                topic,
+                actor_id_for(topic, founder.peer_id()),
+                TopicGenesis {
+                    event_type_id: Note::TYPE_ID.into(),
+                    initial_peers: joiners.iter().map(|joiner| joiner.peer_id()).collect(),
+                    replication_policy: ReplicationPolicy::default(),
+                },
+                &founder,
+            )
+            .unwrap();
+        let mut ops = vec![genesis.clone()];
+        for joiner in &joiners {
+            // Each branch knows only the genesis, so every event is one of its children.
+            let branch = oplog::Oplog::with_storage(MemoryStorage::new());
+            branch.receive_ops(vec![genesis.clone()]).unwrap();
+            let note = EventEnvelope::encode_event(&Note { text: "fan".into() }).unwrap();
+            let actor = actor_id_for(topic, joiner.peer_id());
+            ops.push(branch.create_event_op(topic, actor, note, joiner).unwrap());
+        }
+        oplog::Oplog::with_storage(storage.clone())
+            .receive_ops(ops)
+            .unwrap();
+
+        assert!(storage.reset_topic(&topic).is_err());
+        assert_eq!(storage.purge_topic(&topic, 16).unwrap(), 501);
+        assert!(storage.topic_state(&topic).unwrap().is_none());
+        assert!(storage.actor_clock(&topic).unwrap().is_empty());
+    }
+
     #[test]
     fn reset_clears() {
         let dir = tempfile::tempdir().unwrap();
