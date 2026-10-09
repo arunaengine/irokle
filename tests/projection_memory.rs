@@ -120,9 +120,9 @@ fn assert_cache_bounded() {
     assert!(released <= CACHE_BYTES, "{released} bytes kept");
 }
 
-/// A late event joining 1,024 historical controls needs a cold projection. A
-/// workspace too small for it refuses the event; a large one admits it, and
-/// the whole receive then allocates no more than the workspace it reserved.
+/// A late event joining 1,024 historical controls but not the newest one needs a
+/// cold projection. A workspace too small for it refuses the event; a large one
+/// admits it, and the receive then allocates no more than the workspace it reserved.
 fn assert_workspace_covers() {
     for workspace_bytes in [1_u64 << 20, 64 << 20] {
         let owner = Ed25519Signer::from_bytes(&[33; 32]);
@@ -148,6 +148,12 @@ fn assert_workspace_covers() {
                     .id
             })
             .collect::<BTreeSet<_>>();
+        let newest = TopicControl::AddPeer {
+            peer: PeerId::hash(b"newest"),
+        };
+        source
+            .create_control_op(topic, actor, newest, &owner)
+            .unwrap();
         let late = event(topic, &writer, joined, 1025);
         let receiver = Oplog::with_storage(storage.clone());
         let before = LIVE.load(Ordering::Relaxed);
