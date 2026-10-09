@@ -370,3 +370,69 @@ fn catchup_reads_bounded() {
         );
     }
 }
+
+/// Writers that see each other's ops make ops with several dependencies, which
+/// the projection cache does not keep, so a member check must not reread history.
+#[test]
+fn concurrent_reads_bounded() {
+    use std::sync::atomic::Ordering;
+
+    const HISTORY: usize = 256;
+    const ROUNDS: usize = 8;
+    let alice = node(112);
+    let bob = node(113);
+    let topic = alice
+        .create_topic::<Note>(TopicConfig {
+            initial_peers: [bob.peer_id()].into(),
+            ..TopicConfig::default()
+        })
+        .unwrap();
+    topic.add_peer(PeerId::hash(b"later-peer")).unwrap();
+    for i in 0..HISTORY {
+        topic
+            .publish(Note {
+                text: i.to_string(),
+            })
+            .unwrap();
+    }
+    let summary = bob.sync_summary(topic.id()).unwrap();
+    bob.receive_sync_data_from(
+        alice.peer_id(),
+        alice.plan_sync_data(bob.peer_id(), &summary).unwrap(),
+    )
+    .unwrap();
+    let bob_topic = bob.open_topic::<Note>(topic.id()).unwrap();
+    let storage = StaleReadStorage::new(bob.storage().clone());
+    let receiver = oplog::Oplog::with_storage(storage.clone());
+    let sender = oplog::Oplog::with_storage(alice.storage().clone());
+    for i in 0..ROUNDS {
+        let ours = bob_topic
+            .publish(Note {
+                text: format!("bob {i}"),
+            })
+            .unwrap();
+        let theirs = topic
+            .publish(Note {
+                text: format!("alice {i}"),
+            })
+            .unwrap();
+        let theirs = alice.storage().get_op(&theirs.meta.op_id).unwrap().unwrap();
+        assert_eq!(theirs.signed.body.deps.len(), if i == 0 { 1 } else { 2 });
+        receiver.receive_op(theirs).unwrap();
+        sender
+            .receive_op(bob.storage().get_op(&ours.meta.op_id).unwrap().unwrap())
+            .unwrap();
+    }
+    let reads = storage.op_reads.load(Ordering::Relaxed);
+    assert!(
+        reads < HISTORY,
+        "member checks reread history: reads={reads}"
+    );
+    assert_eq!(
+        storage
+            .actor_clock(&topic.id())
+            .unwrap()
+            .get(&actor_id_for(topic.id(), alice.peer_id())),
+        (HISTORY + ROUNDS + 2) as u64
+    );
+}

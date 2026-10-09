@@ -728,7 +728,9 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             TopicPayload::Event(envelope) => {
                 let state = state.ok_or(Error::TopicNotFound)?;
                 ensure_event_type(&state.event_type_id, &envelope.type_id)?;
-                let author_is_member = if body.deps == *heads {
+                let covered =
+                    body.deps == *heads || self.covers_controls(op, state, overlay.meta)?;
+                let author_is_member = if covered {
                     state.members.contains(&body.author)
                 } else {
                     self.project_membership(
@@ -747,7 +749,9 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             }
             TopicPayload::Control(_) => {
                 let state = state.ok_or(Error::TopicNotFound)?;
-                let author_is_member = if body.deps == *heads {
+                let covered =
+                    body.deps == *heads || self.covers_controls(op, state, overlay.meta)?;
+                let author_is_member = if covered {
                     state.members.contains(&body.author)
                 } else {
                     self.project_membership(
@@ -794,6 +798,25 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             });
         }
         Ok(OpAdmission::Admit)
+    }
+
+    /// Whether `op` depends on every control `state` applies, so the state at its
+    /// dependencies is `state` without walking history. Each actor position names
+    /// one admitted op, so the observed clock decides it.
+    fn covers_controls(
+        &self,
+        op: &Op,
+        state: &TopicState,
+        overlay_meta: &BTreeMap<OpId, OpMeta>,
+    ) -> Result<bool> {
+        let clock = self.meta_for_projected(op, overlay_meta)?.observed_clock;
+        let policy = state.replication_policy_control.iter().map(|(key, _)| key);
+        Ok(state
+            .membership_controls
+            .values()
+            .map(|(key, _)| key)
+            .chain(policy)
+            .all(|key| clock.get(&key.actor_id) >= key.actor_seq))
     }
 
     fn project_membership(
