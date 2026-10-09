@@ -10,6 +10,7 @@ use crate::{
     TopicInfo,
 };
 
+use crate::storage::MAX_PENDING_MISSING_DEPS as MAX_MISSING_DEPS;
 use crate::storage::fjall::provisional::{ACTIVATING, ADMITTED_BYTES, Fence};
 use crate::storage::pressure::{Pressure, Transaction};
 use crate::storage::{
@@ -224,6 +225,14 @@ struct LegacyObligation {
     target_clock: ActorClock,
 }
 
+/// Options of a new op record keyspace: LZ4 on every level, since the uncompressed top levels
+/// hold the newest ops. Fjall keeps the options a keyspace was created with.
+pub(super) fn records_options() -> fjall::KeyspaceCreateOptions {
+    fjall::KeyspaceCreateOptions::default().data_block_compression_policy(
+        fjall::config::CompressionPolicy::all(fjall::CompressionType::Lz4),
+    )
+}
+
 impl FjallStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_persist_mode(path, fjall::PersistMode::SyncAll)
@@ -274,7 +283,7 @@ impl FjallStorage {
         persist_mode: fjall::PersistMode,
         policy: Option<crate::storage::StoragePressure>,
     ) -> Result<Self> {
-        let records = db.keyspace("records", fjall::KeyspaceCreateOptions::default)?;
+        let records = db.keyspace("records", records_options)?;
         let pressure = Pressure::shared(records.path())?;
         if let Some(policy) = policy {
             pressure.configure(policy)?;
@@ -662,7 +671,7 @@ impl FjallStorage {
     #[cfg(test)]
     pub(crate) fn open_interrupted(path: impl AsRef<Path>, steps: usize) -> Result<()> {
         let db = fjall::OptimisticTxDatabase::builder(path.as_ref()).open()?;
-        let records = db.keyspace("records", fjall::KeyspaceCreateOptions::default)?;
+        let records = db.keyspace("records", records_options)?;
         let pressure = Pressure::shared(records.path())?;
         let storage = Self {
             records,
@@ -858,6 +867,23 @@ impl FjallStorage {
             tx.remove(records, key)?;
         }
         Ok(removed)
+    }
+
+    /// Removes up to `limit` keys under `prefix`.
+    pub(super) fn tx_remove_some(
+        tx: &mut Transaction,
+        records: &fjall::OptimisticTxKeyspace,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<usize> {
+        let mut keys = Vec::new();
+        for item in fjall::Readable::prefix(tx, records, prefix).take(limit) {
+            keys.push(item.key()?.to_vec());
+        }
+        for key in &keys {
+            tx.remove(records, key.clone())?;
+        }
+        Ok(keys.len())
     }
 
     pub(super) fn tx_put_obligation(
@@ -1409,6 +1435,104 @@ impl FjallStorage {
         Ok(state.map(|state| (meta, state.genesis)))
     }
 
+    /// Removes rows of `topic_id`'s ops, op by op, until about `limit` rows are gone: child
+    /// edges, dependency edges, op, meta and index row. An op whose child edges do not all fit
+    /// keeps the rest for the next call. Returns the ops and the rows removed.
+    fn tx_remove_ops(
+        &self,
+        tx: &mut Transaction,
+        topic_id: &TopicId,
+        limit: usize,
+    ) -> Result<(usize, usize)> {
+        // Topic op ids come from the `to` index; op records, meta, and the
+        // children edges are keyed by op id, not by topic.
+        let to_prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
+        let mut op_ids = Vec::new();
+        for item in fjall::Readable::prefix(tx, &self.records, to_prefix).take(limit) {
+            let (key, _) = item.into_inner()?;
+            op_ids.push(Self::id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
+        }
+        let (mut ops, mut rows) = (0, 0);
+        for op_id in &op_ids {
+            let room = limit.saturating_sub(rows);
+            let ch_prefix = [b"ch".as_slice(), op_id.as_ref()].concat();
+            let children = Self::tx_remove_some(tx, &self.records, &ch_prefix, room)?;
+            rows += children;
+            if room == 0 || children == room {
+                break;
+            }
+            // Edges pointing at this op go too, or a dependency the reset does
+            // not reach keeps naming a child the topic no longer holds.
+            // Removed edges are skipped, so an op with more edges than fit resumes next time.
+            if let Some(meta) =
+                Self::tx_get::<MetaPrefix>(tx, &self.records, Self::key_id(b"m", op_id))?
+            {
+                let mut full = false;
+                for dep in &meta.deps {
+                    let edge = [b"ch".as_slice(), dep.as_ref(), op_id.as_ref()].concat();
+                    if fjall::Readable::get(tx, &self.records, &edge)?.is_none() {
+                        continue;
+                    }
+                    if rows >= limit {
+                        full = true;
+                        break;
+                    }
+                    tx.remove(&self.records, edge)?;
+                    rows += 1;
+                }
+                if full {
+                    break;
+                }
+            }
+            tx.remove(&self.records, Self::key_id(b"o", op_id))?;
+            tx.remove(&self.records, Self::key_id(b"m", op_id))?;
+            tx.remove(
+                &self.records,
+                [b"to".as_slice(), topic_id.as_ref(), op_id.as_ref()].concat(),
+            )?;
+            (ops, rows) = (ops + 1, rows + 3);
+        }
+        Ok((ops, rows))
+    }
+
+    /// Deletes `topic_id` like [`Storage::reset_topic`], in transactions of about `step` rows.
+    /// Not atomic: no reader or writer may use the store until a purge, resumed after any
+    /// failure, has returned. Returns the ops removed; a repeated purge continues.
+    pub fn purge_topic(&self, topic_id: &TopicId, step: usize) -> Result<usize> {
+        let step = step.max(1);
+        let mut removed = 0;
+        loop {
+            let (ops, rows) = self.transaction(|tx| self.tx_remove_ops(tx, topic_id, step))?;
+            removed += ops;
+            if rows == 0 {
+                break;
+            }
+        }
+        // A buffered op removes up to its missing dependencies' waiters with it.
+        let pending = (step / (MAX_MISSING_DEPS + 4)).max(1);
+        while self.transaction(|tx| Self::tx_drop_pending(tx, &self.records, topic_id, pending))?
+            > 0
+        {}
+        while self.transaction(|tx| Self::tx_drop_rejected(tx, &self.records, topic_id, step))?
+            == step
+        {}
+        // Rows that grow with the ops, actors or peers go in steps too, so the reset stays small.
+        for prefix in [
+            b"as".as_slice(),
+            b"at".as_slice(),
+            b"ss".as_slice(),
+            CLOCK_NODE,
+            PEER_ACK_PREFIX,
+            OBLIGATION_PREFIX,
+        ] {
+            let scan = [prefix, topic_id.as_ref()].concat();
+            while self.transaction(|tx| Self::tx_remove_some(tx, &self.records, &scan, step))?
+                == step
+            {}
+        }
+        Ok(removed + self.reset_topic(topic_id)?)
+    }
+
     fn tx_reset_topic(&self, tx: &mut Transaction, topic_id: &TopicId) -> Result<usize> {
         let epoch_key = Self::key_id(TOPIC_EPOCH_PREFIX, topic_id);
         let epoch: u64 = Self::tx_get(tx, &self.records, epoch_key.as_slice())?.unwrap_or_default();
@@ -1416,44 +1540,7 @@ impl FjallStorage {
             .checked_add(1)
             .ok_or_else(|| Error::Storage("topic data epoch overflow".into()))?;
         Self::tx_put(tx, &self.records, epoch_key, &next_epoch)?;
-        // Topic op ids come from the `to` index; op records, meta, and the
-        // children edges are keyed by op id, not by topic.
-        let to_prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
-        let mut op_ids = Vec::new();
-        for item in fjall::Readable::prefix(tx, &self.records, to_prefix) {
-            let (key, _) = item.into_inner()?;
-            op_ids.push(Self::id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
-        }
-        let removed = op_ids.len();
-        for op_id in &op_ids {
-            // Edges pointing at this op go too, or a dependency the reset does
-            // not reach keeps naming a child the topic no longer holds.
-            if let Some(meta) =
-                Self::tx_get::<MetaPrefix>(tx, &self.records, Self::key_id(b"m", op_id))?
-            {
-                for dep in &meta.deps {
-                    tx.remove(
-                        &self.records,
-                        [b"ch".as_slice(), dep.as_ref(), op_id.as_ref()].concat(),
-                    )?;
-                }
-            }
-            tx.remove(&self.records, Self::key_id(b"o", op_id))?;
-            tx.remove(&self.records, Self::key_id(b"m", op_id))?;
-            let ch_prefix = [b"ch".as_slice(), op_id.as_ref()].concat();
-            let mut ch_keys = Vec::new();
-            for item in fjall::Readable::prefix(tx, &self.records, ch_prefix) {
-                let (key, _) = item.into_inner()?;
-                ch_keys.push(key.to_vec());
-            }
-            for key in ch_keys {
-                tx.remove(&self.records, key)?;
-            }
-            tx.remove(
-                &self.records,
-                [b"to".as_slice(), topic_id.as_ref(), op_id.as_ref()].concat(),
-            )?;
-        }
+        let (removed, _) = self.tx_remove_ops(tx, topic_id, usize::MAX)?;
         for prefix in [
             b"h".as_slice(),
             b"ac".as_slice(),

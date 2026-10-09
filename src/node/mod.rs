@@ -141,6 +141,12 @@ impl<S: Storage> Irokle<S> {
         self.oplog.storage()
     }
 
+    /// The oplog this node admits through. Local writes made with it wait for a
+    /// topic's turn like received batches, so neither voids the other's commit.
+    pub fn oplog(&self) -> &Oplog<S> {
+        &self.oplog
+    }
+
     /// Select sync targets for `topic_id` from one replication-policy and peer-health view.
     pub(crate) fn sync_peers(&self, topic_id: TopicId, state: &TopicState) -> Vec<PeerId> {
         self.peer_health

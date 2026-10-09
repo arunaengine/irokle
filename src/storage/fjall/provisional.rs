@@ -100,10 +100,9 @@ impl FjallStorage {
 
     /// The keyspace of `slot`.
     pub(super) fn slot_records(&self, slot: u32) -> Result<Records> {
-        Ok(self.db.keyspace(
-            &format!("bootstrap-{slot}"),
-            fjall::KeyspaceCreateOptions::default,
-        )?)
+        Ok(self
+            .db
+            .keyspace(&format!("bootstrap-{slot}"), super::store::records_options)?)
     }
 
     fn current_record(&self, provisional: &ProvisionalTopic) -> Result<Option<NamespaceRecord>> {

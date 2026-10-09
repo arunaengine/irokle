@@ -1336,14 +1336,16 @@ fn assert_retains_pending<S: Corrupt>(storage: S) {
     for text in ["one", "two", "three"] {
         topic.publish(Note { text: text.into() }).unwrap();
     }
+    topic.add_peer(PeerId::hash(b"retains-pending")).unwrap();
     let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
-    let (genesis, first, second, third) = (
+    let (genesis, first, second, third, control) = (
         ops[0].clone(),
         ops[1].clone(),
         ops[2].clone(),
         ops[3].clone(),
+        ops[4].clone(),
     );
-    // Depending on `second` alone rather than on the heads makes admission
+    // Depending on `second` alone, behind a later control, makes admission
     // project membership through an ancestry walk that reads the genesis.
     let waiter = Op::sign(
         OpBody {
@@ -1377,10 +1379,13 @@ fn assert_retains_pending<S: Corrupt>(storage: S) {
     damage_op(&storage, &genesis.id, Damage::Meta);
     let fresh = oplog::Oplog::with_storage(storage.clone());
     let admitted = fresh
-        .receive_ops_from_peer(Some(source.peer_id()), vec![second.clone(), third.clone()])
+        .receive_ops_from_peer(
+            Some(source.peer_id()),
+            vec![second.clone(), third.clone(), control.clone()],
+        )
         .unwrap();
 
-    assert_eq!(admitted, [second.id, third.id].into());
+    assert_eq!(admitted, [second.id, third.id, control.id].into());
     // Its wait on `second` resolved, so the retained record is now ready.
     assert!(
         storage
@@ -1964,6 +1969,103 @@ fn memory_repair_limit() {
 #[cfg(feature = "fjall")]
 mod fjall {
     use crate::tests::storage::*;
+
+    /// A purge in small steps removes a long topic as fully as a reset, repeats as a no-op and
+    /// leaves every other topic unchanged.
+    #[test]
+    fn purge_in_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        let (purged, kept) = (TopicId::hash(b"purged"), TopicId::hash(b"kept"));
+        seed_chain(&storage, purged, 1, &["a", "b", "c", "d", "e"]);
+        seed_chain(&storage, kept, 2, &["x"]);
+        let before = topic_snapshot(&storage, &kept);
+
+        assert_eq!(storage.purge_topic(&purged, 2).unwrap(), 6);
+        assert!(storage.list_op_ids(&purged).unwrap().is_empty());
+        assert!(storage.heads(&purged).unwrap().is_empty());
+        assert!(storage.topic_state(&purged).unwrap().is_none());
+        assert_eq!(storage.purge_topic(&purged, 2).unwrap(), 0);
+        assert_eq!(topic_snapshot(&storage, &kept), before);
+    }
+
+    /// A long topic purges under a transaction budget that one reset of its indexes exceeds.
+    #[test]
+    fn purge_within_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pressure = crate::storage::StoragePressure::default();
+        pressure.recovery_buffer_bytes = 128 * 1024;
+        let storage =
+            crate_storage::FjallStorage::open_with_pressure(dir.path(), pressure).unwrap();
+        let topic = TopicId::hash(b"long");
+        let events: Vec<String> = (0..500).map(|index| index.to_string()).collect();
+        let texts: Vec<&str> = events.iter().map(String::as_str).collect();
+        seed_chain(&storage, topic, 1, &texts);
+
+        assert!(storage.reset_topic(&topic).is_err());
+        assert_eq!(storage.purge_topic(&topic, 16).unwrap(), 501);
+        assert!(storage.topic_state(&topic).unwrap().is_none());
+        assert!(storage.actor_clock(&topic).unwrap().is_empty());
+    }
+
+    /// Ops with many children, many dependencies and many actors also purge within the budget.
+    #[test]
+    fn purge_wide_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pressure = crate::storage::StoragePressure::default();
+        pressure.recovery_buffer_bytes = 128 * 1024;
+        let storage =
+            crate_storage::FjallStorage::open_with_pressure(dir.path(), pressure).unwrap();
+        let topic = TopicId::hash(b"wide");
+        let founder = Ed25519Signer::from_bytes(&[1; 32]);
+        let joiners: Vec<Ed25519Signer> = (0..500_u16)
+            .map(|index| {
+                let mut seed = [2; 32];
+                seed[..2].copy_from_slice(&index.to_be_bytes());
+                Ed25519Signer::from_bytes(&seed)
+            })
+            .collect();
+        let genesis = oplog::Oplog::with_storage(MemoryStorage::new())
+            .create_topic_genesis(
+                topic,
+                actor_id_for(topic, founder.peer_id()),
+                TopicGenesis {
+                    event_type_id: Note::TYPE_ID.into(),
+                    initial_peers: joiners.iter().map(|joiner| joiner.peer_id()).collect(),
+                    replication_policy: ReplicationPolicy::default(),
+                },
+                &founder,
+            )
+            .unwrap();
+        let mut ops = vec![genesis.clone()];
+        for joiner in &joiners {
+            // Each branch knows only the genesis, so every event is one of its children.
+            let branch = oplog::Oplog::with_storage(MemoryStorage::new());
+            branch.receive_ops(vec![genesis.clone()]).unwrap();
+            let note = EventEnvelope::encode_event(&Note { text: "fan".into() }).unwrap();
+            let actor = actor_id_for(topic, joiner.peer_id());
+            ops.push(branch.create_event_op(topic, actor, note, joiner).unwrap());
+        }
+        let log = oplog::Oplog::with_storage(storage.clone());
+        log.receive_ops(ops).unwrap();
+        // One more op joins all 500 branches, so it has 500 dependencies.
+        let join = EventEnvelope::encode_event(&Note {
+            text: "join".into(),
+        })
+        .unwrap();
+        log.create_event_op(
+            topic,
+            actor_id_for(topic, founder.peer_id()),
+            join,
+            &founder,
+        )
+        .unwrap();
+
+        assert!(storage.reset_topic(&topic).is_err());
+        assert_eq!(storage.purge_topic(&topic, 16).unwrap(), 502);
+        assert!(storage.topic_state(&topic).unwrap().is_none());
+        assert!(storage.actor_clock(&topic).unwrap().is_empty());
+    }
 
     #[test]
     fn reset_clears() {

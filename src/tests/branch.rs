@@ -525,6 +525,16 @@ fn assert_reset_pauses<S: Storage>(
         },
     )
     .unwrap();
+    // One oplog admits one batch per topic at a time, so the drain pauses
+    // beside the forwarding admission through a second facade of the store.
+    let other = Irokle::with_storage(
+        storage.clone(),
+        NodeConfig {
+            signer: branches.member.clone(),
+            ..NodeConfig::default()
+        },
+    )
+    .unwrap();
     let receive = |source: PeerId, ops: Vec<Op>| {
         node.receive_sync_data_from(source, SyncData { topic_id, ops })
     };
@@ -569,10 +579,9 @@ fn assert_reset_pauses<S: Storage>(
         }
     });
     let draining = paused(&storage, GatePoint::Meta(second.id), &gates[2], {
-        let node = node.clone();
         let first = first.clone();
         move || {
-            node.receive_sync_data_from(
+            other.receive_sync_data_from(
                 third,
                 SyncData {
                     topic_id,

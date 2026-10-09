@@ -129,6 +129,12 @@ impl<S: crate::oplog::Storage> Oplog<S> {
                             PendingVerdict::Retain => {
                                 tracing::debug!(op_id = %op.id, error = %err, "retaining pending op");
                                 held_back.insert(op.id);
+                                // On a busy topic each later buffered op would wait again;
+                                // they stay buffered, and the caller's ops are already done.
+                                if matches!(err, Error::AdmissionConflict) {
+                                    admitted.ready_remaining = true;
+                                    break;
+                                }
                             }
                         }
                         continue;
@@ -196,6 +202,8 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         };
         for attempt in 0..MAX_ADMISSION_RETRIES {
             conflict_pause(attempt);
+            // A wait that runs out fails the job; retrying here would only wait again.
+            let _turn = topic_id.map(|topic| self.turns.take(topic)).transpose()?;
             let before = heads()?;
             if let Some((topic, genesis)) = self.receive_genesis
                 && ops
@@ -728,7 +736,9 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             TopicPayload::Event(envelope) => {
                 let state = state.ok_or(Error::TopicNotFound)?;
                 ensure_event_type(&state.event_type_id, &envelope.type_id)?;
-                let author_is_member = if body.deps == *heads {
+                let covered =
+                    body.deps == *heads || self.covers_controls(op, state, overlay.meta)?;
+                let author_is_member = if covered {
                     state.members.contains(&body.author)
                 } else {
                     self.project_membership(
@@ -747,7 +757,9 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             }
             TopicPayload::Control(_) => {
                 let state = state.ok_or(Error::TopicNotFound)?;
-                let author_is_member = if body.deps == *heads {
+                let covered =
+                    body.deps == *heads || self.covers_controls(op, state, overlay.meta)?;
+                let author_is_member = if covered {
                     state.members.contains(&body.author)
                 } else {
                     self.project_membership(
@@ -794,6 +806,29 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             });
         }
         Ok(OpAdmission::Admit)
+    }
+
+    /// Whether `op` depends on every control `state` applies, so the state at its
+    /// dependencies is `state` without walking history. Each actor position names
+    /// one admitted op, so the observed clock decides it.
+    fn covers_controls(
+        &self,
+        op: &Op,
+        state: &TopicState,
+        overlay_meta: &BTreeMap<OpId, OpMeta>,
+    ) -> Result<bool> {
+        // Without dependencies there is no genesis to cover; the projection refuses it.
+        if op.signed.body.deps.is_empty() {
+            return Ok(false);
+        }
+        let clock = self.meta_for_projected(op, overlay_meta)?.observed_clock;
+        let policy = state.replication_policy_control.iter().map(|(key, _)| key);
+        Ok(state
+            .membership_controls
+            .values()
+            .map(|(key, _)| key)
+            .chain(policy)
+            .all(|key| clock.get(&key.actor_id) >= key.actor_seq))
     }
 
     fn project_membership(
@@ -843,6 +878,14 @@ impl<S: crate::oplog::Storage> Oplog<S> {
                 grows = grows.saturating_add(fold_bytes(&op));
                 folded.push(op);
             }
+        }
+        if seen.len() > LONG_WALK_OPS {
+            tracing::warn!(
+                %topic_id,
+                visited = seen.len(),
+                deps = deps.len(),
+                "membership projection walked a long topic history"
+            );
         }
         let state = if known.is_empty() {
             // Materializing copies the genesis peers besides the state it returns.
@@ -1042,6 +1085,9 @@ pub(super) fn ensure_event_type(expected: &str, actual: &str) -> Result<()> {
 /// B-tree nodes at their lowest occupancy.
 const WALK_BYTES: u64 = 64;
 const SEEN_BYTES: u64 = 80;
+/// Ops one projection may visit before it warns: each visit reads an op from the
+/// store, so longer walks repeated per admission keep a node busy.
+const LONG_WALK_OPS: usize = 10_000;
 /// Bytes a projection charges its store at once.
 const HOLD_BYTES: u64 = 64 * 1024;
 /// Projection workspace any store allows, so a store without a memory budget
@@ -1249,6 +1295,186 @@ mod tests {
         ));
         assert!(log.storage().get_op(&event.id).unwrap().is_none());
         Oplog::new().receive_ops(ops).unwrap();
+    }
+
+    /// A buffered op that loses its admission to conflicts ends the drain of this call,
+    /// so one job does not wait again for each later op; the rest stays buffered.
+    #[test]
+    fn conflict_ends_drain() {
+        use std::sync::atomic::Ordering;
+
+        use crate::oplog::MAX_ADMISSION_RETRIES;
+        use crate::tests::support::StaleReadStorage;
+
+        let owner = Ed25519Signer::from_bytes(&[68; 32]);
+        let writer = Ed25519Signer::from_bytes(&[69; 32]);
+        let topic = TopicId::hash(b"conflict-ends-drain");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let source = Oplog::new();
+        let peers = [owner.peer_id(), writer.peer_id()];
+        let genesis = source
+            .create_topic_genesis(topic, actor, TopicGenesis::new("test.note", peers), &owner)
+            .unwrap();
+        let envelope = EventEnvelope {
+            type_id: "test.note".into(),
+            payload: vec![0].into(),
+        };
+        let base = source
+            .create_event_op(topic, actor, envelope.clone(), &owner)
+            .unwrap();
+        let first = source
+            .create_event_op(topic, actor, envelope.clone(), &owner)
+            .unwrap();
+        let body = OpBody {
+            topic_id: topic,
+            author: writer.peer_id(),
+            actor_id: actor_id_for(topic, writer.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [base.id].into(),
+            generation: base.signed.body.generation + 1,
+            payload: TopicPayload::Event(envelope),
+        };
+        let second = Op::sign(body, &writer).unwrap();
+        let storage = StaleReadStorage::new(MemoryStorage::new());
+        let log = Oplog::with_storage(storage.clone());
+        log.receive_ops(vec![genesis]).unwrap();
+        log.receive_ops(vec![first.clone(), second.clone()])
+            .unwrap();
+        *storage.failed_ops.lock().unwrap() = [first.id, second.id].into();
+        log.receive_ops(vec![base]).unwrap();
+        storage.failed_ops.lock().unwrap().clear();
+
+        storage.conflict_writes(2 * MAX_ADMISSION_RETRIES);
+        let pass = log
+            .receive_ops_admission(None, Vec::new(), &BTreeSet::new(), None)
+            .unwrap();
+        assert!(pass.accepted.is_empty() && pass.ready_remaining);
+        let left = storage.conflicts.load(Ordering::SeqCst);
+        assert_eq!(
+            left, MAX_ADMISSION_RETRIES,
+            "the drain went on after a conflict"
+        );
+        storage.conflict_writes(0);
+        assert_eq!(
+            log.reconcile_pending_ops().unwrap(),
+            [first.id, second.id].into()
+        );
+    }
+
+    /// An event or control without dependencies is no genesis and is refused, also in
+    /// a topic without controls, where no membership projection is needed.
+    #[test]
+    fn rejects_rootless_ops() {
+        let owner = Ed25519Signer::from_bytes(&[66; 32]);
+        let writer = Ed25519Signer::from_bytes(&[67; 32]);
+        let topic = TopicId::hash(b"rejects-rootless-ops");
+        let log = Oplog::new();
+        let genesis = TopicGenesis::new("test.note", [writer.peer_id()]);
+        log.create_topic_genesis(topic, actor_id_for(topic, owner.peer_id()), genesis, &owner)
+            .unwrap();
+        let event = TopicPayload::Event(EventEnvelope {
+            type_id: "test.note".into(),
+            payload: vec![0].into(),
+        });
+        let control = TopicPayload::Control(TopicControl::AddPeer {
+            peer: PeerId::hash(b"rootless"),
+        });
+        for payload in [event, control] {
+            let body = OpBody {
+                topic_id: topic,
+                author: writer.peer_id(),
+                actor_id: actor_id_for(topic, writer.peer_id()),
+                actor_seq: 1,
+                actor_prev: None,
+                deps: BTreeSet::new(),
+                generation: 0,
+                payload,
+            };
+            let op = Op::sign(body, &writer).unwrap();
+            assert!(matches!(log.receive_op(op), Err(Error::TopicNotFound)));
+        }
+    }
+
+    /// A received batch and a local write of a topic wait for the turn of an admission
+    /// paused before its commit, so that commit is not voided and its validation redone.
+    #[test]
+    fn admission_waits_turn() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use crate::tests::support::{Gate, GatePoint, StaleReadStorage};
+
+        let owner = Ed25519Signer::from_bytes(&[63; 32]);
+        let writer = Ed25519Signer::from_bytes(&[64; 32]);
+        let local = Ed25519Signer::from_bytes(&[65; 32]);
+        let topic = TopicId::hash(b"admission-waits-turn");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let source = Oplog::new();
+        let peers = [owner.peer_id(), writer.peer_id(), local.peer_id()];
+        let genesis = source
+            .create_topic_genesis(topic, actor, TopicGenesis::new("test.note", peers), &owner)
+            .unwrap();
+        let envelope = EventEnvelope {
+            type_id: "test.note".into(),
+            payload: vec![0].into(),
+        };
+        let first = source
+            .create_event_op(topic, actor, envelope.clone(), &owner)
+            .unwrap();
+        let body = OpBody {
+            topic_id: topic,
+            author: writer.peer_id(),
+            actor_id: actor_id_for(topic, writer.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [genesis.id].into(),
+            generation: genesis.signed.body.generation + 1,
+            payload: TopicPayload::Event(envelope.clone()),
+        };
+        let second = Op::sign(body, &writer).unwrap();
+        let storage = StaleReadStorage::new(MemoryStorage::new());
+        let log = Oplog::with_storage(storage.clone());
+        log.receive_op(genesis).unwrap();
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        storage.arm_read(GatePoint::Admit(topic), Arc::clone(&gate));
+        let paused = std::thread::spawn({
+            let (log, first) = (log.clone(), first.clone());
+            move || log.receive_op(first)
+        });
+        gate.wait_arrival();
+        let waiting = std::thread::spawn({
+            let (log, second) = (log.clone(), second.clone());
+            move || log.receive_op(second)
+        });
+        let wait_for = |count: usize, what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while log.turns.waiting() < count {
+                assert!(Instant::now() < deadline, "{what} never waited");
+                std::thread::yield_now();
+            }
+        };
+        wait_for(1, "the second admission");
+        let writing = std::thread::spawn({
+            let log = log.clone();
+            move || {
+                log.create_event_op(
+                    topic,
+                    actor_id_for(topic, local.peer_id()),
+                    envelope,
+                    &local,
+                )
+            }
+        });
+        wait_for(2, "the local write");
+        drop(release);
+        paused.join().unwrap().unwrap();
+        waiting.join().unwrap().unwrap();
+        let written = writing.join().unwrap().unwrap();
+        for id in [first.id, second.id, written.id] {
+            assert!(storage.get_op(&id).unwrap().is_some());
+        }
     }
 
     /// A cold projection over a long control chain keeps only the state it
