@@ -1336,14 +1336,16 @@ fn assert_retains_pending<S: Corrupt>(storage: S) {
     for text in ["one", "two", "three"] {
         topic.publish(Note { text: text.into() }).unwrap();
     }
+    topic.add_peer(PeerId::hash(b"retains-pending")).unwrap();
     let ops = oplog::topological(source.storage(), &topic.id()).unwrap();
-    let (genesis, first, second, third) = (
+    let (genesis, first, second, third, control) = (
         ops[0].clone(),
         ops[1].clone(),
         ops[2].clone(),
         ops[3].clone(),
+        ops[4].clone(),
     );
-    // Depending on `second` alone rather than on the heads makes admission
+    // Depending on `second` alone, behind a later control, makes admission
     // project membership through an ancestry walk that reads the genesis.
     let waiter = Op::sign(
         OpBody {
@@ -1377,10 +1379,13 @@ fn assert_retains_pending<S: Corrupt>(storage: S) {
     damage_op(&storage, &genesis.id, Damage::Meta);
     let fresh = oplog::Oplog::with_storage(storage.clone());
     let admitted = fresh
-        .receive_ops_from_peer(Some(source.peer_id()), vec![second.clone(), third.clone()])
+        .receive_ops_from_peer(
+            Some(source.peer_id()),
+            vec![second.clone(), third.clone(), control.clone()],
+        )
         .unwrap();
 
-    assert_eq!(admitted, [second.id, third.id].into());
+    assert_eq!(admitted, [second.id, third.id, control.id].into());
     // Its wait on `second` resolved, so the retained record is now ready.
     assert!(
         storage
