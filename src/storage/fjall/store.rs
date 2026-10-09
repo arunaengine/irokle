@@ -224,6 +224,14 @@ struct LegacyObligation {
     target_clock: ActorClock,
 }
 
+/// Options of a new op record keyspace: LZ4 on every level, since the uncompressed top levels
+/// hold the newest ops. Fjall keeps the options a keyspace was created with.
+pub(super) fn records_options() -> fjall::KeyspaceCreateOptions {
+    fjall::KeyspaceCreateOptions::default().data_block_compression_policy(
+        fjall::config::CompressionPolicy::all(fjall::CompressionType::Lz4),
+    )
+}
+
 impl FjallStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_persist_mode(path, fjall::PersistMode::SyncAll)
@@ -274,7 +282,7 @@ impl FjallStorage {
         persist_mode: fjall::PersistMode,
         policy: Option<crate::storage::StoragePressure>,
     ) -> Result<Self> {
-        let records = db.keyspace("records", fjall::KeyspaceCreateOptions::default)?;
+        let records = db.keyspace("records", records_options)?;
         let pressure = Pressure::shared(records.path())?;
         if let Some(policy) = policy {
             pressure.configure(policy)?;
@@ -662,7 +670,7 @@ impl FjallStorage {
     #[cfg(test)]
     pub(crate) fn open_interrupted(path: impl AsRef<Path>, steps: usize) -> Result<()> {
         let db = fjall::OptimisticTxDatabase::builder(path.as_ref()).open()?;
-        let records = db.keyspace("records", fjall::KeyspaceCreateOptions::default)?;
+        let records = db.keyspace("records", records_options)?;
         let pressure = Pressure::shared(records.path())?;
         let storage = Self {
             records,
