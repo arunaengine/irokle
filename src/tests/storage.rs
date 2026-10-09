@@ -1970,6 +1970,25 @@ fn memory_repair_limit() {
 mod fjall {
     use crate::tests::storage::*;
 
+    /// A purge in small steps removes a long topic as fully as a reset, repeats as a no-op and
+    /// leaves every other topic unchanged.
+    #[test]
+    fn purge_in_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate_storage::FjallStorage::open(dir.path()).unwrap();
+        let (purged, kept) = (TopicId::hash(b"purged"), TopicId::hash(b"kept"));
+        seed_chain(&storage, purged, 1, &["a", "b", "c", "d", "e"]);
+        seed_chain(&storage, kept, 2, &["x"]);
+        let before = topic_snapshot(&storage, &kept);
+
+        assert_eq!(storage.purge_topic(&purged, 2).unwrap(), 6);
+        assert!(storage.list_op_ids(&purged).unwrap().is_empty());
+        assert!(storage.heads(&purged).unwrap().is_empty());
+        assert!(storage.topic_state(&purged).unwrap().is_none());
+        assert_eq!(storage.purge_topic(&purged, 2).unwrap(), 0);
+        assert_eq!(topic_snapshot(&storage, &kept), before);
+    }
+
     #[test]
     fn reset_clears() {
         let dir = tempfile::tempdir().unwrap();

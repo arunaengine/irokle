@@ -1409,22 +1409,21 @@ impl FjallStorage {
         Ok(state.map(|state| (meta, state.genesis)))
     }
 
-    fn tx_reset_topic(&self, tx: &mut Transaction, topic_id: &TopicId) -> Result<usize> {
-        let epoch_key = Self::key_id(TOPIC_EPOCH_PREFIX, topic_id);
-        let epoch: u64 = Self::tx_get(tx, &self.records, epoch_key.as_slice())?.unwrap_or_default();
-        let next_epoch = epoch
-            .checked_add(1)
-            .ok_or_else(|| Error::Storage("topic data epoch overflow".into()))?;
-        Self::tx_put(tx, &self.records, epoch_key, &next_epoch)?;
+    /// Removes up to `limit` ops of `topic_id` with their meta and child edges.
+    fn tx_remove_ops(
+        &self,
+        tx: &mut Transaction,
+        topic_id: &TopicId,
+        limit: usize,
+    ) -> Result<usize> {
         // Topic op ids come from the `to` index; op records, meta, and the
         // children edges are keyed by op id, not by topic.
         let to_prefix = [b"to".as_slice(), topic_id.as_ref()].concat();
         let mut op_ids = Vec::new();
-        for item in fjall::Readable::prefix(tx, &self.records, to_prefix) {
+        for item in fjall::Readable::prefix(tx, &self.records, to_prefix).take(limit) {
             let (key, _) = item.into_inner()?;
             op_ids.push(Self::id_from_key(key.as_ref(), 2 + TopicId::LEN)?);
         }
-        let removed = op_ids.len();
         for op_id in &op_ids {
             // Edges pointing at this op go too, or a dependency the reset does
             // not reach keeps naming a child the topic no longer holds.
@@ -1454,6 +1453,32 @@ impl FjallStorage {
                 [b"to".as_slice(), topic_id.as_ref(), op_id.as_ref()].concat(),
             )?;
         }
+        Ok(op_ids.len())
+    }
+
+    /// Deletes `topic_id` like [`Storage::reset_topic`], but its ops in transactions of at most
+    /// `step` ops, so an offline cleanup of a long history never needs one large transaction.
+    /// Returns the ops removed; an interrupted or repeated purge continues where it stopped.
+    pub fn purge_topic(&self, topic_id: &TopicId, step: usize) -> Result<usize> {
+        let step = step.max(1);
+        let mut removed = 0;
+        loop {
+            let batch = self.transaction(|tx| self.tx_remove_ops(tx, topic_id, step))?;
+            removed += batch;
+            if batch < step {
+                return Ok(removed + self.reset_topic(topic_id)?);
+            }
+        }
+    }
+
+    fn tx_reset_topic(&self, tx: &mut Transaction, topic_id: &TopicId) -> Result<usize> {
+        let epoch_key = Self::key_id(TOPIC_EPOCH_PREFIX, topic_id);
+        let epoch: u64 = Self::tx_get(tx, &self.records, epoch_key.as_slice())?.unwrap_or_default();
+        let next_epoch = epoch
+            .checked_add(1)
+            .ok_or_else(|| Error::Storage("topic data epoch overflow".into()))?;
+        Self::tx_put(tx, &self.records, epoch_key, &next_epoch)?;
+        let removed = self.tx_remove_ops(tx, topic_id, usize::MAX)?;
         for prefix in [
             b"h".as_slice(),
             b"ac".as_slice(),
