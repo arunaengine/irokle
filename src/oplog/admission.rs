@@ -129,6 +129,12 @@ impl<S: crate::oplog::Storage> Oplog<S> {
                             PendingVerdict::Retain => {
                                 tracing::debug!(op_id = %op.id, error = %err, "retaining pending op");
                                 held_back.insert(op.id);
+                                // On a busy topic each later buffered op would wait again;
+                                // they stay buffered, and the caller's ops are already done.
+                                if matches!(err, Error::AdmissionConflict) {
+                                    admitted.ready_remaining = true;
+                                    break;
+                                }
                             }
                         }
                         continue;
@@ -1289,6 +1295,71 @@ mod tests {
         ));
         assert!(log.storage().get_op(&event.id).unwrap().is_none());
         Oplog::new().receive_ops(ops).unwrap();
+    }
+
+    /// A buffered op that loses its admission to conflicts ends the drain of this call,
+    /// so one job does not wait again for each later op; the rest stays buffered.
+    #[test]
+    fn conflict_ends_drain() {
+        use std::sync::atomic::Ordering;
+
+        use crate::oplog::MAX_ADMISSION_RETRIES;
+        use crate::tests::support::StaleReadStorage;
+
+        let owner = Ed25519Signer::from_bytes(&[68; 32]);
+        let writer = Ed25519Signer::from_bytes(&[69; 32]);
+        let topic = TopicId::hash(b"conflict-ends-drain");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let source = Oplog::new();
+        let peers = [owner.peer_id(), writer.peer_id()];
+        let genesis = source
+            .create_topic_genesis(topic, actor, TopicGenesis::new("test.note", peers), &owner)
+            .unwrap();
+        let envelope = EventEnvelope {
+            type_id: "test.note".into(),
+            payload: vec![0].into(),
+        };
+        let base = source
+            .create_event_op(topic, actor, envelope.clone(), &owner)
+            .unwrap();
+        let first = source
+            .create_event_op(topic, actor, envelope.clone(), &owner)
+            .unwrap();
+        let body = OpBody {
+            topic_id: topic,
+            author: writer.peer_id(),
+            actor_id: actor_id_for(topic, writer.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [base.id].into(),
+            generation: base.signed.body.generation + 1,
+            payload: TopicPayload::Event(envelope),
+        };
+        let second = Op::sign(body, &writer).unwrap();
+        let storage = StaleReadStorage::new(MemoryStorage::new());
+        let log = Oplog::with_storage(storage.clone());
+        log.receive_ops(vec![genesis]).unwrap();
+        log.receive_ops(vec![first.clone(), second.clone()])
+            .unwrap();
+        *storage.failed_ops.lock().unwrap() = [first.id, second.id].into();
+        log.receive_ops(vec![base]).unwrap();
+        storage.failed_ops.lock().unwrap().clear();
+
+        storage.conflict_writes(2 * MAX_ADMISSION_RETRIES);
+        let pass = log
+            .receive_ops_admission(None, Vec::new(), &BTreeSet::new(), None)
+            .unwrap();
+        assert!(pass.accepted.is_empty() && pass.ready_remaining);
+        let left = storage.conflicts.load(Ordering::SeqCst);
+        assert_eq!(
+            left, MAX_ADMISSION_RETRIES,
+            "the drain went on after a conflict"
+        );
+        storage.conflict_writes(0);
+        assert_eq!(
+            log.reconcile_pending_ops().unwrap(),
+            [first.id, second.id].into()
+        );
     }
 
     /// An event or control without dependencies is no genesis and is refused, also in
