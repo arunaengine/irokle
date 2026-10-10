@@ -660,10 +660,13 @@ mod fjall {
         let release = gate.releaser();
         storage.arm_read(GatePoint::Meta(first), std::sync::Arc::clone(&gate));
         let blocked = std::thread::spawn({
-            let log = log.clone();
-            move || ask(&log, &topic_id)
+            let (log, skip) = (log.clone(), gate.skipper());
+            move || {
+                let _skip = skip;
+                ask(&log, &topic_id)
+            }
         });
-        gate.wait_arrival();
+        gate.expect_arrival("the blocked step");
         let held = matches!(
             log.integrity.topics().unwrap()[&topic_id].state,
             State::Scanning {
@@ -732,15 +735,18 @@ mod fjall {
         let release = gate.releaser();
         storage.arm_read(GatePoint::Meta(paused), std::sync::Arc::clone(&gate));
         let scanning = std::thread::spawn({
-            let log = log.clone();
-            move || loop {
-                let integrity = ask(&log, &topic_id);
-                if integrity.is_complete() {
-                    return integrity;
+            let (log, skip) = (log.clone(), gate.skipper());
+            move || {
+                let _skip = skip;
+                loop {
+                    let integrity = ask(&log, &topic_id);
+                    if integrity.is_complete() {
+                        return integrity;
+                    }
                 }
             }
         });
-        gate.wait_arrival();
+        gate.expect_arrival("the scan");
         let published = log.integrity.topics().unwrap()[&topic_id]
             .holes()
             .is_some_and(|holes| holes.contains_key(&lost.id));

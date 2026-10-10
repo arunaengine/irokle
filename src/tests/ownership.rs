@@ -542,7 +542,9 @@ fn assert_raced_quota<S: Storage>(open: impl Fn(StagingLimits) -> S) {
     let gate = Arc::new(Gate::default());
     let release = gate.releaser();
     storage.arm_read(GatePoint::Admit(a_topic), Arc::clone(&gate));
+    let skip = gate.skipper();
     let racing = thread::spawn(move || {
+        let _skip = skip;
         first.receive_sync_outcome(
             a_source.peer_id(),
             SyncData {
@@ -551,7 +553,7 @@ fn assert_raced_quota<S: Storage>(open: impl Fn(StagingLimits) -> S) {
             },
         )
     });
-    gate.wait_arrival();
+    gate.expect_arrival("the first receive");
     let committed = second
         .receive_sync_outcome(
             b_source.peer_id(),
@@ -602,10 +604,13 @@ fn assert_raced_expiry<S: Storage>(storage: S) {
     let release = gate.releaser();
     storage.arm_read(GatePoint::Discard(topic_id), Arc::clone(&gate));
     let expiring = thread::spawn({
-        let reader = reader.clone();
-        move || reader.expire_bootstraps(u64::MAX)
+        let (reader, skip) = (reader.clone(), gate.skipper());
+        move || {
+            let _skip = skip;
+            reader.expire_bootstraps(u64::MAX)
+        }
     });
-    gate.wait_arrival();
+    gate.expect_arrival("the expiry");
     let ReceiveOutcome::Staged(written) = receive(&ops[5..10]) else {
         panic!("expected staging");
     };

@@ -541,11 +541,14 @@ async fn saturated_activation_reopen() {
         SyncMessage::Data(SyncData { topic_id, ops }),
     ];
     let push = tokio::spawn({
-        let net = Arc::clone(&net);
-        async move { net.sync_with(bob_addr, &messages).await.map(drop) }
+        let (net, skip) = (Arc::clone(&net), gate.skipper());
+        async move {
+            let _skip = skip;
+            net.sync_with(bob_addr, &messages).await.map(drop)
+        }
     });
     let arrival = Arc::clone(&gate);
-    tokio::task::spawn_blocking(move || arrival.wait_arrival())
+    tokio::task::spawn_blocking(move || arrival.expect_arrival("the activation"))
         .await
         .unwrap();
     assert!(bob.storage().topic_state(&topic_id).unwrap().is_none());
@@ -953,11 +956,14 @@ async fn cancelled_scan_released() {
     let messages = probe(&alice, &[topic_id]);
     let bob_addr = ready_addr(bob_net.endpoint()).await;
     let asking = tokio::spawn({
-        let net = Arc::clone(&net);
-        async move { net.sync_with(bob_addr, &messages).await.map(drop) }
+        let (net, skip) = (Arc::clone(&net), gate.skipper());
+        async move {
+            let _skip = skip;
+            net.sync_with(bob_addr, &messages).await.map(drop)
+        }
     });
     let arrival = Arc::clone(&gate);
-    tokio::task::spawn_blocking(move || arrival.wait_arrival())
+    tokio::task::spawn_blocking(move || arrival.expect_arrival("the responder's scan"))
         .await
         .unwrap();
     assert!(gate.arrived());

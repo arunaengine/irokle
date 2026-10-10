@@ -169,3 +169,95 @@ fn without_descendants(ops: Vec<Op>, rejected: OpId) -> Vec<Op> {
         .filter(|op| !rejected_ids.contains(&op.id))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::oplog::Oplog;
+    use crate::{
+        Ed25519Signer, Error, EventEnvelope, Op, Signer, TopicGenesis, TopicId, TopicPayload,
+        actor_id_for,
+    };
+
+    /// Two logs of one topic, each holding its own genesis naming both authors,
+    /// ordered by genesis id so the smaller genesis comes first.
+    fn rivals(seed: &[u8]) -> [(Oplog, Op, Ed25519Signer); 2] {
+        let topic = TopicId::hash(seed);
+        let signers = [101, 102].map(|byte| Ed25519Signer::from_bytes(&[byte; 32]));
+        let peers = signers.each_ref().map(Signer::peer_id);
+        let mut rivals = signers.map(|signer| {
+            let log = Oplog::new();
+            let actor = actor_id_for(topic, signer.peer_id());
+            let genesis = TopicGenesis::new("test.note", peers);
+            let op = log
+                .create_topic_genesis(topic, actor, genesis, &signer)
+                .unwrap();
+            (log, op, signer)
+        });
+        rivals.sort_by_key(|(_, op, _)| op.id);
+        rivals
+    }
+
+    fn note(log: &Oplog, genesis: &Op, signer: &Ed25519Signer) -> Op {
+        let envelope = EventEnvelope {
+            type_id: "test.note".into(),
+            payload: vec![0].into(),
+        };
+        let body = &genesis.signed.body;
+        log.create_event_op(body.topic_id, body.actor_id, envelope, signer)
+            .unwrap()
+    }
+
+    /// Both sides of a collision pick the smaller genesis whichever side receives.
+    #[test]
+    fn smaller_genesis_wins() {
+        let [(small_log, small, _), (large_log, large, _)] = rivals(b"smaller-genesis-wins");
+        let verified = BTreeSet::new();
+        let (ops, plan, rejected) = large_log
+            .resolve_genesis_collision(vec![small.clone()], &verified)
+            .unwrap();
+        assert_eq!(ops, vec![small.clone()]);
+        assert_eq!(rejected, None);
+        let eviction = plan.unwrap().eviction;
+        assert_eq!(eviction.losing_genesis, large.id);
+        assert_eq!(eviction.winning_genesis, small.id);
+        let (ops, plan, rejected) = small_log
+            .resolve_genesis_collision(vec![large.clone()], &verified)
+            .unwrap();
+        assert!(ops.is_empty());
+        assert!(plan.is_none());
+        assert_eq!(rejected, Some(large.id));
+    }
+
+    /// A rejected genesis takes its descendants along; unrelated ops stay.
+    #[test]
+    fn drops_loser_descendants() {
+        let [small, large] = rivals(b"drops-loser-descendants");
+        let (small_log, small_genesis, small_signer) = small;
+        let (large_log, large_genesis, large_signer) = large;
+        let child = note(&large_log, &large_genesis, &large_signer);
+        let grandchild = note(&large_log, &large_genesis, &large_signer);
+        let own = note(&small_log, &small_genesis, &small_signer);
+        let ops = vec![grandchild, large_genesis.clone(), own.clone(), child];
+        let (kept, plan, rejected) = small_log
+            .resolve_genesis_collision(ops, &BTreeSet::new())
+            .unwrap();
+        assert_eq!(kept, vec![own]);
+        assert!(plan.is_none());
+        assert_eq!(rejected, Some(large_genesis.id));
+    }
+
+    /// An unverified foreign genesis must carry a valid signature to take part.
+    #[test]
+    fn checks_unverified_signature() {
+        let [(small_log, _, _), (_, large, _)] = rivals(b"checks-unverified-signature");
+        let mut signed = large.signed.clone();
+        if let TopicPayload::Genesis(genesis) = &mut signed.body.payload {
+            genesis.event_type_id = "test.forged".into();
+        }
+        let forged = Op::new(signed).unwrap();
+        let result = small_log.resolve_genesis_collision(vec![forged], &BTreeSet::new());
+        assert!(matches!(result, Err(Error::InvalidSignature)));
+    }
+}

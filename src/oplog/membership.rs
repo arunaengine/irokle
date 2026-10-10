@@ -175,3 +175,71 @@ pub(super) fn merge_states(
     }
     merged.ok_or(Error::TopicNotFound)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::oplog::Oplog;
+    use crate::oplog::membership::{control_key, materialize_topic_state};
+    use crate::{
+        Ed25519Signer, Error, EventEnvelope, ReplicationPolicy, Signer, TopicControl, TopicGenesis,
+        TopicId, actor_id_for,
+    };
+
+    #[test]
+    fn rejects_mixed_topics() {
+        let owner = Ed25519Signer::from_bytes(&[91; 32]);
+        let mut ops = Vec::new();
+        for seed in [&b"mixed-topics-first"[..], b"mixed-topics-second"] {
+            let topic = TopicId::hash(seed);
+            let actor = actor_id_for(topic, owner.peer_id());
+            let log = Oplog::new();
+            let genesis = log
+                .create_topic_genesis(topic, actor, TopicGenesis::new("test.note", []), &owner)
+                .unwrap();
+            let envelope = EventEnvelope {
+                type_id: "test.note".into(),
+                payload: vec![0].into(),
+            };
+            let event = log.create_event_op(topic, actor, envelope, &owner).unwrap();
+            ops.push((genesis, event));
+        }
+        let mixed = vec![ops[0].0.clone(), ops[1].1.clone()];
+        assert!(matches!(
+            materialize_topic_state(mixed, BTreeSet::new()),
+            Err(Error::TopicMismatch)
+        ));
+        let same = vec![ops[1].0.clone(), ops[1].1.clone()];
+        materialize_topic_state(same, BTreeSet::new()).unwrap();
+    }
+
+    /// The policy control with the greatest control key wins in every input order.
+    #[test]
+    fn latest_policy_wins() {
+        let owner = Ed25519Signer::from_bytes(&[92; 32]);
+        let topic = TopicId::hash(b"latest-policy-wins");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let log = Oplog::new();
+        let genesis = log
+            .create_topic_genesis(topic, actor, TopicGenesis::new("test.note", []), &owner)
+            .unwrap();
+        let controls = (1..=3)
+            .map(|peers| {
+                let policy = ReplicationPolicy::all().with_max_sync_peers(peers);
+                let control = TopicControl::SetReplicationPolicy { policy };
+                log.create_control_op(topic, actor, control, &owner)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let latest = ReplicationPolicy::all().with_max_sync_peers(3);
+        for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0], [2, 0, 1]] {
+            let mut ops = vec![genesis.clone()];
+            ops.extend(order.map(|index| controls[index].clone()));
+            let state = materialize_topic_state(ops, BTreeSet::new()).unwrap();
+            assert_eq!(state.replication_policy, latest, "order {order:?}");
+            let (key, _) = state.replication_policy_control.unwrap();
+            assert_eq!(key, control_key(&controls[2]), "order {order:?}");
+        }
+    }
+}

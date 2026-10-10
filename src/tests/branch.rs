@@ -792,7 +792,9 @@ mod iroh {
             let received = thread::spawn({
                 let author = branches.author.peer_id();
                 let genesis = branches.old.0.id;
+                let skip = gate.skipper();
                 move || {
+                    let _skip = skip;
                     node.receive_bound(
                         author,
                         SyncData {
@@ -803,7 +805,7 @@ mod iroh {
                     )
                 }
             });
-            gate.wait_arrival();
+            gate.expect_arrival("the bound receive");
             assert!(gate.arrived() && !gate.has_left() && !received.is_finished());
             reset_to_new(&store, &branches);
             let before = store.topic_view(&topic, None).unwrap();

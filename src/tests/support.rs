@@ -139,6 +139,7 @@ pub(crate) struct Gate {
     state: std::sync::Mutex<(bool, bool)>,
     signal: std::sync::Condvar,
     left: std::sync::atomic::AtomicBool,
+    skipped: std::sync::atomic::AtomicBool,
 }
 
 /// A gate and the read it waits at.
@@ -188,6 +189,8 @@ impl Gate {
     /// Called by a party that finished without reaching the gate, so a waiter
     /// for arrival wakes up.
     pub(crate) fn skip(&self) {
+        self.skipped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.state.lock().unwrap().0 = true;
         self.signal.notify_all();
     }
@@ -200,6 +203,14 @@ impl Gate {
                 .wait_timeout_while(state, std::time::Duration::from_secs(60), |state| !state.0);
     }
 
+    /// Wait for arrival and fail unless the reader, not a party that skipped, reached the gate.
+    pub(crate) fn expect_arrival(&self, what: &str) {
+        self.wait_arrival();
+        let reached =
+            self.state.lock().unwrap().0 && !self.skipped.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(reached, "{what} never reached the gate");
+    }
+
     pub(crate) fn release(&self) {
         self.state.lock().unwrap().1 = true;
         self.signal.notify_all();
@@ -207,6 +218,20 @@ impl Gate {
 
     pub(crate) fn releaser(self: &Arc<Self>) -> GateRelease {
         GateRelease(Arc::clone(self))
+    }
+
+    /// A guard for the paused party that skips on drop, so returning or panicking early
+    /// wakes the waiter at once.
+    pub(crate) fn skipper(self: &Arc<Self>) -> GateSkip {
+        GateSkip(Arc::clone(self))
+    }
+}
+
+pub(crate) struct GateSkip(Arc<Gate>);
+
+impl Drop for GateSkip {
+    fn drop(&mut self) {
+        self.0.skip();
     }
 }
 
