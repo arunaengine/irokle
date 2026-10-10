@@ -41,3 +41,35 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w user.max_user_namespaces=28633 || true
       - run: cargo test --locked --features iroh --test iroh_patchbay_sync -- --nocapture --test-threads=1
+
+  fuzz:
+    runs-on: ubuntu-latest
+    env:
+      FUZZ_TOOLCHAIN: nightly-2026-09-14
+    defaults:
+      run:
+        working-directory: fuzz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-14
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo +$FUZZ_TOOLCHAIN fetch --locked
+      - run: cargo +$FUZZ_TOOLCHAIN fuzz build
+      - run: mkdir -p corpus/wire
+      - run: >-
+          cargo +$FUZZ_TOOLCHAIN fuzz run wire corpus/wire ../tests/fixtures/contracts --
+          -max_total_time=60 -timeout=10
+      - run: cargo +$FUZZ_TOOLCHAIN fuzz run admission -- -max_total_time=60 -timeout=10
+      - run: >-
+          cargo +$FUZZ_TOOLCHAIN fuzz run convergence --
+          -max_total_time=60 -timeout=10 -max_len=256 -len_control=0
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
