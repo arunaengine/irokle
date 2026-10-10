@@ -1440,10 +1440,13 @@ mod tests {
         let release = gate.releaser();
         storage.arm_read(GatePoint::Admit(topic), Arc::clone(&gate));
         let paused = std::thread::spawn({
-            let (log, first) = (log.clone(), first.clone());
-            move || log.receive_op(first)
+            let (log, first, skip) = (log.clone(), first.clone(), gate.skipper());
+            move || {
+                let _skip = skip;
+                log.receive_op(first)
+            }
         });
-        gate.wait_arrival();
+        gate.expect_arrival("the paused admission");
         let waiting = std::thread::spawn({
             let (log, second) = (log.clone(), second.clone());
             move || log.receive_op(second)

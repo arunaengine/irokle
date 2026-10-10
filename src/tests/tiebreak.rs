@@ -157,9 +157,12 @@ fn unrelated_genesis_proceeds() {
     loser
         .storage()
         .arm_read(GatePoint::Meta(loser_event.id), Arc::clone(&gate));
-    let slow =
-        thread::spawn(move || loser.receive_ops_from_peer_evicting(Some(winner_peer), winner_ops));
-    gate.wait_arrival();
+    let skip = gate.skipper();
+    let slow = thread::spawn(move || {
+        let _skip = skip;
+        loser.receive_ops_from_peer_evicting(Some(winner_peer), winner_ops)
+    });
+    gate.expect_arrival("the paused tie-break");
 
     let (sender, receiver) = std::sync::mpsc::channel();
     let unrelated = thread::spawn(move || sender.send(build_fork(7, 8)).unwrap());
