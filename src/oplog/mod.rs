@@ -530,8 +530,6 @@ impl<S: Storage> Oplog<S> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use crate::oplog::{MAX_ADMISSION_RETRIES, Oplog};
     use crate::storage::{MemoryStorage, Storage};
     use crate::tests::support::{
@@ -664,7 +662,7 @@ mod tests {
         log.receive_ops(ops[..3].to_vec()).unwrap();
         log.receive_ops(vec![ops[4].clone()]).unwrap();
         let view = storage.topic_view(&topic, None).unwrap().unwrap();
-        let missing = BTreeSet::from([ops[3].id]);
+        let missing = std::collections::BTreeSet::from([ops[3].id]);
         assert_eq!(view.pending_missing, missing);
         assert_eq!(log.view_unresolved(&view).unwrap(), missing);
         log.receive_ops(vec![ops[3].clone()]).unwrap();
