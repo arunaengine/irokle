@@ -177,3 +177,24 @@ The transport-neutral receive methods and `Storage::put_admitted_batch` are trus
 ## Development
 
 The workspace targets Rust 1.97.1. See [CONTRIBUTING.md](CONTRIBUTING.md) for formatting, linting, tests, documentation, and network-integration checks. Repository-owned code follows [STYLE.md](STYLE.md).
+
+### Fuzzing
+
+The `fuzz/` crate holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) targets. It is a separate workspace because libFuzzer needs a nightly toolchain:
+
+| Target | What it checks |
+| --- | --- |
+| `wire` | Arbitrary bytes through the frame and sync message decoders: no panic, allocations within `frame_decode_bound` and `decoded_message_bound`, and stable round trips. |
+| `admission` | Malformed and hostile ops offered to an in-memory node: rejected input leaves the topic unchanged, and admitted history stays valid and causally complete. |
+| `convergence` | Three in-memory replicas write, change membership and receive every op in different orders: members end with the same history, heads and clocks, with nothing pending. |
+
+Install cargo-fuzz once, then run a target from the `fuzz/` directory:
+
+```bash
+cargo install cargo-fuzz --locked
+cd fuzz
+cargo +nightly-2026-09-14 fuzz run wire -- -max_total_time=60
+cargo +nightly-2026-09-14 fuzz run convergence -- -max_total_time=60 -max_len=256 -len_control=0
+```
+
+Crashing inputs land in `fuzz/artifacts/<target>/`; replay one with `cargo +nightly-2026-09-14 fuzz run <target> <file>`. CI does not run the fuzzers; start the manual `Fuzz` workflow to run each target for 60 seconds.
