@@ -259,3 +259,379 @@ fn is_permanent_rejection(err: &Error) -> bool {
             | Error::RejectedOp(_)
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::PendingVerdict;
+    use crate::oplog::{BatchOverlay, OpAdmission, Oplog};
+    use crate::storage::{MAX_PENDING_MISSING_DEPS, Storage, TopicState};
+    use crate::{
+        Ed25519Signer, Error, EventEnvelope, Op, OpBody, OpId, ReplicationPolicy, Result, Signer,
+        TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
+    };
+
+    /// A topic holding its genesis and bob's first event, plus carol without ops.
+    struct Fixture {
+        log: Oplog,
+        topic: TopicId,
+        genesis: Op,
+        first: Op,
+        bob: Ed25519Signer,
+        carol: Ed25519Signer,
+    }
+
+    fn fixture(seed: u8) -> Fixture {
+        let owner = Ed25519Signer::from_bytes(&[seed; 32]);
+        let bob = Ed25519Signer::from_bytes(&[seed + 1; 32]);
+        let carol = Ed25519Signer::from_bytes(&[seed + 2; 32]);
+        let topic = TopicId::hash([seed]);
+        let log = Oplog::new();
+        let actor = actor_id_for(topic, owner.peer_id());
+        let config = TopicGenesis::new("test.note", [bob.peer_id(), carol.peer_id()]);
+        let genesis = log
+            .create_topic_genesis(topic, actor, config, &owner)
+            .unwrap();
+        let first = sign(&bob, body(&bob, topic, 1, None, &[genesis.id]));
+        log.receive_ops(vec![first.clone()]).unwrap();
+        Fixture {
+            log,
+            topic,
+            genesis,
+            first,
+            bob,
+            carol,
+        }
+    }
+
+    /// An event body of `signer` at `seq` behind `prev`, with the sequence as generation.
+    fn body(
+        signer: &Ed25519Signer,
+        topic: TopicId,
+        seq: u64,
+        prev: Option<OpId>,
+        deps: &[OpId],
+    ) -> OpBody {
+        OpBody {
+            topic_id: topic,
+            author: signer.peer_id(),
+            actor_id: actor_id_for(topic, signer.peer_id()),
+            actor_seq: seq,
+            actor_prev: prev,
+            deps: deps.iter().copied().collect(),
+            generation: seq,
+            payload: TopicPayload::Event(EventEnvelope {
+                type_id: "test.note".into(),
+                payload: vec![0].into(),
+            }),
+        }
+    }
+
+    fn sign(signer: &Ed25519Signer, body: OpBody) -> Op {
+        Op::sign(body, signer).unwrap()
+    }
+
+    fn unknown(name: &str) -> OpId {
+        OpId::hash(name.as_bytes())
+    }
+
+    fn rejects(log: &Oplog, op: &Op, error: Error) -> bool {
+        matches!(
+            log.pending_verdict(op, &error).unwrap(),
+            PendingVerdict::Reject
+        )
+    }
+
+    fn validate(
+        log: &Oplog,
+        op: &Op,
+        missing: &[OpId],
+        state: Option<&TopicState>,
+    ) -> Result<OpAdmission> {
+        let overlay = BatchOverlay {
+            ops: &BTreeMap::new(),
+            meta: &BTreeMap::new(),
+            tips: &BTreeMap::new(),
+            index: &BTreeMap::new(),
+            reset: false,
+        };
+        let missing = missing.iter().copied().collect::<BTreeSet<_>>();
+        log.validate_pending_op(op, &missing, &overlay, state)
+    }
+
+    /// A predecessor that is the stored previous slot of the same actor leaves
+    /// the op waiting, and so does a first op without one.
+    #[test]
+    fn possible_positions_retained() {
+        let f = fixture(10);
+        let second = sign(
+            &f.bob,
+            body(&f.bob, f.topic, 2, Some(f.first.id), &[f.first.id]),
+        );
+        assert!(!rejects(&f.log, &second, Error::ActorPrevMismatch));
+        let opening = sign(&f.carol, body(&f.carol, f.topic, 1, None, &[f.genesis.id]));
+        assert!(!rejects(
+            &f.log,
+            &opening,
+            Error::ActorSeqGap {
+                expected: 1,
+                actual: 1,
+            }
+        ));
+    }
+
+    /// Positions that no later arrival can repair reject the buffered op.
+    #[test]
+    fn impossible_positions_reject() {
+        let f = fixture(20);
+        let missing = unknown("missing");
+        let cases = [
+            (
+                "later op without predecessor",
+                body(&f.carol, f.topic, 2, None, &[missing]),
+            ),
+            (
+                "first op with predecessor",
+                body(
+                    &f.carol,
+                    f.topic,
+                    1,
+                    Some(missing),
+                    &[f.genesis.id, missing],
+                ),
+            ),
+            (
+                "predecessor outside deps",
+                body(&f.carol, f.topic, 2, Some(missing), &[f.genesis.id]),
+            ),
+            (
+                "previous slot held by another op",
+                body(&f.bob, f.topic, 2, Some(missing), &[missing]),
+            ),
+        ];
+        for (case, body) in cases {
+            let signer = if body.author == f.bob.peer_id() {
+                &f.bob
+            } else {
+                &f.carol
+            };
+            let op = sign(signer, body);
+            assert!(rejects(&f.log, &op, Error::ActorPrevMismatch), "{case}");
+        }
+    }
+
+    /// A fork rejects only while another admitted op holds the slot.
+    #[test]
+    fn fork_needs_holder() {
+        let f = fixture(30);
+        let mut forked = body(&f.bob, f.topic, 1, None, &[f.genesis.id]);
+        forked.generation += 1;
+        let forked = sign(&f.bob, forked);
+        assert!(rejects(&f.log, &forked, Error::ActorFork));
+        assert!(!rejects(&f.log, &f.first, Error::ActorFork));
+    }
+
+    /// Failures raised against a fully known causal frontier reject the op.
+    #[test]
+    fn frontier_errors_reject() {
+        let f = fixture(40);
+        let errors = [
+            Error::NotTopicMember,
+            Error::EventTypeMismatch {
+                expected: "test.note".into(),
+                actual: "test.other".into(),
+            },
+            Error::InvalidGenesis,
+            Error::InvalidOpId,
+        ];
+        for error in errors {
+            let name = format!("{error:?}");
+            assert!(rejects(&f.log, &f.first, error), "{name}");
+        }
+    }
+
+    /// Deps in the batch count as present, and a reset treats stored deps as missing.
+    #[test]
+    fn missing_skips_overlay() {
+        let f = fixture(50);
+        let second = sign(
+            &f.bob,
+            body(&f.bob, f.topic, 2, Some(f.first.id), &[f.first.id]),
+        );
+        let missing = unknown("missing");
+        let deps = [f.first.id, second.id, missing];
+        let third = sign(&f.bob, body(&f.bob, f.topic, 3, Some(second.id), &deps));
+        let overlay = BTreeMap::from([(second.id, second)]);
+        let projected = |reset| {
+            f.log
+                .missing_deps_projected(&third, &overlay, reset)
+                .unwrap()
+        };
+        assert_eq!(projected(false), [missing].into());
+        assert_eq!(projected(true), [f.first.id, missing].into());
+    }
+
+    /// The missing dependency limit is inclusive.
+    #[test]
+    fn missing_limit_inclusive() {
+        let f = fixture(60);
+        let state = f.log.storage().topic_state(&f.topic).unwrap();
+        let admits = |count: usize| {
+            let missing = (0..count)
+                .map(|index| unknown(&index.to_string()))
+                .collect::<Vec<_>>();
+            let mut deps = missing.clone();
+            deps.push(f.first.id);
+            let op = sign(&f.bob, body(&f.bob, f.topic, 2, Some(f.first.id), &deps));
+            validate(&f.log, &op, &missing, state.as_ref())
+        };
+        assert!(matches!(
+            admits(MAX_PENDING_MISSING_DEPS),
+            Ok(OpAdmission::Admit)
+        ));
+        assert!(matches!(
+            admits(MAX_PENDING_MISSING_DEPS + 1),
+            Err(Error::Storage(_))
+        ));
+    }
+
+    /// A buffered op whose slot another op holds is a fork.
+    #[test]
+    fn pending_fork_rejected() {
+        let f = fixture(70);
+        let state = f.log.storage().topic_state(&f.topic).unwrap();
+        let missing = unknown("missing");
+        let mut forked = body(&f.bob, f.topic, 1, None, &[f.genesis.id, missing]);
+        forked.generation += 1;
+        let forked = sign(&f.bob, forked);
+        let verdict = validate(&f.log, &forked, &[missing], state.as_ref());
+        assert!(
+            matches!(verdict, Err(Error::ActorFork)),
+            "{:?}",
+            verdict.err()
+        );
+    }
+
+    /// Only a first op without predecessor or deps opens a topic without state.
+    #[test]
+    fn genesis_shape_checked() {
+        let f = fixture(80);
+        let state = f.log.storage().topic_state(&f.topic).unwrap();
+        let topic = TopicId::hash(b"fresh");
+        let missing = unknown("missing");
+        let opening = || OpBody {
+            deps: BTreeSet::new(),
+            generation: 0,
+            payload: TopicPayload::Genesis(TopicGenesis::new("test.note", [])),
+            ..body(&f.bob, topic, 1, None, &[])
+        };
+        let valid = sign(&f.bob, opening());
+        assert!(matches!(
+            validate(&f.log, &valid, &[], None),
+            Ok(OpAdmission::Admit)
+        ));
+        let later = OpBody {
+            actor_seq: 2,
+            ..opening()
+        };
+        let behind = OpBody {
+            actor_prev: Some(missing),
+            ..opening()
+        };
+        let dependent = OpBody {
+            deps: [missing].into(),
+            ..opening()
+        };
+        let cases = [
+            ("later sequence", later, None),
+            ("predecessor", behind, None),
+            ("dependency", dependent, None),
+            ("existing state", opening(), state.as_ref()),
+        ];
+        for (case, body, state) in cases {
+            let op = sign(&f.bob, body);
+            let verdict = validate(&f.log, &op, &[missing], state);
+            assert!(
+                matches!(verdict, Err(Error::InvalidGenesis)),
+                "{case}: {:?}",
+                verdict.err()
+            );
+        }
+    }
+
+    /// Events and controls need a generation above zero even with deps.
+    #[test]
+    fn generation_zero_rejected() {
+        let f = fixture(90);
+        let state = f.log.storage().topic_state(&f.topic).unwrap();
+        let missing = unknown("missing");
+        let event = body(&f.bob, f.topic, 2, Some(f.first.id), &[f.first.id, missing]);
+        let control = TopicPayload::Control(TopicControl::SetReplicationPolicy {
+            policy: ReplicationPolicy::all(),
+        });
+        let payloads = [event.payload.clone(), control];
+        for payload in payloads {
+            let op = sign(
+                &f.bob,
+                OpBody {
+                    generation: 0,
+                    payload,
+                    ..event.clone()
+                },
+            );
+            let verdict = validate(&f.log, &op, &[missing], state.as_ref());
+            assert!(
+                matches!(verdict, Err(Error::InvalidOpId)),
+                "{:?}",
+                verdict.err()
+            );
+        }
+    }
+
+    /// The predecessor must match the sequence and, once known, the same actor.
+    #[test]
+    fn predecessor_shape_checked() {
+        let f = fixture(100);
+        let state = f.log.storage().topic_state(&f.topic).unwrap();
+        let missing = unknown("missing");
+        let cases = [
+            (
+                "first op with predecessor",
+                &f.carol,
+                body(
+                    &f.carol,
+                    f.topic,
+                    1,
+                    Some(missing),
+                    &[f.genesis.id, missing],
+                ),
+            ),
+            (
+                "later op without predecessor",
+                &f.carol,
+                body(&f.carol, f.topic, 2, None, &[missing]),
+            ),
+            (
+                "predecessor of another actor",
+                &f.bob,
+                body(
+                    &f.bob,
+                    f.topic,
+                    2,
+                    Some(f.genesis.id),
+                    &[f.genesis.id, missing],
+                ),
+            ),
+        ];
+        for (case, signer, body) in cases {
+            let op = sign(signer, body);
+            let verdict = validate(&f.log, &op, &[missing], state.as_ref());
+            assert!(
+                matches!(verdict, Err(Error::ActorPrevMismatch)),
+                "{case}: {:?}",
+                verdict.err()
+            );
+        }
+    }
+}
