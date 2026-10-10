@@ -197,4 +197,4 @@ cargo +nightly-2026-09-14 fuzz run wire -- -max_total_time=60
 cargo +nightly-2026-09-14 fuzz run convergence -- -max_total_time=60 -max_len=256 -len_control=0
 ```
 
-Crashing inputs land in `fuzz/artifacts/<target>/`; replay one with `cargo +nightly-2026-09-14 fuzz run <target> <file>`. CI runs each target for 60 seconds on every pull request.
+Crashing inputs land in `fuzz/artifacts/<target>/`; replay one with `cargo +nightly-2026-09-14 fuzz run <target> <file>`. CI does not run the fuzzers; start the manual `Fuzz` workflow to run each target for 60 seconds.
