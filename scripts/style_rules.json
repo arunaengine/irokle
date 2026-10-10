@@ -19,6 +19,8 @@
     ".",
     ".github",
     ".github/workflows",
+    "fuzz",
+    "fuzz/fuzz_targets",
     "examples",
     "irokle-derive",
     "irokle-derive/src",

@@ -5,3 +5,7 @@
 *.log
 *.fjall/
 *.db/
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage

@@ -194,3 +194,38 @@ pub(crate) fn topological_ops(ops: Vec<Op>) -> Result<Vec<Op>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::oplog::topology::topological_ops;
+    use crate::{
+        Ed25519Signer, EventEnvelope, Op, OpBody, OpId, Signer, TopicId, TopicPayload, actor_id_for,
+    };
+
+    /// A batch puts a dependency first even when it claims a later generation.
+    #[test]
+    fn deps_beat_generation() {
+        let signer = Ed25519Signer::from_bytes(&[74; 32]);
+        let topic = TopicId::hash(b"deps-beat-generation");
+        let event = |seq, prev: Option<OpId>, dep, generation| {
+            let body = OpBody {
+                topic_id: topic,
+                author: signer.peer_id(),
+                actor_id: actor_id_for(topic, signer.peer_id()),
+                actor_seq: seq,
+                actor_prev: prev,
+                deps: [dep].into(),
+                generation,
+                payload: TopicPayload::Event(EventEnvelope {
+                    type_id: "test.note".into(),
+                    payload: vec![0].into(),
+                }),
+            };
+            Op::sign(body, &signer).unwrap()
+        };
+        let parent = event(1, None, OpId::hash(b"root"), 5);
+        let child = event(2, Some(parent.id), parent.id, 1);
+        let ordered = topological_ops(vec![child.clone(), parent.clone()]).unwrap();
+        assert_eq!(ordered, [parent, child]);
+    }
+}

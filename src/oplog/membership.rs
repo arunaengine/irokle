@@ -178,13 +178,14 @@ pub(super) fn merge_states(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
 
     use crate::oplog::Oplog;
-    use crate::oplog::membership::{control_key, materialize_topic_state};
+    use crate::oplog::membership::{control_key, materialize_topic_state, merge_states};
     use crate::{
-        Ed25519Signer, Error, EventEnvelope, ReplicationPolicy, Signer, TopicControl, TopicGenesis,
-        TopicId, actor_id_for,
+        Ed25519Signer, Error, EventEnvelope, OpId, PeerId, ReplicationPolicy, Signer, TopicControl,
+        TopicGenesis, TopicId, actor_id_for,
     };
 
     #[test]
@@ -241,5 +242,80 @@ mod tests {
             let (key, _) = state.replication_policy_control.unwrap();
             assert_eq!(key, control_key(&controls[2]), "order {order:?}");
         }
+    }
+
+    /// The same genesis listed twice is one topic, while a second genesis is refused.
+    #[test]
+    fn second_genesis_rejected() {
+        let topic = TopicId::hash(b"second-genesis-rejected");
+        let genesis = |seed| {
+            let owner = Ed25519Signer::from_bytes(&[seed; 32]);
+            let actor = actor_id_for(topic, owner.peer_id());
+            Oplog::new()
+                .create_topic_genesis(topic, actor, TopicGenesis::new("test.note", []), &owner)
+                .unwrap()
+        };
+        let (first, second) = (genesis(93), genesis(94));
+        materialize_topic_state(vec![first.clone(), first.clone()], BTreeSet::new()).unwrap();
+        assert!(matches!(
+            materialize_topic_state(vec![first, second], BTreeSet::new()),
+            Err(Error::InvalidGenesis)
+        ));
+    }
+
+    /// Merging two states keeps the latest control of each kind in either order
+    /// and refuses a state of another genesis.
+    #[test]
+    fn merge_keeps_latest() {
+        let owner = Ed25519Signer::from_bytes(&[95; 32]);
+        let topic = TopicId::hash(b"merge-keeps-latest");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let peer = PeerId::hash(b"merge-keeps-latest-peer");
+        let log = Oplog::new();
+        let genesis = log
+            .create_topic_genesis(topic, actor, TopicGenesis::new("test.note", []), &owner)
+            .unwrap();
+        let policy = |peers| ReplicationPolicy::all().with_max_sync_peers(peers);
+        let controls = [
+            TopicControl::AddPeer { peer },
+            TopicControl::SetReplicationPolicy { policy: policy(1) },
+            TopicControl::RemovePeer { peer },
+            TopicControl::SetReplicationPolicy { policy: policy(2) },
+        ]
+        .map(|control| {
+            log.create_control_op(topic, actor, control, &owner)
+                .unwrap()
+        });
+        let state = |count: usize| {
+            let mut ops = vec![genesis.clone()];
+            ops.extend_from_slice(&controls[..count]);
+            Arc::new(materialize_topic_state(ops, BTreeSet::new()).unwrap())
+        };
+        let (older, newer) = (state(2), state(4));
+        assert!(older.members.contains(&peer));
+        let (left, right) = (OpId::hash(b"left"), OpId::hash(b"right"));
+        let deps = BTreeSet::from([left, right]);
+        for (first, second) in [(&older, &newer), (&newer, &older)] {
+            let projections = BTreeMap::from([(left, first.clone()), (right, second.clone())]);
+            let merged = merge_states(&deps, &projections).unwrap();
+            assert_eq!(merged.replication_policy, policy(2));
+            assert!(!merged.members.contains(&peer));
+        }
+        let other = Ed25519Signer::from_bytes(&[96; 32]);
+        let other_genesis = Oplog::new()
+            .create_topic_genesis(
+                topic,
+                actor_id_for(topic, other.peer_id()),
+                TopicGenesis::new("test.note", []),
+                &other,
+            )
+            .unwrap();
+        let foreign =
+            Arc::new(materialize_topic_state(vec![other_genesis], BTreeSet::new()).unwrap());
+        let projections = BTreeMap::from([(left, older), (right, foreign)]);
+        assert!(matches!(
+            merge_states(&deps, &projections),
+            Err(Error::InvalidGenesis)
+        ));
     }
 }
