@@ -264,9 +264,9 @@ fn is_permanent_rejection(err: &Error) -> bool {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use super::PendingVerdict;
+    use super::{MAX_MISSING_DEPS, PendingVerdict};
     use crate::oplog::{BatchOverlay, OpAdmission, Oplog};
-    use crate::storage::{MAX_PENDING_MISSING_DEPS, Storage, TopicState};
+    use crate::storage::{Storage, TopicState};
     use crate::{
         Ed25519Signer, Error, EventEnvelope, Op, OpBody, OpId, ReplicationPolicy, Result, Signer,
         TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
@@ -486,12 +486,9 @@ mod tests {
             let op = sign(&f.bob, body(&f.bob, f.topic, 2, Some(f.first.id), &deps));
             validate(&f.log, &op, &missing, state.as_ref())
         };
+        assert!(matches!(admits(MAX_MISSING_DEPS), Ok(OpAdmission::Admit)));
         assert!(matches!(
-            admits(MAX_PENDING_MISSING_DEPS),
-            Ok(OpAdmission::Admit)
-        ));
-        assert!(matches!(
-            admits(MAX_PENDING_MISSING_DEPS + 1),
+            admits(MAX_MISSING_DEPS + 1),
             Err(Error::Storage(_))
         ));
     }
