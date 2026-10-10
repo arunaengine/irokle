@@ -27,3 +27,10 @@ path = "fuzz_targets/wire.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "admission"
+path = "fuzz_targets/admission.rs"
+test = false
+doc = false
+bench = false
