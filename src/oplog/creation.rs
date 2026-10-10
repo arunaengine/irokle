@@ -674,3 +674,183 @@ fn heads_after(current: &BTreeSet<crate::OpId>, op: &Op) -> BTreeSet<crate::OpId
     heads.insert(op.id);
     heads
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ed25519_dalek::Signature;
+
+    use crate::oplog::Oplog;
+    use crate::{
+        Ed25519Signer, Error, EventEnvelope, Op, OpBody, PeerId, ReplicationPolicy, Result, Signer,
+        TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
+    };
+
+    fn note(byte: u8) -> EventEnvelope {
+        EventEnvelope {
+            type_id: "test.note".into(),
+            payload: vec![byte].into(),
+        }
+    }
+
+    /// A genesis of `topic` by `signer` without dependencies, signed directly.
+    fn genesis_body(topic: TopicId, signer: &Ed25519Signer, type_id: String) -> OpBody {
+        OpBody {
+            topic_id: topic,
+            author: signer.peer_id(),
+            actor_id: actor_id_for(topic, signer.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [].into(),
+            generation: 0,
+            payload: TopicPayload::Genesis(TopicGenesis::new(type_id, [signer.peer_id()])),
+        }
+    }
+
+    /// The first control of `writer` in `topic`, depending only on `dep`.
+    fn writer_control(topic: TopicId, writer: &Ed25519Signer, dep: &Op) -> Op {
+        let policy = ReplicationPolicy::all().with_max_sync_peers(7);
+        let body = OpBody {
+            topic_id: topic,
+            author: writer.peer_id(),
+            actor_id: actor_id_for(topic, writer.peer_id()),
+            actor_seq: 1,
+            actor_prev: None,
+            deps: [dep.id].into(),
+            generation: dep.signed.body.generation + 1,
+            payload: TopicPayload::Control(TopicControl::SetReplicationPolicy { policy }),
+        };
+        Op::sign(body, writer).unwrap()
+    }
+
+    struct CountingSigner {
+        inner: Ed25519Signer,
+        signed: AtomicUsize,
+    }
+
+    impl Signer for CountingSigner {
+        fn peer_id(&self) -> PeerId {
+            self.inner.peer_id()
+        }
+
+        fn sign(&self, message: &[u8]) -> Result<Signature> {
+            self.signed.fetch_add(1, Ordering::SeqCst);
+            self.inner.sign(message)
+        }
+    }
+
+    /// A second op at a held actor position is a fork; the holder itself is not.
+    #[test]
+    fn rejects_actor_fork() {
+        let owner = Ed25519Signer::from_bytes(&[81; 32]);
+        let topic = TopicId::hash(b"rejects-actor-fork");
+        let actor = actor_id_for(topic, owner.peer_id());
+        let log = Oplog::new();
+        let genesis = TopicGenesis::new("test.note", []);
+        log.create_topic_genesis(topic, actor, genesis, &owner)
+            .unwrap();
+        let first = log.create_event_op(topic, actor, note(0), &owner).unwrap();
+        let mut body = first.signed.body.clone();
+        body.payload = TopicPayload::Event(note(1));
+        let fork = Op::sign(body, &owner).unwrap();
+        assert!(matches!(log.validate_op(&fork), Err(Error::ActorFork)));
+        assert!(matches!(
+            log.validate_op(&first),
+            Err(Error::ActorSeqGap {
+                expected: 3,
+                actual: 2
+            })
+        ));
+    }
+
+    /// A first-position genesis that depends on an existing op of another topic
+    /// is still not a genesis.
+    #[test]
+    fn rejects_genesis_deps() {
+        let owner = Ed25519Signer::from_bytes(&[82; 32]);
+        let other = TopicId::hash(b"rejects-genesis-deps-other");
+        let topic = TopicId::hash(b"rejects-genesis-deps");
+        let log = Oplog::new();
+        let genesis = TopicGenesis::new("test.note", []);
+        let anchor = log
+            .create_topic_genesis(other, actor_id_for(other, owner.peer_id()), genesis, &owner)
+            .unwrap();
+        let mut body = genesis_body(topic, &owner, "test.note".into());
+        body.deps = [anchor.id].into();
+        body.generation = 1;
+        let op = Op::sign(body, &owner).unwrap();
+        assert!(matches!(log.validate_op(&op), Err(Error::InvalidGenesis)));
+    }
+
+    #[test]
+    fn type_length_boundary() {
+        let owner = Ed25519Signer::from_bytes(&[83; 32]);
+        let topic = TopicId::hash(b"type-length-boundary");
+        let log = Oplog::new();
+        let longest = "x".repeat(crate::sync::MAX_TYPE_BYTES);
+        let op = Op::sign(genesis_body(topic, &owner, longest), &owner).unwrap();
+        log.validate_op(&op).unwrap();
+        let too_long = "x".repeat(crate::sync::MAX_TYPE_BYTES + 1);
+        let op = Op::sign(genesis_body(topic, &owner, too_long), &owner).unwrap();
+        assert!(matches!(log.validate_op(&op), Err(Error::InvalidGenesis)));
+    }
+
+    /// A control on stale deps is checked against the members at those deps,
+    /// not against the members at the current heads.
+    #[test]
+    fn control_uses_deps() {
+        let owner = Ed25519Signer::from_bytes(&[84; 32]);
+        let writer = Ed25519Signer::from_bytes(&[85; 32]);
+        let peer = writer.peer_id();
+        for (seed, initial, control, admitted) in [
+            (
+                &b"control-added-later"[..],
+                vec![],
+                TopicControl::AddPeer { peer },
+                false,
+            ),
+            (
+                b"control-removed-later",
+                vec![peer],
+                TopicControl::RemovePeer { peer },
+                true,
+            ),
+        ] {
+            let topic = TopicId::hash(seed);
+            let actor = actor_id_for(topic, owner.peer_id());
+            let log = Oplog::new();
+            let genesis = TopicGenesis::new("test.note", initial);
+            let genesis = log
+                .create_topic_genesis(topic, actor, genesis, &owner)
+                .unwrap();
+            log.create_control_op(topic, actor, control, &owner)
+                .unwrap();
+            let result = log.validate_op(&writer_control(topic, &writer, &genesis));
+            if admitted {
+                result.unwrap();
+            } else {
+                assert!(matches!(result, Err(Error::NotTopicMember)));
+            }
+        }
+    }
+
+    /// A non-member is refused before its signer is asked to sign anything.
+    #[test]
+    fn refuses_before_signing() {
+        let owner = Ed25519Signer::from_bytes(&[86; 32]);
+        let stranger = CountingSigner {
+            inner: Ed25519Signer::from_bytes(&[87; 32]),
+            signed: AtomicUsize::new(0),
+        };
+        let topic = TopicId::hash(b"refuses-before-signing");
+        let log = Oplog::new();
+        let genesis = TopicGenesis::new("test.note", []);
+        log.create_topic_genesis(topic, actor_id_for(topic, owner.peer_id()), genesis, &owner)
+            .unwrap();
+        let actor = actor_id_for(topic, stranger.peer_id());
+        let result = log.create_event_op(topic, actor, note(0), &stranger);
+        assert!(matches!(result, Err(Error::NotTopicMember)));
+        assert_eq!(stranger.signed.load(Ordering::SeqCst), 0);
+    }
+}
