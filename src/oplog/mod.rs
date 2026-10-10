@@ -527,3 +527,161 @@ impl<S: Storage> Oplog<S> {
         self.storage.actor_clock(topic_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::oplog::{MAX_ADMISSION_RETRIES, Oplog};
+    use crate::storage::{MemoryStorage, Storage};
+    use crate::tests::support::{
+        Damage, GatePoint, Isolation, Note, StaleReadStorage, TopicConfig, damage_op, interleave,
+        node,
+    };
+    use crate::{Op, TopicId};
+
+    /// The ops of a topic of `events` notes by one writer, in topological order.
+    fn note_chain(events: usize) -> (TopicId, Vec<Op>) {
+        let source = node(81);
+        let topic = source.create_topic::<Note>(TopicConfig::default()).unwrap();
+        for index in 0..events {
+            let text = index.to_string();
+            topic.publish(Note { text }).unwrap();
+        }
+        let ops = crate::oplog::topological(source.storage(), &topic.id()).unwrap();
+        (topic.id(), ops)
+    }
+
+    /// A log whose third op is buffered ready after a failed write, with the
+    /// fourth op buffered behind it.
+    fn retained_chain() -> (Oplog<StaleReadStorage>, StaleReadStorage, TopicId, Vec<Op>) {
+        let (topic, ops) = note_chain(3);
+        let storage = StaleReadStorage::new(MemoryStorage::new());
+        let log = Oplog::with_storage(storage.clone());
+        log.receive_ops(ops[2..].to_vec()).unwrap();
+        *storage.failed_ops.lock().unwrap() = [ops[2].id].into();
+        log.receive_ops(ops[..2].to_vec()).unwrap();
+        storage.failed_ops.lock().unwrap().clear();
+        let ready = storage.ready_pending_after(None, usize::MAX).unwrap();
+        assert_eq!(ready.len(), 1, "the third op is not retained ready");
+        (log, storage, topic, ops)
+    }
+
+    /// A pass that admits an op and then loses the next one to conflicts leaves
+    /// ready work, so reconciliation runs another pass that admits it.
+    #[test]
+    fn reconcile_repeats_passes() {
+        let (log, storage, topic, ops) = retained_chain();
+        let conflicts = storage.clone();
+        let accepted = interleave(
+            &storage,
+            (GatePoint::Admit(topic), 1),
+            Isolation::Commits,
+            move || log.reconcile_pending_ops().unwrap(),
+            move || conflicts.conflict_writes(MAX_ADMISSION_RETRIES),
+        );
+        assert_eq!(accepted, [ops[2].id, ops[3].id].into());
+    }
+
+    /// Ready ops that no pass can admit end reconciliation after one pass. The
+    /// conflict budget outlasts one pass only, so a repeated pass shows up here.
+    #[test]
+    fn reconcile_stops_stalled() {
+        use std::sync::atomic::Ordering;
+
+        let (log, storage, _, ops) = retained_chain();
+        storage.conflict_writes(2 * MAX_ADMISSION_RETRIES);
+        assert!(log.reconcile_pending_ops().unwrap().is_empty());
+        let left = storage.conflicts.load(Ordering::SeqCst);
+        assert_eq!(
+            left, MAX_ADMISSION_RETRIES,
+            "reconciliation repeated a pass"
+        );
+        storage.conflict_writes(0);
+        let accepted = log.reconcile_pending_ops().unwrap();
+        assert_eq!(accepted, [ops[2].id, ops[3].id].into());
+    }
+
+    /// A lost record makes the admitted history not whole until it is repaired,
+    /// while a buffered op waiting for a dependency does not count.
+    #[test]
+    fn hole_breaks_history() {
+        let (topic, ops) = note_chain(5);
+        let storage = MemoryStorage::new();
+        let log = Oplog::with_storage(storage.clone());
+        log.receive_ops(ops[..4].to_vec()).unwrap();
+        log.receive_ops(vec![ops[5].clone()]).unwrap();
+        damage_op(&storage, &ops[2].id, Damage::Op);
+        assert!(!log.history_whole(&topic).unwrap());
+        log.receive_ops(vec![ops[2].clone()]).unwrap();
+        assert!(log.history_whole(&topic).unwrap());
+    }
+
+    /// Records of a topic without state are scanned on each question.
+    #[test]
+    fn stateless_holes_counted() {
+        let (topic, ops) = note_chain(2);
+        let full = MemoryStorage::new();
+        Oplog::with_storage(full.clone())
+            .receive_ops(ops.clone())
+            .unwrap();
+        let bare = MemoryStorage::new();
+        let orphan = |op: &Op| bare.orphan_op(op, &full.get_meta(&op.id).unwrap().unwrap());
+        let log = Oplog::with_storage(bare.clone());
+        orphan(&ops[2]);
+        assert!(log.storage().topic_state(&topic).unwrap().is_none());
+        assert!(!log.history_whole(&topic).unwrap());
+        assert_eq!(log.topic_unresolved(&topic).unwrap(), [ops[1].id].into());
+        orphan(&ops[1]);
+        orphan(&ops[0]);
+        assert!(log.history_whole(&topic).unwrap());
+        assert!(log.topic_unresolved(&topic).unwrap().is_empty());
+    }
+
+    /// A repair admitted through this oplog removes the hole from its cache at
+    /// once, before any question checks it again.
+    #[test]
+    fn repair_clears_hole() {
+        let (topic, ops) = note_chain(4);
+        let storage = MemoryStorage::new();
+        let log = Oplog::with_storage(storage.clone());
+        log.receive_ops(ops.clone()).unwrap();
+        damage_op(&storage, &ops[2].id, Damage::Op);
+        assert_eq!(log.topic_unresolved(&topic).unwrap(), [ops[2].id].into());
+        assert_eq!(log.integrity.listed([&ops[2]]).unwrap().len(), 1);
+        log.receive_ops(vec![ops[2].clone()]).unwrap();
+        assert!(log.integrity.listed([&ops[2]]).unwrap().is_empty());
+    }
+
+    /// The waits of a view count while its branch and epoch are current only
+    /// through the current state; after a reset they count as they were.
+    #[cfg(feature = "iroh")]
+    #[test]
+    fn stale_view_unresolved() {
+        let (topic, ops) = note_chain(4);
+        let storage = MemoryStorage::new();
+        let log = Oplog::with_storage(storage.clone());
+        log.receive_ops(ops[..3].to_vec()).unwrap();
+        log.receive_ops(vec![ops[4].clone()]).unwrap();
+        let view = storage.topic_view(&topic, None).unwrap().unwrap();
+        let missing = BTreeSet::from([ops[3].id]);
+        assert_eq!(view.pending_missing, missing);
+        assert_eq!(log.view_unresolved(&view).unwrap(), missing);
+        log.receive_ops(vec![ops[3].clone()]).unwrap();
+        assert!(log.view_unresolved(&view).unwrap().is_empty());
+        storage.reset_topic(&topic).unwrap();
+        log.receive_ops(ops).unwrap();
+        assert_eq!(log.view_unresolved(&view).unwrap(), missing);
+    }
+
+    /// The observed clock holds each actor's admitted position.
+    #[test]
+    fn clock_tracks_admission() {
+        let (topic, ops) = note_chain(2);
+        let log = Oplog::new();
+        log.receive_ops(ops.clone()).unwrap();
+        let last = &ops[2].signed.body;
+        let clock = log.observed_clock(&topic).unwrap();
+        assert_eq!(clock.get(&last.actor_id), last.actor_seq);
+    }
+}
