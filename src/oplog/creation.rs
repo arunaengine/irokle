@@ -51,6 +51,7 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             actor_id,
             TopicPayload::Genesis(genesis),
             signer,
+            None,
             effects,
         )
         .map(|(op, _)| op)
@@ -122,6 +123,28 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         .map(|(op, _)| op)
     }
 
+    /// Creates an event op only while the topic's genesis is `genesis`. The check reads the state
+    /// the append commits against inside the topic's admission turn, so a genesis a received
+    /// history installed first refuses it with [`Error::GenesisMoved`] before it enters the log.
+    pub fn create_event_on(
+        &self,
+        topic_id: TopicId,
+        actor_id: ActorId,
+        event: EventEnvelope,
+        signer: &impl Signer,
+        genesis: OpId,
+    ) -> Result<Op> {
+        self.create_local_effects(
+            topic_id,
+            actor_id,
+            TopicPayload::Event(event),
+            signer,
+            Some(genesis),
+            |_, _, _| Ok(AdmissionEffects::default()),
+        )
+        .map(|(op, _)| op)
+    }
+
     pub(crate) fn create_event_effects<F>(
         &self,
         topic_id: TopicId,
@@ -138,6 +161,7 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             actor_id,
             TopicPayload::Event(event),
             signer,
+            None,
             effects,
         )
     }
@@ -170,6 +194,7 @@ impl<S: crate::oplog::Storage> Oplog<S> {
             actor_id,
             TopicPayload::Control(control),
             signer,
+            None,
             effects,
         )
         .map(|(op, _)| op)
@@ -181,6 +206,7 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         actor_id: ActorId,
         payload: TopicPayload,
         signer: &impl Signer,
+        genesis: Option<OpId>,
         effects: F,
     ) -> Result<(Op, OpMeta)>
     where
@@ -192,11 +218,10 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         for attempt in 0..MAX_ADMISSION_RETRIES {
             conflict_pause(attempt);
             match self.try_local_effects(
-                topic_id,
-                actor_id,
+                (topic_id, actor_id),
                 payload.clone(),
                 signer,
-                &mut signed,
+                (&mut signed, genesis),
                 &effects,
             ) {
                 Err(err) if is_admission_race(&err) => continue,
@@ -208,11 +233,10 @@ impl<S: crate::oplog::Storage> Oplog<S> {
 
     fn try_local_effects<F>(
         &self,
-        topic_id: TopicId,
-        actor_id: ActorId,
+        (topic_id, actor_id): (TopicId, ActorId),
         payload: TopicPayload,
         signer: &impl Signer,
-        signed: &mut Option<Op>,
+        (signed, genesis): (&mut Option<Op>, Option<OpId>),
         effects: &F,
     ) -> Result<(Op, OpMeta)>
     where
@@ -231,6 +255,13 @@ impl<S: crate::oplog::Storage> Oplog<S> {
         }
         let expected_heads = self.storage.heads(&topic_id)?;
         let expected_state = self.storage.topic_state(&topic_id)?;
+        // Checked on the state the commit is bound to: a receive that changes it voids the commit,
+        // and the retry checks the genesis it installed.
+        if let Some(genesis) = genesis
+            && expected_state.as_ref().map(|state| state.genesis) != Some(genesis)
+        {
+            return Err(Error::GenesisMoved);
+        }
         let op = self.next_local_op(
             topic_id,
             actor_id,
@@ -682,6 +713,7 @@ mod tests {
     use ed25519_dalek::Signature;
 
     use crate::oplog::Oplog;
+    use crate::storage::Storage;
     use crate::{
         Ed25519Signer, Error, EventEnvelope, Op, OpBody, PeerId, ReplicationPolicy, Result, Signer,
         TopicControl, TopicGenesis, TopicId, TopicPayload, actor_id_for,
@@ -852,5 +884,93 @@ mod tests {
         let result = log.create_event_op(topic, actor, note(0), &stranger);
         assert!(matches!(result, Err(Error::NotTopicMember)));
         assert_eq!(stranger.signed.load(Ordering::SeqCst), 0);
+    }
+
+    /// An event of the forked test topics, whose genesis expects notes.
+    fn fork_note(text: &str) -> EventEnvelope {
+        let note = crate::tests::support::Note { text: text.into() };
+        EventEnvelope::encode_event(&note).unwrap()
+    }
+
+    #[test]
+    fn bound_append_lands() {
+        let topic = TopicId::hash(b"bound-append");
+        let peer = Ed25519Signer::from_bytes(&[2; 32]).peer_id();
+        let storage = crate::storage::MemoryStorage::new();
+        let (log, signer, genesis, _) =
+            crate::tests::support::forked_side(storage, topic, 1, [peer], "first");
+        let actor = actor_id_for(topic, signer.peer_id());
+        let op = log
+            .create_event_on(topic, actor, fork_note("second"), &signer, genesis.id)
+            .unwrap();
+        let tip = log.storage().actor_tip(&topic, &actor).unwrap();
+        assert_eq!(tip, Some((3, op.id)));
+    }
+
+    #[test]
+    fn other_genesis_refused() {
+        let topic = TopicId::hash(b"other-genesis");
+        let peer = Ed25519Signer::from_bytes(&[2; 32]).peer_id();
+        let storage = crate::storage::MemoryStorage::new();
+        let (log, signer, _, event) =
+            crate::tests::support::forked_side(storage, topic, 1, [peer], "first");
+        let actor = actor_id_for(topic, signer.peer_id());
+        let other = crate::OpId::from_bytes([9; 32]);
+        let result = log.create_event_on(topic, actor, fork_note("second"), &signer, other);
+        assert!(matches!(result, Err(Error::GenesisMoved)));
+        let tip = log.storage().actor_tip(&topic, &actor).unwrap();
+        assert_eq!(tip, Some((2, event.id)));
+    }
+
+    /// A received history that replaces the genesis while a bound append waits for the topic's
+    /// turn makes that append refuse, so it never lands on the new history.
+    #[test]
+    fn replaced_genesis_refused() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use crate::tests::support::{Gate, GatePoint, StaleReadStorage, forked_side};
+
+        let topic = TopicId::hash(b"replaced-genesis");
+        let peer = |seed: u8| Ed25519Signer::from_bytes(&[seed; 32]).peer_id();
+        let stale = || StaleReadStorage::new(crate::storage::MemoryStorage::new());
+        let (log_a, _, g_a, e_a) = forked_side(stale(), topic, 5, [peer(6)], "a");
+        let (log_b, _, g_b, e_b) = forked_side(stale(), topic, 6, [peer(5)], "b");
+        let (loser, seed, losing, loser_event, winner, winner_ops) = match g_a.id < g_b.id {
+            true => (log_b, 6, g_b.id, e_b, peer(5), vec![g_a, e_a]),
+            false => (log_a, 5, g_a.id, e_a, peer(6), vec![g_b, e_b]),
+        };
+
+        // The receive pauses inside its turn while it resolves the tie-break.
+        let gate = Arc::new(Gate::default());
+        let release = gate.releaser();
+        loser
+            .storage()
+            .arm_read(GatePoint::Meta(loser_event.id), Arc::clone(&gate));
+        let receiving = std::thread::spawn({
+            let (log, skip) = (loser.clone(), gate.skipper());
+            move || {
+                let _skip = skip;
+                log.receive_ops_from_peer_evicting(Some(winner), winner_ops)
+            }
+        });
+        gate.expect_arrival("the paused tie-break");
+        let appending = std::thread::spawn({
+            let log = loser.clone();
+            move || {
+                let signer = Ed25519Signer::from_bytes(&[seed; 32]);
+                let actor = actor_id_for(topic, signer.peer_id());
+                log.create_event_on(topic, actor, fork_note("later"), &signer, losing)
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while loser.turns.waiting() < 1 {
+            assert!(Instant::now() < deadline, "the bound append never waited");
+            std::thread::yield_now();
+        }
+        drop(release);
+        assert_eq!(receiving.join().unwrap().unwrap().evictions.len(), 1);
+        let appended = appending.join().unwrap();
+        assert!(matches!(appended, Err(Error::GenesisMoved)));
     }
 }
