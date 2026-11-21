@@ -47,6 +47,10 @@ pub enum Error {
     #[error("topic not found")]
     TopicNotFound,
 
+    /// A guarded append found another genesis than the one it was bound to.
+    #[error("topic genesis is not the expected one")]
+    GenesisMoved,
+
     /// The topic holds [`crate::sync::MAX_TOPIC_ACTORS`] actors, so a new writer
     /// would make its sync summary too large for one frame.
     #[error("topic holds the most actors a sync summary can carry")]
